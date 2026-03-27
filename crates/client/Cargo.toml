@@ -1,0 +1,13 @@
+[package]
+name = "phantom-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phantom-core = { path = "../core" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+minifb = "0.27"
+clap = { version = "4", features = ["derive"] }

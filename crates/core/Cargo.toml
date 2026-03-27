@@ -1,0 +1,10 @@
+[package]
+name = "phantom-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tracing = "0.1"

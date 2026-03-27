@@ -1,0 +1,14 @@
+[package]
+name = "phantom-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phantom-core = { path = "../core" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+scrap = "0.5"
+zstd = "0.13"
+clap = { version = "4", features = ["derive"] }
+enigo = "0.3"
