@@ -11,3 +11,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 minifb = "0.27"
 clap = { version = "4", features = ["derive"] }
+openh264 = "0.6"

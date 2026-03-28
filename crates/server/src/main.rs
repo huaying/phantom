@@ -1,4 +1,5 @@
 mod capture_scrap;
+mod encode_h264;
 mod encode_zstd;
 mod input_injector;
 mod transport_tcp;
@@ -6,7 +7,7 @@ mod transport_tcp;
 use anyhow::Result;
 use clap::Parser;
 use phantom_core::capture::FrameCapture;
-use phantom_core::encode::Encoder;
+use phantom_core::encode::FrameEncoder;
 use phantom_core::frame::PixelFormat;
 use phantom_core::input::InputEvent;
 use phantom_core::protocol::Message;
@@ -26,9 +27,9 @@ struct Args {
     #[arg(short, long, default_value_t = 30)]
     fps: u32,
 
-    /// Zstd compression level (1-22).
-    #[arg(short, long, default_value_t = 3)]
-    compression: i32,
+    /// Target bitrate in kbps for H.264.
+    #[arg(short, long, default_value_t = 5000)]
+    bitrate: u32,
 }
 
 fn main() -> Result<()> {
@@ -43,7 +44,10 @@ fn main() -> Result<()> {
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
 
     let mut capture = capture_scrap::ScrapCapture::new()?;
-    let mut encoder = encode_zstd::ZstdEncoder::new(args.compression);
+    let (width, height) = capture.resolution();
+
+    let mut h264_encoder =
+        encode_h264::OpenH264Encoder::new(width, height, args.fps as f32, args.bitrate)?;
     let mut differ = TileDiffer::new();
     let listener = transport_tcp::TcpServerTransport::bind(&args.listen)?;
 
@@ -51,31 +55,36 @@ fn main() -> Result<()> {
         tracing::info!("waiting for client...");
         let conn = listener.accept_tcp()?;
 
-        if let Err(e) = run_session(&mut capture, &mut encoder, &mut differ, conn, frame_interval)
-        {
+        if let Err(e) = run_session(
+            &mut capture,
+            &mut h264_encoder,
+            &mut differ,
+            conn,
+            frame_interval,
+        ) {
             tracing::warn!("session ended: {e}");
-            differ = TileDiffer::new();
+            differ.reset();
+            h264_encoder.force_keyframe();
         }
     }
 }
 
 fn run_session(
     capture: &mut capture_scrap::ScrapCapture,
-    encoder: &mut encode_zstd::ZstdEncoder,
+    encoder: &mut encode_h264::OpenH264Encoder,
     differ: &mut TileDiffer,
     conn: transport_tcp::TcpConnection,
     frame_interval: Duration,
 ) -> Result<()> {
     let (mut sender, receiver) = conn.split()?;
 
-    // Send hello
     let (width, height) = capture.resolution();
     sender.send_msg(&Message::Hello {
         width,
         height,
         format: PixelFormat::Bgra8,
     })?;
-    tracing::info!(width, height, "session started");
+    tracing::info!(width, height, "session started (H.264)");
 
     // Spawn input receive thread
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
@@ -83,12 +92,10 @@ fn run_session(
         input_receive_loop(receiver, input_tx);
     });
 
-    // Init input injector
     let mut injector = match input_injector::InputInjector::new() {
         Ok(inj) => Some(inj),
         Err(e) => {
             tracing::warn!("input injection unavailable: {e}");
-            tracing::warn!("grant Accessibility permission to enable remote control");
             None
         }
     };
@@ -97,16 +104,15 @@ fn run_session(
     let mut stats_time = Instant::now();
     let mut stats_frames: u64 = 0;
     let mut stats_bytes: u64 = 0;
+    let mut stats_skipped: u64 = 0;
 
     loop {
         let loop_start = Instant::now();
 
-        // Process pending input events (non-blocking)
+        // Process input (non-blocking)
         while let Ok(event) = input_rx.try_recv() {
             if let Some(ref mut inj) = injector {
-                if let Err(e) = inj.inject(&event) {
-                    tracing::debug!("input inject error: {e}");
-                }
+                let _ = inj.inject(&event);
             }
         }
 
@@ -119,39 +125,43 @@ fn run_session(
             }
         };
 
-        // Diff
-        let dirty = differ.diff(&frame);
-        if dirty.is_empty() {
+        // Quick check: skip encoding if nothing changed
+        if !differ.has_changes(&frame) {
+            stats_skipped += 1;
             let elapsed = loop_start.elapsed();
             if elapsed < frame_interval {
                 std::thread::sleep(frame_interval - elapsed);
             }
             continue;
         }
+        // Update differ state (just store current frame for next comparison)
+        differ.diff(&frame);
 
-        // Encode & send
-        let encoded = encoder.encode_tiles(&dirty)?;
-        let frame_bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
-        stats_bytes += frame_bytes as u64;
+        // Encode H.264
+        let encoded = encoder.encode_frame(&frame)?;
+        stats_bytes += encoded.data.len() as u64;
         stats_frames += 1;
 
+        // Send
         sequence += 1;
-        sender.send_msg(&Message::FrameUpdate {
+        sender.send_msg(&Message::VideoFrame {
             sequence,
-            tiles: encoded,
+            frame: encoded,
         })?;
 
-        // Stats every 5s
+        // Stats
         if stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = stats_time.elapsed().as_secs_f64();
             tracing::info!(
                 fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
                 bandwidth = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
+                skipped = stats_skipped,
                 "stats"
             );
             stats_time = Instant::now();
             stats_frames = 0;
             stats_bytes = 0;
+            stats_skipped = 0;
         }
 
         let elapsed = loop_start.elapsed();

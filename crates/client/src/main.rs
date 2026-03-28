@@ -1,3 +1,4 @@
+mod decode_h264;
 mod decode_zstd;
 mod display_minifb;
 mod input_capture;
@@ -7,6 +8,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use phantom_core::decode::Decoder;
 use phantom_core::display::Display;
+use phantom_core::encode::FrameDecoder;
 use phantom_core::protocol::Message;
 use phantom_core::transport::{Connection, MessageReceiver, MessageSender};
 use std::sync::mpsc;
@@ -30,7 +32,6 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Connect and receive Hello
     let transport = transport_tcp::TcpClientTransport::new(&args.connect);
     let mut conn = transport.connect_tcp()?;
 
@@ -42,49 +43,64 @@ fn main() -> Result<()> {
         _ => bail!("expected Hello message"),
     };
 
-    // Split connection for bidirectional use
     let (sender, receiver) = conn.split()?;
 
-    // Init display (must be on main thread for macOS)
+    // Display (main thread for macOS)
     let mut display = display_minifb::MinifbDisplay::new();
     display.init(width, height)?;
 
-    let mut decoder = decode_zstd::ZstdDecoder::new();
+    // Decoders
+    let mut h264_decoder = decode_h264::OpenH264Decoder::new(width, height)?;
+    let mut tile_decoder = decode_zstd::ZstdDecoder::new();
     let mut input_capture = input_capture::InputCapture::new();
 
-    // Spawn network receive thread
+    // Network receive thread
     let (frame_tx, frame_rx) = mpsc::channel::<Message>();
-    std::thread::spawn(move || {
-        recv_loop(receiver, frame_tx);
-    });
+    std::thread::spawn(move || recv_loop(receiver, frame_tx));
 
-    // Input sender runs in a separate thread too (to not block main loop on TCP write)
+    // Input send thread
     let (input_tx, input_rx) = mpsc::channel::<Message>();
-    std::thread::spawn(move || {
-        input_send_loop(sender, input_rx);
-    });
+    std::thread::spawn(move || input_send_loop(sender, input_rx));
 
-    // -- Main loop: display + input capture --
     let mut stats_time = Instant::now();
-    let mut stats_frames: u64 = 0;
+    let mut stats_video_frames: u64 = 0;
+    let mut stats_tile_updates: u64 = 0;
 
     loop {
-        // Drain frame updates (use latest only)
-        let mut last_update = None;
+        // Drain messages, keep latest of each type
+        let mut last_video = None;
+        let mut last_tiles = None;
+
         while let Ok(msg) = frame_rx.try_recv() {
-            if let Message::FrameUpdate { .. } = &msg {
-                last_update = Some(msg);
+            match msg {
+                Message::VideoFrame { .. } => last_video = Some(msg),
+                Message::TileUpdate { .. } => last_tiles = Some(msg),
+                _ => {}
             }
         }
 
-        // Decode and composite
-        if let Some(Message::FrameUpdate { tiles, .. }) = last_update {
+        // Decode H.264 full frame
+        if let Some(Message::VideoFrame { frame, .. }) = last_video {
+            match h264_decoder.decode_frame(&frame.data) {
+                Ok(rgb32) => {
+                    display.update_full_frame(&rgb32);
+                    stats_video_frames += 1;
+                }
+                Err(e) => tracing::debug!("H.264 decode error: {e}"),
+            }
+        }
+
+        // Decode lossless tile updates (overlay on top of H.264 frame)
+        if let Some(Message::TileUpdate { tiles, .. }) = last_tiles {
             let mut decoded = Vec::with_capacity(tiles.len());
             for tile in &tiles {
-                decoded.push(decoder.decode_tile(tile)?);
+                match tile_decoder.decode_tile(tile) {
+                    Ok(dt) => decoded.push(dt),
+                    Err(e) => tracing::debug!("tile decode error: {e}"),
+                }
             }
             display.update_tiles(&decoded)?;
-            stats_frames += 1;
+            stats_tile_updates += 1;
         }
 
         // Present
@@ -93,10 +109,9 @@ fn main() -> Result<()> {
             break;
         }
 
-        // Capture and send input events
+        // Input capture → send
         let events = input_capture.poll(display.window().unwrap());
         for event in events {
-            // Best-effort send; if channel is full, drop input
             let _ = input_tx.send(Message::Input(event));
         }
 
@@ -104,11 +119,13 @@ fn main() -> Result<()> {
         if stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = stats_time.elapsed().as_secs_f64();
             tracing::info!(
-                fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
+                video_fps = format_args!("{:.1}", stats_video_frames as f64 / elapsed),
+                tile_updates = stats_tile_updates,
                 "stats"
             );
             stats_time = Instant::now();
-            stats_frames = 0;
+            stats_video_frames = 0;
+            stats_tile_updates = 0;
         }
 
         std::thread::sleep(Duration::from_millis(1));

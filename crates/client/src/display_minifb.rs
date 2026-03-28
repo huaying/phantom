@@ -4,7 +4,6 @@ use phantom_core::decode::DecodedTile;
 use phantom_core::display::Display;
 use phantom_core::tile::TILE_SIZE;
 
-/// CPU-based display using minifb (simple framebuffer window).
 pub struct MinifbDisplay {
     window: Option<Window>,
     buffer: Vec<u32>,
@@ -22,9 +21,14 @@ impl MinifbDisplay {
         }
     }
 
-    /// Access the underlying window (for input capture).
     pub fn window(&self) -> Option<&Window> {
         self.window.as_ref()
+    }
+
+    /// Replace entire framebuffer with decoded H.264 frame (0RGB u32 format).
+    pub fn update_full_frame(&mut self, rgb32: &[u32]) {
+        let len = self.buffer.len().min(rgb32.len());
+        self.buffer[..len].copy_from_slice(&rgb32[..len]);
     }
 }
 
@@ -52,28 +56,31 @@ impl Display for MinifbDisplay {
     }
 
     fn update_tiles(&mut self, tiles: &[DecodedTile]) -> Result<()> {
-        let bpp = 4; // BGRA
+        let bpp = 4;
+        let w = self.width as usize;
+
         for tile in tiles {
-            let base_x = tile.tile_x * TILE_SIZE;
-            let base_y = tile.tile_y * TILE_SIZE;
+            let base_x = (tile.tile_x * TILE_SIZE) as usize;
+            let base_y = (tile.tile_y * TILE_SIZE) as usize;
+            let tw = tile.pixel_width as usize;
+            let th = tile.pixel_height as usize;
 
-            for row in 0..tile.pixel_height {
-                for col in 0..tile.pixel_width {
-                    let src_idx = (row * tile.pixel_width + col) as usize * bpp;
-                    let dst_x = (base_x + col) as usize;
-                    let dst_y = (base_y + row) as usize;
+            for row in 0..th {
+                let dst_y = base_y + row;
+                if dst_y >= self.height as usize {
+                    break;
+                }
 
-                    if dst_x >= self.width as usize || dst_y >= self.height as usize {
-                        continue;
-                    }
+                let src_offset = row * tw * bpp;
+                let dst_offset = dst_y * w + base_x;
+                let copy_w = tw.min(w - base_x);
 
-                    let dst_idx = dst_y * self.width as usize + dst_x;
-
-                    // BGRA → 0RGB
-                    let b = tile.data[src_idx] as u32;
-                    let g = tile.data[src_idx + 1] as u32;
-                    let r = tile.data[src_idx + 2] as u32;
-                    self.buffer[dst_idx] = (r << 16) | (g << 8) | b;
+                for col in 0..copy_w {
+                    let si = src_offset + col * bpp;
+                    let b = tile.data[si] as u32;
+                    let g = tile.data[si + 1] as u32;
+                    let r = tile.data[si + 2] as u32;
+                    self.buffer[dst_offset + col] = (r << 16) | (g << 8) | b;
                 }
             }
         }

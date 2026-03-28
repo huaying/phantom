@@ -1,20 +1,25 @@
-use crate::encode::EncodedTile;
+use crate::encode::{EncodedFrame, EncodedTile};
 use crate::frame::PixelFormat;
 use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol messages between server and client.
 #[derive(Serialize, Deserialize)]
 pub enum Message {
-    /// Server → Client: initial handshake with display info.
+    /// Server → Client: initial handshake.
     Hello {
         width: u32,
         height: u32,
         format: PixelFormat,
     },
 
-    /// Server → Client: a set of updated tiles for one frame.
-    FrameUpdate {
+    /// Server → Client: H.264/AV1 encoded full frame (lossy, during motion).
+    VideoFrame {
+        sequence: u64,
+        frame: EncodedFrame,
+    },
+
+    /// Server → Client: tile-based lossless update (quality refinement when static).
+    TileUpdate {
         sequence: u64,
         tiles: Vec<EncodedTile>,
     },
@@ -22,19 +27,15 @@ pub enum Message {
     /// Client → Server: input event.
     Input(InputEvent),
 
-    /// Either direction: keep-alive ping.
     Ping,
-
-    /// Either direction: keep-alive pong.
     Pong,
 }
 
-// -- Wire framing helpers for length-prefixed bincode over TCP --
+// -- Wire framing: [u32 big-endian length][bincode payload] --
 
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 
-/// Write a message as [u32 big-endian length][bincode payload].
 pub fn write_message(writer: &mut impl Write, msg: &Message) -> Result<()> {
     let payload = bincode::serialize(msg).context("serialize message")?;
     let len = payload.len() as u32;
@@ -44,7 +45,6 @@ pub fn write_message(writer: &mut impl Write, msg: &Message) -> Result<()> {
     Ok(())
 }
 
-/// Read a message from [u32 big-endian length][bincode payload].
 pub fn read_message(reader: &mut impl Read) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;

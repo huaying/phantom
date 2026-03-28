@@ -1,28 +1,39 @@
-//! Mock server that generates fake frames for testing the client.
-//! No screen capture needed — works without any OS permissions.
+//! Mock server: generates animated H.264 frames. No screen capture needed.
 
 use anyhow::Result;
-use phantom_core::encode::{EncodedTile, TileEncoding};
+use openh264::encoder::{Encoder, EncoderConfig};
+use openh264::formats::YUVBuffer;
+use phantom_core::encode::{EncodedFrame, VideoCodec};
 use phantom_core::frame::PixelFormat;
 use phantom_core::protocol::{self, Message};
 use std::io::Write;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
+struct BgraFrame<'a>(&'a [u8], usize, usize);
+impl openh264::formats::RGBSource for BgraFrame<'_> {
+    fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+    fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
+        let i = (y * self.1 + x) * 4;
+        (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+    }
+}
+
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
-const TILE_SIZE: u32 = 64;
 const FPS: u32 = 30;
+const BITRATE_KBPS: u32 = 3000;
 
 fn main() -> Result<()> {
-    eprintln!("Mock server listening on 0.0.0.0:9900 ({}x{})", WIDTH, HEIGHT);
+    eprintln!(
+        "Mock server on 0.0.0.0:9900 ({}x{}, H.264 {}kbps)",
+        WIDTH, HEIGHT, BITRATE_KBPS
+    );
     let listener = TcpListener::bind("0.0.0.0:9900")?;
-
     let (mut stream, addr) = listener.accept()?;
     stream.set_nodelay(true)?;
     eprintln!("Client connected from {addr}");
 
-    // Send Hello
     protocol::write_message(
         &mut stream,
         &Message::Hello {
@@ -32,91 +43,50 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
-    let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
-    let frame_interval = Duration::from_secs_f64(1.0 / FPS as f64);
+    let config = EncoderConfig::new()
+        .max_frame_rate(FPS as f32)
+        .set_bitrate_bps(BITRATE_KBPS * 1000);
+    let api = openh264::OpenH264API::from_source();
+    let mut encoder = Encoder::with_api_config(api, config)?;
 
+    let frame_interval = Duration::from_secs_f64(1.0 / FPS as f64);
     let mut sequence = 0u64;
     let start = Instant::now();
+    let mut total_bytes: u64 = 0;
 
     loop {
         let loop_start = Instant::now();
         let t = start.elapsed().as_secs_f32();
         sequence += 1;
 
-        let mut tiles = Vec::new();
+        let bgra = generate_frame(WIDTH, HEIGHT, t);
+        let yuv = YUVBuffer::from_rgb_source(BgraFrame(&bgra, WIDTH as usize, HEIGHT as usize));
+        let bitstream = encoder.encode(&yuv)?;
+        let h264_data = bitstream.to_vec();
+        total_bytes += h264_data.len() as u64;
 
-        for ty in 0..tiles_y {
-            for tx in 0..tiles_x {
-                let tw = (WIDTH - tx * TILE_SIZE).min(TILE_SIZE);
-                let th = (HEIGHT - ty * TILE_SIZE).min(TILE_SIZE);
+        let msg = Message::VideoFrame {
+            sequence,
+            frame: EncodedFrame {
+                codec: VideoCodec::H264,
+                data: h264_data,
+                is_keyframe: sequence == 1,
+            },
+        };
 
-                let mut data = Vec::with_capacity((tw * th * 4) as usize);
-                for py in 0..th {
-                    for px in 0..tw {
-                        let gx = tx * TILE_SIZE + px;
-                        let gy = ty * TILE_SIZE + py;
-
-                        // Animated gradient + moving circle
-                        let fx = gx as f32 / WIDTH as f32;
-                        let fy = gy as f32 / HEIGHT as f32;
-
-                        // Circle position (bouncing)
-                        let cx = 0.5 + 0.3 * (t * 0.7).sin();
-                        let cy = 0.5 + 0.3 * (t * 1.1).cos();
-                        let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-                        let in_circle = dist < 0.1;
-
-                        let (r, g, b) = if in_circle {
-                            // White circle
-                            (240u8, 240u8, 240u8)
-                        } else {
-                            // Animated gradient background
-                            let phase = t * 0.5;
-                            let r = ((fx * 200.0 + phase * 50.0) % 255.0) as u8;
-                            let g = ((fy * 200.0) % 255.0) as u8;
-                            let b = (((fx + fy) * 100.0 + phase * 30.0) % 255.0) as u8;
-                            (r, g, b)
-                        };
-
-                        // BGRA
-                        data.push(b);
-                        data.push(g);
-                        data.push(r);
-                        data.push(255);
-                    }
-                }
-
-                // Compress with zstd
-                let compressed = zstd::encode_all(data.as_slice(), 1)?;
-                let (final_data, encoding) = if compressed.len() < data.len() {
-                    (compressed, TileEncoding::Zstd)
-                } else {
-                    (data, TileEncoding::Raw)
-                };
-
-                tiles.push(EncodedTile {
-                    tile_x: tx,
-                    tile_y: ty,
-                    pixel_width: tw,
-                    pixel_height: th,
-                    encoding,
-                    data: final_data,
-                });
-            }
-        }
-
-        if let Err(e) = protocol::write_message(
-            &mut stream,
-            &Message::FrameUpdate { sequence, tiles },
-        ) {
+        if let Err(e) = protocol::write_message(&mut stream, &msg) {
             eprintln!("Client disconnected: {e}");
             break;
         }
         stream.flush()?;
 
         if sequence % 150 == 0 {
-            eprintln!("Sent {sequence} frames ({:.0}s)", t);
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "Frame {sequence} | {:.0}s | avg {:.1} KB/s",
+                elapsed,
+                total_bytes as f64 / elapsed / 1024.0
+            );
         }
 
         let elapsed = loop_start.elapsed();
@@ -126,4 +96,36 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn generate_frame(width: u32, height: u32, t: f32) -> Vec<u8> {
+    let mut bgra = vec![0u8; (width * height * 4) as usize];
+    let cx = 0.5 + 0.3 * (t * 0.7).sin();
+    let cy = 0.5 + 0.3 * (t * 1.1).cos();
+
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+
+            let (r, g, b) = if dist < 0.08 {
+                (255u8, 255, 255)
+            } else {
+                let phase = t * 0.3;
+                (
+                    ((fx * 200.0 + phase * 50.0) % 255.0) as u8,
+                    ((fy * 180.0) % 255.0) as u8,
+                    (((fx + fy) * 100.0 + phase * 30.0) % 255.0) as u8,
+                )
+            };
+
+            let idx = ((y * width + x) * 4) as usize;
+            bgra[idx] = b;
+            bgra[idx + 1] = g;
+            bgra[idx + 2] = r;
+            bgra[idx + 3] = 255;
+        }
+    }
+    bgra
 }

@@ -12,3 +12,4 @@ scrap = "0.5"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
 enigo = "0.3"
+openh264 = "0.6"

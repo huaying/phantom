@@ -4,45 +4,72 @@ pub const TILE_SIZE: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct DirtyTile {
-    /// Tile grid coordinate (not pixel coordinate).
     pub tile_x: u32,
     pub tile_y: u32,
-    /// Actual pixel dimensions (edge tiles may be smaller than TILE_SIZE).
     pub pixel_width: u32,
     pub pixel_height: u32,
-    /// Raw pixel data for this tile, row-major, same format as source frame.
     pub data: Vec<u8>,
 }
 
 /// Detects which tiles changed between consecutive frames.
-///
-/// Uses simple byte comparison. Future: GPU compute shader for faster diff.
 pub struct TileDiffer {
-    prev_data: Option<Vec<u8>>,
+    prev_data: Vec<u8>,
     width: u32,
     height: u32,
+    initialized: bool,
 }
 
 impl TileDiffer {
     pub fn new() -> Self {
         Self {
-            prev_data: None,
+            prev_data: Vec::new(),
             width: 0,
             height: 0,
+            initialized: false,
         }
     }
 
-    /// Compare `frame` against the previous frame, return list of changed tiles.
-    /// First call always returns all tiles as dirty.
+    /// Quick check: did anything change at all? (Cheap — samples ~64 points.)
+    pub fn has_changes(&self, frame: &Frame) -> bool {
+        if !self.initialized
+            || self.width != frame.width
+            || self.height != frame.height
+        {
+            return true;
+        }
+
+        let len = frame.data.len();
+        if len != self.prev_data.len() {
+            return true;
+        }
+
+        // Sample 64 evenly-spaced 4-byte pixels
+        let step = (len / 256).max(4);
+        let mut offset = 0;
+        while offset + 4 <= len {
+            if frame.data[offset..offset + 4] != self.prev_data[offset..offset + 4] {
+                return true;
+            }
+            offset += step;
+        }
+
+        // Check last few bytes too
+        if frame.data[len - 4..] != self.prev_data[len - 4..] {
+            return true;
+        }
+
+        false
+    }
+
+    /// Full diff: return list of changed tiles. Updates internal state.
     pub fn diff(&mut self, frame: &Frame) -> Vec<DirtyTile> {
         let bpp = frame.format.bytes_per_pixel();
         let stride = frame.stride();
         let tiles_x = (frame.width + TILE_SIZE - 1) / TILE_SIZE;
         let tiles_y = (frame.height + TILE_SIZE - 1) / TILE_SIZE;
 
-        // If resolution changed, treat everything as dirty.
         let resolution_changed =
-            self.width != frame.width || self.height != frame.height;
+            !self.initialized || self.width != frame.width || self.height != frame.height;
 
         let mut dirty = Vec::new();
 
@@ -53,22 +80,30 @@ impl TileDiffer {
                 let tile_x_px = (tx * TILE_SIZE) as usize;
                 let tile_y_px = (ty * TILE_SIZE) as usize;
 
-                let changed = if resolution_changed || self.prev_data.is_none() {
+                let changed = if resolution_changed {
                     true
                 } else {
-                    let prev = self.prev_data.as_ref().unwrap();
                     tile_changed(
-                        &frame.data, prev, stride, bpp,
-                        tile_x_px, tile_y_px,
-                        tile_w as usize, tile_h as usize,
+                        &frame.data,
+                        &self.prev_data,
+                        stride,
+                        bpp,
+                        tile_x_px,
+                        tile_y_px,
+                        tile_w as usize,
+                        tile_h as usize,
                     )
                 };
 
                 if changed {
                     let tile_data = extract_tile(
-                        &frame.data, stride, bpp,
-                        tile_x_px, tile_y_px,
-                        tile_w as usize, tile_h as usize,
+                        &frame.data,
+                        stride,
+                        bpp,
+                        tile_x_px,
+                        tile_y_px,
+                        tile_w as usize,
+                        tile_h as usize,
                     );
                     dirty.push(DirtyTile {
                         tile_x: tx,
@@ -81,17 +116,31 @@ impl TileDiffer {
             }
         }
 
-        self.prev_data = Some(frame.data.clone());
+        // Reuse allocation instead of clone
+        self.prev_data.clear();
+        self.prev_data.extend_from_slice(&frame.data);
         self.width = frame.width;
         self.height = frame.height;
+        self.initialized = true;
 
         dirty
+    }
+
+    pub fn reset(&mut self) {
+        self.initialized = false;
+        self.prev_data.clear();
     }
 }
 
 fn tile_changed(
-    curr: &[u8], prev: &[u8], stride: usize, bpp: usize,
-    x_px: usize, y_px: usize, w: usize, h: usize,
+    curr: &[u8],
+    prev: &[u8],
+    stride: usize,
+    bpp: usize,
+    x_px: usize,
+    y_px: usize,
+    w: usize,
+    h: usize,
 ) -> bool {
     let row_bytes = w * bpp;
     for row in 0..h {
@@ -105,8 +154,13 @@ fn tile_changed(
 }
 
 fn extract_tile(
-    data: &[u8], stride: usize, bpp: usize,
-    x_px: usize, y_px: usize, w: usize, h: usize,
+    data: &[u8],
+    stride: usize,
+    bpp: usize,
+    x_px: usize,
+    y_px: usize,
+    w: usize,
+    h: usize,
 ) -> Vec<u8> {
     let row_bytes = w * bpp;
     let mut out = Vec::with_capacity(row_bytes * h);
@@ -125,13 +179,11 @@ mod tests {
     use std::time::Instant;
 
     fn make_frame(width: u32, height: u32, fill: u8) -> Frame {
-        let bpp = 4;
-        let data = vec![fill; (width * height) as usize * bpp];
         Frame {
             width,
             height,
             format: PixelFormat::Bgra8,
-            data,
+            data: vec![fill; (width * height * 4) as usize],
             timestamp: Instant::now(),
         }
     }
@@ -141,7 +193,6 @@ mod tests {
         let mut differ = TileDiffer::new();
         let frame = make_frame(128, 128, 0);
         let dirty = differ.diff(&frame);
-        // 128/64 = 2x2 = 4 tiles
         assert_eq!(dirty.len(), 4);
     }
 
@@ -155,15 +206,28 @@ mod tests {
     }
 
     #[test]
+    fn has_changes_fast_check() {
+        let mut differ = TileDiffer::new();
+        let frame = make_frame(128, 128, 42);
+        assert!(differ.has_changes(&frame)); // first time
+        differ.diff(&frame);
+        assert!(!differ.has_changes(&frame)); // same frame
+
+        let mut frame2 = make_frame(128, 128, 42);
+        // Change the last 4 bytes (always checked by has_changes)
+        let len = frame2.data.len();
+        frame2.data[len - 1] = 99;
+        assert!(differ.has_changes(&frame2)); // changed
+    }
+
+    #[test]
     fn one_pixel_change_one_dirty_tile() {
         let mut differ = TileDiffer::new();
         let frame1 = make_frame(128, 128, 0);
         differ.diff(&frame1);
 
         let mut frame2 = make_frame(128, 128, 0);
-        // Change one pixel in tile (1, 0) — pixel at (64, 0)
-        let bpp = 4;
-        let offset = 0 * (128 * bpp) + 64 * bpp; // row 0, col 64
+        let offset = 64 * 4; // pixel (64, 0) → tile (1, 0)
         frame2.data[offset] = 255;
 
         let dirty = differ.diff(&frame2);
@@ -175,13 +239,10 @@ mod tests {
     #[test]
     fn non_aligned_resolution() {
         let mut differ = TileDiffer::new();
-        // 100x100 → tiles: ceil(100/64)=2 x ceil(100/64)=2 = 4 tiles
-        // Edge tiles: width 36, height 36
         let frame = make_frame(100, 100, 0);
         let dirty = differ.diff(&frame);
         assert_eq!(dirty.len(), 4);
 
-        // Check edge tile dimensions
         let bottom_right = dirty.iter().find(|t| t.tile_x == 1 && t.tile_y == 1).unwrap();
         assert_eq!(bottom_right.pixel_width, 36);
         assert_eq!(bottom_right.pixel_height, 36);
@@ -191,7 +252,6 @@ mod tests {
     fn tile_data_correctness() {
         let mut differ = TileDiffer::new();
         let mut frame = make_frame(128, 64, 0);
-        // Fill tile (1,0) area with 0xFF
         let bpp = 4;
         for row in 0..64u32 {
             for col in 64..128u32 {

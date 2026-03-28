@@ -10,11 +10,7 @@ pub struct DecodedTile {
     pub data: Vec<u8>,
 }
 
-/// Trait for decoding encoded tiles back to raw pixels.
-///
-/// Implementations:
-/// - `ZstdDecoder`: CPU lossless decompression
-/// - Future: `NvdecDecoder` (GPU H.264), `SoftH264Decoder` (CPU H.264)
+/// Tile-level decoder (lossless quality updates).
 pub trait Decoder: Send {
     fn decode_tile(&mut self, tile: &EncodedTile) -> Result<DecodedTile>;
 }
