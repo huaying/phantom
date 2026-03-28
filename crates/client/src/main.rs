@@ -1,3 +1,4 @@
+mod cursor;
 mod decode_h264;
 mod decode_zstd;
 mod display_minifb;

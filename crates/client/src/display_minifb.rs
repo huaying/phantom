@@ -1,5 +1,6 @@
+use crate::cursor::LocalCursor;
 use anyhow::{Context, Result};
-use minifb::{Window, WindowOptions};
+use minifb::{MouseMode, Window, WindowOptions};
 use phantom_core::decode::DecodedTile;
 use phantom_core::display::Display;
 use phantom_core::tile::TILE_SIZE;
@@ -7,12 +8,11 @@ use phantom_core::tile::TILE_SIZE;
 pub struct MinifbDisplay {
     window: Option<Window>,
     buffer: Vec<u32>,
-    /// Server (framebuffer) resolution.
     server_width: u32,
     server_height: u32,
-    /// Actual window size on screen.
     window_width: u32,
     window_height: u32,
+    cursor: LocalCursor,
 }
 
 impl MinifbDisplay {
@@ -24,6 +24,7 @@ impl MinifbDisplay {
             server_height: 0,
             window_width: 0,
             window_height: 0,
+            cursor: LocalCursor::new(),
         }
     }
 
@@ -114,11 +115,30 @@ impl Display for MinifbDisplay {
             return Ok(false);
         }
 
-        // Track if window was resized
+        // Track window resize
         let (cur_w, cur_h) = window.get_size();
         if cur_w as u32 != self.window_width || cur_h as u32 != self.window_height {
             self.window_width = cur_w as u32;
             self.window_height = cur_h as u32;
+        }
+
+        // Draw local cursor at mouse position (in server coordinates)
+        let cursor_pos = window.get_mouse_pos(MouseMode::Clamp).map(|(wx, wy)| {
+            let scale_x = self.server_width as f32 / self.window_width as f32;
+            let scale_y = self.server_height as f32 / self.window_height as f32;
+            ((wx * scale_x) as i32, (wy * scale_y) as i32)
+        });
+
+        // Undraw previous cursor, draw new one
+        self.cursor.undraw(&mut self.buffer);
+        if let Some((cx, cy)) = cursor_pos {
+            self.cursor.draw(
+                &mut self.buffer,
+                self.server_width as usize,
+                self.server_height as usize,
+                cx,
+                cy,
+            );
         }
 
         window
