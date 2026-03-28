@@ -1,5 +1,6 @@
 pub mod frame;
 pub mod capture;
+pub mod clipboard;
 pub mod color;
 pub mod crypto;
 pub mod encode;

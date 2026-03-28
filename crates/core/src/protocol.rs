@@ -27,6 +27,9 @@ pub enum Message {
     /// Client → Server: input event.
     Input(InputEvent),
 
+    /// Bidirectional: clipboard content changed.
+    ClipboardSync(String),
+
     Ping,
     Pong,
 }

@@ -7,6 +7,7 @@ mod transport_tcp;
 
 use anyhow::{bail, Result};
 use clap::Parser;
+use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
 use phantom_core::decode::Decoder;
 use phantom_core::display::Display;
@@ -141,8 +142,10 @@ fn run_session(
     let mut h264_decoder = decode_h264::OpenH264Decoder::new(width, height)?;
     let mut tile_decoder = decode_zstd::ZstdDecoder::new();
     let mut input_capture = input_capture::InputCapture::new();
+    let mut clipboard = ClipboardTracker::new();
+    let mut arboard = arboard::Clipboard::new().ok();
+    let mut clipboard_poll = Instant::now();
 
-    // Track if network threads are alive
     let connected = Arc::new(AtomicBool::new(true));
 
     let (frame_tx, frame_rx) = mpsc::channel::<Message>();
@@ -163,18 +166,28 @@ fn run_session(
     let mut stats_video: u64 = 0;
 
     loop {
-        // Check if disconnected
         if !connected.load(Ordering::Relaxed) {
-            return Ok(false); // disconnect → reconnect
+            return Ok(false);
         }
 
         let mut last_video = None;
         let mut last_tiles = None;
+        let mut clipboard_msgs = Vec::new();
         while let Ok(msg) = frame_rx.try_recv() {
             match msg {
                 Message::VideoFrame { .. } => last_video = Some(msg),
                 Message::TileUpdate { .. } => last_tiles = Some(msg),
+                Message::ClipboardSync(text) => clipboard_msgs.push(text),
                 _ => {}
+            }
+        }
+
+        // Apply clipboard from server
+        for text in clipboard_msgs {
+            if clipboard.on_remote_update(&text) {
+                if let Some(ref mut ab) = arboard {
+                    let _ = ab.set_text(&text);
+                }
             }
         }
 
@@ -208,6 +221,18 @@ fn run_session(
         });
         for event in events {
             let _ = input_tx.send(Message::Input(event));
+        }
+
+        // Poll local clipboard every 250ms
+        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
+            clipboard_poll = Instant::now();
+            if let Some(ref mut ab) = arboard {
+                if let Ok(text) = ab.get_text() {
+                    if let Some(changed) = clipboard.check_local_change(&text) {
+                        let _ = input_tx.send(Message::ClipboardSync(changed));
+                    }
+                }
+            }
         }
 
         if stats_time.elapsed() >= Duration::from_secs(5) {

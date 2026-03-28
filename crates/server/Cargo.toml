@@ -3,6 +3,12 @@ name = "phantom-server"
 version = "0.1.0"
 edition = "2021"
 
+# Future feature flags for additional encoders:
+# [features]
+# default = ["openh264-encoder"]
+# openh264-encoder = ["openh264"]
+# ffmpeg-encoder = ["ffmpeg-next"]  # enables x264, NVENC, VAAPI, AV1
+
 [dependencies]
 phantom-core = { path = "../core" }
 anyhow = "1"
@@ -13,4 +19,5 @@ scrap = "0.5"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
 enigo = "0.3"
+arboard = "3"
 openh264 = "0.6"
