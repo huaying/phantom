@@ -1,0 +1,26 @@
+services:
+  # Real X11 server mode (captures Xvfb desktop with xclock, xeyes, xterm)
+  server:
+    build: .
+    ports:
+      - "9900:9900"
+    environment:
+      - RESOLUTION=1280x720x24
+    command: ["server"]
+
+  # QUIC mode (UDP)
+  server-quic:
+    build: .
+    ports:
+      - "9900:9900/udp"
+      - "9900:9900/tcp"
+    environment:
+      - RESOLUTION=1280x720x24
+    command: ["server-quic"]
+
+  # Mock server (animated test pattern, no X11 needed)
+  mock:
+    build: .
+    ports:
+      - "9900:9900"
+    command: ["mock"]
