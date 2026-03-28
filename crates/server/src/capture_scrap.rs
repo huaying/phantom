@@ -29,6 +29,9 @@ impl FrameCapture for ScrapCapture {
             Ok(frame) => {
                 // scrap returns BGRA on all platforms, but stride may differ
                 // from width * 4 due to padding. Copy row by row.
+                if self.height == 0 || self.width == 0 {
+                    return Ok(None);
+                }
                 let stride = frame.len() / self.height as usize;
                 let bpp = 4;
                 let expected_stride = self.width as usize * bpp;

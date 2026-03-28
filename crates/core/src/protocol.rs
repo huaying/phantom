@@ -48,10 +48,17 @@ pub fn write_message(writer: &mut impl Write, msg: &Message) -> Result<()> {
     Ok(())
 }
 
+/// Maximum message size: 64 MB. Prevents OOM from malicious/corrupted length fields.
+const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 pub fn read_message(reader: &mut impl Read) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("message too large ({len} bytes, max {MAX_MESSAGE_SIZE})");
+    }
 
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;

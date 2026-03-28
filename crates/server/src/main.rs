@@ -270,7 +270,7 @@ fn run_session(
             None => {
                 if quality.should_send_lossless() {
                     if let Some(ref f) = last_frame {
-                        send_lossless_update(&mut *sender, &mut zstd_encoder, differ, f, &mut sequence)?;
+                        send_lossless_update(&mut *sender, &mut zstd_encoder, f, &mut sequence)?;
                         quality.mark_lossless_sent();
                         stats_lossless += 1;
                     }
@@ -302,7 +302,7 @@ fn run_session(
             last_frame = Some(frame);
         } else if quality.should_send_lossless() {
             if let Some(ref f) = last_frame {
-                let bytes = send_lossless_update(&mut *sender, &mut zstd_encoder, differ, f, &mut sequence)?;
+                let bytes = send_lossless_update(&mut *sender, &mut zstd_encoder, f, &mut sequence)?;
                 stats_bytes += bytes as u64;
                 quality.mark_lossless_sent();
                 stats_lossless += 1;
@@ -333,12 +333,12 @@ fn run_session(
 
 fn send_lossless_update(
     sender: &mut dyn MessageSender, encoder: &mut encode_zstd::ZstdEncoder,
-    differ: &mut TileDiffer, frame: &Frame, sequence: &mut u64,
+    frame: &Frame, sequence: &mut u64,
 ) -> Result<usize> {
-    let saved = std::mem::replace(differ, TileDiffer::new());
-    let all_tiles = differ.diff(frame);
-    *differ = saved;
-    differ.diff(frame);
+    // Use a fresh differ to get ALL tiles (first frame = all dirty).
+    // Don't touch the main differ's state.
+    let mut fresh = TileDiffer::new();
+    let all_tiles = fresh.diff(frame);
     let encoded = encoder.encode_tiles(&all_tiles)?;
     let total_bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
     *sequence += 1;

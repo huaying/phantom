@@ -96,6 +96,10 @@ fn main() -> Result<()> {
         // Receive Hello
         let (width, height) = match receiver.recv_msg() {
             Ok(Message::Hello { width, height, .. }) => {
+                if width == 0 || height == 0 || width > 8192 || height > 8192 {
+                    tracing::warn!(width, height, "invalid resolution from server");
+                    continue;
+                }
                 tracing::info!(width, height, "connected");
                 (width, height)
             }
@@ -112,7 +116,7 @@ fn main() -> Result<()> {
 
         // Run session (returns on disconnect)
         let should_quit = run_session(
-            display.as_mut().unwrap(),
+            display.as_mut().expect("display must be initialized"),
             sender,
             receiver,
             width,
@@ -216,7 +220,8 @@ fn run_session(
             return Ok(true); // window closed → quit
         }
 
-        let events = input_capture.poll(display.window().unwrap(), |x, y| {
+        let Some(window) = display.window() else { continue };
+        let events = input_capture.poll(window, |x, y| {
             display.map_mouse(x, y)
         });
         for event in events {

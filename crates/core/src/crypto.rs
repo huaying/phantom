@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
+const MAX_ENCRYPTED_SIZE: usize = 64 * 1024 * 1024;
 
 /// Generates a random 32-byte key and returns it as a hex string.
 pub fn generate_key_hex() -> String {
@@ -25,18 +26,28 @@ pub fn parse_key_hex(hex_str: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn make_nonce(counter: u64) -> [u8; NONCE_LEN] {
+fn make_nonce(session_id: [u8; 4], counter: u64) -> [u8; NONCE_LEN] {
     let mut nonce = [0u8; NONCE_LEN];
+    nonce[..4].copy_from_slice(&session_id);
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
     nonce
 }
 
+fn random_session_id() -> [u8; 4] {
+    use rand::RngCore;
+    let mut id = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut id);
+    id
+}
+
 /// Encrypted writer: wraps any Write with ChaCha20-Poly1305.
 /// Wire format per message: [4-byte total_len][12-byte nonce][ciphertext + 16-byte tag]
+/// Each session gets a random 4-byte prefix to prevent nonce reuse across sessions.
 pub struct EncryptedWriter<W: Write> {
     inner: W,
     cipher: ChaCha20Poly1305,
     counter: u64,
+    session_id: [u8; 4],
 }
 
 impl<W: Write> EncryptedWriter<W> {
@@ -45,12 +56,13 @@ impl<W: Write> EncryptedWriter<W> {
             inner: writer,
             cipher: ChaCha20Poly1305::new(key.into()),
             counter: 0,
+            session_id: random_session_id(),
         }
     }
 
     pub fn write_encrypted(&mut self, plaintext: &[u8]) -> Result<()> {
         self.counter += 1;
-        let nonce_bytes = make_nonce(self.counter);
+        let nonce_bytes = make_nonce(self.session_id, self.counter);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -68,10 +80,10 @@ impl<W: Write> EncryptedWriter<W> {
 }
 
 /// Encrypted reader: wraps any Read with ChaCha20-Poly1305.
+/// Nonce is read from the wire (sent by writer). AEAD tag provides authentication.
 pub struct EncryptedReader<R: Read> {
     inner: R,
     cipher: ChaCha20Poly1305,
-    counter: u64,
 }
 
 impl<R: Read> EncryptedReader<R> {
@@ -79,7 +91,6 @@ impl<R: Read> EncryptedReader<R> {
         Self {
             inner: reader,
             cipher: ChaCha20Poly1305::new(key.into()),
-            counter: 0,
         }
     }
 
@@ -91,6 +102,9 @@ impl<R: Read> EncryptedReader<R> {
         if total_len < NONCE_LEN + TAG_LEN {
             bail!("encrypted message too short ({total_len} bytes)");
         }
+        if total_len > MAX_ENCRYPTED_SIZE {
+            bail!("encrypted message too large ({total_len} bytes)");
+        }
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         self.inner.read_exact(&mut nonce_bytes)?;
@@ -100,16 +114,10 @@ impl<R: Read> EncryptedReader<R> {
         let mut ciphertext = vec![0u8; ct_len];
         self.inner.read_exact(&mut ciphertext)?;
 
-        self.counter += 1;
-        let expected_nonce = make_nonce(self.counter);
-        if nonce_bytes != expected_nonce {
-            bail!("nonce mismatch — wrong key or corrupted stream");
-        }
-
         let plaintext = self
             .cipher
             .decrypt(nonce, ciphertext.as_slice())
-            .map_err(|_| anyhow::anyhow!("decryption failed — wrong key?"))?;
+            .map_err(|_| anyhow::anyhow!("decryption failed"))?;
 
         Ok(plaintext)
     }

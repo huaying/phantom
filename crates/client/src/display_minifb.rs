@@ -88,6 +88,16 @@ impl Display for MinifbDisplay {
             let tw = tile.pixel_width as usize;
             let th = tile.pixel_height as usize;
 
+            // Validate tile bounds
+            if base_x >= w || base_y >= self.server_height as usize {
+                continue;
+            }
+            let expected_data = tw * th * bpp;
+            if tile.data.len() < expected_data {
+                tracing::debug!("tile data too short ({} < {}), skipping", tile.data.len(), expected_data);
+                continue;
+            }
+
             for row in 0..th {
                 let dst_y = base_y + row;
                 if dst_y >= self.server_height as usize {
@@ -95,14 +105,14 @@ impl Display for MinifbDisplay {
                 }
                 let src_offset = row * tw * bpp;
                 let dst_offset = dst_y * w + base_x;
-                let copy_w = tw.min(w - base_x);
+                let copy_w = tw.min(w.saturating_sub(base_x));
 
                 for col in 0..copy_w {
                     let si = src_offset + col * bpp;
-                    let b = tile.data[si] as u32;
-                    let g = tile.data[si + 1] as u32;
-                    let r = tile.data[si + 2] as u32;
-                    self.buffer[dst_offset + col] = (r << 16) | (g << 8) | b;
+                    self.buffer[dst_offset + col] =
+                        ((tile.data[si + 2] as u32) << 16)
+                        | ((tile.data[si + 1] as u32) << 8)
+                        | (tile.data[si] as u32);
                 }
             }
         }
@@ -110,7 +120,10 @@ impl Display for MinifbDisplay {
     }
 
     fn present(&mut self) -> Result<bool> {
-        let window = self.window.as_mut().unwrap();
+        let window = match self.window.as_mut() {
+            Some(w) => w,
+            None => anyhow::bail!("display not initialized"),
+        };
         if !window.is_open() {
             return Ok(false);
         }

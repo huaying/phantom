@@ -42,6 +42,9 @@ impl TileDiffer {
         if len != self.prev_data.len() {
             return true;
         }
+        if len < 4 {
+            return frame.data != self.prev_data;
+        }
 
         // Sample 64 evenly-spaced 4-byte pixels
         let step = (len / 256).max(4);

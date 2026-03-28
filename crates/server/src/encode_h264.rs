@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use openh264::encoder::{Encoder, EncoderConfig};
+use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 use phantom_core::encode::{EncodedFrame, FrameEncoder, VideoCodec};
 use phantom_core::frame::Frame;
@@ -56,12 +56,13 @@ impl FrameEncoder for OpenH264Encoder {
         let yuv = YUVBuffer::from_rgb_source(bgra);
 
         let bitstream = self.encoder.encode(&yuv).context("H.264 encode failed")?;
+        let is_keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
         let data = bitstream.to_vec();
 
         Ok(EncodedFrame {
             codec: VideoCodec::H264,
             data,
-            is_keyframe: false,
+            is_keyframe,
         })
     }
 
