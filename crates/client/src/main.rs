@@ -12,7 +12,9 @@ use phantom_core::display::Display;
 use phantom_core::encode::FrameDecoder;
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -54,46 +56,117 @@ fn main() -> Result<()> {
         }
     };
 
-    let transport = transport_tcp::TcpClientTransport::new(&args.connect);
-    let conn = transport.connect_tcp()?;
+    let mut display: Option<display_minifb::MinifbDisplay> = None;
+    let mut backoff = Duration::from_millis(500);
+    let max_backoff = Duration::from_secs(10);
 
-    // Split with or without encryption
-    let (sender, mut receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
-        if let Some(ref key) = encryption_key {
-            let (s, r) = conn.split_encrypted(key)?;
-            (Box::new(s), Box::new(r))
-        } else {
-            let (s, r) = conn.split()?;
-            (Box::new(s), Box::new(r))
+    loop {
+        // -- Connect --
+        tracing::info!(addr = %args.connect, "connecting...");
+        let conn = match transport_tcp::TcpClientTransport::new(&args.connect).connect_tcp() {
+            Ok(c) => {
+                backoff = Duration::from_millis(500); // reset on success
+                c
+            }
+            Err(e) => {
+                tracing::warn!("connection failed: {e}, retrying in {:.1}s", backoff.as_secs_f32());
+                // Keep presenting if we have a display (shows last frame)
+                if let Some(ref mut d) = display {
+                    if !d.present().unwrap_or(false) {
+                        break; // window closed
+                    }
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
         };
 
-    // Receive Hello
-    let (width, height) = match receiver.recv_msg()? {
-        Message::Hello { width, height, .. } => {
-            tracing::info!(width, height, "connected");
-            (width, height)
+        let (sender, mut receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
+            if let Some(ref key) = encryption_key {
+                let (s, r) = conn.split_encrypted(key)?;
+                (Box::new(s), Box::new(r))
+            } else {
+                let (s, r) = conn.split()?;
+                (Box::new(s), Box::new(r))
+            };
+
+        // Receive Hello
+        let (width, height) = match receiver.recv_msg() {
+            Ok(Message::Hello { width, height, .. }) => {
+                tracing::info!(width, height, "connected");
+                (width, height)
+            }
+            Ok(_) => { tracing::warn!("unexpected message, expected Hello"); continue; }
+            Err(e) => { tracing::warn!("handshake failed: {e}"); continue; }
+        };
+
+        // Init or reinit display
+        if display.is_none() {
+            let mut d = display_minifb::MinifbDisplay::new();
+            d.init(width, height)?;
+            display = Some(d);
         }
-        _ => bail!("expected Hello message"),
-    };
 
-    let mut display = display_minifb::MinifbDisplay::new();
-    display.init(width, height)?;
+        // Run session (returns on disconnect)
+        let should_quit = run_session(
+            display.as_mut().unwrap(),
+            sender,
+            receiver,
+            width,
+            height,
+        )?;
 
+        if should_quit {
+            break;
+        }
+
+        tracing::info!("disconnected, reconnecting in {:.1}s...", backoff.as_secs_f32());
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(max_backoff);
+    }
+
+    Ok(())
+}
+
+/// Run one session. Returns Ok(true) if window was closed (quit), Ok(false) on disconnect.
+fn run_session(
+    display: &mut display_minifb::MinifbDisplay,
+    sender: Box<dyn MessageSender>,
+    receiver: Box<dyn MessageReceiver>,
+    width: u32,
+    height: u32,
+) -> Result<bool> {
     let mut h264_decoder = decode_h264::OpenH264Decoder::new(width, height)?;
     let mut tile_decoder = decode_zstd::ZstdDecoder::new();
     let mut input_capture = input_capture::InputCapture::new();
 
+    // Track if network threads are alive
+    let connected = Arc::new(AtomicBool::new(true));
+
     let (frame_tx, frame_rx) = mpsc::channel::<Message>();
-    std::thread::spawn(move || recv_loop(receiver, frame_tx));
+    let recv_connected = connected.clone();
+    std::thread::spawn(move || {
+        recv_loop(receiver, frame_tx);
+        recv_connected.store(false, Ordering::Relaxed);
+    });
 
     let (input_tx, input_rx) = mpsc::channel::<Message>();
-    std::thread::spawn(move || input_send_loop(sender, input_rx));
+    let send_connected = connected.clone();
+    std::thread::spawn(move || {
+        input_send_loop(sender, input_rx);
+        send_connected.store(false, Ordering::Relaxed);
+    });
 
     let mut stats_time = Instant::now();
     let mut stats_video: u64 = 0;
-    let mut stats_tiles: u64 = 0;
 
     loop {
+        // Check if disconnected
+        if !connected.load(Ordering::Relaxed) {
+            return Ok(false); // disconnect → reconnect
+        }
+
         let mut last_video = None;
         let mut last_tiles = None;
         while let Ok(msg) = frame_rx.try_recv() {
@@ -110,7 +183,7 @@ fn main() -> Result<()> {
                     display.update_full_frame(&rgb32);
                     stats_video += 1;
                 }
-                Err(e) => tracing::debug!("H.264 decode error: {e}"),
+                Err(e) => tracing::debug!("H.264 decode: {e}"),
             }
         }
 
@@ -119,15 +192,14 @@ fn main() -> Result<()> {
             for tile in &tiles {
                 match tile_decoder.decode_tile(tile) {
                     Ok(dt) => decoded.push(dt),
-                    Err(e) => tracing::debug!("tile decode error: {e}"),
+                    Err(e) => tracing::debug!("tile decode: {e}"),
                 }
             }
-            display.update_tiles(&decoded)?;
-            stats_tiles += 1;
+            let _ = display.update_tiles(&decoded);
         }
 
         if !display.present()? {
-            break;
+            return Ok(true); // window closed → quit
         }
 
         let events = input_capture.poll(display.window().unwrap(), |x, y| {
@@ -141,34 +213,27 @@ fn main() -> Result<()> {
             let elapsed = stats_time.elapsed().as_secs_f64();
             tracing::info!(
                 video_fps = format_args!("{:.1}", stats_video as f64 / elapsed),
-                quality_updates = stats_tiles,
                 "stats"
             );
             stats_time = Instant::now();
             stats_video = 0;
-            stats_tiles = 0;
         }
 
         std::thread::sleep(Duration::from_millis(1));
     }
-
-    Ok(())
 }
 
 fn recv_loop(mut receiver: Box<dyn MessageReceiver>, tx: mpsc::Sender<Message>) {
     loop {
         match receiver.recv_msg() {
             Ok(msg) => { if tx.send(msg).is_err() { break; } }
-            Err(e) => { tracing::debug!("receive ended: {e}"); break; }
+            Err(_) => break,
         }
     }
 }
 
 fn input_send_loop(mut sender: Box<dyn MessageSender>, rx: mpsc::Receiver<Message>) {
     while let Ok(msg) = rx.recv() {
-        if let Err(e) = sender.send_msg(&msg) {
-            tracing::debug!("input send ended: {e}");
-            break;
-        }
+        if sender.send_msg(&msg).is_err() { break; }
     }
 }
