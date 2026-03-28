@@ -1,13 +1,22 @@
 use minifb::{Key, MouseMode, Window};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
-/// Captures mouse and keyboard input from a minifb window.
-/// Tracks state to only emit press/release/move events on changes.
+const KEY_REPEAT_DELAY: Duration = Duration::from_millis(500);
+const KEY_REPEAT_INTERVAL: Duration = Duration::from_millis(33); // ~30 repeats/sec
+
 pub struct InputCapture {
     prev_mouse_pos: (f32, f32),
     prev_mouse_buttons: [bool; 3],
     prev_keys: HashSet<Key>,
+    /// Track when each key was first pressed and when last repeat was sent.
+    held_keys: HashMap<Key, HeldKeyState>,
+}
+
+struct HeldKeyState {
+    pressed_at: Instant,
+    last_repeat: Instant,
 }
 
 impl InputCapture {
@@ -16,11 +25,10 @@ impl InputCapture {
             prev_mouse_pos: (-1.0, -1.0),
             prev_mouse_buttons: [false; 3],
             prev_keys: HashSet::new(),
+            held_keys: HashMap::new(),
         }
     }
 
-    /// Poll the window for input changes.
-    /// `map_coords` converts window-space mouse coordinates to server-space.
     pub fn poll(
         &mut self,
         window: &Window,
@@ -65,15 +73,37 @@ impl InputCapture {
 
         // -- Keyboard --
         let keys: HashSet<Key> = window.get_keys().into_iter().collect();
+        let now = Instant::now();
 
         // Newly pressed
         for &key in &keys {
             if !self.prev_keys.contains(&key) {
                 if let Some(kc) = minifb_to_keycode(key) {
-                    events.push(InputEvent::Key {
-                        key: kc,
-                        pressed: true,
-                    });
+                    events.push(InputEvent::Key { key: kc, pressed: true });
+                }
+                self.held_keys.insert(key, HeldKeyState {
+                    pressed_at: now,
+                    last_repeat: now,
+                });
+            }
+        }
+
+        // Key repeat for held keys
+        for &key in &keys {
+            if self.prev_keys.contains(&key) {
+                // Key was already down — check if we should repeat
+                if let Some(state) = self.held_keys.get_mut(&key) {
+                    let held_duration = now - state.pressed_at;
+                    let since_repeat = now - state.last_repeat;
+
+                    if held_duration >= KEY_REPEAT_DELAY && since_repeat >= KEY_REPEAT_INTERVAL {
+                        if let Some(kc) = minifb_to_keycode(key) {
+                            // Send press+release pair to simulate repeat
+                            events.push(InputEvent::Key { key: kc, pressed: false });
+                            events.push(InputEvent::Key { key: kc, pressed: true });
+                        }
+                        state.last_repeat = now;
+                    }
                 }
             }
         }
@@ -82,11 +112,9 @@ impl InputCapture {
         for &key in &self.prev_keys {
             if !keys.contains(&key) {
                 if let Some(kc) = minifb_to_keycode(key) {
-                    events.push(InputEvent::Key {
-                        key: kc,
-                        pressed: false,
-                    });
+                    events.push(InputEvent::Key { key: kc, pressed: false });
                 }
+                self.held_keys.remove(&key);
             }
         }
 
@@ -97,97 +125,49 @@ impl InputCapture {
 
 fn minifb_to_keycode(key: Key) -> Option<KeyCode> {
     Some(match key {
-        Key::A => KeyCode::A,
-        Key::B => KeyCode::B,
-        Key::C => KeyCode::C,
-        Key::D => KeyCode::D,
-        Key::E => KeyCode::E,
-        Key::F => KeyCode::F,
-        Key::G => KeyCode::G,
-        Key::H => KeyCode::H,
-        Key::I => KeyCode::I,
-        Key::J => KeyCode::J,
-        Key::K => KeyCode::K,
-        Key::L => KeyCode::L,
-        Key::M => KeyCode::M,
-        Key::N => KeyCode::N,
-        Key::O => KeyCode::O,
-        Key::P => KeyCode::P,
-        Key::Q => KeyCode::Q,
-        Key::R => KeyCode::R,
-        Key::S => KeyCode::S,
-        Key::T => KeyCode::T,
-        Key::U => KeyCode::U,
-        Key::V => KeyCode::V,
-        Key::W => KeyCode::W,
-        Key::X => KeyCode::X,
-        Key::Y => KeyCode::Y,
-        Key::Z => KeyCode::Z,
+        Key::A => KeyCode::A, Key::B => KeyCode::B, Key::C => KeyCode::C,
+        Key::D => KeyCode::D, Key::E => KeyCode::E, Key::F => KeyCode::F,
+        Key::G => KeyCode::G, Key::H => KeyCode::H, Key::I => KeyCode::I,
+        Key::J => KeyCode::J, Key::K => KeyCode::K, Key::L => KeyCode::L,
+        Key::M => KeyCode::M, Key::N => KeyCode::N, Key::O => KeyCode::O,
+        Key::P => KeyCode::P, Key::Q => KeyCode::Q, Key::R => KeyCode::R,
+        Key::S => KeyCode::S, Key::T => KeyCode::T, Key::U => KeyCode::U,
+        Key::V => KeyCode::V, Key::W => KeyCode::W, Key::X => KeyCode::X,
+        Key::Y => KeyCode::Y, Key::Z => KeyCode::Z,
 
-        Key::Key0 => KeyCode::Key0,
-        Key::Key1 => KeyCode::Key1,
-        Key::Key2 => KeyCode::Key2,
-        Key::Key3 => KeyCode::Key3,
-        Key::Key4 => KeyCode::Key4,
-        Key::Key5 => KeyCode::Key5,
-        Key::Key6 => KeyCode::Key6,
-        Key::Key7 => KeyCode::Key7,
-        Key::Key8 => KeyCode::Key8,
-        Key::Key9 => KeyCode::Key9,
+        Key::Key0 => KeyCode::Key0, Key::Key1 => KeyCode::Key1,
+        Key::Key2 => KeyCode::Key2, Key::Key3 => KeyCode::Key3,
+        Key::Key4 => KeyCode::Key4, Key::Key5 => KeyCode::Key5,
+        Key::Key6 => KeyCode::Key6, Key::Key7 => KeyCode::Key7,
+        Key::Key8 => KeyCode::Key8, Key::Key9 => KeyCode::Key9,
 
-        Key::F1 => KeyCode::F1,
-        Key::F2 => KeyCode::F2,
-        Key::F3 => KeyCode::F3,
-        Key::F4 => KeyCode::F4,
-        Key::F5 => KeyCode::F5,
-        Key::F6 => KeyCode::F6,
-        Key::F7 => KeyCode::F7,
-        Key::F8 => KeyCode::F8,
-        Key::F9 => KeyCode::F9,
-        Key::F10 => KeyCode::F10,
-        Key::F11 => KeyCode::F11,
-        Key::F12 => KeyCode::F12,
+        Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2, Key::F3 => KeyCode::F3,
+        Key::F4 => KeyCode::F4, Key::F5 => KeyCode::F5, Key::F6 => KeyCode::F6,
+        Key::F7 => KeyCode::F7, Key::F8 => KeyCode::F8, Key::F9 => KeyCode::F9,
+        Key::F10 => KeyCode::F10, Key::F11 => KeyCode::F11, Key::F12 => KeyCode::F12,
 
-        Key::LeftShift => KeyCode::LeftShift,
-        Key::RightShift => KeyCode::RightShift,
-        Key::LeftCtrl => KeyCode::LeftCtrl,
-        Key::RightCtrl => KeyCode::RightCtrl,
-        Key::LeftAlt => KeyCode::LeftAlt,
-        Key::RightAlt => KeyCode::RightAlt,
-        Key::LeftSuper => KeyCode::LeftMeta,
-        Key::RightSuper => KeyCode::RightMeta,
+        Key::LeftShift => KeyCode::LeftShift, Key::RightShift => KeyCode::RightShift,
+        Key::LeftCtrl => KeyCode::LeftCtrl, Key::RightCtrl => KeyCode::RightCtrl,
+        Key::LeftAlt => KeyCode::LeftAlt, Key::RightAlt => KeyCode::RightAlt,
+        Key::LeftSuper => KeyCode::LeftMeta, Key::RightSuper => KeyCode::RightMeta,
 
-        Key::Up => KeyCode::Up,
-        Key::Down => KeyCode::Down,
-        Key::Left => KeyCode::Left,
-        Key::Right => KeyCode::Right,
-        Key::Home => KeyCode::Home,
-        Key::End => KeyCode::End,
-        Key::PageUp => KeyCode::PageUp,
-        Key::PageDown => KeyCode::PageDown,
+        Key::Up => KeyCode::Up, Key::Down => KeyCode::Down,
+        Key::Left => KeyCode::Left, Key::Right => KeyCode::Right,
+        Key::Home => KeyCode::Home, Key::End => KeyCode::End,
+        Key::PageUp => KeyCode::PageUp, Key::PageDown => KeyCode::PageDown,
 
-        Key::Backspace => KeyCode::Backspace,
-        Key::Delete => KeyCode::Delete,
-        Key::Tab => KeyCode::Tab,
-        Key::Enter => KeyCode::Enter,
-        Key::Space => KeyCode::Space,
-        Key::Escape => KeyCode::Escape,
+        Key::Backspace => KeyCode::Backspace, Key::Delete => KeyCode::Delete,
+        Key::Tab => KeyCode::Tab, Key::Enter => KeyCode::Enter,
+        Key::Space => KeyCode::Space, Key::Escape => KeyCode::Escape,
         Key::Insert => KeyCode::Insert,
 
-        Key::Minus => KeyCode::Minus,
-        Key::Equal => KeyCode::Equal,
-        Key::LeftBracket => KeyCode::LeftBracket,
-        Key::RightBracket => KeyCode::RightBracket,
-        Key::Backslash => KeyCode::Backslash,
-        Key::Semicolon => KeyCode::Semicolon,
-        Key::Apostrophe => KeyCode::Apostrophe,
-        Key::Backquote => KeyCode::Grave,
-        Key::Comma => KeyCode::Comma,
-        Key::Period => KeyCode::Period,
-        Key::Slash => KeyCode::Slash,
-        Key::CapsLock => KeyCode::CapsLock,
-        Key::NumLock => KeyCode::NumLock,
-        Key::ScrollLock => KeyCode::ScrollLock,
+        Key::Minus => KeyCode::Minus, Key::Equal => KeyCode::Equal,
+        Key::LeftBracket => KeyCode::LeftBracket, Key::RightBracket => KeyCode::RightBracket,
+        Key::Backslash => KeyCode::Backslash, Key::Semicolon => KeyCode::Semicolon,
+        Key::Apostrophe => KeyCode::Apostrophe, Key::Backquote => KeyCode::Grave,
+        Key::Comma => KeyCode::Comma, Key::Period => KeyCode::Period,
+        Key::Slash => KeyCode::Slash, Key::CapsLock => KeyCode::CapsLock,
+        Key::NumLock => KeyCode::NumLock, Key::ScrollLock => KeyCode::ScrollLock,
 
         _ => return None,
     })

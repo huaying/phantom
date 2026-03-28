@@ -250,6 +250,7 @@ fn run_session(
     let mut stats_lossless: u64 = 0;
     let mut stats_bytes: u64 = 0;
     let mut last_frame: Option<Frame> = None;
+    let mut had_input = false;
 
     loop {
         let loop_start = Instant::now();
@@ -259,6 +260,7 @@ fn run_session(
             match event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
                     if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
+                    had_input = true;
                 }
                 Ok(InboundEvent::Clipboard(text)) => {
                     if clipboard.on_remote_update(&text) {
@@ -306,7 +308,11 @@ fn run_session(
             }
         };
 
-        if differ.has_changes(&frame) {
+        // After input injection, always encode (screen likely changed in ways
+        // that sampling-based has_changes() might miss, e.g. xeyes, cursor blink).
+        let changed = had_input || differ.has_changes(&frame);
+        if changed {
+            had_input = false; // consumed — reset for next iteration
             differ.diff(&frame);
             quality.on_motion();
 
@@ -351,13 +357,12 @@ fn run_session(
         }
 
         // Frame pacing: sleep in small increments, processing input between each.
-        // This ensures input latency stays < 2ms even at low FPS.
         while loop_start.elapsed() < frame_interval {
-            // Drain input during idle time
             while let Ok(event) = event_rx.try_recv() {
                 match event {
                     InboundEvent::Input(input) => {
                         if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
+                        had_input = true; // will force encode next iteration
                     }
                     InboundEvent::Clipboard(text) => {
                         if clipboard.on_remote_update(&text) {
