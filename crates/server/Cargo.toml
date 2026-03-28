@@ -18,6 +18,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 scrap = "0.5"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ring = "0.17"
 enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"

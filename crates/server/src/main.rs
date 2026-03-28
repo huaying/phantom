@@ -2,6 +2,7 @@ mod capture_scrap;
 mod encode_h264;
 mod encode_zstd;
 mod input_injector;
+mod transport_quic;
 mod transport_tcp;
 
 use anyhow::Result;
@@ -37,6 +38,10 @@ struct Args {
     /// Video encoder: openh264 (default). Future: x264, nvenc, vaapi.
     #[arg(long, default_value = "openh264")]
     encoder: String,
+
+    /// Transport protocol: tcp (default) or quic (UDP, better for WAN).
+    #[arg(long, default_value = "tcp")]
+    transport: String,
 }
 
 /// Messages from the network receive thread to the main loop.
@@ -81,18 +86,39 @@ fn main() -> Result<()> {
         &args.encoder, width, height, args.fps as f32, args.bitrate,
     )?;
     let mut differ = TileDiffer::new();
-    let listener = transport_tcp::TcpServerTransport::bind(&args.listen)?;
+
+    // Build transport based on --transport flag
+    let tcp_listener;
+    let quic_listener;
+    match args.transport.as_str() {
+        "tcp" => {
+            tcp_listener = Some(transport_tcp::TcpServerTransport::bind(&args.listen)?);
+            quic_listener = None;
+        }
+        "quic" => {
+            tcp_listener = None;
+            quic_listener = Some(transport_quic::QuicServerTransport::bind(&args.listen)?);
+        }
+        other => anyhow::bail!("unknown transport '{other}'. Available: tcp, quic"),
+    }
 
     loop {
         tracing::info!("waiting for client...");
-        let conn = listener.accept_tcp()?;
+
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
-            if let Some(ref key) = encryption_key {
-                let (s, r) = conn.split_encrypted(key)?;
+            if let Some(ref quic) = quic_listener {
+                // QUIC: encryption is built-in (TLS), no need for ChaCha20 layer
+                let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))
             } else {
-                let (s, r) = conn.split()?;
-                (Box::new(s), Box::new(r))
+                let conn = tcp_listener.as_ref().unwrap().accept_tcp()?;
+                if let Some(ref key) = encryption_key {
+                    let (s, r) = conn.split_encrypted(key)?;
+                    (Box::new(s), Box::new(r))
+                } else {
+                    let (s, r) = conn.split()?;
+                    (Box::new(s), Box::new(r))
+                }
             };
 
         if let Err(e) = run_session(

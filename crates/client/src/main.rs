@@ -3,6 +3,7 @@ mod decode_h264;
 mod decode_zstd;
 mod display_minifb;
 mod input_capture;
+mod transport_quic;
 mod transport_tcp;
 
 use anyhow::{bail, Result};
@@ -33,6 +34,10 @@ struct Args {
     /// Disable encryption (must match server's --no-encrypt).
     #[arg(long)]
     no_encrypt: bool,
+
+    /// Transport protocol: tcp (default) or quic (must match server).
+    #[arg(long, default_value = "tcp")]
+    transport: String,
 }
 
 fn main() -> Result<()> {
@@ -58,40 +63,59 @@ fn main() -> Result<()> {
         }
     };
 
+    // For QUIC, we need the transport to persist across reconnects (holds the runtime)
+    let quic_transport = if args.transport == "quic" {
+        Some(transport_quic::QuicClientTransport::new()?)
+    } else {
+        None
+    };
+
     let mut display: Option<display_minifb::MinifbDisplay> = None;
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(10);
 
     loop {
         // -- Connect --
-        tracing::info!(addr = %args.connect, "connecting...");
-        let conn = match transport_tcp::TcpClientTransport::new(&args.connect).connect_tcp() {
-            Ok(c) => {
-                backoff = Duration::from_millis(500); // reset on success
-                c
+        tracing::info!(addr = %args.connect, transport = %args.transport, "connecting...");
+
+        let connect_result: Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> =
+            if let Some(ref quic) = quic_transport {
+                // QUIC: encryption built-in, no need for ChaCha20 layer
+                match quic.connect(&args.connect) {
+                    Ok((s, r)) => Ok((Box::new(s), Box::new(r))),
+                    Err(e) => Err(e),
+                }
+            } else {
+                // TCP
+                match transport_tcp::TcpClientTransport::new(&args.connect).connect_tcp() {
+                    Ok(conn) => {
+                        if let Some(ref key) = encryption_key {
+                            let (s, r) = conn.split_encrypted(key)?;
+                            Ok((Box::new(s), Box::new(r)))
+                        } else {
+                            let (s, r) = conn.split()?;
+                            Ok((Box::new(s), Box::new(r)))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+        let (sender, mut receiver) = match connect_result {
+            Ok(pair) => {
+                backoff = Duration::from_millis(500);
+                pair
             }
             Err(e) => {
                 tracing::warn!("connection failed: {e}, retrying in {:.1}s", backoff.as_secs_f32());
-                // Keep presenting if we have a display (shows last frame)
                 if let Some(ref mut d) = display {
-                    if !d.present().unwrap_or(false) {
-                        break; // window closed
-                    }
+                    if !d.present().unwrap_or(false) { break; }
                 }
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(max_backoff);
                 continue;
             }
         };
-
-        let (sender, mut receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
-            if let Some(ref key) = encryption_key {
-                let (s, r) = conn.split_encrypted(key)?;
-                (Box::new(s), Box::new(r))
-            } else {
-                let (s, r) = conn.split()?;
-                (Box::new(s), Box::new(r))
-            };
 
         // Receive Hello
         let (width, height) = match receiver.recv_msg() {
