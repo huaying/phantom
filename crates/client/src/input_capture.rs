@@ -1,173 +1,100 @@
-use minifb::{Key, MouseMode, Window};
-use phantom_core::input::{InputEvent, KeyCode, MouseButton};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use phantom_core::input::{InputEvent, KeyCode, MouseButton as PhantomMouseButton};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::keyboard::{KeyCode as WinitKey, PhysicalKey};
 
-const KEY_REPEAT_DELAY: Duration = Duration::from_millis(500);
-const KEY_REPEAT_INTERVAL: Duration = Duration::from_millis(33); // ~30 repeats/sec
-
-pub struct InputCapture {
-    prev_mouse_pos: (f32, f32),
-    prev_mouse_buttons: [bool; 3],
-    prev_keys: HashSet<Key>,
-    /// Track when each key was first pressed and when last repeat was sent.
-    held_keys: HashMap<Key, HeldKeyState>,
+/// Convert winit keyboard event to phantom InputEvent.
+pub fn key_event(key: &PhysicalKey, state: ElementState) -> Option<InputEvent> {
+    let PhysicalKey::Code(code) = key else { return None };
+    let kc = winit_to_keycode(*code)?;
+    Some(InputEvent::Key {
+        key: kc,
+        pressed: state == ElementState::Pressed,
+    })
 }
 
-struct HeldKeyState {
-    pressed_at: Instant,
-    last_repeat: Instant,
+/// Convert winit mouse button event.
+pub fn mouse_button_event(button: MouseButton, state: ElementState) -> Option<InputEvent> {
+    let btn = match button {
+        MouseButton::Left => PhantomMouseButton::Left,
+        MouseButton::Right => PhantomMouseButton::Right,
+        MouseButton::Middle => PhantomMouseButton::Middle,
+        _ => return None,
+    };
+    Some(InputEvent::MouseButton {
+        button: btn,
+        pressed: state == ElementState::Pressed,
+    })
 }
 
-impl InputCapture {
-    pub fn new() -> Self {
-        Self {
-            prev_mouse_pos: (-1.0, -1.0),
-            prev_mouse_buttons: [false; 3],
-            prev_keys: HashSet::new(),
-            held_keys: HashMap::new(),
-        }
-    }
+/// Convert winit mouse move to phantom InputEvent (caller maps coordinates).
+pub fn mouse_move_event(x: i32, y: i32) -> InputEvent {
+    InputEvent::MouseMove { x, y }
+}
 
-    pub fn poll(
-        &mut self,
-        window: &Window,
-        map_coords: impl Fn(f32, f32) -> (i32, i32),
-    ) -> Vec<InputEvent> {
-        let mut events = Vec::new();
-
-        // -- Mouse position --
-        if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
-            if (x - self.prev_mouse_pos.0).abs() > 0.5
-                || (y - self.prev_mouse_pos.1).abs() > 0.5
-            {
-                let (sx, sy) = map_coords(x, y);
-                events.push(InputEvent::MouseMove { x: sx, y: sy });
-                self.prev_mouse_pos = (x, y);
-            }
-        }
-
-        // -- Mouse buttons --
-        let buttons = [
-            (minifb::MouseButton::Left, MouseButton::Left),
-            (minifb::MouseButton::Right, MouseButton::Right),
-            (minifb::MouseButton::Middle, MouseButton::Middle),
-        ];
-        for (i, (mfb_btn, phantom_btn)) in buttons.iter().enumerate() {
-            let down = window.get_mouse_down(*mfb_btn);
-            if down != self.prev_mouse_buttons[i] {
-                events.push(InputEvent::MouseButton {
-                    button: *phantom_btn,
-                    pressed: down,
-                });
-                self.prev_mouse_buttons[i] = down;
-            }
-        }
-
-        // -- Mouse scroll --
-        if let Some((dx, dy)) = window.get_scroll_wheel() {
-            if dx.abs() > 0.01 || dy.abs() > 0.01 {
-                events.push(InputEvent::MouseScroll { dx, dy });
-            }
-        }
-
-        // -- Keyboard --
-        let keys: HashSet<Key> = window.get_keys().into_iter().collect();
-        let now = Instant::now();
-
-        // Newly pressed
-        for &key in &keys {
-            if !self.prev_keys.contains(&key) {
-                if let Some(kc) = minifb_to_keycode(key) {
-                    events.push(InputEvent::Key { key: kc, pressed: true });
-                }
-                self.held_keys.insert(key, HeldKeyState {
-                    pressed_at: now,
-                    last_repeat: now,
-                });
-            }
-        }
-
-        // Key repeat for held keys
-        for &key in &keys {
-            if self.prev_keys.contains(&key) {
-                // Key was already down — check if we should repeat
-                if let Some(state) = self.held_keys.get_mut(&key) {
-                    let held_duration = now - state.pressed_at;
-                    let since_repeat = now - state.last_repeat;
-
-                    if held_duration >= KEY_REPEAT_DELAY && since_repeat >= KEY_REPEAT_INTERVAL {
-                        if let Some(kc) = minifb_to_keycode(key) {
-                            // Send press+release pair to simulate repeat
-                            events.push(InputEvent::Key { key: kc, pressed: false });
-                            events.push(InputEvent::Key { key: kc, pressed: true });
-                        }
-                        state.last_repeat = now;
-                    }
-                }
-            }
-        }
-
-        // Newly released
-        for &key in &self.prev_keys {
-            if !keys.contains(&key) {
-                if let Some(kc) = minifb_to_keycode(key) {
-                    events.push(InputEvent::Key { key: kc, pressed: false });
-                }
-                self.held_keys.remove(&key);
-            }
-        }
-
-        self.prev_keys = keys;
-        events
+/// Convert winit scroll event.
+pub fn scroll_event(delta: MouseScrollDelta) -> Option<InputEvent> {
+    let (dx, dy) = match delta {
+        MouseScrollDelta::LineDelta(x, y) => (x, y),
+        MouseScrollDelta::PixelDelta(pos) => (pos.x as f32 / 120.0, pos.y as f32 / 120.0),
+    };
+    if dx.abs() > 0.01 || dy.abs() > 0.01 {
+        Some(InputEvent::MouseScroll { dx, dy })
+    } else {
+        None
     }
 }
 
-fn minifb_to_keycode(key: Key) -> Option<KeyCode> {
+fn winit_to_keycode(key: WinitKey) -> Option<KeyCode> {
     Some(match key {
-        Key::A => KeyCode::A, Key::B => KeyCode::B, Key::C => KeyCode::C,
-        Key::D => KeyCode::D, Key::E => KeyCode::E, Key::F => KeyCode::F,
-        Key::G => KeyCode::G, Key::H => KeyCode::H, Key::I => KeyCode::I,
-        Key::J => KeyCode::J, Key::K => KeyCode::K, Key::L => KeyCode::L,
-        Key::M => KeyCode::M, Key::N => KeyCode::N, Key::O => KeyCode::O,
-        Key::P => KeyCode::P, Key::Q => KeyCode::Q, Key::R => KeyCode::R,
-        Key::S => KeyCode::S, Key::T => KeyCode::T, Key::U => KeyCode::U,
-        Key::V => KeyCode::V, Key::W => KeyCode::W, Key::X => KeyCode::X,
-        Key::Y => KeyCode::Y, Key::Z => KeyCode::Z,
+        WinitKey::KeyA => KeyCode::A, WinitKey::KeyB => KeyCode::B,
+        WinitKey::KeyC => KeyCode::C, WinitKey::KeyD => KeyCode::D,
+        WinitKey::KeyE => KeyCode::E, WinitKey::KeyF => KeyCode::F,
+        WinitKey::KeyG => KeyCode::G, WinitKey::KeyH => KeyCode::H,
+        WinitKey::KeyI => KeyCode::I, WinitKey::KeyJ => KeyCode::J,
+        WinitKey::KeyK => KeyCode::K, WinitKey::KeyL => KeyCode::L,
+        WinitKey::KeyM => KeyCode::M, WinitKey::KeyN => KeyCode::N,
+        WinitKey::KeyO => KeyCode::O, WinitKey::KeyP => KeyCode::P,
+        WinitKey::KeyQ => KeyCode::Q, WinitKey::KeyR => KeyCode::R,
+        WinitKey::KeyS => KeyCode::S, WinitKey::KeyT => KeyCode::T,
+        WinitKey::KeyU => KeyCode::U, WinitKey::KeyV => KeyCode::V,
+        WinitKey::KeyW => KeyCode::W, WinitKey::KeyX => KeyCode::X,
+        WinitKey::KeyY => KeyCode::Y, WinitKey::KeyZ => KeyCode::Z,
 
-        Key::Key0 => KeyCode::Key0, Key::Key1 => KeyCode::Key1,
-        Key::Key2 => KeyCode::Key2, Key::Key3 => KeyCode::Key3,
-        Key::Key4 => KeyCode::Key4, Key::Key5 => KeyCode::Key5,
-        Key::Key6 => KeyCode::Key6, Key::Key7 => KeyCode::Key7,
-        Key::Key8 => KeyCode::Key8, Key::Key9 => KeyCode::Key9,
+        WinitKey::Digit0 => KeyCode::Key0, WinitKey::Digit1 => KeyCode::Key1,
+        WinitKey::Digit2 => KeyCode::Key2, WinitKey::Digit3 => KeyCode::Key3,
+        WinitKey::Digit4 => KeyCode::Key4, WinitKey::Digit5 => KeyCode::Key5,
+        WinitKey::Digit6 => KeyCode::Key6, WinitKey::Digit7 => KeyCode::Key7,
+        WinitKey::Digit8 => KeyCode::Key8, WinitKey::Digit9 => KeyCode::Key9,
 
-        Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2, Key::F3 => KeyCode::F3,
-        Key::F4 => KeyCode::F4, Key::F5 => KeyCode::F5, Key::F6 => KeyCode::F6,
-        Key::F7 => KeyCode::F7, Key::F8 => KeyCode::F8, Key::F9 => KeyCode::F9,
-        Key::F10 => KeyCode::F10, Key::F11 => KeyCode::F11, Key::F12 => KeyCode::F12,
+        WinitKey::F1 => KeyCode::F1, WinitKey::F2 => KeyCode::F2,
+        WinitKey::F3 => KeyCode::F3, WinitKey::F4 => KeyCode::F4,
+        WinitKey::F5 => KeyCode::F5, WinitKey::F6 => KeyCode::F6,
+        WinitKey::F7 => KeyCode::F7, WinitKey::F8 => KeyCode::F8,
+        WinitKey::F9 => KeyCode::F9, WinitKey::F10 => KeyCode::F10,
+        WinitKey::F11 => KeyCode::F11, WinitKey::F12 => KeyCode::F12,
 
-        Key::LeftShift => KeyCode::LeftShift, Key::RightShift => KeyCode::RightShift,
-        Key::LeftCtrl => KeyCode::LeftCtrl, Key::RightCtrl => KeyCode::RightCtrl,
-        Key::LeftAlt => KeyCode::LeftAlt, Key::RightAlt => KeyCode::RightAlt,
-        Key::LeftSuper => KeyCode::LeftMeta, Key::RightSuper => KeyCode::RightMeta,
+        WinitKey::ShiftLeft => KeyCode::LeftShift, WinitKey::ShiftRight => KeyCode::RightShift,
+        WinitKey::ControlLeft => KeyCode::LeftCtrl, WinitKey::ControlRight => KeyCode::RightCtrl,
+        WinitKey::AltLeft => KeyCode::LeftAlt, WinitKey::AltRight => KeyCode::RightAlt,
+        WinitKey::SuperLeft => KeyCode::LeftMeta, WinitKey::SuperRight => KeyCode::RightMeta,
 
-        Key::Up => KeyCode::Up, Key::Down => KeyCode::Down,
-        Key::Left => KeyCode::Left, Key::Right => KeyCode::Right,
-        Key::Home => KeyCode::Home, Key::End => KeyCode::End,
-        Key::PageUp => KeyCode::PageUp, Key::PageDown => KeyCode::PageDown,
+        WinitKey::ArrowUp => KeyCode::Up, WinitKey::ArrowDown => KeyCode::Down,
+        WinitKey::ArrowLeft => KeyCode::Left, WinitKey::ArrowRight => KeyCode::Right,
+        WinitKey::Home => KeyCode::Home, WinitKey::End => KeyCode::End,
+        WinitKey::PageUp => KeyCode::PageUp, WinitKey::PageDown => KeyCode::PageDown,
 
-        Key::Backspace => KeyCode::Backspace, Key::Delete => KeyCode::Delete,
-        Key::Tab => KeyCode::Tab, Key::Enter => KeyCode::Enter,
-        Key::Space => KeyCode::Space, Key::Escape => KeyCode::Escape,
-        Key::Insert => KeyCode::Insert,
+        WinitKey::Backspace => KeyCode::Backspace, WinitKey::Delete => KeyCode::Delete,
+        WinitKey::Tab => KeyCode::Tab, WinitKey::Enter => KeyCode::Enter,
+        WinitKey::Space => KeyCode::Space, WinitKey::Escape => KeyCode::Escape,
+        WinitKey::Insert => KeyCode::Insert,
 
-        Key::Minus => KeyCode::Minus, Key::Equal => KeyCode::Equal,
-        Key::LeftBracket => KeyCode::LeftBracket, Key::RightBracket => KeyCode::RightBracket,
-        Key::Backslash => KeyCode::Backslash, Key::Semicolon => KeyCode::Semicolon,
-        Key::Apostrophe => KeyCode::Apostrophe, Key::Backquote => KeyCode::Grave,
-        Key::Comma => KeyCode::Comma, Key::Period => KeyCode::Period,
-        Key::Slash => KeyCode::Slash, Key::CapsLock => KeyCode::CapsLock,
-        Key::NumLock => KeyCode::NumLock, Key::ScrollLock => KeyCode::ScrollLock,
+        WinitKey::Minus => KeyCode::Minus, WinitKey::Equal => KeyCode::Equal,
+        WinitKey::BracketLeft => KeyCode::LeftBracket, WinitKey::BracketRight => KeyCode::RightBracket,
+        WinitKey::Backslash => KeyCode::Backslash, WinitKey::Semicolon => KeyCode::Semicolon,
+        WinitKey::Quote => KeyCode::Apostrophe, WinitKey::Backquote => KeyCode::Grave,
+        WinitKey::Comma => KeyCode::Comma, WinitKey::Period => KeyCode::Period,
+        WinitKey::Slash => KeyCode::Slash, WinitKey::CapsLock => KeyCode::CapsLock,
+        WinitKey::NumLock => KeyCode::NumLock, WinitKey::ScrollLock => KeyCode::ScrollLock,
 
         _ => return None,
     })
