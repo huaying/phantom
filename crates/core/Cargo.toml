@@ -3,10 +3,14 @@ name = "phantom-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["crypto"]
+crypto = ["chacha20poly1305", "rand"]
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tracing = "0.1"
-chacha20poly1305 = "0.10"
-rand = "0.8"
+chacha20poly1305 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
