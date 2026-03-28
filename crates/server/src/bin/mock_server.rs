@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         }
         stream.flush()?;
 
-        if sequence % 150 == 0 {
+        if sequence.is_multiple_of(150) {
             let elapsed = start.elapsed().as_secs_f64();
             eprintln!(
                 "Frame {sequence} | {:.0}s | avg {:.1} KB/s",

@@ -176,7 +176,7 @@ impl CongestionTracker {
     fn should_skip_frame(&mut self) -> bool {
         self.frame_counter += 1;
         if self.skip_ratio <= 1 { return false; }
-        self.frame_counter % self.skip_ratio as u64 != 0
+        !self.frame_counter.is_multiple_of(self.skip_ratio as u64)
     }
 
     fn on_frame_sent(&mut self, send_duration: Duration) {

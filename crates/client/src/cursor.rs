@@ -1,6 +1,6 @@
-/// Local cursor overlay — drawn on the client framebuffer before present.
-/// Eliminates perceived mouse latency by rendering cursor at local position.
-
+// Local cursor overlay — drawn on the client framebuffer before present.
+// Eliminates perceived mouse latency by rendering cursor at local position.
+//
 // 12x19 arrow cursor bitmap (1 = white, 2 = black outline, 0 = transparent)
 const CURSOR_W: usize = 12;
 const CURSOR_H: usize = 19;

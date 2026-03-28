@@ -12,6 +12,7 @@ pub struct DirtyTile {
 }
 
 /// Detects which tiles changed between consecutive frames.
+#[derive(Default)]
 pub struct TileDiffer {
     prev_data: Vec<u8>,
     width: u32,
@@ -68,8 +69,8 @@ impl TileDiffer {
     pub fn diff(&mut self, frame: &Frame) -> Vec<DirtyTile> {
         let bpp = frame.format.bytes_per_pixel();
         let stride = frame.stride();
-        let tiles_x = (frame.width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (frame.height + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_x = frame.width.div_ceil(TILE_SIZE);
+        let tiles_y = frame.height.div_ceil(TILE_SIZE);
 
         let resolution_changed =
             !self.initialized || self.width != frame.width || self.height != frame.height;
@@ -135,6 +136,7 @@ impl TileDiffer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tile_changed(
     curr: &[u8],
     prev: &[u8],

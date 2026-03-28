@@ -1,6 +1,6 @@
 /// Clipboard sync logic shared between server and client.
 /// Tracks last-known content to avoid echo loops.
-
+#[derive(Default)]
 pub struct ClipboardTracker {
     /// Content we last SET (from remote) — don't echo it back.
     last_set: String,

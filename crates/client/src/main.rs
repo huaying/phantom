@@ -279,11 +279,8 @@ fn run_session(
 }
 
 fn recv_loop(mut receiver: Box<dyn MessageReceiver>, tx: mpsc::Sender<Message>) {
-    loop {
-        match receiver.recv_msg() {
-            Ok(msg) => { if tx.send(msg).is_err() { break; } }
-            Err(_) => break,
-        }
+    while let Ok(msg) = receiver.recv_msg() {
+        if tx.send(msg).is_err() { break; }
     }
 }
 
