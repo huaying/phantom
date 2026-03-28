@@ -130,7 +130,9 @@ fn main() -> Result<()> {
             break;
         }
 
-        let events = input_capture.poll(display.window().unwrap());
+        let events = input_capture.poll(display.window().unwrap(), |x, y| {
+            display.map_mouse(x, y)
+        });
         for event in events {
             let _ = input_tx.send(Message::Input(event));
         }

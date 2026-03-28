@@ -19,8 +19,13 @@ impl InputCapture {
         }
     }
 
-    /// Poll the window for input changes. Returns a list of new events.
-    pub fn poll(&mut self, window: &Window) -> Vec<InputEvent> {
+    /// Poll the window for input changes.
+    /// `map_coords` converts window-space mouse coordinates to server-space.
+    pub fn poll(
+        &mut self,
+        window: &Window,
+        map_coords: impl Fn(f32, f32) -> (i32, i32),
+    ) -> Vec<InputEvent> {
         let mut events = Vec::new();
 
         // -- Mouse position --
@@ -28,10 +33,8 @@ impl InputCapture {
             if (x - self.prev_mouse_pos.0).abs() > 0.5
                 || (y - self.prev_mouse_pos.1).abs() > 0.5
             {
-                events.push(InputEvent::MouseMove {
-                    x: x as i32,
-                    y: y as i32,
-                });
+                let (sx, sy) = map_coords(x, y);
+                events.push(InputEvent::MouseMove { x: sx, y: sy });
                 self.prev_mouse_pos = (x, y);
             }
         }

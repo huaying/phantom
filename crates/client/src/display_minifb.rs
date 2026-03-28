@@ -7,8 +7,12 @@ use phantom_core::tile::TILE_SIZE;
 pub struct MinifbDisplay {
     window: Option<Window>,
     buffer: Vec<u32>,
-    width: u32,
-    height: u32,
+    /// Server (framebuffer) resolution.
+    server_width: u32,
+    server_height: u32,
+    /// Actual window size on screen.
+    window_width: u32,
+    window_height: u32,
 }
 
 impl MinifbDisplay {
@@ -16,8 +20,10 @@ impl MinifbDisplay {
         Self {
             window: None,
             buffer: Vec::new(),
-            width: 0,
-            height: 0,
+            server_width: 0,
+            server_height: 0,
+            window_width: 0,
+            window_height: 0,
         }
     }
 
@@ -25,25 +31,37 @@ impl MinifbDisplay {
         self.window.as_ref()
     }
 
-    /// Replace entire framebuffer with decoded H.264 frame (0RGB u32 format).
     pub fn update_full_frame(&mut self, rgb32: &[u32]) {
         let len = self.buffer.len().min(rgb32.len());
         self.buffer[..len].copy_from_slice(&rgb32[..len]);
+    }
+
+    /// Map mouse coordinates from window space to server space.
+    pub fn map_mouse(&self, win_x: f32, win_y: f32) -> (i32, i32) {
+        let scale_x = self.server_width as f32 / self.window_width as f32;
+        let scale_y = self.server_height as f32 / self.window_height as f32;
+        ((win_x * scale_x) as i32, (win_y * scale_y) as i32)
     }
 }
 
 impl Display for MinifbDisplay {
     fn init(&mut self, width: u32, height: u32) -> Result<()> {
-        self.width = width;
-        self.height = height;
+        self.server_width = width;
+        self.server_height = height;
         self.buffer = vec![0u32; (width * height) as usize];
+
+        // Scale window to fit ~80% of the client's screen height.
+        // minifb's ScaleMode::AspectRatioStretch handles the rendering.
+        let (win_w, win_h) = fit_to_screen(width, height, 0.8);
+        self.window_width = win_w;
+        self.window_height = win_h;
 
         let window = Window::new(
             "Phantom Remote Desktop",
-            width as usize,
-            height as usize,
+            win_w as usize,
+            win_h as usize,
             WindowOptions {
-                resize: false,
+                resize: true,
                 scale_mode: minifb::ScaleMode::AspectRatioStretch,
                 ..WindowOptions::default()
             },
@@ -51,13 +69,17 @@ impl Display for MinifbDisplay {
         .context("failed to create window")?;
 
         self.window = Some(window);
-        tracing::info!(width, height, "display initialized");
+        tracing::info!(
+            server = format_args!("{}x{}", width, height),
+            window = format_args!("{}x{}", win_w, win_h),
+            "display initialized"
+        );
         Ok(())
     }
 
     fn update_tiles(&mut self, tiles: &[DecodedTile]) -> Result<()> {
         let bpp = 4;
-        let w = self.width as usize;
+        let w = self.server_width as usize;
 
         for tile in tiles {
             let base_x = (tile.tile_x * TILE_SIZE) as usize;
@@ -67,10 +89,9 @@ impl Display for MinifbDisplay {
 
             for row in 0..th {
                 let dst_y = base_y + row;
-                if dst_y >= self.height as usize {
+                if dst_y >= self.server_height as usize {
                     break;
                 }
-
                 let src_offset = row * tw * bpp;
                 let dst_offset = dst_y * w + base_x;
                 let copy_w = tw.min(w - base_x);
@@ -92,9 +113,46 @@ impl Display for MinifbDisplay {
         if !window.is_open() {
             return Ok(false);
         }
+
+        // Track if window was resized
+        let (cur_w, cur_h) = window.get_size();
+        if cur_w as u32 != self.window_width || cur_h as u32 != self.window_height {
+            self.window_width = cur_w as u32;
+            self.window_height = cur_h as u32;
+        }
+
         window
-            .update_with_buffer(&self.buffer, self.width as usize, self.height as usize)
+            .update_with_buffer(
+                &self.buffer,
+                self.server_width as usize,
+                self.server_height as usize,
+            )
             .context("display update failed")?;
         Ok(true)
     }
+}
+
+/// Calculate a window size that fits within `fraction` of the primary screen.
+fn fit_to_screen(server_w: u32, server_h: u32, fraction: f32) -> (u32, u32) {
+    // Try to detect screen size. If we can't, fall back to server resolution.
+    let (screen_w, screen_h) = detect_screen_size().unwrap_or((server_w, server_h));
+
+    let max_w = (screen_w as f32 * fraction) as u32;
+    let max_h = (screen_h as f32 * fraction) as u32;
+
+    if server_w <= max_w && server_h <= max_h {
+        // Server resolution fits, use it directly
+        return (server_w, server_h);
+    }
+
+    // Scale down maintaining aspect ratio
+    let scale = (max_w as f32 / server_w as f32).min(max_h as f32 / server_h as f32);
+    let win_w = (server_w as f32 * scale) as u32;
+    let win_h = (server_h as f32 * scale) as u32;
+    (win_w.max(320), win_h.max(240))
+}
+
+fn detect_screen_size() -> Option<(u32, u32)> {
+    // Use scrap to detect primary display size (works cross-platform)
+    scrap::Display::primary().ok().map(|d| (d.width() as u32, d.height() as u32))
 }

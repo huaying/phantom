@@ -917,6 +917,7 @@ dependencies = [
  "minifb",
  "openh264",
  "phantom-core",
+ "scrap",
  "tracing",
  "tracing-subscriber",
  "zstd",
