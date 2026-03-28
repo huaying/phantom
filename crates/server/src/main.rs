@@ -28,7 +28,7 @@ struct Args {
     fps: u32,
     #[arg(short, long, default_value_t = 5000)]
     bitrate: u32,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 2000)]
     quality_delay_ms: u64,
     #[arg(short, long)]
     key: Option<String>,

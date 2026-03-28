@@ -88,6 +88,7 @@ struct Session {
     input_tx: mpsc::Sender<Message>,
     connected: Arc<AtomicBool>,
     cursor_pos: Option<PhysicalPosition<f64>>,
+    modifiers: winit::event::Modifiers,
     clipboard: ClipboardTracker,
     arboard: Option<arboard::Clipboard>,
     clipboard_poll: Instant,
@@ -212,6 +213,7 @@ impl App {
             input_tx,
             connected,
             cursor_pos: None,
+            modifiers: winit::event::Modifiers::default(),
             clipboard: ClipboardTracker::default(),
             arboard: arboard::Clipboard::new().ok(),
             clipboard_poll: Instant::now(),
@@ -319,27 +321,26 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                session.modifiers = mods;
+            }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
-                // Intercept Cmd+V (Mac) / Ctrl+V → send PasteRequest to server
-                if key_event.state == winit::event::ElementState::Pressed
+                // Intercept Cmd+V (Mac) / Ctrl+V → paste clipboard as typed text
+                let mods = session.modifiers.state();
+                let is_paste = key_event.state == winit::event::ElementState::Pressed
                     && !key_event.repeat
                     && matches!(
                         key_event.physical_key,
                         winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
                     )
-                {
-                    let dominated_by_modifier = matches!(
-                        &key_event.logical_key,
-                        winit::keyboard::Key::Character(ch) if ch.as_str() != "v" && ch.as_str() != "V"
-                    );
-                    if dominated_by_modifier {
-                        // Ctrl+V or Cmd+V detected — read local clipboard and paste on server
-                        if let Some(ref mut ab) = session.arboard {
-                            if let Ok(text) = ab.get_text() {
-                                if !text.is_empty() {
-                                    let _ = session.input_tx.send(Message::PasteText(text));
-                                    return; // eat the V key
-                                }
+                    && (mods.super_key() || mods.control_key());
+
+                if is_paste {
+                    if let Some(ref mut ab) = session.arboard {
+                        if let Ok(text) = ab.get_text() {
+                            if !text.is_empty() {
+                                let _ = session.input_tx.send(Message::PasteText(text));
+                                return; // eat the V key
                             }
                         }
                     }
