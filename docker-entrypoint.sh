@@ -13,14 +13,11 @@ echo "Display: $DISPLAY"
 Xvfb $DISPLAY -screen 0 $RESOLUTION +extension RANDR &
 sleep 1
 
-# Launch some X11 apps so there's something to see
+# Launch X11 apps for visual content
 if [ "$MODE" != "mock" ]; then
-    # xclock in top-left
     xclock -geometry 200x200+10+10 &
-    # xeyes follows cursor
     xeyes -geometry 150x100+250+10 &
-    # xterm with system info
-    xterm -geometry 80x20+10+250 -e "echo 'Phantom Server running on Linux'; echo 'Resolution: $RESOLUTION'; echo 'PID: $$'; uname -a; echo ''; echo 'This is a live X11 desktop.'; echo 'Move your mouse and type!'; bash" &
+    xterm -geometry 80x24+10+250 -e "echo '=== Phantom Remote Desktop ==='; echo 'Linux $(uname -r)'; echo 'Resolution: $RESOLUTION'; echo ''; echo 'Try: move mouse (xeyes follows), type here'; echo ''; exec bash" &
     sleep 1
 fi
 

@@ -350,9 +350,26 @@ fn run_session(
             stats_bytes = 0;
         }
 
-        let elapsed = loop_start.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
+        // Frame pacing: sleep in small increments, processing input between each.
+        // This ensures input latency stays < 2ms even at low FPS.
+        while loop_start.elapsed() < frame_interval {
+            // Drain input during idle time
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    InboundEvent::Input(input) => {
+                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
+                    }
+                    InboundEvent::Clipboard(text) => {
+                        if clipboard.on_remote_update(&text) {
+                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        }
+                    }
+                    InboundEvent::Disconnected => {
+                        anyhow::bail!("client disconnected");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }

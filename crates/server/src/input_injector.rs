@@ -19,6 +19,7 @@ impl InputInjector {
     pub fn inject(&mut self, event: &InputEvent) -> Result<()> {
         match event {
             InputEvent::MouseMove { x, y } => {
+                tracing::trace!(x, y, "mouse move");
                 self.enigo
                     .move_mouse(*x, *y, Coordinate::Abs)
                     .map_err(|e| anyhow::anyhow!("mouse move: {e}"))?;

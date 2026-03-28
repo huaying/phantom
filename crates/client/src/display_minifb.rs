@@ -37,11 +37,13 @@ impl MinifbDisplay {
         self.buffer[..len].copy_from_slice(&rgb32[..len]);
     }
 
-    /// Map mouse coordinates from window space to server space.
-    pub fn map_mouse(&self, win_x: f32, win_y: f32) -> (i32, i32) {
-        let scale_x = self.server_width as f32 / self.window_width as f32;
-        let scale_y = self.server_height as f32 / self.window_height as f32;
-        ((win_x * scale_x) as i32, (win_y * scale_y) as i32)
+    /// Map mouse coordinates to server space.
+    /// minifb with ScaleMode::AspectRatioStretch + get_mouse_pos(Clamp) returns
+    /// coordinates in buffer (server) space already. So we just clamp, no scaling.
+    pub fn map_mouse(&self, x: f32, y: f32) -> (i32, i32) {
+        let sx = (x as i32).clamp(0, self.server_width as i32 - 1);
+        let sy = (y as i32).clamp(0, self.server_height as i32 - 1);
+        (sx, sy)
     }
 }
 
@@ -135,11 +137,9 @@ impl Display for MinifbDisplay {
             self.window_height = cur_h as u32;
         }
 
-        // Draw local cursor at mouse position (in server coordinates)
-        let cursor_pos = window.get_mouse_pos(MouseMode::Clamp).map(|(wx, wy)| {
-            let scale_x = self.server_width as f32 / self.window_width as f32;
-            let scale_y = self.server_height as f32 / self.window_height as f32;
-            ((wx * scale_x) as i32, (wy * scale_y) as i32)
+        // Draw local cursor at mouse position (already in server/buffer coordinates)
+        let cursor_pos = window.get_mouse_pos(MouseMode::Clamp).map(|(x, y)| {
+            (x as i32, y as i32)
         });
 
         // Undraw previous cursor, draw new one
