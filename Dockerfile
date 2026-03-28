@@ -33,6 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-shm0 \
     ca-certificates \
     xclip \
+    # Lightweight XFCE desktop
+    xfce4 \
+    xfce4-terminal \
+    dbus-x11 \
+    # Useful apps for testing
+    mousepad \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/phantom-server /usr/local/bin/
