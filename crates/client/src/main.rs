@@ -320,6 +320,31 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // Intercept Cmd+V (Mac) / Ctrl+V → send PasteRequest to server
+                if key_event.state == winit::event::ElementState::Pressed
+                    && !key_event.repeat
+                    && matches!(
+                        key_event.physical_key,
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
+                    )
+                {
+                    let dominated_by_modifier = matches!(
+                        &key_event.logical_key,
+                        winit::keyboard::Key::Character(ch) if ch.as_str() != "v" && ch.as_str() != "V"
+                    );
+                    if dominated_by_modifier {
+                        // Ctrl+V or Cmd+V detected — read local clipboard and paste on server
+                        if let Some(ref mut ab) = session.arboard {
+                            if let Ok(text) = ab.get_text() {
+                                if !text.is_empty() {
+                                    let _ = session.input_tx.send(Message::PasteText(text));
+                                    return; // eat the V key
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(input) = input_capture::key_event(&key_event.physical_key, key_event.state) {
                     let _ = session.input_tx.send(Message::Input(input));
                 }

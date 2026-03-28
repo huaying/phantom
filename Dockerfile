@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-randr0 \
     libxcb-shm0 \
     ca-certificates \
+    xclip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/phantom-server /usr/local/bin/

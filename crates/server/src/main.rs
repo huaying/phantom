@@ -48,6 +48,7 @@ struct Args {
 enum InboundEvent {
     Input(InputEvent),
     Clipboard(String),
+    PasteText(String),
     Disconnected,
 }
 
@@ -266,9 +267,20 @@ fn run_session(
                     if clipboard.on_remote_update(&text) {
                         if let Some(ref mut ab) = arboard {
                             let _ = ab.set_text(&text);
-                            tracing::debug!("clipboard received from client ({} chars)", text.len());
                         }
                     }
+                }
+                Ok(InboundEvent::PasteText(text)) => {
+                    // Set clipboard AND type it out
+                    if let Some(ref mut ab) = arboard {
+                        let _ = ab.set_text(&text);
+                    }
+                    clipboard.on_remote_update(&text);
+                    if let Some(ref mut inj) = injector {
+                        let _ = inj.type_text(&text);
+                        had_input = true;
+                    }
+                    tracing::debug!("paste: {} chars", text.len());
                 }
                 Ok(InboundEvent::Disconnected) => {
                     anyhow::bail!("client disconnected");
@@ -369,6 +381,14 @@ fn run_session(
                             if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
                         }
                     }
+                    InboundEvent::PasteText(text) => {
+                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        clipboard.on_remote_update(&text);
+                        if let Some(ref mut inj) = injector {
+                            let _ = inj.type_text(&text);
+                            had_input = true;
+                        }
+                    }
                     InboundEvent::Disconnected => {
                         anyhow::bail!("client disconnected");
                     }
@@ -399,6 +419,7 @@ fn receive_loop(mut receiver: Box<dyn MessageReceiver>, tx: mpsc::Sender<Inbound
         match receiver.recv_msg() {
             Ok(Message::Input(event)) => { let _ = tx.send(InboundEvent::Input(event)); }
             Ok(Message::ClipboardSync(text)) => { let _ = tx.send(InboundEvent::Clipboard(text)); }
+            Ok(Message::PasteText(text)) => { let _ = tx.send(InboundEvent::PasteText(text)); }
             Ok(_) => {}
             Err(_) => { let _ = tx.send(InboundEvent::Disconnected); break; }
         }

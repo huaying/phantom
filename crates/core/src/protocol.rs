@@ -30,6 +30,9 @@ pub enum Message {
     /// Bidirectional: clipboard content changed.
     ClipboardSync(String),
 
+    /// Client → Server: paste this text into the focused app (type it out).
+    PasteText(String),
+
     Ping,
     Pong,
 }

@@ -16,6 +16,14 @@ impl InputInjector {
         Ok(Self { enigo })
     }
 
+    /// Type out a string (for paste operations).
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
+        self.enigo
+            .text(text)
+            .map_err(|e| anyhow::anyhow!("type text: {e}"))?;
+        Ok(())
+    }
+
     pub fn inject(&mut self, event: &InputEvent) -> Result<()> {
         match event {
             InputEvent::MouseMove { x, y } => {
