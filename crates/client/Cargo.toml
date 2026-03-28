@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 phantom-core = { path = "../core" }
 anyhow = "1"
+bincode = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"

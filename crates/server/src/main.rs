@@ -7,12 +7,13 @@ mod transport_tcp;
 use anyhow::Result;
 use clap::Parser;
 use phantom_core::capture::FrameCapture;
+use phantom_core::crypto;
 use phantom_core::encode::{Encoder, FrameEncoder};
 use phantom_core::frame::{Frame, PixelFormat};
 use phantom_core::input::InputEvent;
 use phantom_core::protocol::Message;
 use phantom_core::tile::TileDiffer;
-use phantom_core::transport::MessageSender;
+use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,15 @@ struct Args {
     /// Milliseconds of stillness before sending lossless quality update.
     #[arg(long, default_value_t = 500)]
     quality_delay_ms: u64,
+
+    /// Encryption key (64 hex chars). If omitted, generates a new key.
+    /// Pass --no-encrypt to disable encryption entirely.
+    #[arg(short, long)]
+    key: Option<String>,
+
+    /// Disable encryption (insecure, for testing only).
+    #[arg(long)]
+    no_encrypt: bool,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +58,24 @@ fn main() -> Result<()> {
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let quality_delay = Duration::from_millis(args.quality_delay_ms);
 
+    // Resolve encryption key
+    let encryption_key: Option<[u8; 32]> = if args.no_encrypt {
+        tracing::warn!("encryption DISABLED — traffic is plaintext");
+        None
+    } else {
+        let key = match &args.key {
+            Some(hex) => crypto::parse_key_hex(hex)?,
+            None => {
+                let hex = crypto::generate_key_hex();
+                tracing::info!("generated encryption key (pass to client with --key):");
+                eprintln!("\n  --key {hex}\n");
+                crypto::parse_key_hex(&hex)?
+            }
+        };
+        tracing::info!("encryption ENABLED (ChaCha20-Poly1305)");
+        Some(key)
+    };
+
     let mut capture = capture_scrap::ScrapCapture::new()?;
     let (width, height) = capture.resolution();
 
@@ -60,11 +88,22 @@ fn main() -> Result<()> {
         tracing::info!("waiting for client...");
         let conn = listener.accept_tcp()?;
 
+        // Split with or without encryption
+        let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
+            if let Some(ref key) = encryption_key {
+                let (s, r) = conn.split_encrypted(key)?;
+                (Box::new(s), Box::new(r))
+            } else {
+                let (s, r) = conn.split()?;
+                (Box::new(s), Box::new(r))
+            };
+
         if let Err(e) = run_session(
             &mut capture,
             &mut h264_encoder,
             &mut differ,
-            conn,
+            sender,
+            receiver,
             frame_interval,
             quality_delay,
         ) {
@@ -75,34 +114,23 @@ fn main() -> Result<()> {
     }
 }
 
-/// Tracks the two-phase rendering state.
 struct QualityState {
-    /// When the screen last had motion (H.264 frame was sent).
     last_motion: Instant,
-    /// Whether we've already sent a lossless update for the current static period.
     lossless_sent: bool,
-    /// The settle time before sending lossless update.
     delay: Duration,
 }
 
 impl QualityState {
     fn new(delay: Duration) -> Self {
-        Self {
-            last_motion: Instant::now(),
-            lossless_sent: false,
-            delay,
-        }
+        Self { last_motion: Instant::now(), lossless_sent: false, delay }
     }
-
     fn on_motion(&mut self) {
         self.last_motion = Instant::now();
         self.lossless_sent = false;
     }
-
     fn should_send_lossless(&self) -> bool {
         !self.lossless_sent && self.last_motion.elapsed() >= self.delay
     }
-
     fn mark_lossless_sent(&mut self) {
         self.lossless_sent = true;
     }
@@ -112,21 +140,19 @@ fn run_session(
     capture: &mut capture_scrap::ScrapCapture,
     h264_encoder: &mut encode_h264::OpenH264Encoder,
     differ: &mut TileDiffer,
-    conn: transport_tcp::TcpConnection,
+    mut sender: Box<dyn MessageSender>,
+    receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
     quality_delay: Duration,
 ) -> Result<()> {
-    let (mut sender, receiver) = conn.split()?;
-
     let (width, height) = capture.resolution();
     sender.send_msg(&Message::Hello {
         width,
         height,
         format: PixelFormat::Bgra8,
     })?;
-    tracing::info!(width, height, "session started (H.264 + lossless QU)");
+    tracing::info!(width, height, "session started");
 
-    // Spawn input receive thread
     let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
     std::thread::spawn(move || {
         input_receive_loop(receiver, input_tx);
@@ -142,43 +168,32 @@ fn run_session(
 
     let mut zstd_encoder = encode_zstd::ZstdEncoder::new(3);
     let mut quality = QualityState::new(quality_delay);
-
     let mut sequence: u64 = 0;
     let mut stats_time = Instant::now();
     let mut stats_h264: u64 = 0;
     let mut stats_lossless: u64 = 0;
     let mut stats_bytes: u64 = 0;
-
-    // Keep the last captured frame for lossless update
     let mut last_frame: Option<Frame> = None;
 
     loop {
         let loop_start = Instant::now();
 
-        // Process input (non-blocking)
         while let Ok(event) = input_rx.try_recv() {
             if let Some(ref mut inj) = injector {
                 let _ = inj.inject(&event);
             }
         }
 
-        // Capture
         let frame = match capture.capture()? {
             Some(f) => f,
             None => {
-                // No new frame from OS — but check if we should send lossless
                 if quality.should_send_lossless() {
                     if let Some(ref f) = last_frame {
                         send_lossless_update(
-                            &mut sender,
-                            &mut zstd_encoder,
-                            differ,
-                            f,
-                            &mut sequence,
+                            &mut *sender, &mut zstd_encoder, differ, f, &mut sequence,
                         )?;
                         quality.mark_lossless_sent();
                         stats_lossless += 1;
-                        tracing::info!("lossless quality update sent");
                     }
                 }
                 std::thread::sleep(Duration::from_millis(1));
@@ -187,50 +202,33 @@ fn run_session(
         };
 
         if differ.has_changes(&frame) {
-            // === MOTION: encode H.264 ===
             differ.diff(&frame);
             quality.on_motion();
 
             let encoded = h264_encoder.encode_frame(&frame)?;
             stats_bytes += encoded.data.len() as u64;
             stats_h264 += 1;
-
             sequence += 1;
-            sender.send_msg(&Message::VideoFrame {
-                sequence,
-                frame: encoded,
-            })?;
-
+            sender.send_msg(&Message::VideoFrame { sequence, frame: encoded })?;
             last_frame = Some(frame);
-        } else {
-            // === STATIC: check if we should send lossless quality update ===
-            if quality.should_send_lossless() {
-                if let Some(ref f) = last_frame {
-                    let bytes = send_lossless_update(
-                        &mut sender,
-                        &mut zstd_encoder,
-                        differ,
-                        f,
-                        &mut sequence,
-                    )?;
-                    stats_bytes += bytes as u64;
-                    quality.mark_lossless_sent();
-                    stats_lossless += 1;
-                    tracing::info!(
-                        bytes = format_args!("{:.1} KB", bytes as f64 / 1024.0),
-                        "lossless quality update sent"
-                    );
-                }
+        } else if quality.should_send_lossless() {
+            if let Some(ref f) = last_frame {
+                let bytes = send_lossless_update(
+                    &mut *sender, &mut zstd_encoder, differ, f, &mut sequence,
+                )?;
+                stats_bytes += bytes as u64;
+                quality.mark_lossless_sent();
+                stats_lossless += 1;
+                tracing::info!(bytes = format_args!("{:.1} KB", bytes as f64 / 1024.0), "quality update");
             }
         }
 
-        // Stats
         if stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = stats_time.elapsed().as_secs_f64();
             tracing::info!(
                 h264_fps = format_args!("{:.1}", stats_h264 as f64 / elapsed),
                 lossless = stats_lossless,
-                bandwidth = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
+                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
                 "stats"
             );
             stats_time = Instant::now();
@@ -246,45 +244,34 @@ fn run_session(
     }
 }
 
-/// Send pixel-perfect lossless tile update for the full frame.
-/// Returns total bytes sent.
 fn send_lossless_update(
-    sender: &mut transport_tcp::TcpSender,
+    sender: &mut dyn MessageSender,
     encoder: &mut encode_zstd::ZstdEncoder,
     differ: &mut TileDiffer,
     frame: &Frame,
     sequence: &mut u64,
 ) -> Result<usize> {
-    // Get all tiles (force full frame by resetting differ)
-    let saved_state = std::mem::replace(differ, TileDiffer::new());
+    let saved = std::mem::replace(differ, TileDiffer::new());
     let all_tiles = differ.diff(frame);
-    *differ = saved_state;
-    // Re-update differ state so it has the current frame
+    *differ = saved;
     differ.diff(frame);
 
     let encoded = encoder.encode_tiles(&all_tiles)?;
     let total_bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
 
     *sequence += 1;
-    sender.send_msg(&Message::TileUpdate {
-        sequence: *sequence,
-        tiles: encoded,
-    })?;
-
+    sender.send_msg(&Message::TileUpdate { sequence: *sequence, tiles: encoded })?;
     Ok(total_bytes)
 }
 
 fn input_receive_loop(
-    mut receiver: transport_tcp::TcpReceiver,
+    mut receiver: Box<dyn MessageReceiver>,
     tx: mpsc::Sender<InputEvent>,
 ) {
-    use phantom_core::transport::MessageReceiver;
     loop {
         match receiver.recv_msg() {
             Ok(Message::Input(event)) => {
-                if tx.send(event).is_err() {
-                    break;
-                }
+                if tx.send(event).is_err() { break; }
             }
             Ok(_) => {}
             Err(e) => {

@@ -1,6 +1,7 @@
 pub mod frame;
 pub mod capture;
 pub mod color;
+pub mod crypto;
 pub mod encode;
 pub mod decode;
 pub mod transport;

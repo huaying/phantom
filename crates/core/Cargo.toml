@@ -8,3 +8,5 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tracing = "0.1"
+chacha20poly1305 = "0.10"
+rand = "0.8"
