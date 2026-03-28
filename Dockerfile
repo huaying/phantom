@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext-dev \
     libxrandr-dev \
     libxtst-dev \
+    libxdo-dev \
+    libxcb-randr0-dev \
+    libxcb-shm0-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,6 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrandr2 \
     libxtst6 \
+    libxdo3 \
+    libxcb-randr0 \
+    libxcb-shm0 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

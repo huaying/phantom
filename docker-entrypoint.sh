@@ -2,6 +2,7 @@
 set -e
 
 MODE=${1:-server}
+shift 2>/dev/null || true
 
 echo "=== Phantom Docker ==="
 echo "Mode: $MODE"
