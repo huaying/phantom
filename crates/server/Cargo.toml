@@ -24,6 +24,8 @@ rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ring = "0.17"
 tungstenite = "0.24"
+str0m = "0.6"
+serde_json = "1"
 enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"

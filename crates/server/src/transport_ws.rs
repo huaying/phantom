@@ -28,7 +28,15 @@ pub fn start_http_server(port: u16) -> Result<()> {
 
 pub struct WsServerTransport {
     /// Receives fully upgraded WebSocket connections.
-    conn_rx: mpsc::Receiver<(WsSender, WsReceiver)>,
+    conn_rx: mpsc::Receiver<WsConnection>,
+}
+
+/// A WebSocket connection with separate data and signaling channels.
+pub struct WsConnection {
+    pub data_sender: WsSender,
+    pub data_receiver: WsReceiver,
+    pub signaling_tx: mpsc::Sender<String>,   // send JSON text to client
+    pub signaling_rx: mpsc::Receiver<String>,  // receive JSON text from client
 }
 
 impl WsServerTransport {
@@ -47,20 +55,23 @@ impl WsServerTransport {
                     Ok(ws) => {
                         tracing::info!(?peer, "WebSocket connected");
 
-                        // Split WebSocket into sender/receiver using channels.
-                        // One thread owns the WebSocket, two channels bridge send/recv.
+                        // Channels for binary data (bincode messages)
                         let (send_tx, send_rx) = mpsc::channel::<Vec<u8>>();
                         let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>();
+                        // Channels for text signaling (JSON for WebRTC)
+                        let (sig_out_tx, sig_out_rx) = mpsc::channel::<String>();
+                        let (sig_in_tx, sig_in_rx) = mpsc::channel::<String>();
 
-                        // IO thread: owns the WebSocket, reads and writes
                         std::thread::spawn(move || {
-                            ws_io_loop(ws, send_rx, recv_tx);
+                            ws_io_loop(ws, send_rx, recv_tx, sig_out_rx, sig_in_tx);
                         });
 
-                        let _ = conn_tx.send((
-                            WsSender { tx: send_tx },
-                            WsReceiver { rx: recv_rx },
-                        ));
+                        let _ = conn_tx.send(WsConnection {
+                            data_sender: WsSender { tx: send_tx },
+                            data_receiver: WsReceiver { rx: recv_rx },
+                            signaling_tx: sig_out_tx,
+                            signaling_rx: sig_in_rx,
+                        });
                     }
                     Err(e) => {
                         tracing::debug!(?peer, "WebSocket handshake failed: {e}");
@@ -72,33 +83,37 @@ impl WsServerTransport {
         Ok(Self { conn_rx })
     }
 
-    pub fn accept(&self) -> Result<(WsSender, WsReceiver)> {
+    pub fn accept(&self) -> Result<WsConnection> {
         self.conn_rx.recv().context("WebSocket channel closed")
     }
 }
 
 /// Single thread that owns the WebSocket and handles both read and write.
+/// Single thread owning the WebSocket. Handles:
+/// - Binary frames: data (bincode messages)
+/// - Text frames: signaling (JSON for WebRTC)
 fn ws_io_loop(
     mut ws: WebSocket<TcpStream>,
     send_rx: mpsc::Receiver<Vec<u8>>,
     recv_tx: mpsc::Sender<Vec<u8>>,
+    sig_out_rx: mpsc::Receiver<String>,
+    sig_in_tx: mpsc::Sender<String>,
 ) {
     if let Ok(stream) = ws.get_ref().try_clone() {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(5)));
     }
 
-    let mut recv_count: u64 = 0;
-    let mut send_count: u64 = 0;
-
     loop {
-        // Send outgoing
+        // Send outgoing binary data
         while let Ok(data) = send_rx.try_recv() {
-            send_count += 1;
-            if send_count <= 5 {
-                tracing::debug!(send_count, bytes = data.len(), "ws send");
-            }
             if ws.send(tungstenite::Message::Binary(data)).is_err() {
-                tracing::debug!("ws send failed, closing");
+                return;
+            }
+        }
+
+        // Send outgoing signaling text
+        while let Ok(text) = sig_out_rx.try_recv() {
+            if ws.send(tungstenite::Message::Text(text)).is_err() {
                 return;
             }
         }
@@ -106,28 +121,18 @@ fn ws_io_loop(
         // Read incoming
         match ws.read() {
             Ok(tungstenite::Message::Binary(data)) => {
-                recv_count += 1;
-                if recv_count <= 5 {
-                    tracing::info!(recv_count, bytes = data.len(), "ws recv from client");
-                }
-                if recv_tx.send(data).is_err() {
-                    return;
-                }
+                if recv_tx.send(data).is_err() { return; }
             }
-            Ok(tungstenite::Message::Close(_)) => {
-                tracing::debug!("ws close received");
-                return;
+            Ok(tungstenite::Message::Text(text)) => {
+                // Signaling message (SDP/ICE JSON)
+                if sig_in_tx.send(text).is_err() { return; }
             }
-            Ok(msg) => {
-                tracing::debug!("ws other: {:?}", msg);
-            }
+            Ok(tungstenite::Message::Close(_)) => return,
+            Ok(_) => {} // ping/pong
             Err(tungstenite::Error::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                tracing::debug!("ws read error: {e}");
-                return;
-            }
+            Err(_) => return,
         }
     }
 }

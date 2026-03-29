@@ -4,6 +4,7 @@ mod encode_zstd;
 mod input_injector;
 mod transport_quic;
 mod transport_tcp;
+mod transport_webrtc;
 mod transport_ws;
 
 use anyhow::Result;
@@ -124,8 +125,23 @@ fn main() -> Result<()> {
 
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
             if let Some(ref ws) = ws_listener {
-                let (s, r) = ws.accept()?;
-                (Box::new(s), Box::new(r))
+                let conn = ws.accept()?;
+
+                // Try WebRTC DataChannel upgrade (UDP, lower latency)
+                let udp_port = args.listen.rsplit(':').next()
+                    .and_then(|p| p.parse::<u16>().ok()).unwrap_or(9900) + 2;
+                match transport_webrtc::negotiate(
+                    &conn.signaling_tx, &conn.signaling_rx, udp_port,
+                ) {
+                    Ok((s, r)) => {
+                        tracing::info!("WebRTC DataChannel established");
+                        (Box::new(s) as _, Box::new(r) as _)
+                    }
+                    Err(e) => {
+                        tracing::info!("WebRTC unavailable ({e}), using WebSocket");
+                        (Box::new(conn.data_sender) as _, Box::new(conn.data_receiver) as _)
+                    }
+                }
             } else if let Some(ref quic) = quic_listener {
                 let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))
