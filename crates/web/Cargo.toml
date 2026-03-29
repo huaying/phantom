@@ -13,6 +13,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+ruzstd = "0.7"
 
 [dependencies.web-sys]
 version = "0.3"

@@ -20,6 +20,10 @@ if [ "$MODE" != "mock" ]; then
         export XDG_SESSION_TYPE=x11
         dbus-launch startxfce4 &
         sleep 3
+        # Remove XFCE Super key shortcuts (conflict with macOS Cmd key)
+        xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Super>e" -r 2>/dev/null
+        xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Super>p" -r 2>/dev/null
+        xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Super>r" -r 2>/dev/null
     else
         # Fallback
         xclock -geometry 200x200+10+10 &
@@ -35,6 +39,11 @@ case "$MODE" in
     server)
         echo "Starting phantom-server..."
         exec phantom-server --no-encrypt "$@"
+        ;;
+    server-web)
+        echo "Starting phantom-server (web)..."
+        echo "Open http://localhost:9900 in your browser"
+        exec phantom-server --transport web --no-encrypt "$@"
         ;;
     server-encrypted)
         echo "Starting phantom-server (encrypted)..."

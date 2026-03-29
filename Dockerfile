@@ -49,7 +49,7 @@ COPY --from=builder /build/target/release/mock_server /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-EXPOSE 9900/tcp 9900/udp
+EXPOSE 9900/tcp 9900/udp 9901/tcp
 
 ENV DISPLAY=:99
 ENV RESOLUTION=1280x720x24

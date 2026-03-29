@@ -4,6 +4,7 @@ mod encode_zstd;
 mod input_injector;
 mod transport_quic;
 mod transport_tcp;
+mod transport_ws;
 
 use anyhow::Result;
 use clap::Parser;
@@ -91,24 +92,41 @@ fn main() -> Result<()> {
     // Build transport based on --transport flag
     let tcp_listener;
     let quic_listener;
+    let ws_listener;
     match args.transport.as_str() {
         "tcp" => {
             tcp_listener = Some(transport_tcp::TcpServerTransport::bind(&args.listen)?);
             quic_listener = None;
+            ws_listener = None;
         }
         "quic" => {
             tcp_listener = None;
             quic_listener = Some(transport_quic::QuicServerTransport::bind(&args.listen)?);
+            ws_listener = None;
         }
-        other => anyhow::bail!("unknown transport '{other}'. Available: tcp, quic"),
+        "web" => {
+            tcp_listener = None;
+            quic_listener = None;
+            // HTTP serves static files (HTML + WASM) on main port
+            // WebSocket on main port + 1 for data
+            let port: u16 = args.listen.split(':').last()
+                .and_then(|p| p.parse().ok()).unwrap_or(9900);
+            let ws_addr = format!("0.0.0.0:{}", port + 1);
+            transport_ws::start_http_server(port)?;
+            tracing::info!("open http://localhost:{port} in browser");
+            ws_listener = Some(transport_ws::WsServerTransport::bind(&ws_addr)?);
+        }
+        other => anyhow::bail!("unknown transport '{other}'. Available: tcp, quic, web"),
     }
 
     loop {
         tracing::info!("waiting for client...");
 
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
-            if let Some(ref quic) = quic_listener {
-                // QUIC: encryption is built-in (TLS), no need for ChaCha20 layer
+            if let Some(ref ws) = ws_listener {
+                let (s, r) = ws.accept()?;
+                (Box::new(s), Box::new(r))
+            } else if let Some(ref quic) = quic_listener {
                 let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))
             } else {
