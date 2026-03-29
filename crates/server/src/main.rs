@@ -109,7 +109,7 @@ fn main() -> Result<()> {
             quic_listener = None;
             // HTTP serves static files (HTML + WASM) on main port
             // WebSocket on main port + 1 for data
-            let port: u16 = args.listen.split(':').last()
+            let port: u16 = args.listen.rsplit(':').next()
                 .and_then(|p| p.parse().ok()).unwrap_or(9900);
             let ws_addr = format!("0.0.0.0:{}", port + 1);
             transport_ws::start_http_server(port)?;
@@ -371,7 +371,7 @@ fn run_session(
                 stats_bytes += bytes as u64;
                 stats_tiles += 1;
                 sequence += 1;
-                sender.send_msg(&Message::TileUpdate { sequence, tiles: encoded })?;
+                sender.send_msg(&Message::TileUpdate { sequence, tiles: Box::new(encoded) })?;
             } else if !dirty_tiles.is_empty() {
                 // Large change (scrolling, video) → full H.264 frame
                 let encoded = video_encoder.encode_frame(&frame)?;
@@ -379,7 +379,7 @@ fn run_session(
                 stats_h264 += 1;
                 sequence += 1;
                 let send_start = Instant::now();
-                sender.send_msg(&Message::VideoFrame { sequence, frame: encoded })?;
+                sender.send_msg(&Message::VideoFrame { sequence, frame: Box::new(encoded) })?;
                 congestion.on_frame_sent(send_start.elapsed());
             }
 
@@ -451,7 +451,7 @@ fn send_lossless_update(
     let encoded = encoder.encode_tiles(&all_tiles)?;
     let total_bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
     *sequence += 1;
-    sender.send_msg(&Message::TileUpdate { sequence: *sequence, tiles: encoded })?;
+    sender.send_msg(&Message::TileUpdate { sequence: *sequence, tiles: Box::new(encoded) })?;
     Ok(total_bytes)
 }
 

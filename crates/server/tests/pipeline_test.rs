@@ -1,4 +1,4 @@
-use phantom_core::color::{bgra_to_yuv420, yuv420_to_rgb32};
+use phantom_core::color::yuv420_to_rgb32;
 use phantom_core::decode::{DecodedTile, Decoder};
 use phantom_core::encode::{EncodedFrame, EncodedTile, Encoder, TileEncoding, VideoCodec};
 use phantom_core::frame::{Frame, PixelFormat};
@@ -70,7 +70,7 @@ fn tile_pipeline_roundtrip() {
     assert_eq!(dirty.len(), 4);
 
     let encoded = encoder.encode_tiles(&dirty).unwrap();
-    let msg = Message::TileUpdate { sequence: 1, tiles: encoded };
+    let msg = Message::TileUpdate { sequence: 1, tiles: Box::new(encoded) };
 
     let mut buf = Vec::new();
     protocol::write_message(&mut buf, &msg).unwrap();
@@ -81,7 +81,7 @@ fn tile_pipeline_roundtrip() {
         Message::TileUpdate { sequence, tiles } => {
             assert_eq!(sequence, 1);
             assert_eq!(tiles.len(), 4);
-            for tile in &tiles {
+            for tile in tiles.iter() {
                 let decoded = decoder.decode_tile(tile).unwrap();
                 assert!(decoded.data.iter().all(|&b| b == 0xAB));
             }
@@ -177,14 +177,14 @@ fn protocol_message_roundtrip() {
         Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8 },
         Message::Ping,
         Message::Pong,
-        Message::TileUpdate { sequence: 42, tiles: vec![] },
+        Message::TileUpdate { sequence: 42, tiles: Box::new(vec![]) },
         Message::VideoFrame {
             sequence: 1,
-            frame: EncodedFrame {
+            frame: Box::new(EncodedFrame {
                 codec: VideoCodec::H264,
                 data: vec![0, 0, 0, 1, 67],
                 is_keyframe: true,
-            },
+            }),
         },
     ];
 

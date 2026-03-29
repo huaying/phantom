@@ -67,11 +67,11 @@ fn main() -> Result<()> {
 
         let msg = Message::VideoFrame {
             sequence,
-            frame: EncodedFrame {
+            frame: Box::new(EncodedFrame {
                 codec: VideoCodec::H264,
                 data: h264_data,
                 is_keyframe: sequence == 1,
-            },
+            }),
         };
 
         if let Err(e) = protocol::write_message(&mut stream, &msg) {

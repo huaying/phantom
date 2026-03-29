@@ -75,6 +75,7 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AppState {
     Disconnected,
     Connected(Session),
@@ -284,7 +285,7 @@ impl ApplicationHandler for App {
                 }
                 if let Some(Message::TileUpdate { tiles, .. }) = last_tiles {
                     let mut decoded = Vec::with_capacity(tiles.len());
-                    for tile in &tiles {
+                    for tile in tiles.iter() {
                         if let Ok(dt) = session.tile_decoder.decode_tile(tile) {
                             decoded.push(dt);
                         }

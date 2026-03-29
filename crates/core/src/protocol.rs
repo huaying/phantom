@@ -15,13 +15,13 @@ pub enum Message {
     /// Server → Client: H.264/AV1 encoded full frame (lossy, during motion).
     VideoFrame {
         sequence: u64,
-        frame: EncodedFrame,
+        frame: Box<EncodedFrame>,
     },
 
     /// Server → Client: tile-based lossless update (quality refinement when static).
     TileUpdate {
         sequence: u64,
-        tiles: Vec<EncodedTile>,
+        tiles: Box<Vec<EncodedTile>>,
     },
 
     /// Client → Server: input event.

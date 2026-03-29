@@ -58,7 +58,6 @@ pub fn main() {
 
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
-    let host = window.location().host().unwrap();
 
     // Use the canvas already in HTML (styled by CSS)
     let canvas: HtmlCanvasElement = document.get_element_by_id("screen").unwrap()
@@ -181,7 +180,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         }
         Message::TileUpdate { tiles, .. } => {
             let s = state.borrow();
-            for tile in &tiles {
+            for tile in tiles.iter() {
                 // Decompress tile data
                 let bgra = match tile.encoding {
                     TileEncoding::Zstd => {
@@ -362,14 +361,11 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
                         let ws = st.ws.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             let promise = cb.read_text();
-                            match wasm_bindgen_futures::JsFuture::from(promise).await {
-                                Ok(val) => {
-                                    let text: String = val.as_string().unwrap_or_default();
-                                    if !text.is_empty() {
-                                        send_msg(&ws, &Message::PasteText(text));
-                                    }
+                            if let Ok(val) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                                let text: String = val.as_string().unwrap_or_default();
+                                if !text.is_empty() {
+                                    send_msg(&ws, &Message::PasteText(text));
                                 }
-                                Err(_) => {}
                             }
                         });
                         return;

@@ -1,6 +1,6 @@
 /// Headless end-to-end test: mock server → TCP → client decoder pipeline.
 /// No window, no screen capture. Tests the full network + codec path.
-use phantom_core::encode::{EncodedFrame, FrameDecoder, VideoCodec};
+use phantom_core::encode::{EncodedFrame, VideoCodec};
 use phantom_core::frame::PixelFormat;
 use phantom_core::protocol::{self, Message};
 use std::io::{BufReader, BufWriter};
@@ -78,11 +78,11 @@ fn headless_e2e_h264_over_tcp() {
                 &mut writer,
                 &Message::VideoFrame {
                     sequence: i as u64 + 1,
-                    frame: EncodedFrame {
+                    frame: Box::new(EncodedFrame {
                         codec: VideoCodec::H264,
                         data: h264_data,
                         is_keyframe: i == 0,
-                    },
+                    }),
                 },
             )
             .unwrap();
