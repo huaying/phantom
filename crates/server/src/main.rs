@@ -14,7 +14,7 @@ use phantom_core::encode::{Encoder, FrameEncoder};
 use phantom_core::frame::{Frame, PixelFormat};
 use phantom_core::input::InputEvent;
 use phantom_core::protocol::Message;
-use phantom_core::tile::TileDiffer;
+use phantom_core::tile::{TileDiffer, TILE_SIZE};
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -238,6 +238,10 @@ fn run_session(
         Err(e) => { tracing::warn!("input injection unavailable: {e}"); None }
     };
 
+    // Hide remote cursor — client renders its own local cursor.
+    // This prevents mouse movement from causing dirty tiles on the server.
+    hide_remote_cursor();
+
     let mut zstd_encoder = encode_zstd::ZstdEncoder::new(3);
     let mut quality = QualityState::new(quality_delay);
     let mut congestion = CongestionTracker::new(frame_interval);
@@ -248,6 +252,7 @@ fn run_session(
     let mut sequence: u64 = 0;
     let mut stats_time = Instant::now();
     let mut stats_h264: u64 = 0;
+    let mut stats_tiles: u64 = 0;
     let mut stats_lossless: u64 = 0;
     let mut stats_bytes: u64 = 0;
     let mut last_frame: Option<Frame> = None;
@@ -324,24 +329,41 @@ fn run_session(
         // that sampling-based has_changes() might miss, e.g. xeyes, cursor blink).
         let changed = had_input || differ.has_changes(&frame);
         if changed {
-            had_input = false; // consumed — reset for next iteration
-            differ.diff(&frame);
+            had_input = false;
+            let dirty_tiles = differ.diff(&frame);
             quality.on_motion();
 
-            // Congestion: skip frame if we're falling behind
             if congestion.should_skip_frame() {
                 last_frame = Some(frame);
                 continue;
             }
 
-            let encoded = video_encoder.encode_frame(&frame)?;
-            stats_bytes += encoded.data.len() as u64;
-            stats_h264 += 1;
-            sequence += 1;
+            // Smart encoding: choose strategy based on dirty area
+            let total_tiles = (frame.width.div_ceil(TILE_SIZE) * frame.height.div_ceil(TILE_SIZE)) as usize;
+            let dirty_percent = if total_tiles > 0 {
+                dirty_tiles.len() as f32 / total_tiles as f32
+            } else {
+                1.0
+            };
 
-            let send_start = Instant::now();
-            sender.send_msg(&Message::VideoFrame { sequence, frame: encoded })?;
-            congestion.on_frame_sent(send_start.elapsed());
+            if dirty_percent < 0.10 && !dirty_tiles.is_empty() {
+                // Small change (typing, cursor) → send only dirty tiles (0.1ms vs 15ms)
+                let encoded = zstd_encoder.encode_tiles(&dirty_tiles)?;
+                let bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
+                stats_bytes += bytes as u64;
+                stats_tiles += 1;
+                sequence += 1;
+                sender.send_msg(&Message::TileUpdate { sequence, tiles: encoded })?;
+            } else if !dirty_tiles.is_empty() {
+                // Large change (scrolling, video) → full H.264 frame
+                let encoded = video_encoder.encode_frame(&frame)?;
+                stats_bytes += encoded.data.len() as u64;
+                stats_h264 += 1;
+                sequence += 1;
+                let send_start = Instant::now();
+                sender.send_msg(&Message::VideoFrame { sequence, frame: encoded })?;
+                congestion.on_frame_sent(send_start.elapsed());
+            }
 
             last_frame = Some(frame);
         } else if quality.should_send_lossless() {
@@ -356,14 +378,15 @@ fn run_session(
         if stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = stats_time.elapsed().as_secs_f64();
             tracing::info!(
-                h264_fps = format_args!("{:.1}", stats_h264 as f64 / elapsed),
+                h264 = format_args!("{:.1}/s", stats_h264 as f64 / elapsed),
+                tiles = format_args!("{:.1}/s", stats_tiles as f64 / elapsed),
                 lossless = stats_lossless,
                 bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
-                skip = format_args!("1/{}", congestion.skip_ratio),
                 "stats"
             );
             stats_time = Instant::now();
             stats_h264 = 0;
+            stats_tiles = 0;
             stats_lossless = 0;
             stats_bytes = 0;
         }
@@ -423,5 +446,40 @@ fn receive_loop(mut receiver: Box<dyn MessageReceiver>, tx: mpsc::Sender<Inbound
             Ok(_) => {}
             Err(_) => { let _ = tx.send(InboundEvent::Disconnected); break; }
         }
+    }
+}
+
+/// Hide the remote OS cursor so mouse movement doesn't cause dirty tiles.
+/// Client renders its own local cursor instead.
+fn hide_remote_cursor() {
+    #[cfg(target_os = "linux")]
+    {
+        // Create a 1x1 transparent cursor using xdotool/unclutter or xfixes
+        // Try multiple methods in order of preference
+        if std::process::Command::new("unclutter")
+            .args(["-idle", "0", "-root"])
+            .spawn()
+            .is_ok()
+        {
+            tracing::info!("remote cursor hidden (unclutter)");
+            return;
+        }
+
+        // Fallback: use xdotool to set blank cursor on root window
+        if std::process::Command::new("xdotool")
+            .args(["search", "--name", ".*"])
+            .output()
+            .is_ok()
+        {
+            // xdotool can't directly hide cursor, but we tried
+            tracing::debug!("xdotool available but cursor hiding limited");
+        }
+
+        tracing::debug!("could not hide remote cursor (install 'unclutter' for best results)");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::debug!("remote cursor hiding not implemented for this OS");
     }
 }

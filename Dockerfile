@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-shm0 \
     ca-certificates \
     xclip \
+    unclutter \
     # Lightweight XFCE desktop
     xfce4 \
     xfce4-terminal \
