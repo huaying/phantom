@@ -103,7 +103,7 @@ impl WebServerTransport {
             // Wait for notification
             let _ = self.rtc_notify.recv_timeout(std::time::Duration::from_millis(100));
             // Take the latest session (run_loop may have overwritten multiple times)
-            if let Some((s, r)) = self.rtc_session.lock().unwrap().take() {
+            if let Some((s, r)) = self.rtc_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 return Ok((Box::new(s), Box::new(r)));
             }
         }

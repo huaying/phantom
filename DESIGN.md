@@ -285,9 +285,12 @@ Hardware probe at startup auto-selects the best implementation for each trait.
 | 11 | **Window scaling** | Auto-fit 80% screen, resize, coordinate mapping |
 | 12 | **Adaptive quality** | Congestion-based frame skipping (1/2→1/3→1/4) |
 | 13 | **Native client (winit)** | OS key repeat, proper modifiers, event-driven |
-| 14 | **WASM client crate** | 97KB, shares phantom-core, WebCodecs+Canvas+Input |
-| 15 | **Docker test env** | XFCE desktop, OrbStack, 1920x1080 |
-| 16 | **Mock server** | Animated H.264 test frames, no screen capture needed |
+| 14 | **Web client (WebRTC)** | 207KB WASM, DataChannel (UDP), WebCodecs+Canvas, POST /rtc signaling |
+| 15 | **Web client (WS fallback)** | WebSocket transport preserved for adaptive mode |
+| 16 | **Smart encoding** | dirty <10% → tiles (0.1ms), ≥10% → H.264 (15ms), saves 90% CPU |
+| 17 | **Hidden remote cursor** | Server hides OS cursor, client renders locally, mouse move = 0 CPU |
+| 18 | **Docker test env** | XFCE desktop, OrbStack, 1920x1080 |
+| 19 | **Mock server** | Animated H.264 test frames, no screen capture needed |
 
 ### Test Coverage (21 tests)
 
@@ -304,33 +307,36 @@ Hardware probe at startup auto-selects the best implementation for each trait.
 
 ---
 
-## Web Client Plan
+## Web Client — Implemented
 
-### Phase 1: WebSocket (get it working)
-WebSocket as data transport. Simplest path to browser access.
+### WebRTC DataChannel (current)
 
-- `crates/server/src/web_server.rs` — axum HTTP (embedded static files + WS)
-- `crates/server/src/transport_ws.rs` — WS MessageSender/Receiver
-- `crates/server/web/index.html` — minimal HTML loader
-- WASM output embedded in server binary via `include_bytes!`
-- `--transport web` flag
-
-### Phase 2: WebRTC DataChannel (upgrade to UDP)
-Replace WS data path with DataChannel. WS remains for signaling only.
-
+Signaling via HTTP POST `/rtc` (str0m pattern — no WebSocket for signaling):
 ```
-DataChannel #1 — Video:     ordered=false, maxRetransmits=0 (like raw UDP)
-DataChannel #2 — Input:     ordered=true,  maxRetransmits=2
-DataChannel #3 — Control:   ordered=true,  reliable
+Browser: createOffer → POST /rtc → setRemoteDescription(answer)
+Server:  str0m accept_offer → return answer → run_loop drives ICE/DTLS
 ```
 
-- `crates/server/src/transport_webrtc.rs` — str0m/webrtc-rs
-- WASM client: RTCPeerConnection via web-sys, fallback to WS
-- No HTTPS required (signaling over ws://, data over DTLS)
+3 DataChannels:
+- **Video DC** (reliable, ordered): Hello + VideoFrame + TileUpdate
+- **Input DC** (ordered, maxRetransmits=2): Mouse/keyboard events
+- **Control DC** (reliable): Clipboard, Ping
 
-### Phase 3: Multi-stream + Lossless in Browser
-- TileUpdate over reliable DataChannel → zstd decompress in WASM
-- Two-phase rendering in browser: H.264 + lossless overlay
+Server architecture (str0m official pattern):
+- Single UDP socket, single `run_loop` thread, one active client
+- `ActiveClient` replaced on browser refresh (immediate, no timeout)
+- Session delivered via `Mutex<Option>` slot (always latest, stale auto-dropped)
+- Bounded channels for video (30 frames) prevent memory growth
+- Keepalive ping every 1s detects dead sessions
+
+WebSocket fallback preserved (`accept_ws()` ready for future adaptive mode).
+
+### WASM Client (207KB)
+- Shares phantom-core (protocol, input, clipboard types)
+- WebCodecs H.264 hardware decode → Canvas drawImage
+- TileUpdate: ruzstd decompress → BGRA→RGBA → putImageData
+- RTCPeerConnection + 3 DataChannels via web-sys
+- Ctrl+V paste interception
 
 ---
 

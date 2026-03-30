@@ -118,7 +118,7 @@ struct ActiveClient {
     /// Session loop sends data here → we write to DataChannels
     video_rx: Option<mpsc::Receiver<Vec<u8>>>,
     control_out_rx: Option<mpsc::Receiver<Vec<u8>>>,
-    /// We receive data from DataChannels → send to session loop here
+    /// We receive data from DataChannels → send to session loop
     input_in_tx: Option<mpsc::Sender<Vec<u8>>>,
     control_in_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
@@ -156,8 +156,10 @@ impl ActiveClient {
                     tracing::info!("all 3 DataChannels open — session ready");
                     self.channels_ready = true;
 
-                    let (video_tx, video_rx) = mpsc::channel();
-                    let (ctrl_out_tx, ctrl_out_rx) = mpsc::channel();
+                    // Bounded for session→runloop (video is high bandwidth)
+                    let (video_tx, video_rx) = mpsc::sync_channel(30); // ~1s of frames
+                    let (ctrl_out_tx, ctrl_out_rx) = mpsc::sync_channel(64);
+                    // Unbounded for runloop→session (input/control are small + infrequent)
                     let (input_in_tx, input_in_rx) = mpsc::channel();
                     let (ctrl_in_tx, ctrl_in_rx) = mpsc::channel();
 
@@ -167,7 +169,7 @@ impl ActiveClient {
                     self.control_in_tx = Some(ctrl_in_tx);
 
                     // Overwrite any stale session — main thread always gets the latest
-                    *session_slot.lock().unwrap() = Some((
+                    *session_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((
                         WebRtcSender { video_tx, control_tx: ctrl_out_tx },
                         WebRtcReceiver { input_rx: input_in_rx, control_rx: ctrl_in_rx },
                     ));
@@ -216,19 +218,29 @@ impl ActiveClient {
 }
 
 pub struct WebRtcSender {
-    video_tx: mpsc::Sender<Vec<u8>>,
-    control_tx: mpsc::Sender<Vec<u8>>,
+    video_tx: mpsc::SyncSender<Vec<u8>>,
+    control_tx: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl MessageSender for WebRtcSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         let payload = bincode::serialize(msg).context("serialize")?;
         match msg {
-            // Hello goes on video DC too — must arrive before first VideoFrame
             Message::Hello { .. } | Message::VideoFrame { .. } | Message::TileUpdate { .. } => {
-                self.video_tx.send(payload).map_err(|_| anyhow::anyhow!("video DC closed"))
+                // try_send: drop frame if buffer full (backpressure)
+                self.video_tx.try_send(payload)
+                    .map_err(|e| match e {
+                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
+                        mpsc::TrySendError::Full(_) => { /* drop frame, not fatal */ anyhow::anyhow!("") },
+                    })
+                    .or(Ok(())) // Full is OK — just skip this frame
             }
-            _ => self.control_tx.send(payload).map_err(|_| anyhow::anyhow!("control DC closed")),
+            _ => self.control_tx.try_send(payload)
+                    .map_err(|e| match e {
+                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
+                        mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                    })
+                    .or(Ok(())),
         }
     }
 }
