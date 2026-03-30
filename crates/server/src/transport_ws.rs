@@ -7,6 +7,26 @@ use std::sync::{mpsc, Arc, Mutex};
 use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
 
+/// Generate a self-signed TLS config for HTTPS (enables WebCodecs on non-localhost).
+fn make_tls_acceptor() -> Result<Arc<rustls::ServerConfig>> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Phantom Remote Desktop");
+    // Add SANs for any IP
+    params.subject_alt_names = vec![
+        rcgen::SanType::DnsName("localhost".try_into()?),
+        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+    ];
+    let cert = params.self_signed(&key_pair)?;
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| anyhow::anyhow!("key: {e}"))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)?;
+    Ok(Arc::new(config))
+}
+
 /// Embedded static files for the web client.
 /// Only included when the WASM files exist (built via `wasm-pack build crates/web`).
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -63,17 +83,26 @@ impl WebServerTransport {
         // Channel for WS fallback connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
 
-        // HTTP server thread (serves static files + POST /rtc)
+        // HTTPS server thread (serves static files + POST /rtc)
+        // Self-signed TLS enables WebCodecs (VideoDecoder) on non-localhost origins.
+        let tls_acceptor = make_tls_acceptor()?;
         let http_addr = format!("0.0.0.0:{http_port}");
-        let http_listener = TcpListener::bind(&http_addr).context("bind HTTP")?;
-        tracing::info!(addr = %http_addr, "HTTP server (static + POST /rtc)");
+        let http_listener = TcpListener::bind(&http_addr).context("bind HTTPS")?;
+        tracing::info!(addr = %http_addr, "HTTPS server (static + POST /rtc)");
 
         std::thread::spawn(move || {
-            for stream in http_listener.incoming().flatten() {
+            for tcp_stream in http_listener.incoming().flatten() {
+                let tls = tls_acceptor.clone();
                 let rtc_tx = rtc_tx.clone();
                 let candidate_addr = candidate_addr;
                 std::thread::spawn(move || {
-                    let _ = handle_http(stream, rtc_tx, candidate_addr);
+                    let conn = match rustls::ServerConnection::new(tls) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+                    // Wrap in a BufReader-compatible type for handle_http
+                    let _ = handle_http_rw(&mut stream, rtc_tx, candidate_addr);
                 });
             }
         });
@@ -127,93 +156,73 @@ impl WebServerTransport {
     }
 }
 
-fn handle_http(
-    mut stream: TcpStream,
+/// Handle a single HTTP request over any Read+Write stream (plain TCP or TLS).
+fn handle_http_rw(
+    stream: &mut (impl Read + Write),
     rtc_tx: mpsc::Sender<Rtc>,
     candidate_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    // Read full request (headers + body) into buffer
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf)?;
+    buf.truncate(n);
+    let request = String::from_utf8_lossy(&buf);
 
-    let method = request_line.split_whitespace().next().unwrap_or("GET");
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let method = request.split_whitespace().next().unwrap_or("GET");
+    let path = request.split_whitespace().nth(1).unwrap_or("/");
 
-    // Read headers
-    let mut content_length: usize = 0;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.trim().is_empty() { break; }
-        if let Some(val) = line.strip_prefix("Content-Length:").or(line.strip_prefix("content-length:")) {
-            content_length = val.trim().parse().unwrap_or(0);
-        }
-    }
+    // Find body after \r\n\r\n
+    let body_start = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(n);
 
     match (method, path) {
         ("POST", "/rtc") => {
-            // Read SDP offer body
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body)?;
-            let offer_json: serde_json::Value = serde_json::from_slice(&body)?;
+            let body = &buf[body_start..];
+            let offer_json: serde_json::Value = serde_json::from_slice(body)?;
             let sdp_str = offer_json["sdp"].as_str().context("missing sdp")?;
 
-            // Create Rtc, accept offer, return answer
             let mut rtc = Rtc::builder().build();
-            let candidate = Candidate::host(candidate_addr, "udp")
-                .context("host candidate")?;
+            let candidate = Candidate::host(candidate_addr, "udp").context("host candidate")?;
             rtc.add_local_candidate(candidate);
 
-            let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str)
-                .context("parse SDP")?;
-            let answer = rtc.sdp_api().accept_offer(offer)
-                .context("accept offer")?;
+            let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str).context("parse SDP")?;
+            let answer = rtc.sdp_api().accept_offer(offer).context("accept offer")?;
+            let answer_json = serde_json::json!({ "type": "answer", "sdp": answer.to_sdp_string() });
 
-            let answer_json = serde_json::json!({
-                "type": "answer",
-                "sdp": answer.to_sdp_string(),
-            });
-
-            // Send Rtc to main thread for the IO loop
             rtc_tx.send(rtc).map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
 
-            // Respond with SDP answer
             let resp_body = answer_json.to_string();
-            write!(
-                stream,
+            write!(stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
                 resp_body.len()
             )?;
             stream.write_all(resp_body.as_bytes())?;
-            stream.flush()?;
             tracing::info!("SDP offer/answer exchanged via POST /rtc");
         }
         ("OPTIONS", "/rtc") => {
-            // CORS preflight
-            write!(
-                stream,
+            write!(stream,
                 "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n"
             )?;
-            stream.flush()?;
         }
         _ => {
-            // Serve static files
             let (status, content_type, body): (&str, &str, &[u8]) = match path {
                 "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
                 "/phantom_web.js" => ("200 OK", "application/javascript", WASM_JS),
                 "/phantom_web_bg.wasm" => ("200 OK", "application/wasm", WASM_BIN),
                 _ => ("404 Not Found", "text/plain", b"404 Not Found"),
             };
-            write!(
-                stream,
+            write!(stream,
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
                 body.len()
             )?;
             stream.write_all(body)?;
-            stream.flush()?;
         }
     }
+    stream.flush()?;
     Ok(())
+}
+
+fn handle_http(mut stream: TcpStream, rtc_tx: mpsc::Sender<Rtc>, candidate_addr: std::net::SocketAddr) -> Result<()> {
+    handle_http_rw(&mut stream, rtc_tx, candidate_addr)
 }
 
 fn get_local_ip() -> Option<std::net::IpAddr> {
