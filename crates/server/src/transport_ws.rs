@@ -3,7 +3,7 @@ use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
 
@@ -13,9 +13,13 @@ const WASM_JS: &[u8] = include_bytes!("../../web/pkg/phantom_web.js");
 const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
 
 /// Combined web server: HTTP static files + WebSocket fallback + WebRTC via POST /rtc.
+type SessionPair = (super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver);
+
 pub struct WebServerTransport {
-    /// Ready WebRTC sessions (from run loop, after DataChannels open)
-    rtc_session_rx: mpsc::Receiver<(super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver)>,
+    /// Latest ready WebRTC session. run_loop overwrites, main thread takes.
+    rtc_session: Arc<Mutex<Option<SessionPair>>>,
+    /// Notification: new session available
+    rtc_notify: mpsc::Receiver<()>,
     /// WebSocket fallback sessions
     ws_rx: mpsc::Receiver<WsConnection>,
 }
@@ -38,12 +42,14 @@ impl WebServerTransport {
 
         // Channel: POST /rtc → run loop (raw Rtc instances)
         let (rtc_tx, rtc_rx) = mpsc::channel::<Rtc>();
-        // Channel: run loop → accept() (ready sessions with open DataChannels)
-        let (session_tx, rtc_session_rx) = mpsc::channel();
+        // Shared session slot: run_loop writes latest, main thread takes it
+        let rtc_session: Arc<Mutex<Option<SessionPair>>> = Arc::new(Mutex::new(None));
+        let rtc_session2 = rtc_session.clone();
+        let (notify_tx, rtc_notify) = mpsc::channel::<()>();
 
-        // Start WebRTC run loop (single thread, single UDP socket, manages all clients)
+        // Start WebRTC run loop
         std::thread::spawn(move || {
-            super::transport_webrtc::run_loop(candidate_addr, rtc_rx, session_tx);
+            super::transport_webrtc::run_loop(candidate_addr, rtc_rx, rtc_session2, notify_tx);
         });
         // Channel for WS fallback connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
@@ -88,20 +94,19 @@ impl WebServerTransport {
             }
         });
 
-        Ok(Self { rtc_session_rx, ws_rx })
+        Ok(Self { rtc_session, rtc_notify, ws_rx })
     }
 
-    /// Accept: WebRTC (from run loop, DataChannels already open). Blocks until ready.
-    /// Drains stale sessions, uses the latest.
+    /// Accept: WebRTC. Blocks until a session is ready. Always gets the latest.
     pub fn accept_webrtc(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
-        // Block until at least one session arrives
-        let (mut s, mut r) = self.rtc_session_rx.recv().context("WebRTC session channel closed")?;
-        // Drain any stale sessions (from rapid refreshes), keep latest
-        while let Ok((s2, r2)) = self.rtc_session_rx.try_recv() {
-            s = s2;
-            r = r2;
+        loop {
+            // Wait for notification
+            let _ = self.rtc_notify.recv_timeout(std::time::Duration::from_millis(100));
+            // Take the latest session (run_loop may have overwritten multiple times)
+            if let Some((s, r)) = self.rtc_session.lock().unwrap().take() {
+                return Ok((Box::new(s), Box::new(r)));
+            }
         }
-        Ok((Box::new(s), Box::new(r)))
     }
 
     /// Accept: WebSocket only (fallback mode).

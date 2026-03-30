@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::net::UdpSocket;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use str0m::channel::ChannelId;
 use str0m::net::Protocol;
@@ -19,7 +19,8 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 pub fn run_loop(
     candidate_addr: std::net::SocketAddr,
     rtc_rx: mpsc::Receiver<Rtc>,
-    session_tx: mpsc::Sender<(WebRtcSender, WebRtcReceiver)>,
+    session_slot: Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
+    notify_tx: mpsc::Sender<()>,
 ) {
     // One UDP socket for the entire server lifetime
     let socket = match UdpSocket::bind(format!("0.0.0.0:{}", candidate_addr.port())) {
@@ -67,7 +68,7 @@ pub fn run_loop(
                         let _ = socket.send_to(&t.contents, t.destination);
                     }
                     Ok(Output::Event(event)) => {
-                        client.handle_event(event, &session_tx);
+                        client.handle_event(event, &session_slot, &notify_tx);
                     }
                     Ok(Output::Timeout(_)) => break,
                     Err(_) => break,
@@ -136,7 +137,8 @@ impl ActiveClient {
     fn handle_event(
         &mut self,
         event: Event,
-        session_tx: &mpsc::Sender<(WebRtcSender, WebRtcReceiver)>,
+        session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
+        notify_tx: &mpsc::Sender<()>,
     ) {
         match event {
             Event::ChannelOpen(id, label) => {
@@ -148,7 +150,6 @@ impl ActiveClient {
                     _ => {}
                 }
 
-                // All 3 open? Create channels and notify session loop
                 if self.video_id.is_some() && self.input_id.is_some()
                     && self.control_id.is_some() && !self.channels_ready
                 {
@@ -165,10 +166,12 @@ impl ActiveClient {
                     self.input_in_tx = Some(input_in_tx);
                     self.control_in_tx = Some(ctrl_in_tx);
 
-                    let _ = session_tx.send((
+                    // Overwrite any stale session — main thread always gets the latest
+                    *session_slot.lock().unwrap() = Some((
                         WebRtcSender { video_tx, control_tx: ctrl_out_tx },
                         WebRtcReceiver { input_rx: input_in_rx, control_rx: ctrl_in_rx },
                     ));
+                    let _ = notify_tx.send(());
                 }
             }
             Event::ChannelData(cd) => {
@@ -238,11 +241,19 @@ pub struct WebRtcReceiver {
 impl MessageReceiver for WebRtcReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
         loop {
-            if let Ok(d) = self.input_rx.try_recv() {
-                return bincode::deserialize(&d).context("deserialize");
+            match self.input_rx.try_recv() {
+                Ok(d) => return bincode::deserialize(&d).context("deserialize"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("input channel closed");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            if let Ok(d) = self.control_rx.try_recv() {
-                return bincode::deserialize(&d).context("deserialize");
+            match self.control_rx.try_recv() {
+                Ok(d) => return bincode::deserialize(&d).context("deserialize"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("control channel closed");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
             std::thread::sleep(Duration::from_millis(1));
         }

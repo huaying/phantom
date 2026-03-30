@@ -272,6 +272,7 @@ fn run_session(
 
     let mut sequence: u64 = 0;
     let mut stats_time = Instant::now();
+    let mut keepalive_time = Instant::now();
     let mut stats_h264: u64 = 0;
     let mut stats_tiles: u64 = 0;
     let mut stats_lossless: u64 = 0;
@@ -410,6 +411,15 @@ fn run_session(
             stats_tiles = 0;
             stats_lossless = 0;
             stats_bytes = 0;
+
+        }
+
+        // Keepalive every 1s: detect dead connection (channel dropped on browser refresh)
+        if keepalive_time.elapsed() >= Duration::from_secs(1) {
+            keepalive_time = Instant::now();
+            if sender.send_msg(&Message::Ping).is_err() {
+                anyhow::bail!("connection lost (keepalive failed)");
+            }
         }
 
         // Frame pacing: sleep in small increments, processing input between each.
