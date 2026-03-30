@@ -242,14 +242,16 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // Process received frames — decode every VideoFrame sequentially
+                // Process received frames — decode every VideoFrame to maintain
+                // decoder state, but only render the last decoded result.
+                let mut last_decoded = None;
                 let mut last_tiles = None;
                 let mut clipboard_msgs = Vec::new();
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
                         Message::VideoFrame { frame, .. } => {
                             if let Ok(rgb32) = session.h264_decoder.decode_frame(&frame.data) {
-                                session.display.update_full_frame(&rgb32);
+                                last_decoded = Some(rgb32);
                                 session.stats_video += 1;
                             }
                         }
@@ -257,6 +259,9 @@ impl ApplicationHandler for App {
                         Message::ClipboardSync(t) => clipboard_msgs.push(t),
                         _ => {}
                     }
+                }
+                if let Some(rgb32) = last_decoded {
+                    session.display.update_full_frame(&rgb32);
                 }
 
                 // Clipboard from server
