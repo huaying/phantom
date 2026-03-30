@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
@@ -14,11 +14,10 @@ const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
 
 /// Combined web server: HTTP static files + WebSocket fallback + WebRTC via POST /rtc.
 pub struct WebServerTransport {
-    rtc_rx: mpsc::Receiver<Rtc>,
+    /// Ready WebRTC sessions (from run loop, after DataChannels open)
+    rtc_session_rx: mpsc::Receiver<(super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver)>,
+    /// WebSocket fallback sessions
     ws_rx: mpsc::Receiver<WsConnection>,
-    pub udp_socket: UdpSocket,
-    /// The address str0m told the browser to connect to (must match Receive.destination)
-    pub candidate_addr: std::net::SocketAddr,
 }
 
 pub struct WsConnection {
@@ -28,21 +27,24 @@ pub struct WsConnection {
 
 impl WebServerTransport {
     pub fn start(http_port: u16, ws_port: u16, udp_port: u16) -> Result<Self> {
-        // UDP socket for WebRTC
-        let udp_socket = UdpSocket::bind(format!("0.0.0.0:{udp_port}"))
-            .context("bind UDP")?;
-        let udp_addr = udp_socket.local_addr()?;
-
         // ICE candidate IP: use PHANTOM_HOST env var, or detect, or fallback to 127.0.0.1
+        // No UDP socket created here — each session creates its own in run_rtc()
         let host_ip: std::net::IpAddr = std::env::var("PHANTOM_HOST")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| get_local_ip().unwrap_or([127, 0, 0, 1].into()));
-        let candidate_addr = std::net::SocketAddr::new(host_ip, udp_addr.port());
+        let candidate_addr = std::net::SocketAddr::new(host_ip, udp_port);
         tracing::info!(%candidate_addr, "WebRTC ICE candidate address");
 
-        // Channel for Rtc instances from POST /rtc
+        // Channel: POST /rtc → run loop (raw Rtc instances)
         let (rtc_tx, rtc_rx) = mpsc::channel::<Rtc>();
+        // Channel: run loop → accept() (ready sessions with open DataChannels)
+        let (session_tx, rtc_session_rx) = mpsc::channel();
+
+        // Start WebRTC run loop (single thread, single UDP socket, manages all clients)
+        std::thread::spawn(move || {
+            super::transport_webrtc::run_loop(candidate_addr, rtc_rx, session_tx);
+        });
         // Channel for WS fallback connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
 
@@ -86,19 +88,20 @@ impl WebServerTransport {
             }
         });
 
-        Ok(Self { rtc_rx, ws_rx, udp_socket, candidate_addr })
+        Ok(Self { rtc_session_rx, ws_rx })
     }
 
-    /// Accept: WebRTC only (via POST /rtc). Blocks until a WebRTC client connects.
+    /// Accept: WebRTC (from run loop, DataChannels already open). Blocks until ready.
+    /// Drains stale sessions, uses the latest.
     pub fn accept_webrtc(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
-        loop {
-            if let Ok(rtc) = self.rtc_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                tracing::info!("WebRTC client accepted via POST /rtc");
-                // Pass candidate_addr as destination for str0m Receive matching
-                let (s, r) = super::transport_webrtc::run_rtc(rtc, &self.udp_socket, self.candidate_addr)?;
-                return Ok((Box::new(s), Box::new(r)));
-            }
+        // Block until at least one session arrives
+        let (mut s, mut r) = self.rtc_session_rx.recv().context("WebRTC session channel closed")?;
+        // Drain any stale sessions (from rapid refreshes), keep latest
+        while let Ok((s2, r2)) = self.rtc_session_rx.try_recv() {
+            s = s2;
+            r = r2;
         }
+        Ok((Box::new(s), Box::new(r)))
     }
 
     /// Accept: WebSocket only (fallback mode).

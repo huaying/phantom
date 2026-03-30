@@ -243,6 +243,10 @@ fn run_session(
     frame_interval: Duration,
     quality_delay: Duration,
 ) -> Result<()> {
+    // New client needs a keyframe to start decoding
+    video_encoder.force_keyframe();
+    differ.reset();
+
     let (width, height) = capture.resolution();
     sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
     tracing::info!(width, height, "session started");

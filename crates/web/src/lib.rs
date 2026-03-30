@@ -93,10 +93,9 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     };
 
     // Create 3 DataChannels
-    let mut video_init = RtcDataChannelInit::new();
-    video_init.ordered(false);
-    video_init.max_retransmits(0);
-    let video_dc = pc.create_data_channel_with_data_channel_dict("video", &video_init);
+    // Video DC: ordered + reliable for now (ensures keyframes arrive intact).
+    // TODO: switch to unreliable + periodic keyframes for lower latency.
+    let video_dc = pc.create_data_channel("video");
     video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let mut input_init = RtcDataChannelInit::new();
