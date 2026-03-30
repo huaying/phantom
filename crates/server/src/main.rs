@@ -235,7 +235,7 @@ fn create_encoder(
 }
 
 fn run_session(
-    capture: &mut capture_scrap::ScrapCapture,
+    capture: &mut dyn FrameCapture,
     video_encoder: &mut dyn FrameEncoder,
     differ: &mut TileDiffer,
     mut sender: Box<dyn MessageSender>,
