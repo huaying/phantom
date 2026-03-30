@@ -87,11 +87,29 @@ fn main() -> Result<()> {
         Some(key)
     };
 
-    let mut capture: Box<dyn phantom_core::capture::FrameCapture> = create_capture(&args.capture)?;
-    let (width, height) = capture.resolution();
-    let mut video_encoder: Box<dyn FrameEncoder> = create_encoder(
-        &args.encoder, width, height, args.fps as f32, args.bitrate,
-    )?;
+    let use_gpu_pipeline = args.capture == "nvfbc" && args.encoder == "nvenc";
+
+    // GPU zero-copy pipeline or CPU pipeline
+    let mut gpu = if use_gpu_pipeline {
+        Some(GpuPipeline::new(args.fps, args.bitrate)?)
+    } else {
+        None
+    };
+    let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
+        Some(create_capture(&args.capture)?)
+    } else {
+        None
+    };
+    let (width, height) = if let Some(ref gpu) = gpu {
+        (gpu.width, gpu.height)
+    } else {
+        capture.as_ref().unwrap().resolution()
+    };
+    let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
+        Some(create_encoder(&args.encoder, width, height, args.fps as f32, args.bitrate)?)
+    } else {
+        None
+    };
     let mut differ = TileDiffer::new();
 
     // Build transport based on --transport flag
@@ -143,13 +161,28 @@ fn main() -> Result<()> {
                 }
             };
 
-        if let Err(e) = run_session(
-            &mut *capture, &mut *video_encoder, &mut differ,
-            sender, receiver, frame_interval, quality_delay,
-        ) {
+        let result = if let Some(ref mut gpu) = gpu {
+            run_session_gpu(
+                &mut gpu.capture, &mut gpu.encoder,
+                sender, receiver, frame_interval,
+            )
+        } else {
+            run_session(
+                &mut **capture.as_mut().unwrap(),
+                &mut **video_encoder.as_mut().unwrap(),
+                &mut differ,
+                sender, receiver, frame_interval, quality_delay,
+            )
+        };
+        if let Err(e) = result {
             tracing::warn!("session ended: {e}");
-            differ.reset();
-            video_encoder.force_keyframe();
+            if let Some(ref mut enc) = video_encoder {
+                differ.reset();
+                enc.force_keyframe();
+            }
+            if let Some(ref mut gpu) = gpu {
+                gpu.encoder.force_keyframe();
+            }
         }
     }
 }
@@ -218,29 +251,67 @@ impl CongestionTracker {
     }
 }
 
-/// Create the screen capture backend based on --capture flag.
+/// GPU zero-copy pipeline: NVFBC capture + NVENC encode, no CPU involvement.
+struct GpuPipeline {
+    capture: phantom_gpu::nvfbc::NvfbcCapture,
+    encoder: phantom_gpu::nvenc::NvencEncoder,
+    width: u32,
+    height: u32,
+}
+
+impl GpuPipeline {
+    fn new(fps: u32, bitrate_kbps: u32) -> Result<Self> {
+        use phantom_core::capture::FrameCapture;
+        let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
+        let dev = cuda.device_get(0)?;
+        let primary_ctx = cuda.primary_ctx_retain(dev)?;
+        unsafe { cuda.ctx_push(primary_ctx)? };
+
+        let mut capture = phantom_gpu::nvfbc::NvfbcCapture::new(
+            std::sync::Arc::clone(&cuda),
+            primary_ctx,
+            phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12,
+        )?;
+        let (sw, sh) = capture.resolution();
+
+        // Grab one frame to get actual dimensions (may differ from screen size)
+        let first = loop {
+            std::thread::sleep(Duration::from_millis(20));
+            match capture.grab_cuda() {
+                Ok(Some(f)) => break f,
+                Ok(None) => continue,
+                Err(e) => anyhow::bail!("NVFBC initial grab failed: {e}"),
+            }
+        };
+        let (width, height) = (first.width, first.height);
+        tracing::info!(screen_w = sw, screen_h = sh, width, height, "NVFBC→NVENC GPU pipeline");
+
+        // Release NVFBC context, init NVENC with shared primary context
+        capture.release_context()?;
+        let encoder = unsafe {
+            phantom_gpu::nvenc::NvencEncoder::with_context(
+                cuda, primary_ctx, false, width, height, fps, bitrate_kbps,
+            )?
+        };
+
+        Ok(Self { capture, encoder, width, height })
+    }
+}
+
+/// Create the screen capture backend based on --capture flag (CPU path only).
 fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
     match name {
         "scrap" => {
             let cap = capture_scrap::ScrapCapture::new()?;
             Ok(Box::new(cap))
         }
-        "nvfbc" => {
-            let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
-            let dev = cuda.device_get(0)?;
-            let ctx = cuda.ctx_create(dev)?;
-            let cap = phantom_gpu::nvfbc::NvfbcCapture::new(
-                cuda, ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_BGRA,
-            )?;
-            Ok(Box::new(cap))
-        }
         other => anyhow::bail!(
-            "unknown capture '{other}'. Available: scrap, nvfbc"
+            "unknown capture '{other}'. Available: scrap, nvfbc (use with --encoder nvenc for GPU pipeline)"
         ),
     }
 }
 
-/// Create the video encoder based on --encoder flag.
+/// Create the video encoder based on --encoder flag (CPU path only).
 fn create_encoder(
     name: &str, width: u32, height: u32, fps: f32, bitrate_kbps: u32,
 ) -> Result<Box<dyn FrameEncoder>> {
@@ -259,6 +330,142 @@ fn create_encoder(
         other => anyhow::bail!(
             "unknown encoder '{other}'. Available: openh264, nvenc"
         ),
+    }
+}
+
+/// GPU zero-copy session loop: NVFBC grab → NVENC encode → send.
+/// No tile differ or smart encoding — NVENC at ~4ms is fast enough for every frame.
+fn run_session_gpu(
+    capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
+    encoder: &mut phantom_gpu::nvenc::NvencEncoder,
+    mut sender: Box<dyn MessageSender>,
+    receiver: Box<dyn MessageReceiver>,
+    frame_interval: Duration,
+) -> Result<()> {
+    use phantom_core::capture::FrameCapture;
+    use phantom_core::encode::FrameEncoder;
+
+    encoder.force_keyframe();
+    let (width, height) = capture.resolution();
+    sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
+    tracing::info!(width, height, "GPU session started");
+
+    let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
+    std::thread::spawn(move || { receive_loop(receiver, event_tx); });
+
+    let mut injector = match input_injector::InputInjector::new() {
+        Ok(inj) => Some(inj),
+        Err(e) => { tracing::warn!("input injection unavailable: {e}"); None }
+    };
+
+    hide_remote_cursor();
+
+    let mut clipboard = ClipboardTracker::new();
+    let mut arboard = arboard::Clipboard::new().ok();
+    let mut clipboard_poll = Instant::now();
+    let mut sequence: u64 = 0;
+    let mut stats_time = Instant::now();
+    let mut stats_frames: u64 = 0;
+    let mut stats_bytes: u64 = 0;
+    let mut keepalive_time = Instant::now();
+
+    loop {
+        let loop_start = Instant::now();
+
+        // Process inbound events
+        loop {
+            match event_rx.try_recv() {
+                Ok(InboundEvent::Input(event)) => {
+                    if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
+                }
+                Ok(InboundEvent::Clipboard(text)) => {
+                    if clipboard.on_remote_update(&text) {
+                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                    }
+                }
+                Ok(InboundEvent::PasteText(text)) => {
+                    if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                    clipboard.on_remote_update(&text);
+                    if let Some(ref mut inj) = injector { let _ = inj.type_text(&text); }
+                }
+                Ok(InboundEvent::Disconnected) => anyhow::bail!("client disconnected"),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("client disconnected"),
+            }
+        }
+
+        // Clipboard polling
+        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
+            clipboard_poll = Instant::now();
+            if let Some(ref mut ab) = arboard {
+                if let Ok(text) = ab.get_text() {
+                    if let Some(changed) = clipboard.check_local_change(&text) {
+                        sender.send_msg(&Message::ClipboardSync(changed))?;
+                    }
+                }
+            }
+        }
+
+        // GPU capture → encode → send (zero-copy)
+        capture.bind_context()?;
+        let gpu_frame = capture.grab_cuda();
+        capture.release_context()?;
+
+        if let Ok(Some(f)) = gpu_frame {
+            let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
+            let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
+            stats_bytes += encoded.data.len() as u64;
+            stats_frames += 1;
+            sequence += 1;
+            sender.send_msg(&Message::VideoFrame {
+                sequence,
+                frame: Box::new(encoded),
+            })?;
+        }
+
+        // Stats
+        if stats_time.elapsed() >= Duration::from_secs(5) {
+            let elapsed = stats_time.elapsed().as_secs_f64();
+            tracing::info!(
+                fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
+                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
+                "GPU stats"
+            );
+            stats_time = Instant::now();
+            stats_frames = 0;
+            stats_bytes = 0;
+        }
+
+        // Keepalive
+        if keepalive_time.elapsed() >= Duration::from_secs(1) {
+            keepalive_time = Instant::now();
+            if sender.send_msg(&Message::Ping).is_err() {
+                anyhow::bail!("connection lost (keepalive failed)");
+            }
+        }
+
+        // Frame pacing
+        while loop_start.elapsed() < frame_interval {
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    InboundEvent::Input(input) => {
+                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
+                    }
+                    InboundEvent::Clipboard(text) => {
+                        if clipboard.on_remote_update(&text) {
+                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        }
+                    }
+                    InboundEvent::PasteText(text) => {
+                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        clipboard.on_remote_update(&text);
+                        if let Some(ref mut inj) = injector { let _ = inj.type_text(&text); }
+                    }
+                    InboundEvent::Disconnected => anyhow::bail!("client disconnected"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
