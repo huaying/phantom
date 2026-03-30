@@ -37,9 +37,13 @@ struct Args {
     #[arg(long)]
     no_encrypt: bool,
 
-    /// Video encoder: openh264 (default). Future: x264, nvenc, vaapi.
+    /// Video encoder: openh264 (CPU, default), nvenc (NVIDIA GPU).
     #[arg(long, default_value = "openh264")]
     encoder: String,
+
+    /// Screen capture: scrap (CPU, default), nvfbc (NVIDIA GPU).
+    #[arg(long, default_value = "scrap")]
+    capture: String,
 
     /// Transport protocol: tcp (default) or quic (UDP, better for WAN).
     #[arg(long, default_value = "tcp")]
@@ -83,7 +87,7 @@ fn main() -> Result<()> {
         Some(key)
     };
 
-    let mut capture = capture_scrap::ScrapCapture::new()?;
+    let mut capture: Box<dyn phantom_core::capture::FrameCapture> = create_capture(&args.capture)?;
     let (width, height) = capture.resolution();
     let mut video_encoder: Box<dyn FrameEncoder> = create_encoder(
         &args.encoder, width, height, args.fps as f32, args.bitrate,
@@ -140,7 +144,7 @@ fn main() -> Result<()> {
             };
 
         if let Err(e) = run_session(
-            &mut capture, &mut *video_encoder, &mut differ,
+            &mut *capture, &mut *video_encoder, &mut differ,
             sender, receiver, frame_interval, quality_delay,
         ) {
             tracing::warn!("session ended: {e}");
@@ -214,8 +218,29 @@ impl CongestionTracker {
     }
 }
 
+/// Create the screen capture backend based on --capture flag.
+fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
+    match name {
+        "scrap" => {
+            let cap = capture_scrap::ScrapCapture::new()?;
+            Ok(Box::new(cap))
+        }
+        "nvfbc" => {
+            let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
+            let dev = cuda.device_get(0)?;
+            let ctx = cuda.ctx_create(dev)?;
+            let cap = phantom_gpu::nvfbc::NvfbcCapture::new(
+                cuda, ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_BGRA,
+            )?;
+            Ok(Box::new(cap))
+        }
+        other => anyhow::bail!(
+            "unknown capture '{other}'. Available: scrap, nvfbc"
+        ),
+    }
+}
+
 /// Create the video encoder based on --encoder flag.
-/// Currently only openh264. Add new backends here.
 fn create_encoder(
     name: &str, width: u32, height: u32, fps: f32, bitrate_kbps: u32,
 ) -> Result<Box<dyn FrameEncoder>> {
@@ -224,12 +249,15 @@ fn create_encoder(
             let enc = encode_h264::OpenH264Encoder::new(width, height, fps, bitrate_kbps)?;
             Ok(Box::new(enc))
         }
-        // Future backends:
-        // "x264" => { ... }
-        // "nvenc" => { ... }
-        // "vaapi" => { ... }
+        "nvenc" => {
+            let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
+            let enc = phantom_gpu::nvenc::NvencEncoder::new(
+                cuda, 0, width, height, fps as u32, bitrate_kbps,
+            )?;
+            Ok(Box::new(enc))
+        }
         other => anyhow::bail!(
-            "unknown encoder '{}'. Available: openh264. Future: x264, nvenc, vaapi", other
+            "unknown encoder '{other}'. Available: openh264, nvenc"
         ),
     }
 }

@@ -1,0 +1,370 @@
+//! NVENC hardware H.264 encoder — implements `FrameEncoder` trait.
+//!
+//! Pipeline: BGRA CPU frame → NV12 conversion (CPU) → cuMemcpyHtoD → NVENC encode (GPU)
+//! With NVFBC: CUdeviceptr (GPU) → NVENC encode (GPU) — zero CPU copy.
+
+use crate::cuda::CudaLib;
+use crate::dl::DynLib;
+use crate::sys::*;
+use anyhow::{bail, Context, Result};
+use phantom_core::encode::{EncodedFrame, FrameEncoder, VideoCodec};
+use phantom_core::frame::Frame;
+use std::ffi::c_void;
+use std::sync::Arc;
+
+/// Entry point symbol: populates the NVENC function pointer table.
+type FnNvEncodeAPICreateInstance = unsafe extern "C" fn(list: *mut c_void) -> NVENCSTATUS;
+
+pub struct NvencEncoder {
+    cuda: Arc<CudaLib>,
+    ctx: CUcontext,
+    api: NvEncFunctionList,
+    encoder: *mut c_void,
+    output_buf: *mut c_void,
+    width: u32,
+    height: u32,
+    /// Persistent GPU buffer for NV12 input (reused across frames).
+    device_buf: CUdeviceptr,
+    _device_buf_size: usize,
+    /// CPU-side NV12 buffer (reused across frames).
+    nv12_buf: Vec<u8>,
+    force_idr: bool,
+    frame_idx: u64,
+    _nvenc_lib: DynLib,
+}
+
+// NVENC encoder handle is not thread-safe, but we only use it from one thread.
+unsafe impl Send for NvencEncoder {}
+
+impl NvencEncoder {
+    pub fn new(
+        cuda: Arc<CudaLib>,
+        device_ordinal: i32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        // Load NVENC library
+        let nvenc_lib = DynLib::open(&["libnvidia-encode.so.1", "libnvidia-encode.so"])
+            .context("failed to load libnvidia-encode")?;
+
+        let create_instance: FnNvEncodeAPICreateInstance = unsafe {
+            nvenc_lib.sym("NvEncodeAPICreateInstance")
+                .context("NvEncodeAPICreateInstance symbol not found")?
+        };
+
+        // Populate function table
+        let mut api = NvEncFunctionList::zeroed();
+        api.set_version();
+        let status = unsafe { create_instance(api.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            bail!("NvEncodeAPICreateInstance failed: {status}");
+        }
+
+        // Create CUDA context
+        let dev = cuda.device_get(device_ordinal)?;
+        let ctx = cuda.ctx_create(dev)?;
+
+        // Open encode session
+        let mut session_params = NvEncOpenEncodeSessionExParams::zeroed();
+        session_params.set_version();
+        session_params.set_device_type_cuda();
+        session_params.set_device(ctx);
+        session_params.set_api_version();
+
+        let mut encoder: *mut c_void = std::ptr::null_mut();
+        let f = api.open_encode_session_ex().context("nvEncOpenEncodeSessionEx is null")?;
+        let status = unsafe { f(session_params.as_mut_ptr(), &mut encoder) };
+        if status != NV_ENC_SUCCESS {
+            bail!("nvEncOpenEncodeSessionEx failed: {status}");
+        }
+
+        // Get preset config (low latency)
+        let mut preset_config = NvEncPresetConfig::zeroed();
+        preset_config.set_version();
+        preset_config.set_config_version();
+
+        let f = api.get_encode_preset_config_ex()
+            .context("nvEncGetEncodePresetConfigEx is null")?;
+        let status = unsafe {
+            f(
+                encoder,
+                NV_ENC_CODEC_H264_GUID,
+                NV_ENC_PRESET_P4_GUID,
+                NV_ENC_TUNING_INFO_LOW_LATENCY,
+                preset_config.as_mut_ptr(),
+            )
+        };
+        if status != NV_ENC_SUCCESS {
+            bail!("nvEncGetEncodePresetConfigEx failed: {status}");
+        }
+
+        // Extract and customize config
+        let mut config = preset_config.copy_config();
+        config.set_gop_length(u32::MAX); // infinite GOP (low latency)
+        config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
+        config.set_avg_bitrate(bitrate_kbps * 1000);
+        config.set_max_bitrate(bitrate_kbps * 1000 * 2);
+
+        // Initialize encoder
+        let mut init_params = NvEncInitializeParams::zeroed();
+        init_params.set_version();
+        init_params.set_encode_guid(&NV_ENC_CODEC_H264_GUID);
+        init_params.set_preset_guid(&NV_ENC_PRESET_P4_GUID);
+        init_params.set_encode_width(width);
+        init_params.set_encode_height(height);
+        init_params.set_dar_width(width);
+        init_params.set_dar_height(height);
+        init_params.set_frame_rate_num(fps);
+        init_params.set_frame_rate_den(1);
+        init_params.set_enable_encode_async(0);
+        init_params.set_enable_ptd(1); // picture type decision
+        init_params.set_encode_config(config.as_mut_ptr());
+        init_params.set_tuning_info(NV_ENC_TUNING_INFO_LOW_LATENCY);
+
+        let f = api.initialize_encoder().context("nvEncInitializeEncoder is null")?;
+        let status = unsafe { f(encoder, init_params.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            bail!("nvEncInitializeEncoder failed: {status}");
+        }
+
+        // Create output bitstream buffer
+        let mut buf_params = NvEncCreateBitstreamBuffer::zeroed();
+        buf_params.set_version();
+        let f = api.create_bitstream_buffer().context("nvEncCreateBitstreamBuffer is null")?;
+        let status = unsafe { f(encoder, buf_params.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            bail!("nvEncCreateBitstreamBuffer failed: {status}");
+        }
+        let output_buf = buf_params.bitstream_buffer();
+
+        // Allocate persistent GPU buffer for NV12 input
+        let nv12_size = (width as usize) * (height as usize) * 3 / 2;
+        unsafe { cuda.ctx_push(ctx)? };
+        let device_buf = cuda.mem_alloc(nv12_size)?;
+        cuda.ctx_pop()?;
+
+        tracing::info!(
+            width, height, fps, bitrate_kbps,
+            "NVENC H.264 encoder initialized (GPU)"
+        );
+
+        Ok(Self {
+            cuda,
+            ctx,
+            api,
+            encoder,
+            output_buf,
+            width,
+            height,
+            device_buf,
+            _device_buf_size: nv12_size,
+            nv12_buf: vec![0u8; nv12_size],
+            force_idr: true, // first frame is always IDR
+            frame_idx: 0,
+            _nvenc_lib: nvenc_lib,
+        })
+    }
+
+    /// Encode a raw NV12 buffer that's already on the GPU (CUdeviceptr).
+    /// This is the zero-copy path used with NVFBC.
+    pub fn encode_device_nv12(
+        &mut self,
+        device_ptr: CUdeviceptr,
+        pitch: u32,
+    ) -> Result<EncodedFrame> {
+        self.encode_registered(device_ptr, pitch)
+    }
+
+    /// Convert BGRA CPU frame to NV12, upload, and encode.
+    fn encode_cpu_frame(&mut self, frame: &Frame) -> Result<EncodedFrame> {
+        bgra_to_nv12(
+            &frame.data,
+            self.width as usize,
+            self.height as usize,
+            &mut self.nv12_buf,
+        );
+
+        unsafe { self.cuda.ctx_push(self.ctx)? };
+        self.cuda.memcpy_htod(self.device_buf, &self.nv12_buf)?;
+        self.cuda.ctx_pop()?;
+
+        self.encode_registered(self.device_buf, self.width)
+    }
+
+    /// Register a CUDA device pointer with NVENC, map, encode, read bitstream.
+    fn encode_registered(
+        &mut self,
+        device_ptr: CUdeviceptr,
+        pitch: u32,
+    ) -> Result<EncodedFrame> {
+        unsafe { self.cuda.ctx_push(self.ctx)? };
+
+        // Register resource
+        let mut reg = NvEncRegisterResource::zeroed();
+        reg.set_version();
+        reg.set_resource_type(NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR);
+        reg.set_width(self.width);
+        reg.set_height(self.height);
+        reg.set_pitch(pitch);
+        reg.set_resource_to_register(device_ptr as *mut c_void);
+        reg.set_buffer_format(NV_ENC_BUFFER_FORMAT_NV12);
+        reg.set_buffer_usage(0); // NV_ENC_INPUT_IMAGE
+
+        let f = self.api.register_resource().context("register_resource")?;
+        let status = unsafe { f(self.encoder, reg.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            self.cuda.ctx_pop()?;
+            bail!("nvEncRegisterResource failed: {status}");
+        }
+        let registered = reg.registered_resource();
+
+        // Map input resource
+        let mut map = NvEncMapInputResource::zeroed();
+        map.set_version();
+        map.set_registered_resource(registered);
+
+        let f = self.api.map_input_resource().context("map_input_resource")?;
+        let status = unsafe { f(self.encoder, map.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            // Cleanup: unregister
+            if let Some(f) = self.api.unregister_resource() {
+                unsafe { f(self.encoder, registered) };
+            }
+            self.cuda.ctx_pop()?;
+            bail!("nvEncMapInputResource failed: {status}");
+        }
+        let mapped = map.mapped_resource();
+
+        // Encode picture
+        let mut pic = NvEncPicParams::zeroed();
+        pic.set_version();
+        pic.set_input_width(self.width);
+        pic.set_input_height(self.height);
+        pic.set_input_pitch(pitch);
+        pic.set_input_buffer(mapped);
+        pic.set_output_bitstream(self.output_buf);
+        pic.set_buffer_fmt(NV_ENC_BUFFER_FORMAT_NV12);
+        pic.set_picture_struct(NV_ENC_PIC_STRUCT_FRAME);
+        pic.set_input_timestamp(self.frame_idx);
+
+        if self.force_idr {
+            pic.set_encode_pic_flags(NV_ENC_PIC_FLAG_FORCEIDR);
+            self.force_idr = false;
+        }
+
+        let f = self.api.encode_picture().context("encode_picture")?;
+        let status = unsafe { f(self.encoder, pic.as_mut_ptr()) };
+
+        // Lock and read bitstream (even if encode returned error, try to clean up)
+        let result = if status == NV_ENC_SUCCESS {
+            self.read_bitstream()
+        } else {
+            Err(anyhow::anyhow!("nvEncEncodePicture failed: {status}"))
+        };
+
+        // Cleanup: unmap, unregister
+        if let Some(f) = self.api.unmap_input_resource() {
+            unsafe { f(self.encoder, mapped) };
+        }
+        if let Some(f) = self.api.unregister_resource() {
+            unsafe { f(self.encoder, registered) };
+        }
+
+        self.cuda.ctx_pop()?;
+        self.frame_idx += 1;
+        result
+    }
+
+    fn read_bitstream(&self) -> Result<EncodedFrame> {
+        let mut lock = NvEncLockBitstream::zeroed();
+        lock.set_version();
+        lock.set_output_bitstream(self.output_buf);
+
+        let f = self.api.lock_bitstream().context("lock_bitstream")?;
+        let status = unsafe { f(self.encoder, lock.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            bail!("nvEncLockBitstream failed: {status}");
+        }
+
+        let size = lock.bitstream_size() as usize;
+        let ptr = lock.bitstream_ptr();
+        let pic_type = lock.picture_type();
+        let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        let is_keyframe = pic_type == NV_ENC_PIC_TYPE_IDR || pic_type == NV_ENC_PIC_TYPE_I;
+
+        // Unlock
+        if let Some(f) = self.api.unlock_bitstream() {
+            unsafe { f(self.encoder, self.output_buf) };
+        }
+
+        Ok(EncodedFrame {
+            codec: VideoCodec::H264,
+            data,
+            is_keyframe,
+        })
+    }
+}
+
+impl FrameEncoder for NvencEncoder {
+    fn encode_frame(&mut self, frame: &Frame) -> Result<EncodedFrame> {
+        self.encode_cpu_frame(frame)
+    }
+
+    fn force_keyframe(&mut self) {
+        self.force_idr = true;
+    }
+}
+
+impl Drop for NvencEncoder {
+    fn drop(&mut self) {
+        // Free device buffer
+        unsafe { self.cuda.ctx_push(self.ctx) }.ok();
+        self.cuda.mem_free(self.device_buf);
+
+        // Destroy bitstream buffer
+        if let Some(f) = self.api.destroy_bitstream_buffer() {
+            unsafe { f(self.encoder, self.output_buf) };
+        }
+
+        // Destroy encoder
+        if let Some(f) = self.api.destroy_encoder() {
+            unsafe { f(self.encoder) };
+        }
+
+        self.cuda.ctx_pop().ok();
+
+        // Destroy CUDA context
+        unsafe { self.cuda.ctx_destroy(self.ctx) };
+
+        tracing::debug!("NVENC encoder destroyed");
+    }
+}
+
+/// Convert BGRA to NV12 (BT.601) into a pre-allocated buffer.
+/// NV12 layout: Y plane (w*h) followed by interleaved UV plane (w*h/2).
+fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize, nv12: &mut [u8]) {
+    let (y_plane, uv_plane) = nv12.split_at_mut(width * height);
+
+    for row in 0..height {
+        for col in 0..width {
+            let idx = (row * width + col) * 4;
+            let b = bgra[idx] as i32;
+            let g = bgra[idx + 1] as i32;
+            let r = bgra[idx + 2] as i32;
+
+            // BT.601 full range
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            y_plane[row * width + col] = y.clamp(0, 255) as u8;
+
+            if row % 2 == 0 && col % 2 == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let uv_idx = (row / 2) * width + col;
+                uv_plane[uv_idx] = u.clamp(0, 255) as u8;
+                uv_plane[uv_idx + 1] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+}

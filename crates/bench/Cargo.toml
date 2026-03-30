@@ -1,0 +1,10 @@
+[package]
+name = "phantom-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phantom-core = { path = "../core" }
+phantom-gpu = { path = "../gpu" }
+openh264 = "0.6"
+anyhow = "1"

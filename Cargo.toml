@@ -5,4 +5,6 @@ members = [
     "crates/server",
     "crates/client",
     "crates/web",
+    "crates/gpu",
+    "crates/bench",
 ]
