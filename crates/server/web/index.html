@@ -12,11 +12,6 @@
       height: 100vh;
       object-fit: contain;
       cursor: crosshair;
-      image-rendering: auto;
-    }
-    #status {
-      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-      color: #666; font: 13px monospace; pointer-events: none; z-index: 10;
     }
   </style>
 </head>
@@ -24,14 +19,7 @@
   <canvas id="screen"></canvas>
   <script type="module">
     import init from './phantom_web.js';
-    document.getElementById('status').textContent = 'Connecting...';
-    try {
-      await init();
-      document.getElementById('status').style.display = 'none';
-    } catch(e) {
-      document.getElementById('status').textContent = 'Error: ' + e.message;
-      console.error(e);
-    }
+    try { await init(); } catch(e) { console.error('WASM init failed:', e); }
   </script>
 </body>
 </html>
