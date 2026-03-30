@@ -8,9 +8,18 @@ use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
 
 /// Embedded static files for the web client.
+/// Only included when the WASM files exist (built via `wasm-pack build crates/web`).
 const INDEX_HTML: &str = include_str!("../web/index.html");
+
+#[cfg(feature = "web-client")]
 const WASM_JS: &[u8] = include_bytes!("../../web/pkg/phantom_web.js");
+#[cfg(feature = "web-client")]
 const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
+
+#[cfg(not(feature = "web-client"))]
+const WASM_JS: &[u8] = b"console.error('web client not compiled: build with --features web-client')";
+#[cfg(not(feature = "web-client"))]
+const WASM_BIN: &[u8] = b"";
 
 /// Combined web server: HTTP static files + WebSocket fallback + WebRTC via POST /rtc.
 type SessionPair = (super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver);

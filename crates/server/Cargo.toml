@@ -3,11 +3,9 @@ name = "phantom-server"
 version = "0.1.0"
 edition = "2021"
 
-# Future feature flags for additional encoders:
-# [features]
-# default = ["openh264-encoder"]
-# openh264-encoder = ["openh264"]
-# ffmpeg-encoder = ["ffmpeg-next"]  # enables x264, NVENC, VAAPI, AV1
+[features]
+default = ["web-client"]
+web-client = []  # embed WASM web client (requires wasm-pack build first)
 
 [dependencies]
 phantom-core = { path = "../core" }
