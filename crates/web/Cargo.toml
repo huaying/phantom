@@ -14,6 +14,7 @@ js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 ruzstd = "0.7"
+serde_json = "1"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -29,4 +30,9 @@ features = [
     # Events
     "MouseEvent", "KeyboardEvent", "WheelEvent",
     "EventTarget", "Event", "AddEventListenerOptions",
+    # WebRTC DataChannel
+    "RtcPeerConnection", "RtcConfiguration",
+    "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
+    "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelEvent", "RtcDataChannelType",
+    "RtcPeerConnectionIceEvent", "RtcIceCandidate", "RtcIceCandidateInit",
 ]

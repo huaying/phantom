@@ -1836,6 +1836,7 @@ dependencies = [
  "phantom-core",
  "ruzstd",
  "serde",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

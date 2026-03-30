@@ -44,6 +44,11 @@ struct AppState {
     server_width: u32,
     server_height: u32,
     frame_count: u64,
+    /// WebRTC DataChannels (None = using WS fallback)
+    video_dc: Option<web_sys::RtcDataChannel>,
+    input_dc: Option<web_sys::RtcDataChannel>,
+    control_dc: Option<web_sys::RtcDataChannel>,
+    use_webrtc: bool,
 }
 
 thread_local! {
@@ -86,6 +91,10 @@ pub fn main() {
         server_width: 0,
         server_height: 0,
         frame_count: 0,
+        video_dc: None,
+        input_dc: None,
+        control_dc: None,
+        use_webrtc: false,
     }));
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -100,10 +109,18 @@ pub fn main() {
     }
     {
         let s = state.clone();
+        let ws2 = ws.clone();
         let onmsg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let data = js_sys::Uint8Array::new(&buf).to_vec();
-                on_message(&s, &data);
+            let data = e.data();
+            // Text frame = signaling (JSON)
+            if let Some(text) = data.as_string() {
+                on_signaling(&s, &ws2, &text);
+                return;
+            }
+            // Binary frame = data (bincode)
+            if let Ok(buf) = data.dyn_into::<js_sys::ArrayBuffer>() {
+                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                on_message(&s, &bytes);
             }
         });
         ws.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
@@ -125,6 +142,9 @@ pub fn main() {
 
     // Input
     setup_input(&canvas, &document, &state);
+
+    // Attempt WebRTC upgrade
+    setup_webrtc(&ws, &state);
 }
 
 fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
@@ -474,4 +494,181 @@ fn js_code_to_keycode(code: &str) -> Option<KeyCode> {
         "NumLock" => KeyCode::NumLock, "ScrollLock" => KeyCode::ScrollLock,
         _ => return None,
     })
+}
+
+// -- WebRTC DataChannel setup --
+
+fn setup_webrtc(ws: &WebSocket, state: &Rc<RefCell<AppState>>) {
+    use web_sys::{RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcSdpType, RtcSessionDescriptionInit};
+
+    let config = RtcConfiguration::new();
+    let pc = match RtcPeerConnection::new_with_configuration(&config) {
+        Ok(pc) => pc,
+        Err(e) => {
+            console::warn_1(&format!("WebRTC not available: {:?}", e).into());
+            return;
+        }
+    };
+
+    // Create 3 DataChannels
+    let mut video_init = RtcDataChannelInit::new();
+    video_init.ordered(false);
+    video_init.max_retransmits(0);
+    let video_dc = pc.create_data_channel_with_data_channel_dict("video", &video_init);
+    video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+
+    let mut input_init = RtcDataChannelInit::new();
+    input_init.ordered(true);
+    input_init.max_retransmits(2);
+    let input_dc = pc.create_data_channel_with_data_channel_dict("input", &input_init);
+    input_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+
+    let control_dc = pc.create_data_channel("control");
+    control_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+
+    // Store DCs in state
+    {
+        let mut s = state.borrow_mut();
+        s.video_dc = Some(video_dc.clone());
+        s.input_dc = Some(input_dc.clone());
+        s.control_dc = Some(control_dc.clone());
+    }
+
+    // Set up onmessage for video DC (receives VideoFrame/TileUpdate from server)
+    {
+        let s = state.clone();
+        let onmsg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                let data = js_sys::Uint8Array::new(&buf).to_vec();
+                on_message(&s, &data);
+            }
+        });
+        video_dc.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
+        onmsg.forget();
+    }
+
+    // Set up onmessage for control DC (receives Hello, Clipboard, etc.)
+    {
+        let s = state.clone();
+        let onmsg = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                let data = js_sys::Uint8Array::new(&buf).to_vec();
+                on_message(&s, &data);
+            }
+        });
+        control_dc.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
+        onmsg.forget();
+    }
+
+    // ICE candidate handler — send candidates to server via WS
+    {
+        let ws2 = ws.clone();
+        let onice = Closure::<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>::new(move |e: web_sys::RtcPeerConnectionIceEvent| {
+            if let Some(candidate) = e.candidate() {
+                let json = serde_json::json!({
+                    "type": "candidate",
+                    "candidate": candidate.candidate(),
+                    "sdpMid": candidate.sdp_mid(),
+                });
+                let _ = ws2.send_with_str(&json.to_string());
+            }
+        });
+        pc.set_onicecandidate(Some(onice.as_ref().unchecked_ref()));
+        onice.forget();
+    }
+
+    // Create offer and send via WS
+    let ws2 = ws.clone();
+    let pc2 = pc.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        // Create offer
+        let offer = match wasm_bindgen_futures::JsFuture::from(pc2.create_offer()).await {
+            Ok(o) => o,
+            Err(e) => { console::warn_1(&format!("create_offer failed: {:?}", e).into()); return; }
+        };
+
+        let sdp = js_sys::Reflect::get(&offer, &"sdp".into()).unwrap();
+        let sdp_str: String = sdp.as_string().unwrap_or_default();
+
+        // Set local description
+        let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        desc.sdp(&sdp_str);
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_local_description(&desc)).await {
+            console::warn_1(&format!("setLocalDescription failed: {:?}", e).into());
+            return;
+        }
+
+        // Send offer to server via WS text frame
+        let json = serde_json::json!({ "type": "offer", "sdp": sdp_str });
+        let _ = ws2.send_with_str(&json.to_string());
+        console::log_1(&"WebRTC offer sent".into());
+    });
+
+    // Store PC globally so signaling handler can access it
+    js_sys::Reflect::set(
+        &js_sys::global(), &"__phantom_pc".into(), &pc,
+    ).unwrap();
+}
+
+/// Handle signaling messages (JSON text frames from server via WS)
+fn on_signaling(state: &Rc<RefCell<AppState>>, ws: &WebSocket, text: &str) {
+    use web_sys::{RtcSessionDescriptionInit, RtcSdpType, RtcIceCandidateInit};
+
+    let val: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    match val["type"].as_str() {
+        Some("answer") => {
+            // Set remote description
+            if let Some(sdp) = val["sdp"].as_str() {
+                console::log_1(&"WebRTC answer received".into());
+                // Need to get PC... we stored DCs in state but not PC.
+                // Use JS global to retrieve it.
+                let js_code = format!(
+                    "if(window.__phantom_pc) {{ \
+                        window.__phantom_pc.setRemoteDescription(new RTCSessionDescription({{type:'answer',sdp:{}}})); \
+                    }}",
+                    serde_json::json!(sdp)
+                );
+                let _ = js_sys::eval(&js_code);
+            }
+        }
+        Some("candidate") => {
+            if let Some(candidate) = val["candidate"].as_str() {
+                if !candidate.is_empty() {
+                    let js_code = format!(
+                        "if(window.__phantom_pc) {{ \
+                            window.__phantom_pc.addIceCandidate(new RTCIceCandidate({{candidate:{},sdpMid:{}}})); \
+                        }}",
+                        serde_json::json!(candidate),
+                        serde_json::json!(val["sdpMid"]),
+                    );
+                    let _ = js_sys::eval(&js_code);
+                }
+            }
+        }
+        Some("ready") => {
+            console::log_1(&"WebRTC DataChannels ready! Switching to DC.".into());
+            let mut s = state.borrow_mut();
+            s.use_webrtc = true;
+        }
+        _ => {}
+    }
+}
+
+// Modify send_input to use DataChannel when available
+fn send_input_dc(state: &RefCell<AppState>, event: InputEvent) {
+    let s = state.borrow();
+    let msg = Message::Input(event);
+    if let Ok(data) = bincode::serialize(&msg) {
+        if s.use_webrtc {
+            if let Some(ref dc) = s.input_dc {
+                let _ = dc.send_with_u8_array(&data);
+                return;
+            }
+        }
+        let _ = s.ws.send_with_u8_array(&data);
+    }
 }
