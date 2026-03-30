@@ -130,6 +130,7 @@ impl NvencEncoder {
 
         // Extract and customize config
         let mut config = preset_config.copy_config();
+        config.set_profile_guid(&NV_ENC_H264_PROFILE_BASELINE_GUID);
         config.set_gop_length(u32::MAX); // infinite GOP (low latency)
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
@@ -194,6 +195,10 @@ impl NvencEncoder {
             owns_ctx,
             _nvenc_lib: nvenc_lib,
         })
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Encode a raw NV12 buffer that's already on the GPU (CUdeviceptr).

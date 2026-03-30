@@ -346,7 +346,8 @@ fn run_session_gpu(
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();
-    let (width, height) = capture.resolution();
+    // Use encoder dimensions (actual frame size), not screen size from capture.resolution()
+    let (width, height) = encoder.dimensions();
     sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
     tracing::info!(width, height, "GPU session started");
 
@@ -368,6 +369,9 @@ fn run_session_gpu(
     let mut stats_frames: u64 = 0;
     let mut stats_bytes: u64 = 0;
     let mut keepalive_time = Instant::now();
+    let mut had_input = false;
+    // Track consecutive no-frame grabs to back off polling
+    let mut no_frame_count: u32 = 0;
 
     loop {
         let loop_start = Instant::now();
@@ -377,6 +381,7 @@ fn run_session_gpu(
             match event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
                     if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
+                    had_input = true;
                 }
                 Ok(InboundEvent::Clipboard(text)) => {
                     if clipboard.on_remote_update(&text) {
@@ -386,7 +391,10 @@ fn run_session_gpu(
                 Ok(InboundEvent::PasteText(text)) => {
                     if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
                     clipboard.on_remote_update(&text);
-                    if let Some(ref mut inj) = injector { let _ = inj.type_text(&text); }
+                    if let Some(ref mut inj) = injector {
+                        let _ = inj.type_text(&text);
+                        had_input = true;
+                    }
                 }
                 Ok(InboundEvent::Disconnected) => anyhow::bail!("client disconnected"),
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -407,20 +415,40 @@ fn run_session_gpu(
         }
 
         // GPU capture → encode → send (zero-copy)
+        // After input, give the screen a moment to update then grab.
+        if had_input {
+            std::thread::sleep(Duration::from_millis(2));
+            had_input = false;
+            no_frame_count = 0; // reset backoff
+        }
+
         capture.bind_context()?;
         let gpu_frame = capture.grab_cuda();
         capture.release_context()?;
 
-        if let Ok(Some(f)) = gpu_frame {
-            let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
-            let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
-            stats_bytes += encoded.data.len() as u64;
-            stats_frames += 1;
-            sequence += 1;
-            sender.send_msg(&Message::VideoFrame {
-                sequence,
-                frame: Box::new(encoded),
-            })?;
+        match gpu_frame {
+            Ok(Some(f)) => {
+                no_frame_count = 0;
+                let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
+                let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
+                stats_bytes += encoded.data.len() as u64;
+                stats_frames += 1;
+                sequence += 1;
+                sender.send_msg(&Message::VideoFrame {
+                    sequence,
+                    frame: Box::new(encoded),
+                })?;
+            }
+            Ok(None) => {
+                // No new frame — back off slightly to avoid busy-spinning
+                no_frame_count += 1;
+                if no_frame_count > 5 {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("GPU grab error: {e}");
+            }
         }
 
         // Stats
@@ -450,6 +478,7 @@ fn run_session_gpu(
                 match event {
                     InboundEvent::Input(input) => {
                         if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
+                        had_input = true;
                     }
                     InboundEvent::Clipboard(text) => {
                         if clipboard.on_remote_update(&text) {
@@ -459,7 +488,10 @@ fn run_session_gpu(
                     InboundEvent::PasteText(text) => {
                         if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
                         clipboard.on_remote_update(&text);
-                        if let Some(ref mut inj) = injector { let _ = inj.type_text(&text); }
+                        if let Some(ref mut inj) = injector {
+                            let _ = inj.type_text(&text);
+                            had_input = true;
+                        }
                     }
                     InboundEvent::Disconnected => anyhow::bail!("client disconnected"),
                 }

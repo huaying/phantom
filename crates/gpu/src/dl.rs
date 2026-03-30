@@ -1,6 +1,6 @@
 //! Runtime dynamic library loading (dlopen/dlsym/dlclose).
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 
 pub struct DynLib {
     handle: *mut c_void,
@@ -61,13 +61,13 @@ unsafe fn dlerror_str() -> String {
     }
 }
 
-unsafe extern "C" {
+extern "C" {
     #[link_name = "dlopen"]
-    fn libc_dlopen(filename: *const i8, flags: i32) -> *mut c_void;
+    fn libc_dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
     #[link_name = "dlsym"]
-    fn libc_dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    fn libc_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     #[link_name = "dlclose"]
     fn libc_dlclose(handle: *mut c_void) -> i32;
     #[link_name = "dlerror"]
-    fn libc_dlerror() -> *const i8;
+    fn libc_dlerror() -> *const c_char;
 }

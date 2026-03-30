@@ -80,7 +80,8 @@ pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 1;
 pub const NV_ENC_PIC_STRUCT_FRAME: u32 = 1;
 
 // Encode pic flags
-pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 4;
+pub const NV_ENC_PIC_FLAG_FORCEINTRA: u32 = 1;
+pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 2;
 pub const NV_ENC_PIC_FLAG_EOS: u32 = 16;
 
 // Picture type (from lock bitstream)
@@ -116,6 +117,16 @@ pub const NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID: GUID = GUID {
 pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
     data1: 0x90a7b826, data2: 0xdf06, data3: 0x4862,
     data4: [0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81],
+};
+
+pub const NV_ENC_H264_PROFILE_BASELINE_GUID: GUID = GUID {
+    data1: 0x0727bcaa, data2: 0x78c4, data3: 0x4c83,
+    data4: [0x8c, 0x2f, 0xef, 0x3d, 0xff, 0x26, 0x7c, 0x6a],
+};
+
+pub const NV_ENC_H264_PROFILE_HIGH_GUID: GUID = GUID {
+    data1: 0xe7cbc309, data2: 0x4f7a, data3: 0x4b89,
+    data4: [0xaf, 0x2a, 0xd5, 0x37, 0xc9, 0x2b, 0xe3, 0x10],
 };
 
 pub const NV_ENC_PRESET_P1_GUID: GUID = GUID {
@@ -218,6 +229,8 @@ opaque_struct!(NvEncConfig, 3584);
 
 impl NvEncConfig {
     pub fn set_version(&mut self) { self.write_u32(0, NV_ENC_CONFIG_VER); }
+    // profileGUID at offset 4 (16 bytes)
+    pub fn set_profile_guid(&mut self, guid: &GUID) { self.write_guid(4, guid); }
     pub fn set_gop_length(&mut self, v: u32) { self.write_u32(20, v); }
     // rcParams starts at offset 40
     pub fn set_rc_mode(&mut self, v: u32) { self.write_u32(40 + 4, v); }
@@ -620,7 +633,7 @@ impl NvFbcReleaseContextParams {
 // ---- NVFBC function pointer types ----
 
 // All NVFBC functions take opaque param pointers — use *mut c_void for flexibility
-pub type FnNvFbcGetLastErrorStr = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE) -> *const i8;
+pub type FnNvFbcGetLastErrorStr = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE) -> *const std::ffi::c_char;
 pub type FnNvFbcApi = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut c_void) -> NVFBCSTATUS;
 pub type FnNvFbcCreateHandle = unsafe extern "C" fn(handle: *mut NVFBC_SESSION_HANDLE, params: *mut c_void) -> NVFBCSTATUS;
 

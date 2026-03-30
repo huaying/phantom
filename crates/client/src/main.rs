@@ -242,13 +242,17 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // Process received frames
-                let mut last_video = None;
+                // Process received frames — decode every VideoFrame sequentially
                 let mut last_tiles = None;
                 let mut clipboard_msgs = Vec::new();
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
-                        Message::VideoFrame { .. } => last_video = Some(msg),
+                        Message::VideoFrame { frame, .. } => {
+                            if let Ok(rgb32) = session.h264_decoder.decode_frame(&frame.data) {
+                                session.display.update_full_frame(&rgb32);
+                                session.stats_video += 1;
+                            }
+                        }
                         Message::TileUpdate { .. } => last_tiles = Some(msg),
                         Message::ClipboardSync(t) => clipboard_msgs.push(t),
                         _ => {}
@@ -273,14 +277,6 @@ impl ApplicationHandler for App {
                                 let _ = session.input_tx.send(Message::ClipboardSync(changed));
                             }
                         }
-                    }
-                }
-
-                // Decode video
-                if let Some(Message::VideoFrame { frame, .. }) = last_video {
-                    if let Ok(rgb32) = session.h264_decoder.decode_frame(&frame.data) {
-                        session.display.update_full_frame(&rgb32);
-                        session.stats_video += 1;
                     }
                 }
                 if let Some(Message::TileUpdate { tiles, .. }) = last_tiles {

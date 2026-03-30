@@ -25,11 +25,14 @@ impl OpenH264Decoder {
 
 impl FrameDecoder for OpenH264Decoder {
     fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>> {
-        let yuv = self
+        let maybe_yuv = self
             .decoder
             .decode(data)
-            .context("H.264 decode failed")?
-            .context("decoder returned no frame")?;
+            .map_err(|e| anyhow::anyhow!("H.264 decode error: {e}"))?;
+        let yuv = match maybe_yuv {
+            Some(y) => y,
+            None => anyhow::bail!("decoder returned no output frame (data={} bytes)", data.len()),
+        };
 
         let (y_stride, uv_stride, _) = yuv.strides();
 
