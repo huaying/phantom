@@ -56,9 +56,6 @@ pub fn main() {
     let canvas: HtmlCanvasElement = document.get_element_by_id("screen").unwrap()
         .dyn_into().unwrap();
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d").unwrap().unwrap().dyn_into().unwrap();
-    ctx.set_font("13px monospace");
-    ctx.set_fill_style_str("#666");
-    let _ = ctx.fill_text("Connecting...", 10.0, 20.0);
 
     let state = Rc::new(RefCell::new(AppState {
         ctx,
