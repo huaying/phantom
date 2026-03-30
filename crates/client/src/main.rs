@@ -89,6 +89,7 @@ struct Session {
     input_tx: mpsc::Sender<Message>,
     connected: Arc<AtomicBool>,
     cursor_pos: Option<PhysicalPosition<f64>>,
+    last_sent_mouse: (i32, i32),
     modifiers: winit::event::Modifiers,
     clipboard: ClipboardTracker,
     arboard: Option<arboard::Clipboard>,
@@ -214,6 +215,7 @@ impl App {
             input_tx,
             connected,
             cursor_pos: None,
+            last_sent_mouse: (-1, -1),
             modifiers: winit::event::Modifiers::default(),
             clipboard: ClipboardTracker::default(),
             arboard: arboard::Clipboard::new().ok(),
@@ -355,9 +357,16 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 session.cursor_pos = Some(position);
                 let (sx, sy) = session.display.map_to_server(position);
-                let _ = session.input_tx.send(Message::Input(
-                    input_capture::mouse_move_event(sx, sy),
-                ));
+                // Dead zone: skip moves < 2px to filter trackpad noise
+                let (lx, ly) = session.last_sent_mouse;
+                let dx = (sx - lx).abs();
+                let dy = (sy - ly).abs();
+                if dx >= 2 || dy >= 2 {
+                    session.last_sent_mouse = (sx, sy);
+                    let _ = session.input_tx.send(Message::Input(
+                        input_capture::mouse_move_event(sx, sy),
+                    ));
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(input) = input_capture::mouse_button_event(button, state) {

@@ -189,6 +189,13 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 - **NVFBC needs DISPLAY**: set `DISPLAY=:0` when running on remote machine. NVFBC captures X11 framebuffer.
 - **NVFBC + NVENC CUDA context**: use primary context (`cuDevicePrimaryCtxRetain`), not `cuCtxCreate`. Bind/release around NVFBC↔NVENC transitions.
 - **NVENC GUID by value**: `nvEncGetEncodePresetConfigEx` passes GUIDs by value, not by pointer (C ABI).
+- **NVENC profile**: must use Baseline profile. OpenH264 decoder doesn't support High profile (NVENC default).
+- **NVENC FORCEIDR**: value is 2 (0x2), not 4. Wrong value = keyframe never sent = client black screen.
+- **Client VideoFrame decode**: must decode ALL frames sequentially, not just the last one. Keyframes get overwritten by empty P-frames in the channel buffer when encoder is fast (GPU).
+- **Tile + H.264 mixed rendering**: causes visual tearing over high latency. Removed — always use H.264 full frames.
+- **HTTPS required for WebCodecs**: non-localhost HTTP is not a secure context. Server uses self-signed TLS (rcgen) for HTTPS.
+- **GNOME input injection broken**: XTest input injection causes mouse drift and icon flying on GNOME (Mutter compositor). **XFCE works correctly.** Use XFCE or Docker XFCE for testing. GNOME fix may require `libei` or `xdg-remote-desktop-portal`.
+- **WASM feature flag**: `--no-default-features` builds server without WASM (for GPU-only VMs without wasm-pack).
 
 ---
 
