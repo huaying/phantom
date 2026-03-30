@@ -627,24 +627,9 @@ fn run_session(
                 continue;
             }
 
-            // Smart encoding: choose strategy based on dirty area
-            let total_tiles = (frame.width.div_ceil(TILE_SIZE) * frame.height.div_ceil(TILE_SIZE)) as usize;
-            let dirty_percent = if total_tiles > 0 {
-                dirty_tiles.len() as f32 / total_tiles as f32
-            } else {
-                1.0
-            };
-
-            if dirty_percent < 0.10 && !dirty_tiles.is_empty() {
-                // Small change (typing, cursor) → send only dirty tiles (0.1ms vs 15ms)
-                let encoded = zstd_encoder.encode_tiles(&dirty_tiles)?;
-                let bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
-                stats_bytes += bytes as u64;
-                stats_tiles += 1;
-                sequence += 1;
-                sender.send_msg(&Message::TileUpdate { sequence, tiles: Box::new(encoded) })?;
-            } else if !dirty_tiles.is_empty() {
-                // Large change (scrolling, video) → full H.264 frame
+            // Always encode full H.264 frame when there are changes.
+            // Tile mode caused visual tearing when mixed with H.264 over high latency.
+            if !dirty_tiles.is_empty() {
                 let encoded = video_encoder.encode_frame(&frame)?;
                 stats_bytes += encoded.data.len() as u64;
                 stats_h264 += 1;
@@ -655,13 +640,6 @@ fn run_session(
             }
 
             last_frame = Some(frame);
-        } else if quality.should_send_lossless() {
-            if let Some(ref f) = last_frame {
-                let bytes = send_lossless_update(&mut *sender, &mut zstd_encoder, f, &mut sequence)?;
-                stats_bytes += bytes as u64;
-                quality.mark_lossless_sent();
-                stats_lossless += 1;
-            }
         }
 
         if stats_time.elapsed() >= Duration::from_secs(5) {

@@ -37,6 +37,9 @@ struct AppState {
     server_width: u32,
     server_height: u32,
     frame_count: u64,
+    /// Highest sequence number from a fully rendered VideoFrame.
+    /// TileUpdates with sequence <= this are stale and should be skipped.
+    last_video_sequence: u64,
     /// For sending input — either DataChannel or WebSocket
     send_dc: Option<web_sys::RtcDataChannel>,
     send_ws: Option<WebSocket>,
@@ -64,6 +67,7 @@ pub fn main() {
         server_width: 0,
         server_height: 0,
         frame_count: 0,
+        last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
     }));
@@ -224,10 +228,11 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             drop(s);
             setup_decoder(state, width, height);
         }
-        Message::VideoFrame { frame, .. } => {
+        Message::VideoFrame { sequence, frame } => {
             if frame.codec != VideoCodec::H264 || frame.data.is_empty() { return; }
             let mut s = state.borrow_mut();
             s.frame_count += 1;
+            s.last_video_sequence = sequence;
             let fc = s.frame_count;
             if fc <= 3 {
                 console::log_1(&format!("VideoFrame #{fc}: {} bytes, kf={}", frame.data.len(), frame.is_keyframe).into());
@@ -244,8 +249,13 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 decoder.decode(&chunk);
             }
         }
-        Message::TileUpdate { tiles, .. } => {
+        Message::TileUpdate { sequence, tiles } => {
             let s = state.borrow();
+            // Skip tile updates that are older than the last full video frame,
+            // since the video frame already contains the complete screen state.
+            if sequence <= s.last_video_sequence {
+                return;
+            }
             for tile in tiles.iter() {
                 let bgra = match tile.encoding {
                     TileEncoding::Zstd => {
