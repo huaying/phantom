@@ -30,16 +30,46 @@ pub struct NvencEncoder {
     nv12_buf: Vec<u8>,
     force_idr: bool,
     frame_idx: u64,
+    owns_ctx: bool,
     _nvenc_lib: DynLib,
 }
 
 // NVENC encoder handle is not thread-safe, but we only use it from one thread.
 unsafe impl Send for NvencEncoder {}
 
+fn nvenc_status_name(status: NVENCSTATUS) -> &'static str {
+    match status {
+        NV_ENC_SUCCESS => "NV_ENC_SUCCESS",
+        NV_ENC_ERR_INVALID_VERSION => "NV_ENC_ERR_INVALID_VERSION",
+        10 => "NV_ENC_ERR_INVALID_PARAM",
+        23 => "NV_ENC_ERR_RESOURCE_REGISTER_FAILED",
+        26 => "NV_ENC_ERR_MAP_FAILED",
+        _ => "NV_ENC_ERR_UNKNOWN",
+    }
+}
+
 impl NvencEncoder {
     pub fn new(
         cuda: Arc<CudaLib>,
         device_ordinal: i32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        let dev = cuda.device_get(device_ordinal)?;
+        let ctx = cuda.ctx_create(dev)?;
+        unsafe { Self::with_context(cuda, ctx, true, width, height, fps, bitrate_kbps) }
+    }
+
+    /// Create encoder using an existing CUDA context (e.g., shared with NVFBC).
+    ///
+    /// # Safety
+    /// `ctx` must be a valid CUDA context.
+    pub unsafe fn with_context(
+        cuda: Arc<CudaLib>,
+        ctx: CUcontext,
+        owns_ctx: bool,
         width: u32,
         height: u32,
         fps: u32,
@@ -55,16 +85,14 @@ impl NvencEncoder {
         };
 
         // Populate function table
+
         let mut api = NvEncFunctionList::zeroed();
         api.set_version();
         let status = unsafe { create_instance(api.as_mut_ptr()) };
+
         if status != NV_ENC_SUCCESS {
             bail!("NvEncodeAPICreateInstance failed: {status}");
         }
-
-        // Create CUDA context
-        let dev = cuda.device_get(device_ordinal)?;
-        let ctx = cuda.ctx_create(dev)?;
 
         // Open encode session
         let mut session_params = NvEncOpenEncodeSessionExParams::zeroed();
@@ -163,6 +191,7 @@ impl NvencEncoder {
             nv12_buf: vec![0u8; nv12_size],
             force_idr: true, // first frame is always IDR
             frame_idx: 0,
+            owns_ctx,
             _nvenc_lib: nvenc_lib,
         })
     }
@@ -174,6 +203,9 @@ impl NvencEncoder {
         device_ptr: CUdeviceptr,
         pitch: u32,
     ) -> Result<EncodedFrame> {
+        if pitch == 0 {
+            bail!("encode_device_nv12 got pitch=0");
+        }
         self.encode_registered(device_ptr, pitch)
     }
 
@@ -199,7 +231,19 @@ impl NvencEncoder {
         device_ptr: CUdeviceptr,
         pitch: u32,
     ) -> Result<EncodedFrame> {
-        unsafe { self.cuda.ctx_push(self.ctx)? };
+        if pitch < self.width {
+            bail!(
+                "invalid NV12 pitch: {pitch} < width {}",
+                self.width
+            );
+        }
+
+        // Only push context if it's not already current (avoids deadlock with NVFBC)
+        let current_ctx = self.cuda.ctx_get_current()?;
+        let need_push = current_ctx != self.ctx;
+        if need_push {
+            unsafe { self.cuda.ctx_push(self.ctx)? };
+        }
 
         // Register resource
         let mut reg = NvEncRegisterResource::zeroed();
@@ -212,11 +256,27 @@ impl NvencEncoder {
         reg.set_buffer_format(NV_ENC_BUFFER_FORMAT_NV12);
         reg.set_buffer_usage(0); // NV_ENC_INPUT_IMAGE
 
+        tracing::debug!(
+            frame_idx = self.frame_idx,
+            width = self.width,
+            height = self.height,
+            pitch,
+            device_ptr,
+            "nvEncRegisterResource"
+        );
+
         let f = self.api.register_resource().context("register_resource")?;
         let status = unsafe { f(self.encoder, reg.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            self.cuda.ctx_pop()?;
-            bail!("nvEncRegisterResource failed: {status}");
+            if need_push { self.cuda.ctx_pop()?; }
+            bail!(
+                "nvEncRegisterResource failed: status={} ({}) width={} height={} pitch={}",
+                status,
+                nvenc_status_name(status),
+                self.width,
+                self.height,
+                pitch
+            );
         }
         let registered = reg.registered_resource();
 
@@ -232,10 +292,22 @@ impl NvencEncoder {
             if let Some(f) = self.api.unregister_resource() {
                 unsafe { f(self.encoder, registered) };
             }
-            self.cuda.ctx_pop()?;
-            bail!("nvEncMapInputResource failed: {status}");
+            if need_push { self.cuda.ctx_pop()?; }
+            bail!(
+                "nvEncMapInputResource failed: status={} ({})",
+                status,
+                nvenc_status_name(status)
+            );
         }
         let mapped = map.mapped_resource();
+        let mapped_fmt = map.mapped_buffer_fmt();
+        if mapped_fmt != 0 && mapped_fmt != NV_ENC_BUFFER_FORMAT_NV12 {
+            tracing::warn!(
+                mapped_fmt,
+                expected = NV_ENC_BUFFER_FORMAT_NV12,
+                "mapped buffer format differs from NV12"
+            );
+        }
 
         // Encode picture
         let mut pic = NvEncPicParams::zeroed();
@@ -261,7 +333,12 @@ impl NvencEncoder {
         let result = if status == NV_ENC_SUCCESS {
             self.read_bitstream()
         } else {
-            Err(anyhow::anyhow!("nvEncEncodePicture failed: {status}"))
+            Err(anyhow::anyhow!(
+                "nvEncEncodePicture failed: status={} ({}) frame_idx={}",
+                status,
+                nvenc_status_name(status),
+                self.frame_idx
+            ))
         };
 
         // Cleanup: unmap, unregister
@@ -272,7 +349,9 @@ impl NvencEncoder {
             unsafe { f(self.encoder, registered) };
         }
 
-        self.cuda.ctx_pop()?;
+        if need_push {
+            self.cuda.ctx_pop()?;
+        }
         self.frame_idx += 1;
         result
     }
@@ -335,8 +414,10 @@ impl Drop for NvencEncoder {
 
         self.cuda.ctx_pop().ok();
 
-        // Destroy CUDA context
-        unsafe { self.cuda.ctx_destroy(self.ctx) };
+        // Only destroy CUDA context if we created it
+        if self.owns_ctx {
+            unsafe { self.cuda.ctx_destroy(self.ctx) };
+        }
 
         tracing::debug!("NVENC encoder destroyed");
     }

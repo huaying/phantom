@@ -15,6 +15,9 @@ type FnCuMemAlloc = unsafe extern "C" fn(ptr: *mut CUdeviceptr, size: usize) -> 
 type FnCuMemFree = unsafe extern "C" fn(ptr: CUdeviceptr) -> CUresult;
 type FnCuMemcpyHtoD = unsafe extern "C" fn(dst: CUdeviceptr, src: *const c_void, size: usize) -> CUresult;
 type FnCuMemcpyDtoH = unsafe extern "C" fn(dst: *mut c_void, src: CUdeviceptr, size: usize) -> CUresult;
+type FnCuCtxGetCurrent = unsafe extern "C" fn(ctx: *mut CUcontext) -> CUresult;
+type FnCuDevicePrimaryCtxRetain = unsafe extern "C" fn(ctx: *mut CUcontext, dev: CUdevice) -> CUresult;
+type FnCuDevicePrimaryCtxRelease = unsafe extern "C" fn(dev: CUdevice) -> CUresult;
 
 pub struct CudaLib {
     _lib: DynLib,
@@ -28,6 +31,9 @@ pub struct CudaLib {
     cu_mem_free: FnCuMemFree,
     cu_memcpy_htod: FnCuMemcpyHtoD,
     cu_memcpy_dtoh: FnCuMemcpyDtoH,
+    cu_ctx_get_current: FnCuCtxGetCurrent,
+    cu_primary_ctx_retain: FnCuDevicePrimaryCtxRetain,
+    cu_primary_ctx_release: FnCuDevicePrimaryCtxRelease,
 }
 
 impl CudaLib {
@@ -46,6 +52,9 @@ impl CudaLib {
             let cu_mem_free: FnCuMemFree = lib.sym("cuMemFree_v2").context("cuMemFree_v2")?;
             let cu_memcpy_htod: FnCuMemcpyHtoD = lib.sym("cuMemcpyHtoD_v2").context("cuMemcpyHtoD_v2")?;
             let cu_memcpy_dtoh: FnCuMemcpyDtoH = lib.sym("cuMemcpyDtoH_v2").context("cuMemcpyDtoH_v2")?;
+            let cu_ctx_get_current: FnCuCtxGetCurrent = lib.sym("cuCtxGetCurrent").context("cuCtxGetCurrent")?;
+            let cu_primary_ctx_retain: FnCuDevicePrimaryCtxRetain = lib.sym("cuDevicePrimaryCtxRetain").context("cuDevicePrimaryCtxRetain")?;
+            let cu_primary_ctx_release: FnCuDevicePrimaryCtxRelease = lib.sym("cuDevicePrimaryCtxRelease_v2").context("cuDevicePrimaryCtxRelease_v2")?;
 
             let status = (cu_init)(0);
             if status != CUDA_SUCCESS {
@@ -64,6 +73,9 @@ impl CudaLib {
                 cu_mem_free,
                 cu_memcpy_htod,
                 cu_memcpy_dtoh,
+                cu_ctx_get_current,
+                cu_primary_ctx_retain,
+                cu_primary_ctx_release,
             })
         }
     }
@@ -132,6 +144,31 @@ impl CudaLib {
             bail!("cuMemcpyHtoD failed: {status}");
         }
         Ok(())
+    }
+
+    /// Retain the device's primary context. This is the same context NVFBC uses internally.
+    /// Must be paired with `primary_ctx_release`.
+    pub fn primary_ctx_retain(&self, dev: CUdevice) -> Result<CUcontext> {
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        let status = unsafe { (self.cu_primary_ctx_retain)(&mut ctx, dev) };
+        if status != CUDA_SUCCESS {
+            bail!("cuDevicePrimaryCtxRetain failed: {status}");
+        }
+        Ok(ctx)
+    }
+
+    pub fn primary_ctx_release(&self, dev: CUdevice) {
+        unsafe { (self.cu_primary_ctx_release)(dev) };
+    }
+
+    /// Get the current CUDA context (e.g., set by NVFBC internally).
+    pub fn ctx_get_current(&self) -> Result<CUcontext> {
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        let status = unsafe { (self.cu_ctx_get_current)(&mut ctx) };
+        if status != CUDA_SUCCESS {
+            bail!("cuCtxGetCurrent failed: {status}");
+        }
+        Ok(ctx)
     }
 
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {

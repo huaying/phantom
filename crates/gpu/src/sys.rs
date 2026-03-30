@@ -459,8 +459,9 @@ const NVFBC_VERSION: u32 = 1 | (7 << 8); // 1.7 — minor | (major << 8)? No: NV
 // So effectively NVFBC_VERSION << 24 = 7 << 24 = 0x0700_0000.
 
 /// Compute NVFBC struct version: sizeof | (ver << 16) | (NVFBC_VERSION << 24)
+/// NVFBC_VERSION = 1.8 = 8 | (1 << 8) = 0x108. Shifted 24: 0x08000000.
 const fn nvfbc_sv(size: u32, ver: u32) -> u32 {
-    size | (ver << 16) | (0x07 << 24)
+    size | (ver << 16) | (0x08 << 24)
 }
 
 // Capture type
@@ -486,139 +487,84 @@ pub const NVFBC_TRUE: u32 = 1;
 pub const NVFBC_FALSE: u32 = 0;
 
 // ---- NVFBC structs ----
-// NVFBC structs are simpler — define them as proper Rust structs.
+// Sizes verified against nvfbc-sys 0.2.0 bindgen output on the target machine.
+// NVFBC version encoding: sizeof | (struct_ver << 16) | (0x08 << 24)
 
-#[repr(C)]
-pub struct NvFbcCreateHandleParams {
-    pub version: u32,
-    pub private_data: *const c_void,
-    pub private_data_size: u32,
-    pub externally_managed_context: u32, // NVFBC_BOOL
-    pub glx_ctx: *mut c_void,
-    pub glx_fb_config: *mut c_void,
-}
-
+// sizeof=40 (nvfbc-sys), struct_ver=2
+opaque_struct!(NvFbcCreateHandleParams, 40);
 impl NvFbcCreateHandleParams {
     pub fn new() -> Self {
-        Self {
-            version: nvfbc_sv(std::mem::size_of::<Self>() as u32, 1),
-            private_data: std::ptr::null(),
-            private_data_size: 0,
-            externally_managed_context: NVFBC_FALSE,
-            glx_ctx: std::ptr::null_mut(),
-            glx_fb_config: std::ptr::null_mut(),
-        }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(40, 2)); // version
+        s
+    }
+    pub fn set_private_data(&mut self, data: *const c_void, size: u32) {
+        self.write_ptr(8, data as *mut c_void); // offset 8: privateData
+        self.write_u32(16, size);                // offset 16: privateDataSize
     }
 }
 
-#[repr(C)]
-pub struct NvFbcDestroyHandleParams {
-    pub version: u32,
-}
-
+// sizeof=4, struct_ver=1
+opaque_struct!(NvFbcDestroyHandleParams, 8); // pad to 8 for alignment
 impl NvFbcDestroyHandleParams {
     pub fn new() -> Self {
-        Self { version: nvfbc_sv(std::mem::size_of::<Self>() as u32, 1) }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(4, 1));
+        s
     }
 }
 
-#[repr(C)]
-pub struct NvFbcDestroyCaptureSessionParams {
-    pub version: u32,
-}
-
+// sizeof=4, struct_ver=1
+opaque_struct!(NvFbcDestroyCaptureSessionParams, 8);
 impl NvFbcDestroyCaptureSessionParams {
     pub fn new() -> Self {
-        Self { version: nvfbc_sv(std::mem::size_of::<Self>() as u32, 1) }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(4, 1));
+        s
     }
 }
 
-#[repr(C)]
-pub struct NvFbcSize {
-    pub w: u32,
-    pub h: u32,
-}
-
-#[repr(C)]
-pub struct NvFbcBox {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-#[repr(C)]
-pub struct NvFbcRandrOutputInfo {
-    pub id: u32,
-    pub name: [u8; 128],
-    pub tracked_box: NvFbcBox,
-}
-
-#[repr(C)]
-pub struct NvFbcGetStatusParams {
-    pub version: u32,
-    pub is_capture_possible: u32,
-    pub currently_capturing: u32,
-    pub can_create_now: u32,
-    pub screen_size: NvFbcSize,
-    pub xrandr_available: u32,
-    pub outputs: [NvFbcRandrOutputInfo; 5],
-    pub output_num: u32,
-    pub nvfbc_version: u32,
-    pub in_modeset: u32,
-}
-
+// sizeof=780, struct_ver=2
+opaque_struct!(NvFbcGetStatusParams, 780);
 impl NvFbcGetStatusParams {
     pub fn new() -> Self {
-        unsafe {
-            let mut s: Self = std::mem::zeroed();
-            s.version = nvfbc_sv(std::mem::size_of::<Self>() as u32, 1);
-            s
-        }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(780, 2));
+        s
     }
+    pub fn screen_w(&self) -> u32 { self.read_u32(16) }
+    pub fn screen_h(&self) -> u32 { self.read_u32(20) }
+    pub fn nvfbc_version(&self) -> u32 { self.read_u32(772) }
+    pub fn can_create_now(&self) -> bool { self.read_u32(12) != 0 }
 }
 
-#[repr(C)]
-pub struct NvFbcCreateCaptureSessionParams {
-    pub version: u32,
-    pub capture_type: u32,
-    pub tracking_type: u32,
-    pub output_id: u32,
-    pub capture_box: NvFbcBox,
-    pub frame_size: NvFbcSize,
-    pub with_cursor: u32,
-    pub disable_auto_modeset_recovery: u32,
-    pub round_frame_size: u32,
-    pub sampling_rate_ms: u32,
-    pub push_model: u32,
-    pub allow_direct_capture: u32,
-}
-
+// sizeof=64, struct_ver=6
+opaque_struct!(NvFbcCreateCaptureSessionParams, 64);
 impl NvFbcCreateCaptureSessionParams {
     pub fn new() -> Self {
-        unsafe {
-            let mut s: Self = std::mem::zeroed();
-            s.version = nvfbc_sv(std::mem::size_of::<Self>() as u32, 1);
-            s
-        }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(64, 6));
+        s
     }
+    pub fn set_capture_type(&mut self, v: u32) { self.write_u32(4, v); }
+    pub fn set_tracking_type(&mut self, v: u32) { self.write_u32(8, v); }
+    pub fn set_with_cursor(&mut self, v: u32) { self.write_u32(40, v); }
+    pub fn set_sampling_rate_ms(&mut self, v: u32) { self.write_u32(52, v); }
+    pub fn set_push_model(&mut self, v: u32) { self.write_u32(56, v); }
 }
 
-#[repr(C)]
-pub struct NvFbcToCudaSetupParams {
-    pub version: u32,
-    pub buffer_format: u32,
-}
-
+// sizeof=8, struct_ver=1
+opaque_struct!(NvFbcToCudaSetupParams, 8);
 impl NvFbcToCudaSetupParams {
     pub fn new(format: u32) -> Self {
-        Self {
-            version: nvfbc_sv(std::mem::size_of::<Self>() as u32, 1),
-            buffer_format: format,
-        }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(8, 1));
+        s.write_u32(4, format);
+        s
     }
 }
 
+// sizeof=48 (from nvfbc-sys)
 #[repr(C)]
 pub struct NvFbcFrameGrabInfo {
     pub width: u32,
@@ -626,53 +572,68 @@ pub struct NvFbcFrameGrabInfo {
     pub byte_size: u32,
     pub current_frame: u32,
     pub is_new_frame: u32,
-    _pad: u32, // alignment for u64
+    _pad0: u32,
     pub timestamp_us: u64,
     pub missed_frames: u32,
     pub required_post_processing: u32,
     pub direct_capture: u32,
+    _pad1: u32, // pad to 48 bytes
 }
 
-#[repr(C)]
-pub struct NvFbcToCudaGrabFrameParams {
-    pub version: u32,
-    pub flags: u32,
-    pub cuda_device_buffer: *mut c_void, // CUdeviceptr written here by NVFBC
-    pub frame_grab_info: *mut NvFbcFrameGrabInfo,
-    pub timeout_ms: u32,
-}
-
+// sizeof=32, struct_ver=2
+opaque_struct!(NvFbcToCudaGrabFrameParams, 32);
 impl NvFbcToCudaGrabFrameParams {
     pub fn new(info: *mut NvFbcFrameGrabInfo) -> Self {
-        Self {
-            version: nvfbc_sv(std::mem::size_of::<Self>() as u32, 1),
-            flags: NVFBC_TOCUDA_GRAB_FLAGS_NOFLAGS,
-            cuda_device_buffer: std::ptr::null_mut(),
-            frame_grab_info: info,
-            timeout_ms: 0,
-        }
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(32, 2));
+        // flags at offset 4 (default 0 = NOFLAGS)
+        // pCUDADeviceBuffer at offset 8
+        s.write_ptr(16, info as *mut c_void); // pFrameGrabInfo at offset 16
+        // dwTimeoutMs at offset 24
+        s
+    }
+    pub fn set_flags(&mut self, v: u32) { self.write_u32(4, v); }
+    pub fn set_cuda_device_buffer(&mut self, v: *mut c_void) { self.write_ptr(8, v); }
+    pub fn set_timeout_ms(&mut self, v: u32) { self.write_u32(24, v); }
+}
+
+// sizeof=4, struct_ver=1
+opaque_struct!(NvFbcBindContextParams, 8);
+impl NvFbcBindContextParams {
+    pub fn new() -> Self {
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(4, 1));
+        s
+    }
+}
+
+// sizeof=4, struct_ver=1
+opaque_struct!(NvFbcReleaseContextParams, 8);
+impl NvFbcReleaseContextParams {
+    pub fn new() -> Self {
+        let mut s = Self::zeroed();
+        s.write_u32(0, nvfbc_sv(4, 1));
+        s
     }
 }
 
 // ---- NVFBC function pointer types ----
 
+// All NVFBC functions take opaque param pointers — use *mut c_void for flexibility
 pub type FnNvFbcGetLastErrorStr = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE) -> *const i8;
-pub type FnNvFbcCreateHandle = unsafe extern "C" fn(handle: *mut NVFBC_SESSION_HANDLE, params: *mut NvFbcCreateHandleParams) -> NVFBCSTATUS;
-pub type FnNvFbcDestroyHandle = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcDestroyHandleParams) -> NVFBCSTATUS;
-pub type FnNvFbcGetStatus = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcGetStatusParams) -> NVFBCSTATUS;
-pub type FnNvFbcCreateCaptureSession = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcCreateCaptureSessionParams) -> NVFBCSTATUS;
-pub type FnNvFbcDestroyCaptureSession = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcDestroyCaptureSessionParams) -> NVFBCSTATUS;
-pub type FnNvFbcToCudaSetUp = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcToCudaSetupParams) -> NVFBCSTATUS;
-pub type FnNvFbcToCudaGrabFrame = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut NvFbcToCudaGrabFrameParams) -> NVFBCSTATUS;
+pub type FnNvFbcApi = unsafe extern "C" fn(handle: NVFBC_SESSION_HANDLE, params: *mut c_void) -> NVFBCSTATUS;
+pub type FnNvFbcCreateHandle = unsafe extern "C" fn(handle: *mut NVFBC_SESSION_HANDLE, params: *mut c_void) -> NVFBCSTATUS;
 
-/// NVFBC_API_FUNCTION_LIST — loaded via NvFBCCreateInstance
+/// NVFBC function pointers — loaded via dlsym
 pub struct NvFbcFunctionList {
     pub get_last_error_str: FnNvFbcGetLastErrorStr,
     pub create_handle: FnNvFbcCreateHandle,
-    pub destroy_handle: FnNvFbcDestroyHandle,
-    pub get_status: FnNvFbcGetStatus,
-    pub create_capture_session: FnNvFbcCreateCaptureSession,
-    pub destroy_capture_session: FnNvFbcDestroyCaptureSession,
-    pub to_cuda_setup: FnNvFbcToCudaSetUp,
-    pub to_cuda_grab_frame: FnNvFbcToCudaGrabFrame,
+    pub destroy_handle: FnNvFbcApi,
+    pub get_status: FnNvFbcApi,
+    pub create_capture_session: FnNvFbcApi,
+    pub destroy_capture_session: FnNvFbcApi,
+    pub to_cuda_setup: FnNvFbcApi,
+    pub to_cuda_grab_frame: FnNvFbcApi,
+    pub bind_context: FnNvFbcApi,
+    pub release_context: FnNvFbcApi,
 }

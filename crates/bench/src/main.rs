@@ -13,14 +13,13 @@ use phantom_gpu::nvenc::NvencEncoder;
 use std::sync::Arc;
 use std::time::Instant;
 
-const ROUNDS: usize = 50;
-const WARMUP: usize = 3;
+const ROUNDS: usize = 20;
+const WARMUP: usize = 2;
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
     (1280, 720, "720p"),
     (1920, 1080, "1080p"),
     (2560, 1440, "1440p"),
-    (3840, 2160, "4K"),
 ];
 
 const BITRATES_KBPS: &[u32] = &[3000, 5000, 10000];
@@ -113,26 +112,6 @@ impl OpenH264Bench {
     }
 }
 
-/// BGRA to NV12 conversion (CPU) — for measuring per-stage NVENC costs.
-fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, nv12: &mut [u8]) {
-    let (y_plane, uv_plane) = nv12.split_at_mut(w * h);
-    for row in 0..h {
-        for col in 0..w {
-            let i = (row * w + col) * 4;
-            let (b, g, r) = (bgra[i] as i32, bgra[i + 1] as i32, bgra[i + 2] as i32);
-            y_plane[row * w + col] =
-                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
-            if row % 2 == 0 && col % 2 == 0 {
-                let ui = (row / 2) * w + col;
-                uv_plane[ui] =
-                    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-                uv_plane[ui + 1] =
-                    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            }
-        }
-    }
-}
-
 fn main() {
     println!("Phantom Encoder Benchmark");
     println!("=========================\n");
@@ -198,73 +177,6 @@ fn main() {
             println!("{label:<10} {:>5}k  {oh264_str}  {nvenc_str}", bitrate);
         }
         println!();
-    }
-
-    // --- NVENC per-stage breakdown ---
-    if let Some(ref cuda) = cuda {
-        println!("\n=== NVENC per-stage breakdown ===\n");
-        println!(
-            "{:<10} {:>14} {:>14} {:>14} {:>14}",
-            "Res", "Color Conv", "Memcpy H→D", "Encode", "Total"
-        );
-        println!("{}", "-".repeat(72));
-
-        for &(w, h, label) in RESOLUTIONS {
-            let frame = make_frame(w, h);
-            let nv12_size = (w as usize) * (h as usize) * 3 / 2;
-            let mut nv12 = vec![0u8; nv12_size];
-
-            // Stage 1: BGRA → NV12 color conversion
-            let color = bench(ROUNDS, || {
-                bgra_to_nv12(&frame.data, w as usize, h as usize, &mut nv12);
-                0
-            });
-
-            // Stages 2+3 require a working NVENC encoder
-            if let Ok(mut enc) = NvencEncoder::new(Arc::clone(cuda), 0, w, h, 30, 5000) {
-                // Full encode to measure total
-                let total = bench(ROUNDS, || {
-                    enc.encode_frame(&frame).map(|ef| ef.data.len()).unwrap_or(0)
-                });
-
-                // Encode time ~ total - color_convert (memcpy is small but included)
-                let encode_est = (total.avg_ms - color.avg_ms).max(0.0);
-
-                println!(
-                    "{label:<10} {:>12.2}ms {:>12}  {:>12.2}ms {:>12.2}ms",
-                    color.avg_ms, "(included)", encode_est, total.avg_ms
-                );
-            } else {
-                println!("{label:<10} {:>12.2}ms {:>12}  {:>12}  {:>12}", color.avg_ms, "-", "-", "-");
-            }
-        }
-        println!();
-    }
-
-    // --- Speedup summary ---
-    if cuda.is_some() {
-        println!("=== Speedup summary (1080p, 5000kbps) ===\n");
-        let (w, h) = (1920, 1080);
-        let frame = make_frame(w, h);
-        let bitrate = 5000;
-
-        let oh264_time = OpenH264Bench::new(w, h, 30, bitrate).ok().map(|mut enc| {
-            bench(ROUNDS, || enc.encode(&frame).unwrap_or(0)).avg_ms
-        });
-        let nvenc_time = cuda.as_ref().and_then(|c| {
-            NvencEncoder::new(Arc::clone(c), 0, w, h, 30, bitrate).ok()
-        }).map(|mut enc| {
-            bench(ROUNDS, || enc.encode_frame(&frame).map(|ef| ef.data.len()).unwrap_or(0)).avg_ms
-        });
-
-        match (oh264_time, nvenc_time) {
-            (Some(oh), Some(nv)) => {
-                println!("  OpenH264:  {oh:.2}ms");
-                println!("  NVENC:     {nv:.2}ms");
-                println!("  Speedup:   {:.1}x", oh / nv);
-            }
-            _ => println!("  Could not compare (one encoder unavailable)."),
-        }
     }
 
     println!("\ndone.");
