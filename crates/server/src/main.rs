@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     // Build transport based on --transport flag
     let tcp_listener;
     let quic_listener;
-    let ws_listener;
+    let ws_listener: Option<transport_ws::WebServerTransport>;
     match args.transport.as_str() {
         "tcp" => {
             tcp_listener = Some(transport_tcp::TcpServerTransport::bind(&args.listen)?);
@@ -108,14 +108,12 @@ fn main() -> Result<()> {
         "web" => {
             tcp_listener = None;
             quic_listener = None;
-            // HTTP serves static files (HTML + WASM) on main port
-            // WebSocket on main port + 1 for data
             let port: u16 = args.listen.rsplit(':').next()
                 .and_then(|p| p.parse().ok()).unwrap_or(9900);
-            let ws_addr = format!("0.0.0.0:{}", port + 1);
-            transport_ws::start_http_server(port)?;
+            ws_listener = Some(transport_ws::WebServerTransport::start(
+                port, port + 1, port + 2,
+            )?);
             tracing::info!("open http://localhost:{port} in browser");
-            ws_listener = Some(transport_ws::WsServerTransport::bind(&ws_addr)?);
         }
         other => anyhow::bail!("unknown transport '{other}'. Available: tcp, quic, web"),
     }
@@ -125,13 +123,8 @@ fn main() -> Result<()> {
 
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
             if let Some(ref ws) = ws_listener {
-                let conn = ws.accept()?;
-
-                // Start WebSocket session immediately, attempt WebRTC upgrade in background
-                // For now, just use WebSocket. WebRTC negotiation requires the session
-                // to be running first (browser needs Hello before setting up WebRTC).
-                // TODO: mid-session transport upgrade from WS to WebRTC DC
-                (Box::new(conn.data_sender) as _, Box::new(conn.data_receiver) as _)
+                // WebRTC only — no WS fallback. Browser POSTs offer to /rtc.
+                ws.accept_webrtc()?
             } else if let Some(ref quic) = quic_listener {
                 let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))

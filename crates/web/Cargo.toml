@@ -33,6 +33,8 @@ features = [
     # WebRTC DataChannel
     "RtcPeerConnection", "RtcConfiguration",
     "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
-    "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelEvent", "RtcDataChannelType",
+    "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelEvent", "RtcDataChannelType", "RtcDataChannelState",
     "RtcPeerConnectionIceEvent", "RtcIceCandidate", "RtcIceCandidateInit",
+    # Fetch API (for POST /rtc)
+    "Headers", "Request", "RequestInit", "Response",
 ]
