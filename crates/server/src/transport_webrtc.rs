@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use str0m::channel::ChannelId;
 use str0m::net::Protocol;
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use str0m::{Event, Input, Output, Rtc};
 
 /// A single WebRTC run loop managing one client at a time.
 /// Uses the str0m official pattern: one UDP socket, one loop, demux via accepts().

@@ -95,9 +95,9 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     let video_dc = pc.create_data_channel("video");
     video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
-    let mut input_init = RtcDataChannelInit::new();
-    input_init.ordered(true);
-    input_init.max_retransmits(2);
+    let input_init = RtcDataChannelInit::new();
+    input_init.set_ordered(true);
+    input_init.set_max_retransmits(2);
     let input_dc = pc.create_data_channel_with_data_channel_dict("input", &input_init);
     input_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
@@ -152,8 +152,8 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         let sdp_str: String = sdp.as_string().unwrap_or_default();
 
         // Set local description
-        let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        desc.sdp(&sdp_str);
+        let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+        desc.set_sdp(&sdp_str);
         if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_local_description(&desc)).await {
             console::error_1(&format!("setLocalDescription: {:?}", e).into());
             return;
@@ -190,8 +190,8 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
 
         // Set remote description (answer)
         let answer_sdp = js_sys::Reflect::get(&json, &"sdp".into()).unwrap();
-        let mut answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        answer_desc.sdp(&answer_sdp.as_string().unwrap_or_default());
+        let answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+        answer_desc.set_sdp(&answer_sdp.as_string().unwrap_or_default());
 
         if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_remote_description(&answer_desc)).await {
             console::error_1(&format!("setRemoteDescription: {:?}", e).into());

@@ -15,15 +15,15 @@ const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
 /// Combined web server: HTTP static files + WebSocket fallback + WebRTC via POST /rtc.
 type SessionPair = (super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver);
 
+#[allow(dead_code)]
 pub struct WebServerTransport {
-    /// Latest ready WebRTC session. run_loop overwrites, main thread takes.
     rtc_session: Arc<Mutex<Option<SessionPair>>>,
-    /// Notification: new session available
     rtc_notify: mpsc::Receiver<()>,
-    /// WebSocket fallback sessions
+    /// WebSocket fallback (future: adaptive WS/WebRTC)
     ws_rx: mpsc::Receiver<WsConnection>,
 }
 
+#[allow(dead_code)]
 pub struct WsConnection {
     pub data_sender: WsSender,
     pub data_receiver: WsReceiver,
@@ -110,6 +110,7 @@ impl WebServerTransport {
     }
 
     /// Accept: WebSocket only (fallback mode).
+    #[allow(dead_code)]
     pub fn accept_ws(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
         let ws = self.ws_rx.recv().context("WS channel closed")?;
         tracing::info!("WebSocket client accepted");
