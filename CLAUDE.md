@@ -4,7 +4,7 @@
 
 Phantom is a high-performance, open-source remote desktop built in Rust. Target: Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text), single binary deployment, browser + native access.
 
-~4,600 lines Rust, 21 tests, 40 commits, MIT license.
+~6,000 lines Rust, 21 tests, MIT license.
 
 ## Build Commands
 
@@ -14,6 +14,10 @@ wasm-pack build crates/web --target web --no-typescript  # WASM (must run BEFORE
 cargo build --release -p phantom-server                  # server embeds WASM via include_bytes!
 cargo test                                               # 21 tests
 cargo clippy --release                                   # must be zero warnings
+
+# GPU benchmarks (requires NVIDIA GPU + DISPLAY=:0)
+DISPLAY=:0 cargo run --release -p phantom-bench          # encoder comparison: openh264 vs nvenc
+DISPLAY=:0 cargo run --release --example nvenc_bench -p phantom-gpu  # GPU unit tests
 ```
 
 **IMPORTANT**: WASM build order matters. Server embeds `crates/web/pkg/phantom_web_bg.wasm` via `include_bytes!`. If you change WASM code, rebuild WASM first, then server.
@@ -21,14 +25,21 @@ cargo clippy --release                                   # must be zero warnings
 ## Test Environment
 
 ```bash
+# Docker (CPU-only):
 docker build -t phantom .
-# Web client (WebRTC):
 docker run --rm -p 9900:9900 -p 9901:9901 -p 9902:9902/udp -e PHANTOM_HOST=127.0.0.1 phantom server-web
 # → open http://127.0.0.1:9900
 
 # Native client:
 docker run --rm -p 9900:9900 phantom server
 cargo run --release -p phantom-client -- --no-encrypt -c 127.0.0.1:9900
+
+# GPU test VM (A40, driver 550, Ubuntu 24.04):
+ssh horde@10.57.233.13
+DISPLAY=:0 cargo run --release -p phantom-bench           # full encoder benchmark
+DISPLAY=:0 cargo run --release --example nvenc_bench -p phantom-gpu  # GPU unit tests
+# Server with GPU:
+DISPLAY=:0 phantom-server --encoder nvenc --capture nvfbc --transport web
 ```
 
 ---
@@ -125,6 +136,42 @@ capture → TileDiffer (64x64 blocks) → dirty count
 ### Transport abstraction
 `run_session()` takes `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`. All transports (TCP, QUIC, WebSocket, WebRTC) implement same traits. Adding new transport = new file + implement traits + one-line init change.
 
+### GPU pipeline (crates/gpu/)
+All NVIDIA libraries loaded at runtime via dlopen — compiles on any machine, GPU optional.
+
+**NVENC encoder flow** (CPU input path):
+```
+Frame.data (BGRA CPU) → bgra_to_nv12 (CPU) → cuMemcpyHtoD → NVENC encode (GPU) → H.264 bytes
+~10ms at 1080p
+```
+
+**NVFBC→NVENC zero-copy flow** (all GPU):
+```
+NVFBC grab → CUdeviceptr (NV12, GPU) → NVENC encode (GPU) → H.264 bytes
+~4ms at 1080p (capture 0.4ms + encode 3.5ms)
+```
+
+**CUDA context management** (hard-won lessons):
+- Use `cuDevicePrimaryCtxRetain` — NVFBC internally uses the primary context. `cuCtxCreate` creates a separate context that conflicts.
+- NVFBC holds a context lock. Must call `NvFBCReleaseContext` before NVENC operations, `NvFBCBindContext` before NVFBC grab.
+- NVENC's `encode_registered()` checks `ctx_get_current()` and only does `ctx_push` if needed (avoids double-push deadlock).
+
+**NVFBC struct sizes** (critical):
+- NVFBC embeds sizeof in the version field. Wrong size = buffer overflow = silent memory corruption.
+- Verified sizes from nvfbc-sys bindgen: CreateHandleParams=40, CaptureSessionParams=64, GrabFrameParams=32, FrameGrabInfo=48.
+- Use opaque byte arrays (not Rust structs with named fields) to guarantee correct sizes.
+
+**NVFBC function loading**:
+- Do NOT use `NvFBCCreateInstance` — it has strict API version checks that vary by driver.
+- Instead, dlsym each function directly: `NvFBCCreateHandle`, `NvFBCToCudaGrabFrame`, etc.
+
+**Benchmark results** (A40 GPU, 1080p, driver 550):
+```
+OpenH264 (CPU):           47ms  (baseline)
+NVENC (CPU color conv):   10ms  (4.7x faster)
+NVFBC→NVENC (zero-copy):   4ms  (12x faster)
+```
+
 ---
 
 ## Common Pitfalls
@@ -137,10 +184,15 @@ capture → TileDiffer (64x64 blocks) → dirty count
 - **Bounded channels**: video uses `sync_channel(30)` + `try_send` — drops on full, never blocks
 - **Keepalive**: 1s ping via `sender.send_msg(Ping)` detects dead channels after browser refresh
 - **XFCE Super shortcuts**: removed in Docker entrypoint (conflict with macOS Cmd)
+- **NVFBC struct sizes**: must match driver's expected sizeof exactly. Use opaque byte arrays, not Rust structs.
+- **NVFBC FORCE_REFRESH**: blocks on driver 550. Use NOWAIT + ensure screen activity for new frames.
+- **NVFBC needs DISPLAY**: set `DISPLAY=:0` when running on remote machine. NVFBC captures X11 framebuffer.
+- **NVFBC + NVENC CUDA context**: use primary context (`cuDevicePrimaryCtxRetain`), not `cuCtxCreate`. Bind/release around NVFBC↔NVENC transitions.
+- **NVENC GUID by value**: `nvEncGetEncodePresetConfigEx` passes GUIDs by value, not by pointer (C ABI).
 
 ---
 
-## Implemented Features (19)
+## Implemented Features (22)
 
 | # | Feature |
 |---|---------|
@@ -163,16 +215,20 @@ capture → TileDiffer (64x64 blocks) → dirty count
 | 17 | Docker XFCE test environment |
 | 18 | Mock server (test without screen capture) |
 | 19 | Encoder plugin architecture (--encoder flag, Box<dyn FrameEncoder>) |
+| 20 | **NVENC GPU encoding** (`--encoder nvenc`, runtime dlopen, no build-time CUDA dep) |
+| 21 | **NVFBC GPU capture** (`--capture nvfbc`, zero-copy CUdeviceptr) |
+| 22 | **NVFBC→NVENC zero-copy pipeline** (capture+encode ~4ms at 1080p on A40) |
 
 ---
 
 ## Roadmap
 
-### Immediate (GPU machine available at office)
+### Immediate
 | Task | Impact | Notes |
 |------|--------|-------|
-| **NVENC GPU encoding** | encode 15ms→2ms | Implement FrameEncoder for NVENC. Need NVIDIA GPU. |
-| **NVFBC GPU capture** | zero-copy from VRAM | Implement FrameCapture for NVFBC. NVIDIA only. |
+| ~~NVENC GPU encoding~~ | ✅ done | encode 47ms→10ms (CPU path), 4ms (zero-copy) |
+| ~~NVFBC GPU capture~~ | ✅ done | zero-copy CUdeviceptr, ~0.4ms capture |
+| **Integrate GPU pipeline into server** | full end-to-end | Wire `--capture nvfbc --encoder nvenc` into run_session zero-copy loop |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
 | **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
 | **WAN testing** | verify real latency | Need cloud VM, `tc netem` for simulating loss/delay |
@@ -269,6 +325,17 @@ crates/web/src/
   lib.rs               WASM entry, setup_webrtc (POST /rtc), WebCodecs decode,
                        Canvas render, mouse/keyboard/scroll/paste input capture,
                        TileUpdate zstd decompress (ruzstd), DataChannel send/recv
+
+crates/gpu/src/
+  lib.rs               Module exports (pub mod cuda, nvenc, nvfbc, sys)
+  dl.rs                Runtime dlopen/dlsym abstraction (no build-time NVIDIA dep)
+  sys.rs               C FFI types: CUDA, NVENC (SDK 12.1), NVFBC (v1.8/1.9 compat)
+  cuda.rs              CUDA driver API: context, memory, memcpy, primary context
+  nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 GPU encode via NVENC
+  nvfbc.rs             NvfbcCapture (impl FrameCapture): GPU screen capture via NVFBC
+
+crates/bench/src/
+  main.rs              Encoder benchmark: OpenH264 vs NVENC × resolutions + NVFBC zero-copy
 
 crates/server/web/
   index.html           Minimal HTML loader for WASM

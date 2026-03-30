@@ -34,6 +34,10 @@ unsafe impl Send for NvfbcCapture {}
 impl NvfbcCapture {
     /// Create NVFBC capture session outputting to CUDA device pointer.
     pub fn new(cuda: Arc<CudaLib>, ctx: CUcontext, buffer_format: u32) -> Result<Self> {
+        Self::with_options(cuda, ctx, buffer_format, false)
+    }
+
+    pub fn with_options(cuda: Arc<CudaLib>, ctx: CUcontext, buffer_format: u32, with_cursor: bool) -> Result<Self> {
         let lib = DynLib::open(&["libnvidia-fbc.so.1", "libnvidia-fbc.so"])
             .context("failed to load libnvidia-fbc")?;
 
@@ -65,7 +69,7 @@ impl NvfbcCapture {
         let mut session_params = NvFbcCreateCaptureSessionParams::new();
         session_params.set_capture_type(NVFBC_CAPTURE_SHARED_CUDA);
         session_params.set_tracking_type(NVFBC_TRACKING_DEFAULT);
-        session_params.set_with_cursor(NVFBC_FALSE);
+        session_params.set_with_cursor(if with_cursor { NVFBC_TRUE } else { NVFBC_FALSE });
         session_params.set_push_model(NVFBC_FALSE);
         session_params.set_sampling_rate_ms(16); // ~60 Hz
 

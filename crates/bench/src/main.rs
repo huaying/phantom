@@ -6,6 +6,7 @@
 //! Run: cargo run --release -p phantom-bench
 
 use anyhow::Result;
+use phantom_core::capture::FrameCapture;
 use phantom_core::encode::FrameEncoder;
 use phantom_core::frame::{Frame, PixelFormat};
 use phantom_gpu::cuda::CudaLib;
@@ -179,5 +180,117 @@ fn main() {
         println!();
     }
 
-    println!("\ndone.");
+    // --- NVFBC → NVENC zero-copy ---
+    if let Some(ref cuda) = cuda {
+        println!("=== NVFBC → NVENC zero-copy ===\n");
+
+        let dev = cuda.device_get(0).unwrap();
+        let primary_ctx = match cuda.primary_ctx_retain(dev) {
+            Ok(c) => c,
+            Err(e) => { println!("  primary_ctx_retain failed: {e}\n"); println!("done."); return; }
+        };
+        unsafe { cuda.ctx_push(primary_ctx) }.ok();
+
+        match phantom_gpu::nvfbc::NvfbcCapture::with_options(
+            Arc::clone(cuda), primary_ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12, true, // with_cursor for bench
+        ) {
+            Ok(mut cap) => {
+                let (sw, sh) = cap.resolution();
+                println!("  screen: {sw}x{sh}");
+
+                // Spawn background mouse movement to generate frame updates
+                let _mouse_mover = std::process::Command::new("bash")
+                    .args(["-c", "while true; do xdotool mousemove $((RANDOM%1920)) $((RANDOM%1080)) 2>/dev/null; sleep 0.005; done"])
+                    .env("DISPLAY", ":0")
+                    .spawn()
+                    .ok();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                // Wait for first frame
+                let first = loop {
+                    match cap.grab_cuda() {
+                        Ok(Some(f)) => break f,
+                        Ok(None) => { std::thread::sleep(std::time::Duration::from_millis(10)); }
+                        Err(e) => { println!("  grab failed: {e}"); println!("\ndone."); return; }
+                    }
+                };
+                let (fw, fh) = (first.width, first.height);
+                let pitch = first.infer_nv12_pitch().unwrap_or(fw);
+                println!("  frame: {fw}x{fh}, pitch={pitch}");
+
+                // Init NVENC sharing primary context
+                cap.release_context().ok();
+                match unsafe {
+                    NvencEncoder::with_context(Arc::clone(cuda), primary_ctx, false, fw, fh, 30, 5000)
+                } {
+                    Ok(mut enc) => {
+                        // Warmup
+                        for _ in 0..WARMUP {
+                            std::thread::sleep(std::time::Duration::from_millis(16));
+                            cap.bind_context().ok();
+                            if let Ok(Some(f)) = cap.grab_cuda() {
+                                cap.release_context().ok();
+                                let p = f.infer_nv12_pitch().unwrap_or(f.width);
+                                let _ = enc.encode_device_nv12(f.device_ptr, p);
+                            } else {
+                                cap.release_context().ok();
+                            }
+                        }
+
+                        // Measure
+                        let mut cap_times = Vec::new();
+                        let mut enc_times = Vec::new();
+                        let mut total_times = Vec::new();
+                        let mut encoded = 0usize;
+
+                        for _ in 0..ROUNDS {
+                            std::thread::sleep(std::time::Duration::from_millis(16));
+                            cap.bind_context().ok();
+                            let t0 = Instant::now();
+                            let grabbed = cap.grab_cuda();
+                            let cap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            cap.release_context().ok();
+
+                            if let Ok(Some(f)) = grabbed {
+                                let p = f.infer_nv12_pitch().unwrap_or(f.width);
+                                let t1 = Instant::now();
+                                if let Ok(ef) = enc.encode_device_nv12(f.device_ptr, p) {
+                                    let enc_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                                    cap_times.push(cap_ms);
+                                    enc_times.push(enc_ms);
+                                    total_times.push(cap_ms + enc_ms);
+                                    encoded += ef.data.len();
+                                }
+                            }
+                        }
+
+                        if total_times.is_empty() {
+                            println!("  no frames captured (static desktop?)\n");
+                        } else {
+                            cap_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            enc_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            total_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            let n = total_times.len();
+                            let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+                            let p50 = |v: &[f64]| v[v.len() / 2];
+
+                            println!("  frames captured: {n}/{ROUNDS}");
+                            println!("  capture:  avg {:.2}ms  p50 {:.2}ms", avg(&cap_times), p50(&cap_times));
+                            println!("  encode:   avg {:.2}ms  p50 {:.2}ms", avg(&enc_times), p50(&enc_times));
+                            println!("  total:    avg {:.2}ms  p50 {:.2}ms", avg(&total_times), p50(&total_times));
+                            println!("  avg size: {} B/f", encoded / n);
+                        }
+                    }
+                    Err(e) => println!("  NVENC init failed: {e}"),
+                }
+            }
+            Err(e) => println!("  NVFBC not available: {e}"),
+        }
+
+        cuda.ctx_pop().ok();
+        cuda.primary_ctx_release(dev);
+        println!();
+    }
+
+    println!("done.");
 }
