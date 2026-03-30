@@ -20,24 +20,41 @@ pub fn negotiate(
     let local_addr = socket.local_addr()?;
     tracing::info!(%local_addr, "WebRTC UDP bound");
 
-    // Wait for SDP offer from browser
-    let offer_json = signaling_rx
-        .recv_timeout(Duration::from_secs(10))
-        .context("timeout waiting for offer")?;
-    let offer_val: serde_json::Value = serde_json::from_str(&offer_json)?;
-    if offer_val["type"].as_str() != Some("offer") {
-        bail!("expected offer, got: {:?}", offer_val["type"]);
+    // Wait for SDP offer from browser (skip any ICE candidates that arrive first)
+    let mut sdp_str = String::new();
+    let deadline_offer = Instant::now() + Duration::from_secs(10);
+    let mut early_candidates = Vec::new();
+    loop {
+        let msg = signaling_rx
+            .recv_timeout(deadline_offer.saturating_duration_since(Instant::now()).max(Duration::from_millis(100)))
+            .context("timeout waiting for offer")?;
+        let val: serde_json::Value = serde_json::from_str(&msg)?;
+        match val["type"].as_str() {
+            Some("offer") => {
+                sdp_str = val["sdp"].as_str().context("missing sdp")?.to_string();
+                break;
+            }
+            Some("candidate") => {
+                // ICE candidates may arrive before offer — buffer them
+                early_candidates.push(msg);
+            }
+            other => {
+                tracing::debug!("ignoring signaling message: {:?}", other);
+            }
+        }
     }
-    let sdp_str = offer_val["sdp"].as_str().context("missing sdp")?;
 
     // Create Rtc + accept offer
     let mut rtc = Rtc::builder().build();
 
-    // Add our UDP address as a host candidate
-    let candidate = Candidate::host(local_addr, "udp").context("host candidate")?;
+    // Add host candidate with actual IP (not 0.0.0.0)
+    // Use the Docker container's network interface IP
+    let host_ip = get_local_ip().unwrap_or([127, 0, 0, 1].into());
+    let candidate_addr = std::net::SocketAddr::new(host_ip, local_addr.port());
+    let candidate = Candidate::host(candidate_addr, "udp").context("host candidate")?;
     rtc.add_local_candidate(candidate);
 
-    let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str)
+    let offer = str0m::change::SdpOffer::from_sdp_string(&sdp_str)
         .context("parse SDP")?;
     let answer = rtc.sdp_api().accept_offer(offer)
         .context("accept offer")?;
@@ -205,6 +222,13 @@ fn rtc_io_loop(
 
         rtc.handle_input(Input::Timeout(Instant::now())).ok();
     }
+}
+
+fn get_local_ip() -> Option<std::net::IpAddr> {
+    // Connect to a public IP to determine our local interface address
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
 }
 
 pub struct WebRtcSender {
