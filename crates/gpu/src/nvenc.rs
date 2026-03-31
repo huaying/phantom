@@ -76,7 +76,11 @@ impl NvencEncoder {
         bitrate_kbps: u32,
     ) -> Result<Self> {
         // Load NVENC library
-        let nvenc_lib = DynLib::open(&["libnvidia-encode.so.1", "libnvidia-encode.so"])
+        #[cfg(unix)]
+        let names = &["libnvidia-encode.so.1", "libnvidia-encode.so"];
+        #[cfg(windows)]
+        let names = &["nvEncodeAPI64.dll"];
+        let nvenc_lib = DynLib::open(names)
             .context("failed to load libnvidia-encode")?;
 
         let create_instance: FnNvEncodeAPICreateInstance = unsafe {

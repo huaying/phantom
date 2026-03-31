@@ -6,6 +6,7 @@
 //! Run: cargo run --release -p phantom-bench
 
 use anyhow::Result;
+#[cfg(target_os = "linux")]
 use phantom_core::capture::FrameCapture;
 use phantom_core::encode::FrameEncoder;
 use phantom_core::frame::{Frame, PixelFormat};
@@ -180,7 +181,8 @@ fn main() {
         println!();
     }
 
-    // --- NVFBC → NVENC zero-copy ---
+    // --- NVFBC → NVENC zero-copy (Linux only) ---
+    #[cfg(target_os = "linux")]
     if let Some(ref cuda) = cuda {
         println!("=== NVFBC → NVENC zero-copy ===\n");
 

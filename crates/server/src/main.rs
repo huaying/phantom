@@ -87,24 +87,34 @@ fn main() -> Result<()> {
         Some(key)
     };
 
+    #[cfg(target_os = "linux")]
     let use_gpu_pipeline = args.capture == "nvfbc" && args.encoder == "nvenc";
+    #[cfg(not(target_os = "linux"))]
+    let use_gpu_pipeline = false;
 
-    // GPU zero-copy pipeline or CPU pipeline
+    // GPU zero-copy pipeline (Linux only) or CPU pipeline
+    #[cfg(target_os = "linux")]
     let mut gpu = if use_gpu_pipeline {
         Some(GpuPipeline::new(args.fps, args.bitrate)?)
     } else {
         None
     };
+    #[cfg(not(target_os = "linux"))]
+    let _gpu: Option<()> = None;
+
     let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
         Some(create_capture(&args.capture)?)
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
     let (width, height) = if let Some(ref gpu) = gpu {
         (gpu.width, gpu.height)
     } else {
         capture.as_ref().unwrap().resolution()
     };
+    #[cfg(not(target_os = "linux"))]
+    let (width, height) = capture.as_ref().unwrap().resolution();
     let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
         Some(create_encoder(&args.encoder, width, height, args.fps as f32, args.bitrate)?)
     } else {
@@ -161,6 +171,7 @@ fn main() -> Result<()> {
                 }
             };
 
+        #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
             run_session_gpu(
                 &mut gpu.capture, &mut gpu.encoder,
@@ -174,12 +185,20 @@ fn main() -> Result<()> {
                 sender, receiver, frame_interval, quality_delay,
             )
         };
+        #[cfg(not(target_os = "linux"))]
+        let result = run_session(
+            &mut **capture.as_mut().unwrap(),
+            &mut **video_encoder.as_mut().unwrap(),
+            &mut differ,
+            sender, receiver, frame_interval, quality_delay,
+        );
         if let Err(e) = result {
             tracing::warn!("session ended: {e}");
             if let Some(ref mut enc) = video_encoder {
                 differ.reset();
                 enc.force_keyframe();
             }
+            #[cfg(target_os = "linux")]
             if let Some(ref mut gpu) = gpu {
                 let _ = gpu.capture.release_context();
                 if let Err(e) = gpu.reset_for_new_session() {
@@ -254,6 +273,7 @@ impl CongestionTracker {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// GPU zero-copy pipeline: NVFBC capture + NVENC encode, no CPU involvement.
 struct GpuPipeline {
     capture: phantom_gpu::nvfbc::NvfbcCapture,
@@ -266,6 +286,7 @@ struct GpuPipeline {
     bitrate: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl GpuPipeline {
     fn new(fps: u32, bitrate_kbps: u32) -> Result<Self> {
         use phantom_core::capture::FrameCapture;
@@ -359,6 +380,7 @@ fn create_encoder(
     }
 }
 
+#[cfg(target_os = "linux")]
 /// GPU zero-copy session loop: NVFBC grab → NVENC encode → send.
 /// No tile differ or smart encoding — NVENC at ~4ms is fast enough for every frame.
 fn run_session_gpu(

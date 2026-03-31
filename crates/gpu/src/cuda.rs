@@ -38,7 +38,11 @@ pub struct CudaLib {
 
 impl CudaLib {
     pub fn load() -> Result<Self> {
-        let lib = DynLib::open(&["libcuda.so.1", "libcuda.so"])
+        #[cfg(unix)]
+        let names = &["libcuda.so.1", "libcuda.so"];
+        #[cfg(windows)]
+        let names = &["nvcuda.dll"];
+        let lib = DynLib::open(names)
             .context("failed to load CUDA driver library")?;
 
         unsafe {

@@ -29,6 +29,7 @@ fn main() {
     unsafe { cuda.ctx_push(primary_ctx) }.unwrap();
     println!("  pushed primary CUDA context on current thread");
 
+    #[cfg(target_os = "linux")]
     {
         match phantom_gpu::nvfbc::NvfbcCapture::new(
             Arc::clone(&cuda), primary_ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12,
