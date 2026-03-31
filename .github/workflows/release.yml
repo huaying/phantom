@@ -92,8 +92,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: List artifacts
+        run: find dist -type f && ls -la dist/
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
