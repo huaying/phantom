@@ -68,3 +68,73 @@ pub fn read_message(reader: &mut impl Read) -> Result<Message> {
     let msg = bincode::deserialize(&payload).context("deserialize message")?;
     Ok(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{EncodedFrame, VideoCodec};
+    use crate::frame::PixelFormat;
+    use std::io::Cursor;
+
+    #[test]
+    fn roundtrip_hello() {
+        let msg = Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8 };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        let decoded = read_message(&mut cursor).unwrap();
+        match decoded {
+            Message::Hello { width, height, .. } => {
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            _ => panic!("expected Hello"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_video_frame() {
+        let frame = EncodedFrame {
+            codec: VideoCodec::H264,
+            data: vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x28], // fake SPS
+            is_keyframe: true,
+        };
+        let msg = Message::VideoFrame { sequence: 42, frame: Box::new(frame) };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        let decoded = read_message(&mut cursor).unwrap();
+        match decoded {
+            Message::VideoFrame { sequence, frame } => {
+                assert_eq!(sequence, 42);
+                assert!(frame.is_keyframe);
+                assert_eq!(frame.data.len(), 8);
+            }
+            _ => panic!("expected VideoFrame"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_ping() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::Ping).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        assert!(matches!(read_message(&mut cursor).unwrap(), Message::Ping));
+    }
+
+    #[test]
+    fn multiple_messages() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::Ping).unwrap();
+        write_message(&mut buf, &Message::Pong).unwrap();
+        write_message(&mut buf, &Message::ClipboardSync("hello".to_string())).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        assert!(matches!(read_message(&mut cursor).unwrap(), Message::Ping));
+        assert!(matches!(read_message(&mut cursor).unwrap(), Message::Pong));
+        match read_message(&mut cursor).unwrap() {
+            Message::ClipboardSync(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected ClipboardSync"),
+        }
+    }
+}

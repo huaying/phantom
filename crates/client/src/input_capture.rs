@@ -100,3 +100,61 @@ fn winit_to_keycode(key: WinitKey) -> Option<KeyCode> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_mapping_letters() {
+        for (winit, expected) in [
+            (WinitKey::KeyA, KeyCode::A),
+            (WinitKey::KeyZ, KeyCode::Z),
+            (WinitKey::KeyM, KeyCode::M),
+        ] {
+            assert_eq!(winit_to_keycode(winit), Some(expected));
+        }
+    }
+
+    #[test]
+    fn key_mapping_modifiers() {
+        assert_eq!(winit_to_keycode(WinitKey::ShiftLeft), Some(KeyCode::LeftShift));
+        assert_eq!(winit_to_keycode(WinitKey::ControlLeft), Some(KeyCode::LeftCtrl));
+        assert_eq!(winit_to_keycode(WinitKey::AltLeft), Some(KeyCode::LeftAlt));
+    }
+
+    #[test]
+    fn super_key_not_mapped() {
+        // Super/Meta must NOT be mapped — causes stuck modifier on macOS
+        assert_eq!(winit_to_keycode(WinitKey::SuperLeft), None);
+        assert_eq!(winit_to_keycode(WinitKey::SuperRight), None);
+    }
+
+    #[test]
+    fn mouse_move_event_coords() {
+        let event = mouse_move_event(100, 200);
+        match event {
+            InputEvent::MouseMove { x, y } => {
+                assert_eq!(x, 100);
+                assert_eq!(y, 200);
+            }
+            _ => panic!("expected MouseMove"),
+        }
+    }
+
+    #[test]
+    fn mouse_button_press_release() {
+        let press = mouse_button_event(MouseButton::Left, ElementState::Pressed);
+        let release = mouse_button_event(MouseButton::Left, ElementState::Released);
+        assert!(press.is_some());
+        assert!(release.is_some());
+        match press.unwrap() {
+            InputEvent::MouseButton { pressed, .. } => assert!(pressed),
+            _ => panic!("expected MouseButton"),
+        }
+        match release.unwrap() {
+            InputEvent::MouseButton { pressed, .. } => assert!(!pressed),
+            _ => panic!("expected MouseButton"),
+        }
+    }
+}

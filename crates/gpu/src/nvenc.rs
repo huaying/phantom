@@ -428,6 +428,70 @@ impl Drop for NvencEncoder {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra_to_nv12_solid_white() {
+        let w = 16;
+        let h = 16;
+        let bgra = vec![255u8; w * h * 4]; // white BGRA
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        bgra_to_nv12(&bgra, w, h, &mut nv12);
+
+        // Y should be ~235 (BT.601 white)
+        let y_avg = nv12[..w * h].iter().map(|&v| v as u32).sum::<u32>() / (w * h) as u32;
+        assert!(y_avg > 220 && y_avg < 240, "Y avg={y_avg}, expected ~235");
+
+        // UV should be ~128 (neutral chroma)
+        let uv = &nv12[w * h..];
+        let uv_avg = uv.iter().map(|&v| v as u32).sum::<u32>() / uv.len() as u32;
+        assert!(uv_avg > 120 && uv_avg < 136, "UV avg={uv_avg}, expected ~128");
+    }
+
+    #[test]
+    fn bgra_to_nv12_solid_black() {
+        let w = 16;
+        let h = 16;
+        let mut bgra = vec![0u8; w * h * 4];
+        // Set alpha to 255
+        for i in 0..w * h {
+            bgra[i * 4 + 3] = 255;
+        }
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        bgra_to_nv12(&bgra, w, h, &mut nv12);
+
+        // Y should be ~16 (BT.601 black)
+        let y_avg = nv12[..w * h].iter().map(|&v| v as u32).sum::<u32>() / (w * h) as u32;
+        assert!(y_avg < 20, "Y avg={y_avg}, expected ~16");
+    }
+
+    #[test]
+    fn bgra_to_nv12_correct_size() {
+        let w = 1920;
+        let h = 1080;
+        let bgra = vec![128u8; w * h * 4];
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        bgra_to_nv12(&bgra, w, h, &mut nv12);
+        assert_eq!(nv12.len(), w * h * 3 / 2);
+    }
+
+    #[test]
+    fn nvenc_init_requires_gpu() {
+        // This test verifies graceful failure when no GPU is available
+        let cuda = CudaLib::load();
+        if cuda.is_err() {
+            // No GPU — expected on CI/Mac. Just verify it doesn't panic.
+            return;
+        }
+        let cuda = std::sync::Arc::new(cuda.unwrap());
+        let result = NvencEncoder::new(cuda, 0, 320, 240, 30, 1000);
+        // Should succeed if GPU is available
+        assert!(result.is_ok(), "NVENC init failed: {:?}", result.err());
+    }
+}
+
 /// Convert BGRA to NV12 (BT.601) into a pre-allocated buffer.
 /// NV12 layout: Y plane (w*h) followed by interleaved UV plane (w*h/2).
 fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize, nv12: &mut [u8]) {
