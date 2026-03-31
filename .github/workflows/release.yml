@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Linux server + client (static musl)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: linux-x86_64
+            build_server: true
+            build_client: true
+
+          # macOS ARM (client only — server needs Linux for capture)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: macos-aarch64
+            build_server: false
+            build_client: true
+
+          # macOS x86_64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            suffix: macos-x86_64
+            build_server: false
+            build_client: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux: install musl tools
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Build WASM for server (Linux only)
+      - name: Build WASM
+        if: matrix.build_server
+        run: |
+          cargo install wasm-pack
+          wasm-pack build crates/web --target web --no-typescript
+
+      # Build server
+      - name: Build server
+        if: matrix.build_server
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-server
+
+      # Build client
+      - name: Build client
+        if: matrix.build_client
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-client
+
+      # Rename and upload
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.build_server }}" = "true" ]; then
+            cp target/${{ matrix.target }}/release/phantom-server dist/phantom-server-${{ matrix.suffix }}
+          fi
+          if [ "${{ matrix.build_client }}" = "true" ]; then
+            cp target/${{ matrix.target }}/release/phantom-client dist/phantom-client-${{ matrix.suffix }}
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
