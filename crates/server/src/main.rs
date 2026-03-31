@@ -16,7 +16,7 @@ use phantom_core::encode::{Encoder, FrameEncoder};
 use phantom_core::frame::{Frame, PixelFormat};
 use phantom_core::input::InputEvent;
 use phantom_core::protocol::Message;
-use phantom_core::tile::{TileDiffer, TILE_SIZE};
+use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -368,7 +368,6 @@ fn run_session_gpu(
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
 ) -> Result<()> {
-    use phantom_core::capture::FrameCapture;
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();

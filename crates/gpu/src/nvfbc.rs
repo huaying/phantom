@@ -262,7 +262,7 @@ impl GpuFrame {
         }
         let num = (self.byte_size as u64) * 2;
         let den = (self.height as u64) * 3;
-        if den == 0 || num % den != 0 {
+        if den == 0 || !num.is_multiple_of(den) {
             return None;
         }
         let pitch = num / den;

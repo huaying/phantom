@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use str0m::{Candidate, Rtc};
@@ -221,9 +221,6 @@ fn handle_http_rw(
     Ok(())
 }
 
-fn handle_http(mut stream: TcpStream, rtc_tx: mpsc::Sender<Rtc>, candidate_addr: std::net::SocketAddr) -> Result<()> {
-    handle_http_rw(&mut stream, rtc_tx, candidate_addr)
-}
 
 fn get_local_ip() -> Option<std::net::IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;

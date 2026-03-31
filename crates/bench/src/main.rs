@@ -200,7 +200,7 @@ fn main() {
 
                 // Spawn background mouse movement to generate frame updates.
                 // Must be killed when done — stale xdotool processes cause phantom mouse drift.
-                let mut mouse_mover = std::process::Command::new("bash")
+                let _mouse_mover = std::process::Command::new("bash")
                     .args(["-c", "while true; do xdotool mousemove $((RANDOM%1920)) $((RANDOM%1080)) 2>/dev/null; sleep 0.005; done"])
                     .env("DISPLAY", ":0")
                     .spawn()
