@@ -2,8 +2,6 @@ mod capture_scrap;
 mod encode_h264;
 mod encode_zstd;
 mod input_injector;
-#[cfg(target_os = "linux")]
-mod input_uinput;
 mod transport_quic;
 mod transport_tcp;
 mod transport_webrtc;
@@ -47,58 +45,9 @@ struct Args {
     #[arg(long, default_value = "scrap")]
     capture: String,
 
-    /// Input backend: enigo (default, works on XFCE/macOS), uinput (Linux, works on GNOME).
-    #[arg(long, default_value = "enigo")]
-    input: String,
-
     /// Transport protocol: tcp (default) or quic (UDP, better for WAN).
     #[arg(long, default_value = "tcp")]
     transport: String,
-}
-
-/// Unified input injector — wraps either enigo or uinput backend.
-enum Injector {
-    Enigo(input_injector::InputInjector),
-    #[cfg(target_os = "linux")]
-    UInput(input_uinput::UInputInjector),
-}
-
-impl Injector {
-    fn inject(&mut self, event: &InputEvent) -> anyhow::Result<()> {
-        match self {
-            Injector::Enigo(e) => e.inject(event),
-            #[cfg(target_os = "linux")]
-            Injector::UInput(u) => u.inject(event),
-        }
-    }
-    fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
-        match self {
-            Injector::Enigo(e) => e.type_text(text),
-            #[cfg(target_os = "linux")]
-            Injector::UInput(u) => u.type_text(text),
-        }
-    }
-}
-
-fn create_injector(backend: &str, screen_width: u32, screen_height: u32) -> Option<Injector> {
-    match backend {
-        "enigo" => match input_injector::InputInjector::new() {
-            Ok(inj) => Some(Injector::Enigo(inj)),
-            Err(e) => { tracing::warn!("enigo init failed: {e}"); None }
-        },
-        #[cfg(target_os = "linux")]
-        "uinput" => match input_uinput::UInputInjector::new(screen_width, screen_height) {
-            Ok(inj) => Some(Injector::UInput(inj)),
-            Err(e) => { tracing::warn!("uinput init failed: {e}"); None }
-        },
-        other => {
-            tracing::warn!("unknown input backend '{other}', using enigo");
-            match input_injector::InputInjector::new() {
-                Ok(inj) => Some(Injector::Enigo(inj)),
-                Err(e) => { tracing::warn!("enigo init failed: {e}"); None }
-            }
-        }
-    }
 }
 
 /// Messages from the network receive thread to the main loop.
@@ -215,14 +164,14 @@ fn main() -> Result<()> {
         let result = if let Some(ref mut gpu) = gpu {
             run_session_gpu(
                 &mut gpu.capture, &mut gpu.encoder,
-                sender, receiver, frame_interval, &args.input,
+                sender, receiver, frame_interval,
             )
         } else {
             run_session(
                 &mut **capture.as_mut().unwrap(),
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
-                sender, receiver, frame_interval, quality_delay, &args.input,
+                sender, receiver, frame_interval, quality_delay,
             )
         };
         if let Err(e) = result {
@@ -392,7 +341,6 @@ fn run_session_gpu(
     mut sender: Box<dyn MessageSender>,
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
-    input_backend: &str,
 ) -> Result<()> {
     use phantom_core::capture::FrameCapture;
     use phantom_core::encode::FrameEncoder;
@@ -405,7 +353,7 @@ fn run_session_gpu(
     let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
     std::thread::spawn(move || { receive_loop(receiver, event_tx); });
 
-    let mut injector = create_injector(input_backend, width, height);
+    let mut injector = input_injector::InputInjector::new().ok();
 
     hide_remote_cursor();
 
@@ -557,7 +505,6 @@ fn run_session(
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
     quality_delay: Duration,
-    input_backend: &str,
 ) -> Result<()> {
     // New client needs a keyframe to start decoding
     video_encoder.force_keyframe();
@@ -570,7 +517,7 @@ fn run_session(
     let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
     std::thread::spawn(move || { receive_loop(receiver, event_tx); });
 
-    let mut injector = create_injector(input_backend, width, height);
+    let mut injector = input_injector::InputInjector::new().ok();
 
     // Hide remote cursor — client renders its own local cursor.
     // This prevents mouse movement from causing dirty tiles on the server.

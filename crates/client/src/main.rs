@@ -357,11 +357,9 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 session.cursor_pos = Some(position);
                 let (sx, sy) = session.display.map_to_server(position);
-                // Dead zone: skip moves < 2px to filter trackpad noise
+                // Only send if position actually changed (filters trackpad noise)
                 let (lx, ly) = session.last_sent_mouse;
-                let dx = (sx - lx).abs();
-                let dy = (sy - ly).abs();
-                if dx >= 2 || dy >= 2 {
+                if sx != lx || sy != ly {
                     session.last_sent_mouse = (sx, sy);
                     let _ = session.input_tx.send(Message::Input(
                         input_capture::mouse_move_event(sx, sy),
