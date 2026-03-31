@@ -41,10 +41,10 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # Linux: install musl tools
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Linux: install musl tools + X11 dev libs
+      - name: Install Linux dependencies
+        if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev
 
       # Build WASM for server (Linux only)
       - name: Build WASM
