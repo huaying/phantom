@@ -12,8 +12,8 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux server + client (static musl)
-          - target: x86_64-unknown-linux-musl
+          # Linux server + client (gnu — musl can't compile OpenH264 C++)
+          - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             suffix: linux-x86_64
             build_server: true
@@ -41,10 +41,10 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # Linux: install musl tools + X11 dev libs
+      # Linux: install X11 dev libs + nasm (for OpenH264 assembly)
       - name: Install Linux dependencies
         if: contains(matrix.target, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm
 
       # Build WASM for server (Linux only)
       - name: Build WASM
