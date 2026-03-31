@@ -181,7 +181,10 @@ fn main() -> Result<()> {
                 enc.force_keyframe();
             }
             if let Some(ref mut gpu) = gpu {
-                gpu.encoder.force_keyframe();
+                let _ = gpu.capture.release_context();
+                if let Err(e) = gpu.reset_for_new_session() {
+                    tracing::error!("GPU pipeline reset failed: {e}");
+                }
             }
         }
     }
@@ -255,8 +258,12 @@ impl CongestionTracker {
 struct GpuPipeline {
     capture: phantom_gpu::nvfbc::NvfbcCapture,
     encoder: phantom_gpu::nvenc::NvencEncoder,
+    cuda: std::sync::Arc<phantom_gpu::cuda::CudaLib>,
+    ctx: phantom_gpu::sys::CUcontext,
     width: u32,
     height: u32,
+    fps: u32,
+    bitrate: u32,
 }
 
 impl GpuPipeline {
@@ -290,11 +297,30 @@ impl GpuPipeline {
         capture.release_context()?;
         let encoder = unsafe {
             phantom_gpu::nvenc::NvencEncoder::with_context(
-                cuda, primary_ctx, false, width, height, fps, bitrate_kbps,
+                std::sync::Arc::clone(&cuda), primary_ctx, false, width, height, fps, bitrate_kbps,
             )?
         };
 
-        Ok(Self { capture, encoder, width, height })
+        Ok(Self { capture, encoder, cuda, ctx: primary_ctx, width, height, fps, bitrate: bitrate_kbps })
+    }
+
+    /// Recreate NVENC encoder for a fresh session (clears stale reference frames).
+    fn reset_for_new_session(&mut self) -> Result<()> {
+        self.capture.reset_session()?;
+        // Drop old encoder and create fresh one
+        self.encoder = unsafe {
+            phantom_gpu::nvenc::NvencEncoder::with_context(
+                std::sync::Arc::clone(&self.cuda),
+                self.ctx,
+                false,
+                self.width,
+                self.height,
+                self.fps,
+                self.bitrate,
+            )?
+        };
+        tracing::info!("GPU pipeline reset for new session");
+        Ok(())
     }
 }
 
@@ -420,7 +446,7 @@ fn run_session_gpu(
 
         capture.bind_context()?;
         let gpu_frame = capture.grab_cuda();
-        capture.release_context()?;
+        let _ = capture.release_context();
 
         match gpu_frame {
             Ok(Some(f)) => {

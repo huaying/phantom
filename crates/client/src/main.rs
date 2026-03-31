@@ -253,9 +253,18 @@ impl ApplicationHandler for App {
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
                         Message::VideoFrame { frame, .. } => {
-                            if let Ok(rgb32) = session.h264_decoder.decode_frame(&frame.data) {
-                                last_decoded = Some(rgb32);
-                                session.stats_video += 1;
+                            match session.h264_decoder.decode_frame(&frame.data) {
+                                Ok(rgb32) => {
+                                    last_decoded = Some(rgb32);
+                                    session.stats_video += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        size = frame.data.len(),
+                                        keyframe = frame.is_keyframe,
+                                        "decode failed: {e}"
+                                    );
+                                }
                             }
                         }
                         Message::TileUpdate { .. } => last_tiles = Some(msg),

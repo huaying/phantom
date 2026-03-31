@@ -115,6 +115,42 @@ impl NvfbcCapture {
         })
     }
 
+    /// Destroy and recreate the capture session. Resets NVFBC's "seen frames"
+    /// state so grab_cuda() returns frames again after a client reconnect.
+    pub fn reset_session(&mut self) -> Result<()> {
+        // Bind context for the entire destroy+create sequence
+        let _ = self.bind_context();
+
+        // Destroy old session (ignore error if already destroyed)
+        let mut destroy = NvFbcDestroyCaptureSessionParams::new();
+        let _ = unsafe { (self.api.destroy_capture_session)(self.handle, destroy.as_mut_ptr()) };
+
+        // Recreate capture session
+        let mut session_params = NvFbcCreateCaptureSessionParams::new();
+        session_params.set_capture_type(NVFBC_CAPTURE_SHARED_CUDA);
+        session_params.set_tracking_type(NVFBC_TRACKING_DEFAULT);
+        session_params.set_with_cursor(NVFBC_FALSE);
+        session_params.set_push_model(NVFBC_FALSE);
+        session_params.set_sampling_rate_ms(16);
+
+        let status = unsafe { (self.api.create_capture_session)(self.handle, session_params.as_mut_ptr()) };
+        if status != NVFBC_SUCCESS {
+            let _ = self.release_context();
+            bail!("NvFBCCreateCaptureSession (reset) failed: {}", nvfbc_error_detail(&self.api, self.handle, status));
+        }
+
+        let mut setup = NvFbcToCudaSetupParams::new(self._buffer_format);
+        let status = unsafe { (self.api.to_cuda_setup)(self.handle, setup.as_mut_ptr()) };
+        if status != NVFBC_SUCCESS {
+            let _ = self.release_context();
+            bail!("NvFBCToCudaSetUp (reset) failed: {}", nvfbc_error_detail(&self.api, self.handle, status));
+        }
+
+        let _ = self.release_context();
+        tracing::info!("NVFBC capture session reset");
+        Ok(())
+    }
+
     /// NVFBC API version reported by the runtime library.
     ///
     /// Encoded as `minor | (major << 8)` (e.g., 0x107 for 1.7).
