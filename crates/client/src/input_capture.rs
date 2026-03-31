@@ -76,7 +76,8 @@ fn winit_to_keycode(key: WinitKey) -> Option<KeyCode> {
         WinitKey::ShiftLeft => KeyCode::LeftShift, WinitKey::ShiftRight => KeyCode::RightShift,
         WinitKey::ControlLeft => KeyCode::LeftCtrl, WinitKey::ControlRight => KeyCode::RightCtrl,
         WinitKey::AltLeft => KeyCode::LeftAlt, WinitKey::AltRight => KeyCode::RightAlt,
-        WinitKey::SuperLeft => KeyCode::LeftMeta, WinitKey::SuperRight => KeyCode::RightMeta,
+        // Don't send Super/Meta to server — macOS Cmd+Tab causes stuck modifier
+        // that turns all subsequent keys into GNOME/XFCE shortcuts.
 
         WinitKey::ArrowUp => KeyCode::Up, WinitKey::ArrowDown => KeyCode::Down,
         WinitKey::ArrowLeft => KeyCode::Left, WinitKey::ArrowRight => KeyCode::Right,

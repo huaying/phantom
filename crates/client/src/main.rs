@@ -11,6 +11,7 @@ use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
 use phantom_core::decode::Decoder;
 use phantom_core::encode::FrameDecoder;
+use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::rc::Rc;
@@ -374,6 +375,16 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(input) = input_capture::scroll_event(delta) {
                     let _ = session.input_tx.send(Message::Input(input));
+                }
+            }
+            WindowEvent::Focused(false) => {
+                // Release all modifiers when window loses focus to prevent stuck keys.
+                for key in [KeyCode::LeftShift, KeyCode::RightShift,
+                            KeyCode::LeftCtrl, KeyCode::RightCtrl,
+                            KeyCode::LeftAlt, KeyCode::RightAlt] {
+                    let _ = session.input_tx.send(Message::Input(
+                        InputEvent::Key { key, pressed: false },
+                    ));
                 }
             }
             _ => {}

@@ -10,8 +10,14 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn new() -> Result<Self> {
-        let enigo = Enigo::new(&Settings::default())
+        let mut enigo = Enigo::new(&Settings::default())
             .map_err(|e| anyhow::anyhow!("failed to init enigo: {e}"))?;
+
+        // Release all modifier keys to clear any stuck state from previous sessions
+        for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
+            let _ = enigo.key(key, Direction::Release);
+        }
+
         tracing::info!("InputInjector initialized");
         Ok(Self { enigo })
     }
