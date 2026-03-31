@@ -26,9 +26,9 @@ jobs:
             build_server: false
             build_client: true
 
-          # macOS x86_64
+          # macOS x86_64 (via Rosetta on ARM runner)
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             suffix: macos-x86_64
             build_server: false
             build_client: true
