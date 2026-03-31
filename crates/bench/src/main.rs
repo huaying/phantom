@@ -198,8 +198,9 @@ fn main() {
                 let (sw, sh) = cap.resolution();
                 println!("  screen: {sw}x{sh}");
 
-                // Spawn background mouse movement to generate frame updates
-                let _mouse_mover = std::process::Command::new("bash")
+                // Spawn background mouse movement to generate frame updates.
+                // Must be killed when done — stale xdotool processes cause phantom mouse drift.
+                let mut mouse_mover = std::process::Command::new("bash")
                     .args(["-c", "while true; do xdotool mousemove $((RANDOM%1920)) $((RANDOM%1080)) 2>/dev/null; sleep 0.005; done"])
                     .env("DISPLAY", ":0")
                     .spawn()
@@ -286,6 +287,9 @@ fn main() {
             }
             Err(e) => println!("  NVFBC not available: {e}"),
         }
+
+        // Kill any xdotool processes spawned by this bench
+        let _ = std::process::Command::new("pkill").args(["-f", "xdotool mousemove"]).status();
 
         cuda.ctx_pop().ok();
         cuda.primary_ctx_release(dev);
