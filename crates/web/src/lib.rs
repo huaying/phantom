@@ -30,59 +30,6 @@ extern "C" {
     fn new(init: &JsValue) -> JsEncodedVideoChunk;
 }
 
-/// Reassembles chunked DataChannel messages.
-/// Small messages (≤ 16KB) arrive whole. Large messages arrive as chunks
-/// with [u32 total_len LE][chunk_data] framing.
-struct ChunkAssembler {
-    buf: Vec<u8>,
-    expected: usize,
-}
-
-impl ChunkAssembler {
-    fn new() -> Self { Self { buf: Vec::new(), expected: 0 } }
-
-    /// Feed a raw DataChannel message. Returns Some(complete_msg) when done.
-    fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        // If we're not in the middle of reassembly and the message has no chunk header,
-        // it's a small message — return directly.
-        if self.expected == 0 {
-            if data.len() < 4 { return Some(data.to_vec()); }
-            let total = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            // Heuristic: if the "total" field would indicate a chunked message
-            // (total > DC_CHUNK_SIZE and total > data.len()), this is a chunk.
-            // Otherwise it's a regular small message.
-            if total > 16_384 && total > data.len() {
-                // First chunk of a large message
-                self.expected = total;
-                self.buf.clear();
-                self.buf.extend_from_slice(&data[4..]);
-                if self.buf.len() >= self.expected {
-                    self.expected = 0;
-                    return Some(std::mem::take(&mut self.buf));
-                }
-                return None;
-            }
-            // Small message, no framing
-            return Some(data.to_vec());
-        }
-
-        // Continuation chunk: [total_len][data] — skip the 4-byte header
-        let payload = if data.len() >= 4 {
-            let hdr = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            if hdr == self.expected { &data[4..] } else { data }
-        } else {
-            data
-        };
-        self.buf.extend_from_slice(payload);
-        if self.buf.len() >= self.expected {
-            self.expected = 0;
-            Some(std::mem::take(&mut self.buf))
-        } else {
-            None
-        }
-    }
-}
-
 struct AppState {
     ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
@@ -93,9 +40,6 @@ struct AppState {
     /// Whether we've received at least one keyframe. WebCodecs requires a
     /// keyframe before it can decode any delta frames — skip deltas until then.
     got_keyframe: bool,
-    /// Reassembly buffer for chunked DataChannel messages
-    video_assembler: ChunkAssembler,
-    control_assembler: ChunkAssembler,
     /// Highest sequence number from a fully rendered VideoFrame.
     /// TileUpdates with sequence <= this are stale and should be skipped.
     last_video_sequence: u64,
@@ -130,8 +74,6 @@ pub fn main() {
         server_height: 0,
         frame_count: 0,
         got_keyframe: false,
-        video_assembler: ChunkAssembler::new(),
-        control_assembler: ChunkAssembler::new(),
         last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
@@ -162,9 +104,12 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     };
 
     // Create 3 DataChannels
-    // Video DC: ordered + reliable for now (ensures keyframes arrive intact).
-    // TODO: switch to unreliable + periodic keyframes for lower latency.
-    let video_dc = pc.create_data_channel("video");
+    // Video DC: unordered + unreliable for lowest latency.
+    // Lost frames are recovered by periodic keyframes (every 2s).
+    let video_init = RtcDataChannelInit::new();
+    video_init.set_ordered(false);
+    video_init.set_max_retransmits(0);
+    let video_dc = pc.create_data_channel_with_data_channel_dict("video", &video_init);
     video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let input_init = RtcDataChannelInit::new();
@@ -179,32 +124,24 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     // Store input DC for sending
     state.borrow_mut().send_dc = Some(input_dc.clone());
 
-    // onmessage for video DC (receives VideoFrame/TileUpdate, possibly chunked)
+    // onmessage for video DC (receives VideoFrame/TileUpdate)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let raw = js_sys::Uint8Array::new(&buf).to_vec();
-                let complete = s.borrow_mut().video_assembler.feed(&raw);
-                if let Some(data) = complete {
-                    on_message(&s, &data);
-                }
+                on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
             }
         });
         video_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
     }
 
-    // onmessage for control DC (receives Hello, Clipboard, etc., possibly chunked)
+    // onmessage for control DC (receives Hello, Clipboard, etc.)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let raw = js_sys::Uint8Array::new(&buf).to_vec();
-                let complete = s.borrow_mut().control_assembler.feed(&raw);
-                if let Some(data) = complete {
-                    on_message(&s, &data);
-                }
+                on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
             }
         });
         control_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));

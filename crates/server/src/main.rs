@@ -607,6 +607,7 @@ fn run_session(
     let mut had_input = false;
     let mut sent_first_frame = false;
     let mut sent_first_frame_encoded = false;
+    let mut last_keyframe_time = Instant::now();
 
     // Nudge the screen to force DXGI to return a frame on static desktops.
     // Without this, Windows DXGI Desktop Duplication never returns a first frame
@@ -701,17 +702,17 @@ fn run_session(
             // Always encode full H.264 frame when there are changes.
             // Tile mode caused visual tearing when mixed with H.264 over high latency.
             if !dirty_tiles.is_empty() {
-                let mut encoded = video_encoder.encode_frame(&frame)?;
-                // Defensive: if the first frame isn't a keyframe (e.g. encoder
-                // rate control skipped it), force and re-encode immediately.
-                // WebCodecs and most decoders require a keyframe to start.
-                if !sent_first_frame_encoded && !encoded.is_keyframe {
-                    tracing::warn!("first encode was not keyframe (type=P/Skip), forcing re-encode");
+                // Periodic keyframe every 2s — recovers from lost frames on
+                // unreliable WebRTC DataChannel. Also handles first-frame guarantee.
+                if last_keyframe_time.elapsed() >= Duration::from_secs(2) || !sent_first_frame_encoded {
                     video_encoder.force_keyframe();
-                    encoded = video_encoder.encode_frame(&frame)?;
                 }
-                if encoded.is_keyframe && !sent_first_frame_encoded {
-                    tracing::info!(size = encoded.data.len(), "first keyframe sent");
+                let encoded = video_encoder.encode_frame(&frame)?;
+                if encoded.is_keyframe {
+                    last_keyframe_time = Instant::now();
+                    if !sent_first_frame_encoded {
+                        tracing::info!(size = encoded.data.len(), "first keyframe sent");
+                    }
                 }
                 sent_first_frame_encoded = true;
                 stats_bytes += encoded.data.len() as u64;
