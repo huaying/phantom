@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["web-client"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
+webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
 
 [dependencies]
 phantom-core = { path = "../core" }
@@ -22,7 +23,7 @@ rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ring = "0.17"
 tungstenite = "0.24"
-str0m = "0.18"
+str0m = { version = "0.18", optional = true }
 serde_json = "1"
 enigo = "0.3"
 arboard = "3"

@@ -4,6 +4,7 @@ mod encode_zstd;
 mod input_injector;
 mod transport_quic;
 mod transport_tcp;
+#[cfg(feature = "webrtc")]
 mod transport_webrtc;
 mod transport_ws;
 
@@ -171,8 +172,11 @@ fn main() -> Result<()> {
 
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
             if let Some(ref ws) = ws_listener {
-                // Accept WebRTC or WebSocket (browser chooses via ?ws URL param)
-                ws.accept_any()?
+                // Default: WebSocket. With --features webrtc: accept either WS or WebRTC.
+                #[cfg(feature = "webrtc")]
+                { ws.accept_any()? }
+                #[cfg(not(feature = "webrtc"))]
+                { ws.accept_ws()? }
             } else if let Some(ref quic) = quic_listener {
                 let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))

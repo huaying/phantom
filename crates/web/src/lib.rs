@@ -30,6 +30,49 @@ extern "C" {
     fn new(init: &JsValue) -> JsEncodedVideoChunk;
 }
 
+/// Reassembles chunked DataChannel messages.
+/// Small messages (≤ 16KB) arrive whole. Large messages arrive as chunks
+/// with [u32 total_len LE][chunk_data] framing.
+struct ChunkAssembler {
+    buf: Vec<u8>,
+    expected: usize,
+}
+
+impl ChunkAssembler {
+    fn new() -> Self { Self { buf: Vec::new(), expected: 0 } }
+
+    fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if self.expected == 0 {
+            if data.len() < 4 { return Some(data.to_vec()); }
+            let total = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if total > 16_384 && total > data.len() {
+                self.expected = total;
+                self.buf.clear();
+                self.buf.extend_from_slice(&data[4..]);
+                if self.buf.len() >= self.expected {
+                    self.expected = 0;
+                    return Some(std::mem::take(&mut self.buf));
+                }
+                return None;
+            }
+            return Some(data.to_vec());
+        }
+        let payload = if data.len() >= 4 {
+            let hdr = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if hdr == self.expected { &data[4..] } else { data }
+        } else {
+            data
+        };
+        self.buf.extend_from_slice(payload);
+        if self.buf.len() >= self.expected {
+            self.expected = 0;
+            Some(std::mem::take(&mut self.buf))
+        } else {
+            None
+        }
+    }
+}
+
 struct AppState {
     ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
@@ -37,9 +80,9 @@ struct AppState {
     server_width: u32,
     server_height: u32,
     frame_count: u64,
-    /// Whether we've received at least one keyframe. WebCodecs requires a
-    /// keyframe before it can decode any delta frames — skip deltas until then.
     got_keyframe: bool,
+    video_assembler: ChunkAssembler,
+    control_assembler: ChunkAssembler,
     /// Highest sequence number from a fully rendered VideoFrame.
     /// TileUpdates with sequence <= this are stale and should be skipped.
     last_video_sequence: u64,
@@ -57,9 +100,9 @@ pub fn main() {
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
 
-    // Check URL for ?ws to use WebSocket mode
-    let use_ws = window.location().search().unwrap_or_default().contains("ws");
-    let mode = if use_ws { "WebSocket" } else { "WebRTC" };
+    // Default: WebSocket. Add ?rtc to URL for WebRTC DataChannel mode.
+    let use_rtc = window.location().search().unwrap_or_default().contains("rtc");
+    let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
     console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
 
     let canvas: HtmlCanvasElement = document.get_element_by_id("screen").unwrap()
@@ -74,6 +117,8 @@ pub fn main() {
         server_height: 0,
         frame_count: 0,
         got_keyframe: false,
+        video_assembler: ChunkAssembler::new(),
+        control_assembler: ChunkAssembler::new(),
         last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
@@ -84,10 +129,10 @@ pub fn main() {
     // Setup input listeners on canvas
     setup_input(&canvas, &document, &state);
 
-    if use_ws {
-        setup_ws(&state);
-    } else {
+    if use_rtc {
         setup_webrtc(&state);
+    } else {
+        setup_ws(&state);
     }
 }
 
@@ -122,24 +167,32 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     // Store input DC for sending
     state.borrow_mut().send_dc = Some(input_dc.clone());
 
-    // onmessage for video DC (receives VideoFrame/TileUpdate)
+    // onmessage for video DC (chunked reassembly)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
+                let raw = js_sys::Uint8Array::new(&buf).to_vec();
+                let complete = s.borrow_mut().video_assembler.feed(&raw);
+                if let Some(data) = complete {
+                    on_message(&s, &data);
+                }
             }
         });
         video_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
     }
 
-    // onmessage for control DC (receives Hello, Clipboard, etc.)
+    // onmessage for control DC (chunked reassembly)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
+                let raw = js_sys::Uint8Array::new(&buf).to_vec();
+                let complete = s.borrow_mut().control_assembler.feed(&raw);
+                if let Some(data) = complete {
+                    on_message(&s, &data);
+                }
             }
         });
         control_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));

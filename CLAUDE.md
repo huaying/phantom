@@ -9,7 +9,8 @@ Phantom is a high-performance, open-source remote desktop built in Rust. Target:
 ## Build Commands
 
 ```bash
-cargo build --release                                    # native
+cargo build --release                                    # native (WSS web transport)
+cargo build --release --features webrtc                  # native + WebRTC DataChannel support
 wasm-pack build crates/web --target web --no-typescript  # WASM (must run BEFORE server build!)
 cargo build --release -p phantom-server                  # server embeds WASM via include_bytes!
 cargo test                                               # 21 tests
@@ -104,9 +105,9 @@ Server forces IDR keyframe every 2 seconds. Recovers from:
 - Client decoder errors
 - Browser tab backgrounding/foregrounding
 
-### Dual web transport: WebRTC + WSS fallback
-- **WebRTC DataChannel** (default): POST /rtc signaling, str0m 0.18, reliable+ordered. Needs chunking for messages >16KB (SCTP limitation).
-- **WSS** (`?ws` URL param): WebSocket upgrade on same HTTPS port 9900. No message size limits. Validated by Helix as production-viable.
+### Dual web transport: WSS default + WebRTC optional
+- **WSS** (default): WebSocket upgrade on same HTTPS port 9900. No message size limits. Reliable. Validated by Helix as production-viable.
+- **WebRTC DataChannel** (`--features webrtc` build flag, `?rtc` URL param): POST /rtc signaling, str0m 0.18, reliable+ordered. Needs chunking for messages >16KB (SCTP limitation). Only needed for future NAT traversal.
 - **Native**: raw QUIC (no browser overhead, 15-30ms target)
 - All produce same `Box<dyn MessageSender/Receiver>` → same session loop
 
@@ -288,7 +289,7 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 ### Features
 | Task | Impact |
 |------|--------|
-| **Make WS default, WebRTC optional** | WS is more reliable; WebRTC only needed for NAT traversal |
+| ~~Make WS default, WebRTC optional~~ | ✅ done — WS default, `--features webrtc` + `?rtc` for WebRTC |
 | Wayland capture (PipeWire) | modern Linux |
 | Multi-monitor | dev setups |
 | File transfer | drag-and-drop |
