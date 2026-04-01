@@ -54,10 +54,13 @@ thread_local! {
 
 #[wasm_bindgen(start)]
 pub fn main() {
-    console::log_1(&"Phantom Web Client starting (WebRTC mode)...".into());
-
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
+
+    // Check URL for ?ws to use WebSocket mode
+    let use_ws = window.location().search().unwrap_or_default().contains("ws");
+    let mode = if use_ws { "WebSocket" } else { "WebRTC" };
+    console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
 
     let canvas: HtmlCanvasElement = document.get_element_by_id("screen").unwrap()
         .dyn_into().unwrap();
@@ -81,8 +84,11 @@ pub fn main() {
     // Setup input listeners on canvas
     setup_input(&canvas, &document, &state);
 
-    // Start WebRTC via POST /rtc
-    setup_webrtc(&state);
+    if use_ws {
+        setup_ws(&state);
+    } else {
+        setup_webrtc(&state);
+    }
 }
 
 fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
@@ -211,6 +217,56 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
 
     // Keep PC alive
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
+}
+
+fn setup_ws(state: &Rc<RefCell<AppState>>) {
+    let window = web_sys::window().unwrap();
+    let location = window.location();
+    let host = location.host().unwrap_or_default();
+    // WS port = HTTPS port + 1 (e.g. 9900 → 9901)
+    let parts: Vec<&str> = host.split(':').collect();
+    let ws_host = parts[0];
+    let ws_port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9900) + 1;
+    let ws_url = format!("ws://{ws_host}:{ws_port}");
+    console::log_1(&format!("Connecting to {ws_url}...").into());
+
+    let ws = match WebSocket::new(&ws_url) {
+        Ok(ws) => ws,
+        Err(e) => { console::error_1(&format!("WebSocket error: {:?}", e).into()); return; }
+    };
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+
+    // onmessage
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
+            }
+        });
+        ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    // onopen
+    {
+        let cb = Closure::<dyn FnMut()>::new(|| {
+            console::log_1(&"WebSocket connected!".into());
+        });
+        ws.set_onopen(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    // onerror
+    {
+        let cb = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|e: web_sys::ErrorEvent| {
+            console::error_1(&format!("WebSocket error: {:?}", e.message()).into());
+        });
+        ws.set_onerror(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    state.borrow_mut().send_ws = Some(ws);
 }
 
 // -- Message handling (same for WebRTC and WS) --

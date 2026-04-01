@@ -171,8 +171,8 @@ fn main() -> Result<()> {
 
         let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
             if let Some(ref ws) = ws_listener {
-                // WebRTC only — no WS fallback. Browser POSTs offer to /rtc.
-                ws.accept_webrtc()?
+                // Accept WebRTC or WebSocket (browser chooses via ?ws URL param)
+                ws.accept_any()?
             } else if let Some(ref quic) = quic_listener {
                 let (s, r) = quic.accept()?;
                 (Box::new(s), Box::new(r))

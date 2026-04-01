@@ -136,6 +136,7 @@ impl WebServerTransport {
     }
 
     /// Accept: WebRTC. Blocks until a session is ready. Always gets the latest.
+    #[allow(dead_code)]
     pub fn accept_webrtc(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
         loop {
             // Wait for notification
@@ -153,6 +154,23 @@ impl WebServerTransport {
         let ws = self.ws_rx.recv().context("WS channel closed")?;
         tracing::info!("WebSocket client accepted");
         Ok((Box::new(ws.data_sender), Box::new(ws.data_receiver)))
+    }
+
+    /// Accept: either WebRTC or WebSocket, whichever connects first.
+    pub fn accept_any(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
+        loop {
+            // Check WebRTC
+            let _ = self.rtc_notify.recv_timeout(std::time::Duration::from_millis(50));
+            if let Some((s, r)) = self.rtc_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                tracing::info!("accepted WebRTC client");
+                return Ok((Box::new(s), Box::new(r)));
+            }
+            // Check WebSocket
+            if let Ok(ws) = self.ws_rx.try_recv() {
+                tracing::info!("accepted WebSocket client");
+                return Ok((Box::new(ws.data_sender), Box::new(ws.data_receiver)));
+            }
+        }
     }
 }
 
