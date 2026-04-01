@@ -606,6 +606,7 @@ fn run_session(
     let mut last_frame: Option<Frame> = None;
     let mut had_input = false;
     let mut sent_first_frame = false;
+    let mut sent_first_frame_encoded = false;
 
     // Nudge the screen to force DXGI to return a frame on static desktops.
     // Without this, Windows DXGI Desktop Duplication never returns a first frame
@@ -700,7 +701,19 @@ fn run_session(
             // Always encode full H.264 frame when there are changes.
             // Tile mode caused visual tearing when mixed with H.264 over high latency.
             if !dirty_tiles.is_empty() {
-                let encoded = video_encoder.encode_frame(&frame)?;
+                let mut encoded = video_encoder.encode_frame(&frame)?;
+                // Defensive: if the first frame isn't a keyframe (e.g. encoder
+                // rate control skipped it), force and re-encode immediately.
+                // WebCodecs and most decoders require a keyframe to start.
+                if !sent_first_frame_encoded && !encoded.is_keyframe {
+                    tracing::warn!("first encode was not keyframe (type=P/Skip), forcing re-encode");
+                    video_encoder.force_keyframe();
+                    encoded = video_encoder.encode_frame(&frame)?;
+                }
+                if encoded.is_keyframe && !sent_first_frame_encoded {
+                    tracing::info!(size = encoded.data.len(), "first keyframe sent");
+                }
+                sent_first_frame_encoded = true;
                 stats_bytes += encoded.data.len() as u64;
                 stats_h264 += 1;
                 sequence += 1;

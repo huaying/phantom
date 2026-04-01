@@ -37,6 +37,9 @@ struct AppState {
     server_width: u32,
     server_height: u32,
     frame_count: u64,
+    /// Whether we've received at least one keyframe. WebCodecs requires a
+    /// keyframe before it can decode any delta frames — skip deltas until then.
+    got_keyframe: bool,
     /// Highest sequence number from a fully rendered VideoFrame.
     /// TileUpdates with sequence <= this are stale and should be skipped.
     last_video_sequence: u64,
@@ -67,6 +70,7 @@ pub fn main() {
         server_width: 0,
         server_height: 0,
         frame_count: 0,
+        got_keyframe: false,
         last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
@@ -231,22 +235,25 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         Message::VideoFrame { sequence, frame } => {
             if frame.codec != VideoCodec::H264 || frame.data.is_empty() { return; }
             let mut s = state.borrow_mut();
+            let is_key = h264_has_idr(&frame.data);
             // Log first few frames for debugging
             if s.frame_count < 5 {
-                console::log_1(&format!("pre-decode #{}: {} bytes, kf={}", s.frame_count, frame.data.len(), frame.is_keyframe).into());
+                console::log_1(&format!("frame #{}: {} bytes, encoder_kf={}, nal_idr={}", s.frame_count, frame.data.len(), frame.is_keyframe, is_key).into());
             }
+            // WebCodecs requires a keyframe before any delta frames can be decoded.
+            // Skip delta frames until we receive the first keyframe.
+            if !s.got_keyframe && !is_key {
+                console::warn_1(&format!("skipping frame #{} (waiting for keyframe)", s.frame_count).into());
+                s.frame_count += 1;
+                return;
+            }
+            if is_key { s.got_keyframe = true; }
             s.frame_count += 1;
             s.last_video_sequence = sequence;
             let fc = s.frame_count;
-            if fc <= 3 {
-                console::log_1(&format!("VideoFrame #{fc}: {} bytes, kf={}", frame.data.len(), frame.is_keyframe).into());
-            }
             if let Some(ref decoder) = s.decoder {
                 let data_js = js_sys::Uint8Array::from(frame.data.as_slice());
                 let init = js_sys::Object::new();
-                // Detect keyframe by parsing H.264 NAL units directly.
-                // is_keyframe flag from encoder can be unreliable.
-                let is_key = h264_has_idr(&frame.data);
                 js_sys::Reflect::set(&init, &"type".into(),
                     &if is_key { "key" } else { "delta" }.into()).unwrap();
                 js_sys::Reflect::set(&init, &"timestamp".into(),
