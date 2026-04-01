@@ -4,7 +4,7 @@
 
 Phantom is a high-performance, open-source remote desktop built in Rust. Target: Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text), single binary deployment, browser + native access.
 
-~6,000 lines Rust, 21 tests, MIT license.
+~7,000 lines Rust, 21 tests, MIT license. Runs on Linux + Windows.
 
 ## Build Commands
 
@@ -58,17 +58,20 @@ Phantom (target)    20-50ms     pixel-perfect   single binary ✅          ✅
 ```
 
 ### Our 5 Unique Advantages
-1. **Three-phase rendering** — no open-source competitor has pixel-perfect text + low latency
-2. **WebRTC DataChannel + WebCodecs** — no jitter buffer, 2x faster than Neko/Selkies in browser
+1. **DataChannel + WebCodecs** — same approach as Parsec/Zoom, bypasses jitter buffer (30-80ms saved)
+2. **WSS fallback on same port** — WebSocket + WebCodecs as reliable fallback (validated by Helix at scale)
 3. **Single binary** — web client embedded, no Docker/GStreamer/coturn needed
 4. **Rust WASM code sharing** — one codebase for server + web client
-5. **~4,600 lines** — vs KasmVNC 200K+, Neko 15K+, RustDesk 150K
+5. **~7,000 lines** — vs KasmVNC 200K+, Neko 15K+, RustDesk 150K
 
 ### Key Lessons From Competitors
-- **DCV**: two-phase rendering (we have it), QUIC transport (we have it), GPU sharing (future)
-- **KasmVNC**: per-rectangle quality tracking, multi-encoder mixing, FFmpeg dlopen, DLP features
-- **Sunshine**: zero-copy GPU pipeline (NVFBC→CUDA→NVENC), AV1, frame pacing
-- **Parsec**: client-side prediction, BUD protocol, 1000Hz input
+- **Parsec (BorgGames/streaming-client)**: uses DataChannel reliable+ordered for video, MSE decode. Only other production DataChannel video impl.
+- **Zoom**: uses unreliable DataChannel for video, WASM decode. Validated at massive scale.
+- **Neko/Selkies**: use WebRTC Media Track (RTP), not DataChannel. Browser handles decode. Simpler but 30-80ms jitter buffer.
+- **Helix**: killed WebRTC entirely, uses WebSocket + WebCodecs. Reports 20-30ms lower latency than their WebRTC setup.
+- **Sunshine**: no web client. Custom UDP + RTP + Reed-Solomon FEC for native Moonlight clients.
+- **DCV**: QUIC transport (we have it), GPU sharing (future)
+- **KasmVNC**: per-rectangle quality tracking, multi-encoder mixing, DLP features
 - **RustDesk**: NAT traversal, P2P, file transfer
 
 ---
@@ -90,18 +93,22 @@ Browser creates offer → POST /rtc → server returns answer. Single HTTP round
 ### str0m (sans-IO WebRTC)
 Pure Rust, ~15K lines, no tokio for WebRTC path. We provide UDP socket, str0m provides logic. Official `chat.rs` pattern: one socket, one run_loop, demux via `rtc.accepts()`.
 
-### Smart encoding (dirty% threshold)
-CPU-only hosts: 90% of updates are small (typing, cursor). Tiles with zstd = 0.1ms vs H.264 = 15ms. Server hides remote cursor → mouse movement = 0 dirty tiles = 0 CPU.
+**CRITICAL: str0m SCTP cannot deliver messages >16KB reliably.** Regardless of reliable/ordered settings, large DataChannel messages (e.g. 70KB H.264 keyframe) silently fail. Root cause unknown (possibly SCTP congestion window, internal buffer limits, or fragmentation bugs). Workaround: application-level chunking — split messages >16KB into chunks with `[u32 total_len LE][payload]` header, reassemble on client via `ChunkAssembler`.
 
-### Three-phase rendering
-1. Small change (<10% dirty) → zstd tiles only (0.1ms)
-2. Large change (≥10% dirty) → H.264 full frame (15ms)
-3. Static 2s → zstd lossless all tiles (pixel-perfect)
+### Always H.264 full frames (tile mode removed)
+Tile-based rendering (zstd per-tile) was removed — caused visual tearing when mixed with H.264 over high latency. Now every frame change triggers a full H.264 encode. TileDiffer still used to detect whether the screen changed (skips encode on static frames).
 
-### Dual-track network
-- Native: raw QUIC (no browser overhead, 15-30ms target)
-- Browser: WebRTC DataChannel (sandboxed but 20-50ms target)
-- Both produce same `Box<dyn MessageSender/Receiver>` → same session loop
+### Periodic keyframes (2s interval)
+Server forces IDR keyframe every 2 seconds. Recovers from:
+- WebRTC DataChannel packet loss (unreliable mode future)
+- Client decoder errors
+- Browser tab backgrounding/foregrounding
+
+### Dual web transport: WebRTC + WSS fallback
+- **WebRTC DataChannel** (default): POST /rtc signaling, str0m 0.18, reliable+ordered. Needs chunking for messages >16KB (SCTP limitation).
+- **WSS** (`?ws` URL param): WebSocket upgrade on same HTTPS port 9900. No message size limits. Validated by Helix as production-viable.
+- **Native**: raw QUIC (no browser overhead, 15-30ms target)
+- All produce same `Box<dyn MessageSender/Receiver>` → same session loop
 
 ---
 
@@ -110,12 +117,15 @@ CPU-only hosts: 90% of updates are small (typing, cursor). Tiles with zstd = 0.1
 ### WebRTC run_loop (str0m official pattern)
 - **One UDP socket** for entire server lifetime (never rebind — this was a hard bug)
 - **One `run_loop` thread** managing one active client at a time
+- **1ms UDP socket timeout** for responsive polling (was 50ms — caused visible lag)
+- **poll_output after drain_outgoing** — flush written data immediately
 - New POST /rtc → drain all pending Rtc, keep latest → replace active client immediately
 - Session delivered via `Mutex<Option>` slot (always latest, stale auto-dropped)
 - Bounded `sync_channel(30)` for video with `try_send` (backpressure, no blocking)
+- **Chunking**: messages >16KB split into chunks before `ch.write()`. Client reassembles.
 
 ### Session reconnect (hard-won bugs)
-These 4 bugs took significant debugging. Don't reintroduce them:
+These bugs took significant debugging. Don't reintroduce them:
 
 1. **recv_msg() infinite spin**: MUST detect `mpsc::TryRecvError::Disconnected` and return error. Otherwise receive_loop thread spins forever, session never ends, no reconnect.
 
@@ -125,13 +135,16 @@ These 4 bugs took significant debugging. Don't reintroduce them:
 
 4. **force_keyframe at session start**: New client needs IDR frame. Call `video_encoder.force_keyframe()` + `differ.reset()` at the top of `run_session()`.
 
-### Smart encoding flow
+5. **Web client got_keyframe guard**: WebCodecs throws if first frame is delta. Client skips all delta frames until first IDR arrives. Handles race condition where P-frames arrive before keyframe.
+
+### Encoding flow
 ```
-capture → TileDiffer (64x64 blocks) → dirty count
-  if dirty < 10% → zstd tiles only (TileUpdate)
-  if dirty ≥ 10% → H.264 full frame (VideoFrame)
-  if static 2s   → zstd lossless all tiles (quality refinement)
+capture → TileDiffer (64x64 blocks) → any dirty?
+  if dirty → H.264 full frame (VideoFrame)
+  if static → skip encode (zero CPU)
+  every 2s → force keyframe (IDR)
 ```
+TileDiffer detects changes. If nothing changed, no encode. Hidden remote cursor means mouse movement alone = 0 dirty tiles = 0 CPU.
 
 ### Transport abstraction
 `run_session()` takes `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`. All transports (TCP, QUIC, WebSocket, WebRTC) implement same traits. Adding new transport = new file + implement traits + one-line init change.
@@ -192,8 +205,12 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 - **NVENC profile**: must use Baseline profile. OpenH264 decoder doesn't support High profile (NVENC default).
 - **NVENC FORCEIDR**: value is 2 (0x2), not 4. Wrong value = keyframe never sent = client black screen.
 - **Client VideoFrame decode**: must decode ALL frames sequentially, not just the last one. Keyframes get overwritten by empty P-frames in the channel buffer when encoder is fast (GPU).
-- **Tile + H.264 mixed rendering**: causes visual tearing over high latency. Removed — always use H.264 full frames.
+- **Tile + H.264 mixed rendering**: caused visual tearing. Removed — always use H.264 full frames. Tile code still in codebase but unused.
 - **HTTPS required for WebCodecs**: non-localhost HTTP is not a secure context. Server uses self-signed TLS (rcgen) for HTTPS.
+- **str0m DataChannel >16KB**: SCTP silently drops large messages. MUST chunk into ≤16KB pieces. Chrome limit is 256KB but str0m fails well below that.
+- **WebRTC session zombie**: after ICE disconnect, `send_msg()` swallows Full errors. Session never ends. Must detect and terminate.
+- **WSS same port**: WS upgrade on HTTPS port 9900 (not separate port). Avoids self-signed cert rejection for second port.
+- **HTTP query string**: strip `?ws` from path before routing, otherwise `/?ws` returns 404.
 - **Stuck modifier keys**: Super/Meta (macOS Cmd) gets stuck on server after Cmd+Tab. Server releases all modifiers on session start. Client does NOT send Super/Meta, releases modifiers on focus loss.
 - **NVENC reconnect black screen**: must recreate NVENC encoder between sessions (stale reference frames). `GpuPipeline::reset_for_new_session()` destroys+recreates both NVFBC session and NVENC encoder.
 - **Stale xdotool processes**: bench code spawns `xdotool mousemove` loops. Always `pkill -f xdotool` after bench testing — leftover loops send random mouse coordinates causing phantom cursor drift.
@@ -202,13 +219,13 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 
 ---
 
-## Implemented Features (22)
+## Implemented Features (26)
 
 | # | Feature |
 |---|---------|
 | 1 | H.264 encoding (OpenH264 CPU, `--encoder` plugin architecture) |
-| 2 | Three-phase rendering (tiles → H.264 → lossless) |
-| 3 | Smart encoding (dirty% threshold, 90% CPU savings) |
+| 2 | Always H.264 full frames (tile mode removed — caused tearing) |
+| 3 | Periodic keyframe (2s interval, recovers from loss/errors) |
 | 4 | ChaCha20-Poly1305 encryption (TCP) / TLS (QUIC) / DTLS (WebRTC) |
 | 5 | QUIC/UDP transport (quinn) |
 | 6 | TCP transport with optional encryption |
@@ -219,8 +236,8 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | 11 | Window scaling + coordinate mapping |
 | 12 | Adaptive quality (congestion-based frame skipping) |
 | 13 | Native client (winit + softbuffer, OS key repeat) |
-| 14 | Web client WebRTC (DataChannel, WebCodecs, Canvas, POST /rtc signaling) |
-| 15 | Web client WS fallback (preserved for adaptive mode) |
+| 14 | Web client WebRTC (DataChannel + chunking, WebCodecs, Canvas, POST /rtc) |
+| 15 | Web client WSS fallback (`?ws` URL param, same HTTPS port) |
 | 16 | Hidden remote cursor (mouse move = 0 CPU) |
 | 17 | Docker XFCE test environment |
 | 18 | Mock server (test without screen capture) |
@@ -228,6 +245,10 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | 20 | **NVENC GPU encoding** (`--encoder nvenc`, runtime dlopen, no build-time CUDA dep) |
 | 21 | **NVFBC GPU capture** (`--capture nvfbc`, zero-copy CUdeviceptr) |
 | 22 | **NVFBC→NVENC zero-copy pipeline** (capture+encode ~4ms at 1080p on A40) |
+| 23 | **Windows support** (DXGI capture, OpenH264/NVENC, enigo input) |
+| 24 | **Auto-start** (Windows: schtasks ONLOGON, Linux: systemd) |
+| 25 | **Self-signed HTTPS** (rcgen, enables WebCodecs on non-localhost) |
+| 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
 
 ---
 
@@ -238,6 +259,10 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 |------|--------|-------|
 | ~~NVENC GPU encoding~~ | ✅ done | encode 47ms→10ms (CPU path), 4ms (zero-copy) |
 | ~~NVFBC GPU capture~~ | ✅ done | zero-copy CUdeviceptr, ~0.4ms capture |
+| ~~Windows support~~ | ✅ done | DXGI capture, auto-start via schtasks |
+| ~~Web client WSS fallback~~ | ✅ done | `?ws` URL param, same HTTPS port |
+| **Fix WebRTC session disconnect detection** | **high** | `send_msg()` swallows errors → zombie session blocks new clients |
+| **Remove dead tile code** | cleanup | encode_zstd, TileUpdate, TileDiffer dirty% threshold — all unused |
 | **Integrate GPU pipeline into server** | full end-to-end | Wire `--capture nvfbc --encoder nvenc` into run_session zero-copy loop |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
 | **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
@@ -263,7 +288,7 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 ### Features
 | Task | Impact |
 |------|--------|
-| WS/WebRTC adaptive fallback | auto-detect best transport |
+| **Make WS default, WebRTC optional** | WS is more reliable; WebRTC only needed for NAT traversal |
 | Wayland capture (PipeWire) | modern Linux |
 | Multi-monitor | dev setups |
 | File transfer | drag-and-drop |
@@ -279,16 +304,20 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 
 ---
 
-## Technical Debt
+## Technical Debt / Known Bugs
 
 | Item | Severity |
 |------|----------|
+| **WebRTC session doesn't detect disconnect** — WebRTC ICE disconnects but `run_session()` keeps running. `send_msg()` `try_send` Full error swallowed by `.or(Ok(()))`. Blocks WS clients from connecting after WebRTC. | **High** |
+| **str0m SCTP drops large messages** — `ch.write()` silently fails for >16KB messages. Chunking workaround in place but root cause unknown. | **High** |
+| **Server single-session** — only one client at a time. New connections queue until current session ends. Need proper session replacement. | Medium |
 | BGRA→YUV via `pixel_f32()` (slow per-pixel callback) | Medium |
 | Client threads leak on reconnect (no JoinHandle tracking) | Medium |
 | No graceful shutdown (Ctrl+C) | Low |
 | HTTP handler threads unbounded (no pool) | Medium |
 | WS IO loop 5ms latency floor | Low |
 | Mock server lacks encryption/input | Low |
+| Tile code still in codebase but unused (encode_zstd, TileUpdate messages) | Low |
 
 ---
 
@@ -311,15 +340,16 @@ crates/core/src/
   crypto.rs       ChaCha20-Poly1305 EncryptedWriter/Reader (feature-gated)
 
 crates/server/src/
-  main.rs              CLI args, transport selection, session loop, smart encoding, keepalive
-  capture_scrap.rs     ScrapCapture (impl FrameCapture, cross-platform)
+  main.rs              CLI args, transport selection, session loop, H.264 encoding, keepalive,
+                       periodic keyframe, auto-start (--install/--uninstall)
+  capture_scrap.rs     ScrapCapture (impl FrameCapture, cross-platform, DXGI on Windows)
   encode_h264.rs       OpenH264Encoder (impl FrameEncoder, CPU baseline)
-  encode_zstd.rs       ZstdEncoder (impl Encoder, lossless tiles)
-  input_injector.rs    enigo: mouse/keyboard injection + type_text for paste
+  encode_zstd.rs       ZstdEncoder (impl Encoder, lossless tiles — UNUSED, kept for future)
+  input_injector.rs    enigo: mouse/keyboard injection + type_text for paste, modifier release
   transport_tcp.rs     TCP: Plain/Encrypted sender/receiver, split via try_clone
   transport_quic.rs    QUIC: quinn, self-signed TLS, keep-alive
-  transport_ws.rs      WebServerTransport: HTTP static + WS fallback + WebRTC orchestration
-  transport_webrtc.rs  str0m run_loop, ActiveClient, WebRtcSender/Receiver, bounded channels
+  transport_ws.rs      WebServerTransport: HTTPS static + WSS upgrade (same port) + WebRTC POST /rtc
+  transport_webrtc.rs  str0m 0.18 run_loop, ActiveClient, chunked writes (>16KB), 1ms polling
   bin/mock_server.rs   Animated H.264 frames without screen capture
 
 crates/client/src/
@@ -332,9 +362,10 @@ crates/client/src/
   transport_quic.rs    QUIC client: quinn, skip cert verification
 
 crates/web/src/
-  lib.rs               WASM entry, setup_webrtc (POST /rtc), WebCodecs decode,
-                       Canvas render, mouse/keyboard/scroll/paste input capture,
-                       TileUpdate zstd decompress (ruzstd), DataChannel send/recv
+  lib.rs               WASM entry, setup_webrtc (POST /rtc) + setup_ws (?ws fallback),
+                       ChunkAssembler (reassembles >16KB DataChannel messages),
+                       WebCodecs decode, Canvas render, got_keyframe guard,
+                       mouse/keyboard/scroll/paste input capture, h264_has_idr() NAL parser
 
 crates/gpu/src/
   lib.rs               Module exports (pub mod cuda, nvenc, nvfbc, sys)
