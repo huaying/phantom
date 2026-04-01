@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{mpsc, Arc, Mutex};
 use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
@@ -107,28 +107,39 @@ impl WebServerTransport {
             }
         });
 
-        // WebSocket server thread (fallback)
+        // WebSocket server thread (TLS — avoids mixed content when page is HTTPS)
         let ws_addr = format!("0.0.0.0:{ws_port}");
-        let ws_listener = TcpListener::bind(&ws_addr).context("bind WS")?;
-        tracing::info!(addr = %ws_addr, "WebSocket server (fallback)");
+        let ws_listener = TcpListener::bind(&ws_addr).context("bind WSS")?;
+        let ws_tls = make_tls_acceptor()?;
+        tracing::info!(addr = %ws_addr, "WSS server (WebSocket over TLS)");
 
         std::thread::spawn(move || {
-            for stream in ws_listener.incoming().flatten() {
-                let _ = stream.set_nodelay(true);
-                let peer = stream.peer_addr().ok();
-                match tungstenite::accept(stream) {
-                    Ok(ws) => {
-                        tracing::info!(?peer, "WebSocket fallback connected");
-                        let (send_tx, send_rx) = mpsc::channel();
-                        let (recv_tx, recv_rx) = mpsc::channel();
-                        std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
-                        let _ = ws_tx.send(WsConnection {
-                            data_sender: WsSender { tx: send_tx },
-                            data_receiver: WsReceiver { rx: recv_rx },
-                        });
+            for tcp_stream in ws_listener.incoming().flatten() {
+                let _ = tcp_stream.set_nodelay(true);
+                let peer = tcp_stream.peer_addr().ok();
+                let tls = ws_tls.clone();
+                let ws_tx = ws_tx.clone();
+                std::thread::spawn(move || {
+                    let conn = match rustls::ServerConnection::new(tls) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let _ = tcp_stream.set_read_timeout(Some(std::time::Duration::from_millis(5)));
+                    let tls_stream = rustls::StreamOwned::new(conn, tcp_stream);
+                    match tungstenite::accept(tls_stream) {
+                        Ok(ws) => {
+                            tracing::info!(?peer, "WSS client connected");
+                            let (send_tx, send_rx) = mpsc::channel();
+                            let (recv_tx, recv_rx) = mpsc::channel();
+                            std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
+                            let _ = ws_tx.send(WsConnection {
+                                data_sender: WsSender { tx: send_tx },
+                                data_receiver: WsReceiver { rx: recv_rx },
+                            });
+                        }
+                        Err(e) => tracing::debug!(?peer, "WSS handshake failed: {e}"),
                     }
-                    Err(e) => tracing::debug!(?peer, "WS handshake failed: {e}"),
-                }
+                });
             }
         });
 
@@ -187,7 +198,9 @@ fn handle_http_rw(
     let request = String::from_utf8_lossy(&buf);
 
     let method = request.split_whitespace().next().unwrap_or("GET");
-    let path = request.split_whitespace().nth(1).unwrap_or("/");
+    let raw_path = request.split_whitespace().nth(1).unwrap_or("/");
+    // Strip query string for routing (e.g. "/?ws" → "/")
+    let path = raw_path.split('?').next().unwrap_or("/");
 
     // Find body after \r\n\r\n
     let body_start = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(n);
@@ -248,14 +261,12 @@ fn get_local_ip() -> Option<std::net::IpAddr> {
 
 // -- WebSocket fallback IO loop --
 
-fn ws_io_loop(
-    mut ws: WebSocket<TcpStream>,
+fn ws_io_loop<S: std::io::Read + std::io::Write>(
+    mut ws: WebSocket<S>,
     send_rx: mpsc::Receiver<Vec<u8>>,
     recv_tx: mpsc::Sender<Vec<u8>>,
 ) {
-    if let Ok(stream) = ws.get_ref().try_clone() {
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(5)));
-    }
+    // Non-blocking polling: send queued data, then try to read
     loop {
         while let Ok(data) = send_rx.try_recv() {
             if ws.send(tungstenite::Message::Binary(data)).is_err() { return; }

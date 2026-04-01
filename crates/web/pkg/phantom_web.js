@@ -271,6 +271,13 @@ function __wbg_get_imports() {
         __wbg_preventDefault_25a229bfe5c510f8: function(arg0) {
             arg0.preventDefault();
         },
+        __wbg_protocol_2c6bffc6b0fafa07: function() { return handleError(function (arg0, arg1) {
+            const ret = arg1.protocol;
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        }, arguments); },
         __wbg_prototypesetcall_d62e5099504357e6: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },

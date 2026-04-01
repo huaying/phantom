@@ -227,7 +227,9 @@ fn setup_ws(state: &Rc<RefCell<AppState>>) {
     let parts: Vec<&str> = host.split(':').collect();
     let ws_host = parts[0];
     let ws_port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9900) + 1;
-    let ws_url = format!("ws://{ws_host}:{ws_port}");
+    // Use wss:// if page is served over HTTPS (avoids mixed content block)
+    let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+    let ws_url = format!("{protocol}://{ws_host}:{ws_port}");
     console::log_1(&format!("Connecting to {ws_url}...").into());
 
     let ws = match WebSocket::new(&ws_url) {
