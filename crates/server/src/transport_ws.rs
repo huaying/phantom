@@ -4,6 +4,7 @@ use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 use str0m::{Candidate, Rtc};
 use tungstenite::WebSocket;
 
@@ -222,7 +223,7 @@ fn handle_http_rw(
             let offer_json: serde_json::Value = serde_json::from_slice(body)?;
             let sdp_str = offer_json["sdp"].as_str().context("missing sdp")?;
 
-            let mut rtc = Rtc::builder().build();
+            let mut rtc = Rtc::builder().build(Instant::now());
             let candidate = Candidate::host(candidate_addr, "udp").context("host candidate")?;
             rtc.add_local_candidate(candidate);
 

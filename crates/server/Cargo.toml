@@ -22,7 +22,7 @@ rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ring = "0.17"
 tungstenite = "0.24"
-str0m = "0.6"
+str0m = "0.18"
 serde_json = "1"
 enigo = "0.3"
 arboard = "3"

@@ -104,12 +104,10 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     };
 
     // Create 3 DataChannels
-    // Video DC: unordered + unreliable for lowest latency.
-    // Lost frames are recovered by periodic keyframes (every 2s).
-    let video_init = RtcDataChannelInit::new();
-    video_init.set_ordered(false);
-    video_init.set_max_retransmits(0);
-    let video_dc = pc.create_data_channel_with_data_channel_dict("video", &video_init);
+    // Video DC: reliable + ordered (same as Parsec). SCTP handles fragmentation
+    // for large keyframes. H.264 P-frames depend on previous frames, so loss
+    // corrupts the entire stream — reliable delivery is correct here.
+    let video_dc = pc.create_data_channel("video");
     video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
     let input_init = RtcDataChannelInit::new();
