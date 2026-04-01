@@ -8,6 +8,11 @@ use str0m::channel::ChannelId;
 use str0m::net::Protocol;
 use str0m::{Event, Input, Output, Rtc};
 
+/// Max DataChannel message size. SCTP congestion window starts small (~4KB).
+/// Sending messages larger than this causes delivery failures on fresh connections.
+/// 16KB is well under typical SCTP limits and allows fast cwnd growth.
+const DC_CHUNK_SIZE: usize = 16_384;
+
 /// A single WebRTC run loop managing one client at a time.
 /// Uses the str0m official pattern: one UDP socket, one loop, demux via accepts().
 ///
@@ -137,9 +142,6 @@ struct ActiveClient {
     /// We receive data from DataChannels → send to session loop
     input_in_tx: Option<mpsc::Sender<Vec<u8>>>,
     control_in_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// Messages that failed to write (SCTP buffer full). Retry next drain.
-    video_pending: Vec<Vec<u8>>,
-    control_pending: Vec<Vec<u8>>,
 }
 
 impl ActiveClient {
@@ -150,8 +152,6 @@ impl ActiveClient {
             channels_ready: false,
             video_rx: None, control_out_rx: None,
             input_in_tx: None, control_in_tx: None,
-            video_pending: Vec::new(),
-            control_pending: Vec::new(),
         }
     }
 
@@ -218,58 +218,52 @@ impl ActiveClient {
     fn drain_outgoing(&mut self) {
         if !self.channels_ready { return; }
 
-        // Video: retry pending writes first, then drain new messages
-        if let Some(vid) = self.video_id {
-            let mut still_pending = Vec::new();
-            for data in self.video_pending.drain(..) {
-                if let Some(mut ch) = self.rtc.channel(vid) {
-                    if ch.write(true, &data).is_err() {
-                        still_pending.push(data);
-                        break; // SCTP still full, stop trying
-                    }
-                }
-            }
-            self.video_pending = still_pending;
+        // Collect messages first to avoid borrow conflicts with write_chunked
+        let video_msgs: Vec<Vec<u8>> = self.video_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+        let ctrl_msgs: Vec<Vec<u8>> = self.control_out_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
 
-            if self.video_pending.is_empty() {
-                if let Some(ref rx) = self.video_rx {
-                    while let Ok(data) = rx.try_recv() {
-                        if let Some(mut ch) = self.rtc.channel(vid) {
-                            if ch.write(true, &data).is_err() {
-                                self.video_pending.push(data);
-                                break; // buffer full, retry next cycle
-                            }
-                        }
-                    }
-                }
+        if let Some(vid) = self.video_id {
+            for data in &video_msgs {
+                self.write_chunked(vid, data);
             }
         }
-
-        // Control: same pattern
         if let Some(ctrl) = self.control_id {
-            let mut still_pending = Vec::new();
-            for data in self.control_pending.drain(..) {
-                if let Some(mut ch) = self.rtc.channel(ctrl) {
-                    if ch.write(true, &data).is_err() {
-                        still_pending.push(data);
-                        break;
-                    }
-                }
+            for data in &ctrl_msgs {
+                self.write_chunked(ctrl, data);
             }
-            self.control_pending = still_pending;
+        }
+    }
 
-            if self.control_pending.is_empty() {
-                if let Some(ref rx) = self.control_out_rx {
-                    while let Ok(data) = rx.try_recv() {
-                        if let Some(mut ch) = self.rtc.channel(ctrl) {
-                            if ch.write(true, &data).is_err() {
-                                self.control_pending.push(data);
-                                break;
-                            }
-                        }
-                    }
-                }
+    /// Write data to a DataChannel, splitting into chunks if larger than DC_CHUNK_SIZE.
+    /// Small messages (≤ DC_CHUNK_SIZE) are sent as-is (no header overhead).
+    /// Large messages get a simple framing: each chunk is [total_len: u32 LE][chunk_data].
+    /// The receiver reassembles by reading total_len from the first chunk and accumulating
+    /// until total_len bytes of payload have been received.
+    fn write_chunked(&mut self, channel_id: ChannelId, data: &[u8]) {
+        if data.len() <= DC_CHUNK_SIZE {
+            // Small message: send directly, no framing overhead
+            if let Some(mut ch) = self.rtc.channel(channel_id) {
+                let _ = ch.write(true, data);
             }
+            return;
+        }
+
+        // Large message: split into chunks with [total_len][payload] framing
+        let total = data.len() as u32;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + DC_CHUNK_SIZE - 4).min(data.len()); // 4 bytes for header
+            let mut chunk = Vec::with_capacity(4 + (end - offset));
+            chunk.extend_from_slice(&total.to_le_bytes());
+            chunk.extend_from_slice(&data[offset..end]);
+            if let Some(mut ch) = self.rtc.channel(channel_id) {
+                let _ = ch.write(true, &chunk);
+            }
+            offset = end;
         }
     }
 }
