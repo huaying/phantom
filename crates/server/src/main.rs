@@ -48,6 +48,14 @@ struct Args {
     /// Transport protocol: tcp (default) or quic (UDP, better for WAN).
     #[arg(long, default_value = "tcp")]
     transport: String,
+
+    /// Install as auto-start (Windows: logon task, Linux: systemd service).
+    #[arg(long)]
+    install: bool,
+
+    /// Remove auto-start registration.
+    #[arg(long)]
+    uninstall: bool,
 }
 
 /// Messages from the network receive thread to the main loop.
@@ -67,6 +75,14 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.install {
+        return install_autostart();
+    }
+    if args.uninstall {
+        return uninstall_autostart();
+    }
+
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let quality_delay = Duration::from_millis(args.quality_delay_ms);
 
@@ -798,4 +814,102 @@ fn hide_remote_cursor() {
     {
         tracing::debug!("remote cursor hiding not implemented for this OS");
     }
+}
+
+/// Install phantom-server to auto-start on login.
+fn install_autostart() -> Result<()> {
+    use anyhow::Context;
+    let exe = std::env::current_exe().context("get current exe path")?;
+    #[allow(unused_variables)]
+    let exe_str = exe.to_string_lossy();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: create a scheduled task that runs at logon in the interactive session
+        let status = std::process::Command::new("schtasks")
+            .args([
+                "/Create", "/TN", "PhantomServer",
+                "/TR", &format!("\"{exe_str}\" --no-encrypt --transport web"),
+                "/SC", "ONLOGON",
+                "/RL", "HIGHEST",
+                "/IT",  // interactive — runs in the user's desktop session
+                "/F",   // force overwrite
+            ])
+            .status()
+            .context("schtasks")?;
+        if status.success() {
+            println!("Installed: PhantomServer scheduled task (runs at logon)");
+            println!("  To start now: schtasks /Run /TN PhantomServer");
+            println!("  To remove:    phantom-server --uninstall");
+        } else {
+            anyhow::bail!("schtasks failed with {status}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: install systemd user service
+        let service = format!(
+            "[Unit]\nDescription=Phantom Remote Desktop Server\nAfter=graphical.target\n\n\
+             [Service]\nType=simple\nExecStart={exe_str}\nRestart=always\nRestartSec=3\n\
+             Environment=DISPLAY=:0\n\n[Install]\nWantedBy=default.target\n"
+        );
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".config/systemd/user");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("phantom-server.service");
+        std::fs::write(&path, &service)?;
+        std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()?;
+        std::process::Command::new("systemctl")
+            .args(["--user", "enable", "--now", "phantom-server"])
+            .status()?;
+        println!("Installed: systemd user service");
+        println!("  Status: systemctl --user status phantom-server");
+        println!("  Remove: phantom-server --uninstall");
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        println!("Auto-start not yet supported on this OS. Run phantom-server manually.");
+    }
+
+    Ok(())
+}
+
+/// Remove auto-start registration.
+fn uninstall_autostart() -> Result<()> {
+    #[allow(unused_imports)]
+    use anyhow::Context;
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", "PhantomServer", "/F"])
+            .status()
+            .context("schtasks delete")?;
+        if status.success() {
+            println!("Removed: PhantomServer scheduled task");
+        } else {
+            anyhow::bail!("schtasks delete failed");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "phantom-server"])
+            .status()?;
+        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".config/systemd/user/phantom-server.service");
+        let _ = std::fs::remove_file(&path);
+        println!("Removed: systemd user service");
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        println!("Auto-start not supported on this OS.");
+    }
+
+    Ok(())
 }
