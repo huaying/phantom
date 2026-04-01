@@ -214,20 +214,31 @@ impl ActiveClient {
     fn drain_outgoing(&mut self) {
         if !self.channels_ready { return; }
 
-        // Video: send directly (unordered+unreliable — lost frames recovered by keyframes)
+        // Video: reliable + ordered (same as Parsec)
         if let (Some(ref rx), Some(vid)) = (&self.video_rx, self.video_id) {
             while let Ok(data) = rx.try_recv() {
                 if let Some(mut ch) = self.rtc.channel(vid) {
-                    let _ = ch.write(true, &data);
+                    match ch.write(true, &data) {
+                        Ok(n) => {
+                            if data.len() > 10000 {
+                                tracing::info!(size = data.len(), written = n, "DC write large msg");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(size = data.len(), err = %e, "DC write FAILED — message dropped!");
+                        }
+                    }
                 }
             }
         }
 
-        // Control: reliable channel, send directly (small messages)
+        // Control: reliable channel
         if let (Some(ref rx), Some(ctrl)) = (&self.control_out_rx, self.control_id) {
             while let Ok(data) = rx.try_recv() {
                 if let Some(mut ch) = self.rtc.channel(ctrl) {
-                    let _ = ch.write(true, &data);
+                    if let Err(e) = ch.write(true, &data) {
+                        tracing::warn!(size = data.len(), err = %e, "control DC write failed");
+                    }
                 }
             }
         }
