@@ -32,7 +32,7 @@ pub fn run_loop(
         Ok(s) => s,
         Err(e) => { tracing::error!("bind UDP: {e}"); return; }
     };
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(1)));
     let mut buf = vec![0u8; 65535];
 
     tracing::info!(port = candidate_addr.port(), "WebRTC run loop started");
