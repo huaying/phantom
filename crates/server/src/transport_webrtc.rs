@@ -77,6 +77,22 @@ pub fn run_loop(
 
             // Send outgoing data from session loop → DataChannels
             client.drain_outgoing();
+
+            // Flush: poll_output again to immediately transmit data just written
+            // by drain_outgoing. Without this, large messages (e.g. 70KB keyframe)
+            // would wait until the next loop iteration to start transmitting.
+            loop {
+                match client.rtc.poll_output() {
+                    Ok(Output::Transmit(t)) => {
+                        let _ = socket.send_to(&t.contents, t.destination);
+                    }
+                    Ok(Output::Event(event)) => {
+                        client.handle_event(event, &session_slot, &notify_tx);
+                    }
+                    Ok(Output::Timeout(_)) => break,
+                    Err(_) => break,
+                }
+            }
         }
 
         // 4. Read UDP socket
