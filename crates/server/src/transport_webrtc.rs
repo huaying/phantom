@@ -243,14 +243,34 @@ impl MessageSender for WebRtcSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         let payload = bincode::serialize(msg).context("serialize")?;
         match msg {
-            Message::Hello { .. } | Message::VideoFrame { .. } | Message::TileUpdate { .. } => {
-                // try_send: drop frame if buffer full (backpressure)
-                self.video_tx.try_send(payload)
+            // Keyframes + Hello → reliable control channel (must arrive intact)
+            // P-frames → unreliable video channel (lowest latency, loss OK)
+            Message::Hello { .. } | Message::TileUpdate { .. } => {
+                self.control_tx.try_send(payload)
                     .map_err(|e| match e {
-                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
-                        mpsc::TrySendError::Full(_) => { /* drop frame, not fatal */ anyhow::anyhow!("") },
+                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
+                        mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
                     })
-                    .or(Ok(())) // Full is OK — just skip this frame
+                    .or(Ok(()))
+            }
+            Message::VideoFrame { frame, .. } => {
+                if frame.is_keyframe {
+                    // Keyframe → control channel (reliable, guaranteed delivery)
+                    self.control_tx.try_send(payload)
+                        .map_err(|e| match e {
+                            mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
+                            mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                        })
+                        .or(Ok(()))
+                } else {
+                    // P-frame → video channel (unreliable, no retransmit)
+                    self.video_tx.try_send(payload)
+                        .map_err(|e| match e {
+                            mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
+                            mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                        })
+                        .or(Ok(()))
+                }
             }
             _ => self.control_tx.try_send(payload)
                     .map_err(|e| match e {
