@@ -137,6 +137,48 @@ fn h264_encode_decode_roundtrip() {
 }
 
 #[test]
+fn h264_first_frame_is_keyframe() {
+    use openh264::encoder::{Encoder, FrameType};
+    use openh264::formats::YUVBuffer;
+
+    struct BgraFrame<'a>(&'a [u8], usize, usize);
+    impl openh264::formats::RGBSource for BgraFrame<'_> {
+        fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+        fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
+            let i = (y * self.1 + x) * 4;
+            (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+        }
+    }
+
+    let w = 640usize;
+    let h = 480usize;
+    let bgra = vec![128u8; w * h * 4];
+    let yuv = YUVBuffer::from_rgb_source(BgraFrame(&bgra, w, h));
+
+    let mut encoder = Encoder::new().unwrap();
+
+    // First frame must be IDR
+    let bs = encoder.encode(&yuv).unwrap();
+    let ft = bs.frame_type();
+    let data = bs.to_vec();
+    eprintln!("First frame: type={ft:?}, size={}", data.len());
+    assert!(matches!(ft, FrameType::IDR | FrameType::I),
+        "First frame should be IDR/I, got {ft:?}");
+
+    // After force_intra_frame, next frame must be IDR
+    let _bs2 = encoder.encode(&yuv).unwrap().to_vec(); // P-frame
+    encoder.force_intra_frame();
+    let bs3 = encoder.encode(&yuv).unwrap();
+    let ft3 = bs3.frame_type();
+    eprintln!("After force_intra: type={ft3:?}, size={}", bs3.to_vec().len());
+    assert!(matches!(ft3, FrameType::IDR | FrameType::I),
+        "After force_intra_frame should be IDR/I, got {ft3:?}");
+    let has_sps = data.windows(4).any(|w| w == [0, 0, 0, 1])
+        && data.windows(5).any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
+    assert!(has_sps, "Keyframe should contain SPS NAL unit");
+}
+
+#[test]
 fn h264_pframe_smaller_than_keyframe() {
     use openh264::encoder::Encoder;
     use openh264::formats::YUVBuffer;
