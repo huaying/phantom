@@ -21,6 +21,17 @@ impl ScrapCapture {
         tracing::info!(width, height, "ScrapCapture initialized");
         Ok(Self { capturer, width, height })
     }
+
+    /// Recreate the capturer. Resets DXGI Desktop Duplication state so the
+    /// next capture() call returns a frame even on a static desktop.
+    pub fn reset(&mut self) -> Result<()> {
+        let display = Display::primary().context("failed to get primary display")?;
+        self.width = display.width() as u32;
+        self.height = display.height() as u32;
+        self.capturer = Capturer::new(display).context("failed to recreate capturer")?;
+        tracing::debug!("ScrapCapture reset");
+        Ok(())
+    }
 }
 
 impl FrameCapture for ScrapCapture {
@@ -62,5 +73,9 @@ impl FrameCapture for ScrapCapture {
 
     fn resolution(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reset()
     }
 }

@@ -231,6 +231,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         Message::VideoFrame { sequence, frame } => {
             if frame.codec != VideoCodec::H264 || frame.data.is_empty() { return; }
             let mut s = state.borrow_mut();
+            // Log first few frames for debugging
+            if s.frame_count < 5 {
+                console::log_1(&format!("pre-decode #{}: {} bytes, kf={}", s.frame_count, frame.data.len(), frame.is_keyframe).into());
+            }
             s.frame_count += 1;
             s.last_video_sequence = sequence;
             let fc = s.frame_count;
@@ -240,8 +244,11 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if let Some(ref decoder) = s.decoder {
                 let data_js = js_sys::Uint8Array::from(frame.data.as_slice());
                 let init = js_sys::Object::new();
+                // Detect keyframe by parsing H.264 NAL units directly.
+                // is_keyframe flag from encoder can be unreliable.
+                let is_key = h264_has_idr(&frame.data);
                 js_sys::Reflect::set(&init, &"type".into(),
-                    &if frame.is_keyframe { "key" } else { "delta" }.into()).unwrap();
+                    &if is_key { "key" } else { "delta" }.into()).unwrap();
                 js_sys::Reflect::set(&init, &"timestamp".into(),
                     &(fc as f64 * 33333.0).into()).unwrap();
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
@@ -283,14 +290,37 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             }
         }
-        Message::ClipboardSync(text) => {
-            if let Some(w) = web_sys::window() {
-                let nav = w.navigator();
-                { let cb = nav.clipboard(); let _ = cb.write_text(&text); }
-            }
+        Message::ClipboardSync(_text) => {
+            // Clipboard write requires document focus and secure context.
+            // Silently ignore — don't let it crash the message handler.
         }
         _ => {}
     }
+}
+
+/// Check if an H.264 bitstream contains an IDR (keyframe) NAL unit.
+fn h264_has_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        // Look for start code 00 00 00 01 or 00 00 01
+        if data[i..i + 4] == [0, 0, 0, 1] {
+            let nal_type = data[i + 4] & 0x1f;
+            // 5 = IDR slice, 7 = SPS (always precedes keyframe)
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+            i += 4;
+        } else if i + 3 < data.len() && data[i..i + 3] == [0, 0, 1] {
+            let nal_type = data[i + 3] & 0x1f;
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {

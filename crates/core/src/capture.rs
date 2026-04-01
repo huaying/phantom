@@ -12,4 +12,10 @@ pub trait FrameCapture {
 
     /// The current capture resolution.
     fn resolution(&self) -> (u32, u32);
+
+    /// Reset the capturer for a new session. On Windows DXGI, this recreates
+    /// the Desktop Duplication output so capture() returns a fresh frame.
+    fn reset(&mut self) -> Result<()> {
+        Ok(()) // default no-op
+    }
 }

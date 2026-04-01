@@ -572,8 +572,11 @@ fn run_session(
     // New client needs a keyframe to start decoding
     video_encoder.force_keyframe();
     differ.reset();
+    // Reset capturer so DXGI returns a fresh frame (Windows: stale after idle)
+    let _ = capture.reset();
 
     let (width, height) = capture.resolution();
+
     sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
     tracing::info!(width, height, "session started");
 
@@ -602,6 +605,16 @@ fn run_session(
     let mut stats_bytes: u64 = 0;
     let mut last_frame: Option<Frame> = None;
     let mut had_input = false;
+    let mut sent_first_frame = false;
+
+    // Nudge the screen to force DXGI to return a frame on static desktops.
+    // Without this, Windows DXGI Desktop Duplication never returns a first frame
+    // if nothing has changed on screen since the last session.
+    if let Some(ref mut inj) = injector {
+        use phantom_core::input::InputEvent;
+        let _ = inj.inject(&InputEvent::MouseMove { x: 0, y: 0 });
+        let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
+    }
 
     loop {
         let loop_start = Instant::now();
@@ -670,10 +683,11 @@ fn run_session(
             }
         };
 
-        // After input injection, always encode (screen likely changed in ways
-        // that sampling-based has_changes() might miss, e.g. xeyes, cursor blink).
-        let changed = had_input || differ.has_changes(&frame);
+        // First frame must always be encoded (keyframe for client decoder).
+        // After that, encode on input or screen changes.
+        let changed = !sent_first_frame || had_input || differ.has_changes(&frame);
         if changed {
+            sent_first_frame = true;
             had_input = false;
             let dirty_tiles = differ.diff(&frame);
             quality.on_motion();
