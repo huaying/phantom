@@ -222,14 +222,10 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
 fn setup_ws(state: &Rc<RefCell<AppState>>) {
     let window = web_sys::window().unwrap();
     let location = window.location();
-    let host = location.host().unwrap_or_default();
-    // WS port = HTTPS port + 1 (e.g. 9900 → 9901)
-    let parts: Vec<&str> = host.split(':').collect();
-    let ws_host = parts[0];
-    let ws_port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9900) + 1;
-    // Use wss:// if page is served over HTTPS (avoids mixed content block)
+    let host = location.host().unwrap_or_default(); // includes port
+    // Use wss:// on same port as HTTPS (same self-signed cert, no mixed content)
     let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
-    let ws_url = format!("{protocol}://{ws_host}:{ws_port}");
+    let ws_url = format!("{protocol}://{host}/ws");
     console::log_1(&format!("Connecting to {ws_url}...").into());
 
     let ws = match WebSocket::new(&ws_url) {

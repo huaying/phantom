@@ -94,6 +94,7 @@ impl WebServerTransport {
             for tcp_stream in http_listener.incoming().flatten() {
                 let tls = tls_acceptor.clone();
                 let rtc_tx = rtc_tx.clone();
+                let ws_tx = ws_tx.clone();
                 let candidate_addr = candidate_addr;
                 std::thread::spawn(move || {
                     let conn = match rustls::ServerConnection::new(tls) {
@@ -101,34 +102,14 @@ impl WebServerTransport {
                         Err(_) => return,
                     };
                     let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
-                    // Wrap in a BufReader-compatible type for handle_http
-                    let _ = handle_http_rw(&mut stream, rtc_tx, candidate_addr);
-                });
-            }
-        });
-
-        // WebSocket server thread (TLS — avoids mixed content when page is HTTPS)
-        let ws_addr = format!("0.0.0.0:{ws_port}");
-        let ws_listener = TcpListener::bind(&ws_addr).context("bind WSS")?;
-        let ws_tls = make_tls_acceptor()?;
-        tracing::info!(addr = %ws_addr, "WSS server (WebSocket over TLS)");
-
-        std::thread::spawn(move || {
-            for tcp_stream in ws_listener.incoming().flatten() {
-                let _ = tcp_stream.set_nodelay(true);
-                let peer = tcp_stream.peer_addr().ok();
-                let tls = ws_tls.clone();
-                let ws_tx = ws_tx.clone();
-                std::thread::spawn(move || {
-                    let conn = match rustls::ServerConnection::new(tls) {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
-                    let _ = tcp_stream.set_read_timeout(Some(std::time::Duration::from_millis(5)));
-                    let tls_stream = rustls::StreamOwned::new(conn, tcp_stream);
-                    match tungstenite::accept(tls_stream) {
-                        Ok(ws) => {
-                            tracing::info!(?peer, "WSS client connected");
+                    match handle_http_rw(&mut stream, rtc_tx, candidate_addr) {
+                        Ok(HttpResult::WsUpgrade) => {
+                            // Handshake already sent. Create WebSocket from raw stream.
+                            let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_millis(5)));
+                            let ws = tungstenite::WebSocket::from_raw_socket(
+                                stream, tungstenite::protocol::Role::Server, None,
+                            );
+                            tracing::info!("WebSocket client connected via HTTPS port");
                             let (send_tx, send_rx) = mpsc::channel();
                             let (recv_tx, recv_rx) = mpsc::channel();
                             std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
@@ -137,11 +118,17 @@ impl WebServerTransport {
                                 data_receiver: WsReceiver { rx: recv_rx },
                             });
                         }
-                        Err(e) => tracing::debug!(?peer, "WSS handshake failed: {e}"),
+                        _ => {} // Normal HTTP request, already handled
                     }
                 });
             }
         });
+
+        // WebSocket is now handled on the same HTTPS port (9900) via upgrade.
+        // Port 9901 still bound for backwards compatibility but WS clients should
+        // use wss://host:9900/ws instead.
+        let ws_addr = format!("0.0.0.0:{ws_port}");
+        let _ws_listener = TcpListener::bind(&ws_addr).ok(); // bind but don't serve
 
         Ok(Self { rtc_session, rtc_notify, ws_rx })
     }
@@ -185,12 +172,18 @@ impl WebServerTransport {
     }
 }
 
+/// Result of handling an HTTP request. WsUpgrade means the connection wants WebSocket.
+enum HttpResult {
+    Done,
+    WsUpgrade,
+}
+
 /// Handle a single HTTP request over any Read+Write stream (plain TCP or TLS).
 fn handle_http_rw(
     stream: &mut (impl Read + Write),
     rtc_tx: mpsc::Sender<Rtc>,
     candidate_addr: std::net::SocketAddr,
-) -> Result<()> {
+) -> Result<HttpResult> {
     // Read full request (headers + body) into buffer
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
@@ -201,6 +194,24 @@ fn handle_http_rw(
     let raw_path = request.split_whitespace().nth(1).unwrap_or("/");
     // Strip query string for routing (e.g. "/?ws" → "/")
     let path = raw_path.split('?').next().unwrap_or("/");
+
+    // Detect WebSocket upgrade request
+    let request_lower = request.to_ascii_lowercase();
+    if request_lower.contains("upgrade: websocket") {
+        // Extract Sec-WebSocket-Key
+        let key = request.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        // Send 101 Switching Protocols
+        let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        write!(stream,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )?;
+        stream.flush()?;
+        return Ok(HttpResult::WsUpgrade);
+    }
 
     // Find body after \r\n\r\n
     let body_start = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(n);
@@ -249,7 +260,7 @@ fn handle_http_rw(
         }
     }
     stream.flush()?;
-    Ok(())
+    Ok(HttpResult::Done)
 }
 
 
