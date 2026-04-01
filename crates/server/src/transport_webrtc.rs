@@ -121,6 +121,9 @@ struct ActiveClient {
     /// We receive data from DataChannels → send to session loop
     input_in_tx: Option<mpsc::Sender<Vec<u8>>>,
     control_in_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Messages that failed to write (SCTP buffer full). Retry next drain.
+    video_pending: Vec<Vec<u8>>,
+    control_pending: Vec<Vec<u8>>,
 }
 
 impl ActiveClient {
@@ -131,6 +134,8 @@ impl ActiveClient {
             channels_ready: false,
             video_rx: None, control_out_rx: None,
             input_in_tx: None, control_in_tx: None,
+            video_pending: Vec::new(),
+            control_pending: Vec::new(),
         }
     }
 
@@ -197,20 +202,56 @@ impl ActiveClient {
     fn drain_outgoing(&mut self) {
         if !self.channels_ready { return; }
 
-        // Video
-        if let (Some(ref rx), Some(vid)) = (&self.video_rx, self.video_id) {
-            while let Ok(data) = rx.try_recv() {
+        // Video: retry pending writes first, then drain new messages
+        if let Some(vid) = self.video_id {
+            let mut still_pending = Vec::new();
+            for data in self.video_pending.drain(..) {
                 if let Some(mut ch) = self.rtc.channel(vid) {
-                    let _ = ch.write(true, &data);
+                    if ch.write(true, &data).is_err() {
+                        still_pending.push(data);
+                        break; // SCTP still full, stop trying
+                    }
+                }
+            }
+            self.video_pending = still_pending;
+
+            if self.video_pending.is_empty() {
+                if let Some(ref rx) = self.video_rx {
+                    while let Ok(data) = rx.try_recv() {
+                        if let Some(mut ch) = self.rtc.channel(vid) {
+                            if ch.write(true, &data).is_err() {
+                                self.video_pending.push(data);
+                                break; // buffer full, retry next cycle
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Control out
-        if let (Some(ref rx), Some(ctrl)) = (&self.control_out_rx, self.control_id) {
-            while let Ok(data) = rx.try_recv() {
+        // Control: same pattern
+        if let Some(ctrl) = self.control_id {
+            let mut still_pending = Vec::new();
+            for data in self.control_pending.drain(..) {
                 if let Some(mut ch) = self.rtc.channel(ctrl) {
-                    let _ = ch.write(true, &data);
+                    if ch.write(true, &data).is_err() {
+                        still_pending.push(data);
+                        break;
+                    }
+                }
+            }
+            self.control_pending = still_pending;
+
+            if self.control_pending.is_empty() {
+                if let Some(ref rx) = self.control_out_rx {
+                    while let Ok(data) = rx.try_recv() {
+                        if let Some(mut ch) = self.rtc.channel(ctrl) {
+                            if ch.write(true, &data).is_err() {
+                                self.control_pending.push(data);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
