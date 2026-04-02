@@ -223,7 +223,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 - **DXGI refresh rate**: capture FPS capped by monitor refresh rate (DWM). RDP/headless may have low refresh (15-30Hz). Check with `wmic path Win32_VideoController get CurrentRefreshRate`.
 - **WS disconnect under high bandwidth**: TLS write can exceed read timeout → tungstenite interprets as error. Increased timeout from 5ms to 50ms.
 - **Stuck modifier keys**: Super/Meta (macOS Cmd) gets stuck on server after Cmd+Tab. Server releases all modifiers on session start. Client does NOT send Super/Meta, releases modifiers on focus loss.
-- **NVENC reconnect black screen**: must recreate encoder between sessions. NVENC only outputs SPS/PPS on first encode after `nvEncInitializeEncoder()`. `force_keyframe()` produces IDR without SPS/PPS → WebCodecs can't decode. Server recreates encoder via `create_encoder()` after each session.
+- **NVENC SPS/PPS**: NVENC only outputs SPS/PPS on first encode after `nvEncInitializeEncoder()`. `force_keyframe()` produces IDR without SPS/PPS. Fix: server saves SPS/PPS from first keyframe and prepends to subsequent keyframes that lack it. Do NOT recreate encoder per session (causes CUDA context conflicts on Linux).
+- **NVENC set_repeat_sps_pps offset**: offset 152 in NvEncConfig is unreliable across drivers. Driver 537 (L40) ignores it, driver 550 (A40) returns INVALID_PARAM. Do NOT use — use SPS/PPS save+prepend instead.
 - **NVENC WebCodecs codec string**: must use `avc1.42c028` (Baseline Level 4.0). NVENC outputs Level 4.0 for 1080p. Previous `avc1.42001f` (Level 3.1) silently rejected 1080p (exceeds level max 720p).
 - **Stale xdotool processes**: bench code spawns `xdotool mousemove` loops. Always `pkill -f xdotool` after bench testing — leftover loops send random mouse coordinates causing phantom cursor drift.
 - **GNOME input**: enigo (XTest) works on GNOME when no other processes interfere. Previous "GNOME broken" diagnosis was caused by stale xdotool processes, not Mutter.
@@ -277,7 +278,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~Fix WebRTC session disconnect detection~~ | ✅ done | ICE Disconnected → drop ActiveClient → session ends |
 | ~~DXGI→NVENC zero-copy~~ | ✅ done | 6fps→47fps on Windows L40 |
 | ~~Make WS default, WebRTC optional~~ | ✅ done | `--features webrtc` + `?rtc` |
-| **Web client auto-reconnect** | UX | WS disconnects under high load (50ms timeout helps but not 100%). Browser should auto-retry. |
+| ~~Web client auto-reconnect~~ | ✅ done | Exponential backoff 1s→5s cap, resets decoder state |
+| **Multi-transport** | UX | Support TCP + WSS simultaneously (currently one at a time) |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
 | **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
 | **WAN testing** | verify real latency | Need cloud VM, `tc netem` for simulating loss/delay |
@@ -330,7 +332,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | No graceful shutdown (Ctrl+C) | Low |
 | HTTP handler threads unbounded (no pool) | Medium |
 | WS IO loop 50ms read timeout (was 5ms, increased for stability) | Low |
-| Web client no auto-reconnect on WS disconnect | Medium |
+| ~~Web client no auto-reconnect~~ — fixed: exponential backoff | ✅ Fixed |
+| Server single-transport — TCP or WSS, not both simultaneously | Medium |
 | Mock server lacks encryption/input | Low |
 | Tile code still in codebase but unused (encode_zstd, TileUpdate messages) | Low |
 
