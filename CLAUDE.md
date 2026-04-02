@@ -4,7 +4,7 @@
 
 Phantom is a high-performance, open-source remote desktop built in Rust. Target: Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text), single binary deployment, browser + native access.
 
-~7,000 lines Rust, 21 tests, MIT license. Runs on Linux + Windows.
+~17,000 lines Rust (across 7 crates), 21 tests, MIT license. Runs on Linux + Windows.
 
 ## Build Commands
 
@@ -63,7 +63,7 @@ Phantom (target)    20-50ms     pixel-perfect   single binary ✅          ✅
 2. **WSS fallback on same port** — WebSocket + WebCodecs as reliable fallback (validated by Helix at scale)
 3. **Single binary** — web client embedded, no Docker/GStreamer/coturn needed
 4. **Rust WASM code sharing** — one codebase for server + web client
-5. **~7,000 lines** — vs KasmVNC 200K+, Neko 15K+, RustDesk 150K
+5. **~17K lines** — vs KasmVNC 200K+, Neko 15K+, RustDesk 150K
 
 ### Key Lessons From Competitors
 - **Parsec (BorgGames/streaming-client)**: uses DataChannel reliable+ordered for video, MSE decode. Only other production DataChannel video impl.
@@ -231,13 +231,13 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (26)
+## Implemented Features (27)
 
 | # | Feature |
 |---|---------|
 | 1 | H.264 encoding (OpenH264 CPU, `--encoder` plugin architecture) |
-| 2 | Always H.264 full frames (tile mode removed — caused tearing) |
-| 3 | Periodic keyframe (2s interval, recovers from loss/errors) |
+| 2 | H.264 full frames + lossless refinement after 2s idle (tile-based smart encoding removed — caused tearing) |
+| 3 | Periodic keyframe (2s interval, recovers from loss/decoder errors) |
 | 4 | ChaCha20-Poly1305 encryption (TCP) / TLS (QUIC) / DTLS (WebRTC) |
 | 5 | QUIC/UDP transport (quinn) |
 | 6 | TCP transport with optional encryption |
@@ -383,7 +383,7 @@ crates/web/src/
                        mouse/keyboard/scroll/paste input capture, h264_has_idr() NAL parser
 
 crates/gpu/src/
-  lib.rs               Module exports (pub mod cuda, nvenc, nvfbc, sys)
+  lib.rs               Module exports (cuda, nvenc, nvfbc[linux], dxgi[win], dxgi_nvenc[win])
   dl.rs                Runtime dlopen/dlsym abstraction (no build-time NVIDIA dep)
   sys.rs               C FFI types: CUDA, NVENC (SDK 12.1), NVFBC (v1.8/1.9 compat)
   cuda.rs              CUDA driver API: context, memory, memcpy, primary context
