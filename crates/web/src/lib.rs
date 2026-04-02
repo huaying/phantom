@@ -346,7 +346,8 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             let is_key = h264_has_idr(&frame.data);
             // Log first few frames for debugging
             if s.frame_count < 5 {
-                console::log_1(&format!("frame #{}: {} bytes, encoder_kf={}, nal_idr={}", s.frame_count, frame.data.len(), frame.is_keyframe, is_key).into());
+                let hex: String = frame.data.iter().take(32).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                console::log_1(&format!("frame #{}: {} bytes, kf={}, idr={}, hex=[{}]", s.frame_count, frame.data.len(), frame.is_keyframe, is_key, hex).into());
             }
             // WebCodecs requires a keyframe before any delta frames can be decoded.
             // Skip delta frames until we receive the first keyframe.
@@ -467,7 +468,10 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
     let decoder = JsVideoDecoder::new(&init);
 
     let config = js_sys::Object::new();
-    js_sys::Reflect::set(&config, &"codec".into(), &"avc1.42001f".into()).unwrap();
+    // Baseline profile, Level 4.0 — supports 1080p@30fps.
+    // NVENC outputs Level 4.0 (0x28), OpenH264 outputs Level 3.1 (0x1f).
+    // Level 4.0 config decodes both (higher level is superset).
+    js_sys::Reflect::set(&config, &"codec".into(), &"avc1.42c028".into()).unwrap();
     js_sys::Reflect::set(&config, &"codedWidth".into(), &(width).into()).unwrap();
     js_sys::Reflect::set(&config, &"codedHeight".into(), &(height).into()).unwrap();
     js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &true.into()).unwrap();

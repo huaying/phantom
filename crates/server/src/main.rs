@@ -214,9 +214,15 @@ fn main() -> Result<()> {
         );
         if let Err(e) = result {
             tracing::warn!("session ended: {e}");
-            if let Some(ref mut enc) = video_encoder {
-                differ.reset();
-                enc.force_keyframe();
+            // Recreate encoder for new session — NVENC needs fresh encoder
+            // to produce SPS/PPS with the first keyframe. force_keyframe()
+            // alone only produces IDR without SPS/PPS headers.
+            differ.reset();
+            if let Some(ref enc_name) = Some(args.encoder.clone()) {
+                match create_encoder(enc_name, width, height, args.fps as f32, args.bitrate) {
+                    Ok(enc) => { video_encoder = Some(enc); }
+                    Err(e) => tracing::error!("encoder recreate failed: {e}"),
+                }
             }
             #[cfg(target_os = "linux")]
             if let Some(ref mut gpu) = gpu {

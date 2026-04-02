@@ -236,6 +236,13 @@ impl NvEncConfig {
     pub fn set_rc_mode(&mut self, v: u32) { self.write_u32(40 + 4, v); }
     pub fn set_avg_bitrate(&mut self, v: u32) { self.write_u32(40 + 20, v); }
     pub fn set_max_bitrate(&mut self, v: u32) { self.write_u32(40 + 24, v); }
+    // encodeCodecConfig starts at offset 152
+    // h264Config.repeatSPSPPS is bit 0 of the uint32_t at offset 152
+    pub fn set_repeat_sps_pps(&mut self, enable: bool) {
+        let mut v = self.read_u32(152);
+        if enable { v |= 1; } else { v &= !1; }
+        self.write_u32(152, v);
+    }
 }
 
 // --- NV_ENC_PRESET_CONFIG (5128 bytes) ---

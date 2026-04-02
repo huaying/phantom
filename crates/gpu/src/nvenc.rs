@@ -30,6 +30,9 @@ pub struct NvencEncoder {
     nv12_buf: Vec<u8>,
     force_idr: bool,
     frame_idx: u64,
+    /// Saved SPS/PPS NAL units from the first keyframe.
+    /// Prepended to subsequent keyframes that don't include them.
+    sps_pps: Vec<u8>,
     owns_ctx: bool,
     _nvenc_lib: DynLib,
 }
@@ -139,6 +142,7 @@ impl NvencEncoder {
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
         config.set_max_bitrate(bitrate_kbps * 1000 * 2);
+        config.set_repeat_sps_pps(true); // include SPS/PPS with every IDR (WebCodecs needs it)
 
         // Initialize encoder
         let mut init_params = NvEncInitializeParams::zeroed();
@@ -196,6 +200,7 @@ impl NvencEncoder {
             nv12_buf: vec![0u8; nv12_size],
             force_idr: true, // first frame is always IDR
             frame_idx: 0,
+            sps_pps: Vec::new(),
             owns_ctx,
             _nvenc_lib: nvenc_lib,
         })
