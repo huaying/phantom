@@ -213,7 +213,8 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 - **WSS same port**: WS upgrade on HTTPS port 9900 (not separate port). Avoids self-signed cert rejection for second port.
 - **HTTP query string**: strip `?ws` from path before routing, otherwise `/?ws` returns 404.
 - **Stuck modifier keys**: Super/Meta (macOS Cmd) gets stuck on server after Cmd+Tab. Server releases all modifiers on session start. Client does NOT send Super/Meta, releases modifiers on focus loss.
-- **NVENC reconnect black screen**: must recreate NVENC encoder between sessions (stale reference frames). `GpuPipeline::reset_for_new_session()` destroys+recreates both NVFBC session and NVENC encoder.
+- **NVENC reconnect black screen**: must recreate encoder between sessions. NVENC only outputs SPS/PPS on first encode after `nvEncInitializeEncoder()`. `force_keyframe()` produces IDR without SPS/PPS → WebCodecs can't decode. Server recreates encoder via `create_encoder()` after each session.
+- **NVENC WebCodecs codec string**: must use `avc1.42c028` (Baseline Level 4.0). NVENC outputs Level 4.0 for 1080p. Previous `avc1.42001f` (Level 3.1) silently rejected 1080p (exceeds level max 720p).
 - **Stale xdotool processes**: bench code spawns `xdotool mousemove` loops. Always `pkill -f xdotool` after bench testing — leftover loops send random mouse coordinates causing phantom cursor drift.
 - **GNOME input**: enigo (XTest) works on GNOME when no other processes interfere. Previous "GNOME broken" diagnosis was caused by stale xdotool processes, not Mutter.
 - **WASM feature flag**: `--no-default-features` builds server without WASM (for GPU-only VMs without wasm-pack).
