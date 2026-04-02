@@ -8,6 +8,9 @@ use str0m::channel::ChannelId;
 use str0m::net::Protocol;
 use str0m::{Event, Input, Output, Rtc};
 
+/// Max single DataChannel message size. str0m's SCTP silently fails on
+/// messages larger than ~16KB. Split into chunks with reassembly on client.
+const DC_CHUNK_SIZE: usize = 16_384;
 
 /// A single WebRTC run loop managing one client at a time.
 /// Uses the str0m official pattern: one UDP socket, one loop, demux via accepts().
@@ -53,10 +56,11 @@ pub fn run_loop(
             }
         }
 
-        // 2. Clean up disconnected client (ICE timeout, etc.)
+        // 2. Clean up disconnected client
         if let Some(ref client) = active {
-            if !client.rtc.is_alive() {
-                tracing::info!("WebRTC client disconnected");
+            if !client.rtc.is_alive() || client.ice_disconnected {
+                tracing::info!("WebRTC client disconnected (alive={}, ice_disconnected={})",
+                    client.rtc.is_alive(), client.ice_disconnected);
                 active = None;
             }
         }
@@ -132,6 +136,7 @@ struct ActiveClient {
     input_id: Option<ChannelId>,
     control_id: Option<ChannelId>,
     channels_ready: bool,
+    ice_disconnected: bool,
     /// Session loop sends data here → we write to DataChannels
     video_rx: Option<mpsc::Receiver<Vec<u8>>>,
     control_out_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -146,6 +151,7 @@ impl ActiveClient {
             rtc,
             video_id: None, input_id: None, control_id: None,
             channels_ready: false,
+            ice_disconnected: false,
             video_rx: None, control_out_rx: None,
             input_in_tx: None, control_in_tx: None,
         }
@@ -206,6 +212,9 @@ impl ActiveClient {
             }
             Event::IceConnectionStateChange(s) => {
                 tracing::info!(?s, "ICE state");
+                if matches!(s, str0m::IceConnectionState::Disconnected) {
+                    self.ice_disconnected = true;
+                }
             }
             _ => {}
         }
@@ -214,33 +223,46 @@ impl ActiveClient {
     fn drain_outgoing(&mut self) {
         if !self.channels_ready { return; }
 
-        // Video: reliable + ordered (same as Parsec)
-        if let (Some(ref rx), Some(vid)) = (&self.video_rx, self.video_id) {
-            while let Ok(data) = rx.try_recv() {
-                if let Some(mut ch) = self.rtc.channel(vid) {
-                    match ch.write(true, &data) {
-                        Ok(n) => {
-                            if data.len() > 10000 {
-                                tracing::info!(size = data.len(), written = n, "DC write large msg");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(size = data.len(), err = %e, "DC write FAILED — message dropped!");
-                        }
-                    }
-                }
+        // Collect messages to avoid borrow conflict with write_chunked
+        let video_msgs: Vec<Vec<u8>> = self.video_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+        let ctrl_msgs: Vec<Vec<u8>> = self.control_out_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+
+        if let Some(vid) = self.video_id {
+            for data in &video_msgs {
+                self.write_chunked(vid, data);
             }
         }
-
-        // Control: reliable channel
-        if let (Some(ref rx), Some(ctrl)) = (&self.control_out_rx, self.control_id) {
-            while let Ok(data) = rx.try_recv() {
-                if let Some(mut ch) = self.rtc.channel(ctrl) {
-                    if let Err(e) = ch.write(true, &data) {
-                        tracing::warn!(size = data.len(), err = %e, "control DC write failed");
-                    }
-                }
+        if let Some(ctrl) = self.control_id {
+            for data in &ctrl_msgs {
+                self.write_chunked(ctrl, data);
             }
+        }
+    }
+
+    /// Write data to a DataChannel, splitting into chunks if larger than DC_CHUNK_SIZE.
+    /// Small messages sent as-is. Large messages: each chunk = [u32 total_len LE][payload].
+    fn write_chunked(&mut self, channel_id: ChannelId, data: &[u8]) {
+        if data.len() <= DC_CHUNK_SIZE {
+            if let Some(mut ch) = self.rtc.channel(channel_id) {
+                let _ = ch.write(true, data);
+            }
+            return;
+        }
+        let total = data.len() as u32;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + DC_CHUNK_SIZE - 4).min(data.len());
+            let mut chunk = Vec::with_capacity(4 + (end - offset));
+            chunk.extend_from_slice(&total.to_le_bytes());
+            chunk.extend_from_slice(&data[offset..end]);
+            if let Some(mut ch) = self.rtc.channel(channel_id) {
+                let _ = ch.write(true, &chunk);
+            }
+            offset = end;
         }
     }
 }
