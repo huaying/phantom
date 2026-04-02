@@ -262,7 +262,7 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | ~~NVFBC GPU capture~~ | ✅ done | zero-copy CUdeviceptr, ~0.4ms capture |
 | ~~Windows support~~ | ✅ done | DXGI capture, auto-start via schtasks |
 | ~~Web client WSS fallback~~ | ✅ done | `?ws` URL param, same HTTPS port |
-| **Fix WebRTC session disconnect detection** | **high** | `send_msg()` swallows errors → zombie session blocks new clients |
+| ~~Fix WebRTC session disconnect detection~~ | ✅ done | ICE Disconnected → drop ActiveClient → session ends |
 | **Remove dead tile code** | cleanup | encode_zstd, TileUpdate, TileDiffer dirty% threshold — all unused |
 | **Integrate GPU pipeline into server** | full end-to-end | Wire `--capture nvfbc --encoder nvenc` into run_session zero-copy loop |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
@@ -309,7 +309,7 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 
 | Item | Severity |
 |------|----------|
-| **WebRTC session doesn't detect disconnect** — WebRTC ICE disconnects but `run_session()` keeps running. `send_msg()` `try_send` Full error swallowed by `.or(Ok(()))`. Blocks WS clients from connecting after WebRTC. | **High** |
+| ~~WebRTC session zombie~~ — fixed: ICE Disconnected → drop ActiveClient → channels disconnect → session ends | ✅ Fixed |
 | **str0m SCTP drops large messages** — `ch.write()` silently fails for >16KB messages. Chunking workaround in place but root cause unknown. | **High** |
 | **Server single-session** — only one client at a time. New connections queue until current session ends. Need proper session replacement. | Medium |
 | BGRA→YUV via `pixel_f32()` (slow per-pixel callback) | Medium |
