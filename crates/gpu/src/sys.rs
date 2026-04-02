@@ -59,6 +59,7 @@ pub const NV_ENC_LOCK_BITSTREAM_VER: u32 = sv(1) | (1 << 31);       // 0xF101000
 pub const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = sv(1);           // 0x7101000C
 
 // Device type
+pub const NV_ENC_DEVICE_TYPE_DIRECTX: u32 = 0;
 pub const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
 
 // Tuning info
@@ -74,6 +75,7 @@ pub const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x0100_0000;
 pub const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x1000_0000;
 
 // Input resource type
+pub const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0;
 pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 1;
 
 // Picture struct
@@ -200,6 +202,7 @@ opaque_struct!(NvEncOpenEncodeSessionExParams, 1552);
 
 impl NvEncOpenEncodeSessionExParams {
     pub fn set_version(&mut self) { self.write_u32(0, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER); }
+    pub fn set_device_type_directx(&mut self) { self.write_u32(4, NV_ENC_DEVICE_TYPE_DIRECTX); }
     pub fn set_device_type_cuda(&mut self) { self.write_u32(4, NV_ENC_DEVICE_TYPE_CUDA); }
     pub fn set_device(&mut self, ctx: CUcontext) { self.write_ptr(8, ctx); }
     pub fn set_api_version(&mut self) { self.write_u32(24, NVENCAPI_VERSION); }

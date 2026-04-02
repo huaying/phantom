@@ -306,7 +306,7 @@ fn spawn_ws_connection(
     stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     ws_tx: mpsc::Sender<WsConnection>,
 ) {
-    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_millis(5)));
+    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
     let ws = tungstenite::WebSocket::from_raw_socket(
         stream, tungstenite::protocol::Role::Server, None,
     );

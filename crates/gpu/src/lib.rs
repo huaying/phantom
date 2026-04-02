@@ -10,3 +10,7 @@ pub mod cuda;
 pub mod nvenc;
 #[cfg(target_os = "linux")]
 pub mod nvfbc;
+#[cfg(target_os = "windows")]
+pub mod dxgi;
+#[cfg(target_os = "windows")]
+pub mod dxgi_nvenc;

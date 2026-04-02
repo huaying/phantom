@@ -104,19 +104,28 @@ fn main() -> Result<()> {
         Some(key)
     };
 
+    // GPU zero-copy pipeline detection
     #[cfg(target_os = "linux")]
     let use_gpu_pipeline = args.capture == "nvfbc" && args.encoder == "nvenc";
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let use_gpu_pipeline = args.capture == "dxgi" && args.encoder == "nvenc";
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let use_gpu_pipeline = false;
 
-    // GPU zero-copy pipeline (Linux only) or CPU pipeline
+    // GPU zero-copy pipeline (Linux: NVFBC→NVENC, Windows: DXGI→NVENC)
     #[cfg(target_os = "linux")]
     let mut gpu = if use_gpu_pipeline {
         Some(GpuPipeline::new(args.fps, args.bitrate)?)
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let mut gpu_win = if use_gpu_pipeline {
+        Some(phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(args.fps, args.bitrate)?)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _gpu: Option<()> = None;
 
     let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
@@ -124,14 +133,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    #[cfg(target_os = "linux")]
-    let (width, height) = if let Some(ref gpu) = gpu {
-        (gpu.width, gpu.height)
+
+    let (width, height) = if use_gpu_pipeline {
+        #[cfg(target_os = "linux")]
+        { (gpu.as_ref().unwrap().width, gpu.as_ref().unwrap().height) }
+        #[cfg(target_os = "windows")]
+        { (gpu_win.as_ref().unwrap().width, gpu_win.as_ref().unwrap().height) }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        { unreachable!() }
     } else {
         capture.as_ref().unwrap().resolution()
     };
-    #[cfg(not(target_os = "linux"))]
-    let (width, height) = capture.as_ref().unwrap().resolution();
+
     let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
         Some(create_encoder(&args.encoder, width, height, args.fps as f32, args.bitrate)?)
     } else {
@@ -205,7 +218,18 @@ fn main() -> Result<()> {
                 sender, receiver, frame_interval, quality_delay,
             )
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        let result = if let Some(ref mut gw) = gpu_win {
+            run_session_dxgi(gw, sender, receiver, frame_interval)
+        } else {
+            run_session(
+                &mut **capture.as_mut().unwrap(),
+                &mut **video_encoder.as_mut().unwrap(),
+                &mut differ,
+                sender, receiver, frame_interval, quality_delay,
+            )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let result = run_session(
             &mut **capture.as_mut().unwrap(),
             &mut **video_encoder.as_mut().unwrap(),
@@ -229,6 +253,12 @@ fn main() -> Result<()> {
                 let _ = gpu.capture.release_context();
                 if let Err(e) = gpu.reset_for_new_session() {
                     tracing::error!("GPU pipeline reset failed: {e}");
+                }
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(ref mut gw) = gpu_win {
+                if let Err(e) = gw.reset_for_new_session() {
+                    tracing::error!("DXGI pipeline reset failed: {e}");
                 }
             }
         }
@@ -381,6 +411,152 @@ fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapt
         other => anyhow::bail!(
             "unknown capture '{other}'. Available: scrap, nvfbc (use with --encoder nvenc for GPU pipeline)"
         ),
+    }
+}
+
+/// Windows DXGI→NVENC zero-copy session loop.
+#[cfg(target_os = "windows")]
+fn run_session_dxgi(
+    pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
+    mut sender: Box<dyn MessageSender>,
+    receiver: Box<dyn MessageReceiver>,
+    frame_interval: Duration,
+) -> Result<()> {
+    pipeline.force_keyframe();
+    let (width, height) = (pipeline.width, pipeline.height);
+    sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
+    tracing::info!(width, height, "DXGI→NVENC session started");
+
+    let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
+    std::thread::spawn(move || { receive_loop(receiver, event_tx); });
+
+    let mut injector = input_injector::InputInjector::new().ok();
+    hide_remote_cursor();
+
+    let mut clipboard = ClipboardTracker::new();
+    let mut arboard = arboard::Clipboard::new().ok();
+    let mut clipboard_poll = Instant::now();
+    let mut sequence: u64 = 0;
+    let mut stats_time = Instant::now();
+    let mut stats_frames: u64 = 0;
+    let mut stats_bytes: u64 = 0;
+    let mut keepalive_time = Instant::now();
+    let mut had_input = false;
+    let mut last_keyframe_time = Instant::now();
+
+    loop {
+        let loop_start = Instant::now();
+
+        // Process inbound events
+        loop {
+            match event_rx.try_recv() {
+                Ok(InboundEvent::Input(event)) => {
+                    if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
+                    had_input = true;
+                }
+                Ok(InboundEvent::Clipboard(text)) => {
+                    if clipboard.on_remote_update(&text) {
+                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                    }
+                }
+                Ok(InboundEvent::PasteText(text)) => {
+                    if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                    clipboard.on_remote_update(&text);
+                    if let Some(ref mut inj) = injector {
+                        let _ = inj.type_text(&text);
+                        had_input = true;
+                    }
+                }
+                Ok(InboundEvent::Disconnected) => anyhow::bail!("client disconnected"),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("client disconnected"),
+            }
+        }
+
+        // Clipboard polling
+        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
+            clipboard_poll = Instant::now();
+            if let Some(ref mut ab) = arboard {
+                if let Ok(text) = ab.get_text() {
+                    if let Some(changed) = clipboard.check_local_change(&text) {
+                        sender.send_msg(&Message::ClipboardSync(changed))?;
+                    }
+                }
+            }
+        }
+
+        // Periodic keyframe
+        if last_keyframe_time.elapsed() >= Duration::from_secs(2) {
+            pipeline.force_keyframe();
+        }
+
+        // Capture + encode (zero-copy, all GPU)
+        match pipeline.capture_and_encode()? {
+            Some(encoded) => {
+                if encoded.is_keyframe {
+                    last_keyframe_time = Instant::now();
+                }
+                stats_bytes += encoded.data.len() as u64;
+                stats_frames += 1;
+                sequence += 1;
+                sender.send_msg(&Message::VideoFrame { sequence, frame: Box::new(encoded) })?;
+            }
+            None => {
+                // No new frame (static desktop) — short sleep and retry,
+                // don't waste a full frame_interval waiting.
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
+
+        // Stats
+        if stats_time.elapsed() >= Duration::from_secs(5) {
+            let elapsed = stats_time.elapsed().as_secs_f64();
+            tracing::info!(
+                fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
+                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
+                "stats (DXGI→NVENC)"
+            );
+            stats_time = Instant::now();
+            stats_frames = 0;
+            stats_bytes = 0;
+        }
+
+        // Keepalive
+        if keepalive_time.elapsed() >= Duration::from_secs(1) {
+            keepalive_time = Instant::now();
+            if sender.send_msg(&Message::Ping).is_err() {
+                anyhow::bail!("connection lost (keepalive failed)");
+            }
+        }
+
+        // Frame pacing
+        while loop_start.elapsed() < frame_interval {
+            // Process input between sleeps
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    InboundEvent::Input(input) => {
+                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
+                        had_input = true;
+                    }
+                    InboundEvent::Clipboard(text) => {
+                        if clipboard.on_remote_update(&text) {
+                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        }
+                    }
+                    InboundEvent::PasteText(text) => {
+                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
+                        clipboard.on_remote_update(&text);
+                        if let Some(ref mut inj) = injector {
+                            let _ = inj.type_text(&text);
+                            had_input = true;
+                        }
+                    }
+                    InboundEvent::Disconnected => anyhow::bail!("client disconnected"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
