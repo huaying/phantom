@@ -11,20 +11,53 @@ use std::sync::Mutex;
 #[cfg(feature = "webrtc")]
 use std::time::Instant;
 
-/// Generate a self-signed TLS config for HTTPS (enables WebCodecs on non-localhost).
+/// Load or generate a self-signed TLS cert for HTTPS (enables WebCodecs on non-localhost).
+/// Cert is persisted to ~/.phantom_cert.pem + ~/.phantom_key.pem so the browser
+/// only needs to accept it once. Survives server restarts.
 fn make_tls_acceptor() -> Result<Arc<rustls::ServerConfig>> {
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "Phantom Remote Desktop");
-    // Add SANs for any IP
-    params.subject_alt_names = vec![
-        rcgen::SanType::DnsName("localhost".try_into()?),
-        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-    ];
-    let cert = params.self_signed(&key_pair)?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
-        .map_err(|e| anyhow::anyhow!("key: {e}"))?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(&home).join(".phantom");
+    let _ = std::fs::create_dir_all(&dir);
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+
+    let (cert_der, key_der) = if cert_path.exists() && key_path.exists() {
+        // Load existing cert
+        let cert_pem = std::fs::read(&cert_path)?;
+        let key_pem = std::fs::read(&key_path)?;
+        let cert = rustls_pemfile::certs(&mut &cert_pem[..])
+            .next().ok_or_else(|| anyhow::anyhow!("no cert in PEM"))??;
+        let key = rustls_pemfile::private_key(&mut &key_pem[..])?.ok_or_else(|| anyhow::anyhow!("no key in PEM"))?;
+        tracing::info!("loaded TLS cert from {}", cert_path.display());
+        (cert, key)
+    } else {
+        // Generate new cert and save
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
+        params.distinguished_name.push(rcgen::DnType::CommonName, "Phantom Remote Desktop");
+        params.subject_alt_names = vec![
+            rcgen::SanType::DnsName("localhost".try_into()?),
+            rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        ];
+        let cert = params.self_signed(&key_pair)?;
+
+        // Save as PEM for next restart (best-effort, not fatal if it fails)
+        if let Err(e) = std::fs::write(&cert_path, cert.pem()) {
+            tracing::warn!("could not save cert to {}: {e}", cert_path.display());
+        } else if let Err(e) = std::fs::write(&key_path, key_pair.serialize_pem()) {
+            tracing::warn!("could not save key to {}: {e}", key_path.display());
+        } else {
+            tracing::info!("generated TLS cert, saved to {}", cert_path.display());
+        }
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+            .map_err(|e| anyhow::anyhow!("key: {e}"))?;
+        (cert_der, key_der)
+    };
+
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;

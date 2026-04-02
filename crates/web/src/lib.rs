@@ -273,18 +273,29 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
 }
 
-fn setup_ws(state: &Rc<RefCell<AppState>>) {
+fn ws_url() -> String {
     let window = web_sys::window().unwrap();
     let location = window.location();
-    let host = location.host().unwrap_or_default(); // includes port
-    // Use wss:// on same port as HTTPS (same self-signed cert, no mixed content)
+    let host = location.host().unwrap_or_default();
     let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
-    let ws_url = format!("{protocol}://{host}/ws");
-    console::log_1(&format!("Connecting to {ws_url}...").into());
+    format!("{protocol}://{host}/ws")
+}
 
-    let ws = match WebSocket::new(&ws_url) {
+fn setup_ws(state: &Rc<RefCell<AppState>>) {
+    let url = ws_url();
+    connect_ws(state, &url, 1000);
+}
+
+fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
+    console::log_1(&format!("Connecting to {url}...").into());
+
+    let ws = match WebSocket::new(url) {
         Ok(ws) => ws,
-        Err(e) => { console::error_1(&format!("WebSocket error: {:?}", e).into()); return; }
+        Err(e) => {
+            console::error_1(&format!("WebSocket error: {:?}", e).into());
+            schedule_reconnect(state, retry_ms);
+            return;
+        }
     };
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
@@ -300,7 +311,7 @@ fn setup_ws(state: &Rc<RefCell<AppState>>) {
         cb.forget();
     }
 
-    // onopen
+    // onopen — reset retry delay
     {
         let cb = Closure::<dyn FnMut()>::new(|| {
             console::log_1(&"WebSocket connected!".into());
@@ -309,16 +320,49 @@ fn setup_ws(state: &Rc<RefCell<AppState>>) {
         cb.forget();
     }
 
+    // onclose — auto-reconnect with exponential backoff
+    {
+        let s = state.clone();
+        let next_retry = (retry_ms * 2).min(5000); // cap at 5s
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            console::warn_1(&format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into());
+            // Reset state for fresh session
+            {
+                let mut st = s.borrow_mut();
+                st.frame_count = 0;
+                st.got_keyframe = false;
+                st.decoder = None;
+                st.send_ws = None;
+            }
+            schedule_reconnect(&s, next_retry);
+        });
+        ws.set_onclose(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
     // onerror
     {
-        let cb = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|e: web_sys::ErrorEvent| {
-            console::error_1(&format!("WebSocket error: {:?}", e.message()).into());
+        let cb = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|_: web_sys::ErrorEvent| {
+            // onclose will fire after onerror, so reconnect happens there
         });
         ws.set_onerror(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
     }
 
     state.borrow_mut().send_ws = Some(ws);
+}
+
+fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
+    let s = state.clone();
+    let cb = Closure::<dyn FnMut()>::once(move || {
+        let url = ws_url();
+        connect_ws(&s, &url, delay_ms);
+    });
+    let window = web_sys::window().unwrap();
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(), delay_ms as i32,
+    );
+    cb.forget();
 }
 
 // -- Message handling (same for WebRTC and WS) --

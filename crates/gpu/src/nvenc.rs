@@ -142,7 +142,8 @@ impl NvencEncoder {
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
         config.set_max_bitrate(bitrate_kbps * 1000 * 2);
-        config.set_repeat_sps_pps(true); // include SPS/PPS with every IDR (WebCodecs needs it)
+        // Note: set_repeat_sps_pps(true) was attempted but offset 152 is unreliable
+        // across drivers. Instead, we recreate the encoder per session to get SPS/PPS.
 
         // Initialize encoder
         let mut init_params = NvEncInitializeParams::zeroed();
