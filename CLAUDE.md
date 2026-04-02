@@ -186,6 +186,13 @@ NVENC (CPU color conv):   10ms  (4.7x faster)
 NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 ```
 
+**Windows benchmark** (L40 GPU, 1080p, driver 537):
+```
+OpenH264 (CPU capture):      6-8 fps
+NVENC (CPU capture+upload):  17-18 fps
+DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
+```
+
 ---
 
 ## Common Pitfalls
@@ -212,6 +219,9 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 - **WebRTC session zombie**: after ICE disconnect, `send_msg()` swallows Full errors. Session never ends. Must detect and terminate.
 - **WSS same port**: WS upgrade on HTTPS port 9900 (not separate port). Avoids self-signed cert rejection for second port.
 - **HTTP query string**: strip `?ws` from path before routing, otherwise `/?ws` returns 404.
+- **DXGI AcquireNextFrame timeout**: must use blocking timeout (e.g. 33ms), NOT 0. With timeout=0, capture loop misses frames between polls → 15fps instead of 30+fps.
+- **DXGI refresh rate**: capture FPS capped by monitor refresh rate (DWM). RDP/headless may have low refresh (15-30Hz). Check with `wmic path Win32_VideoController get CurrentRefreshRate`.
+- **WS disconnect under high bandwidth**: TLS write can exceed read timeout → tungstenite interprets as error. Increased timeout from 5ms to 50ms.
 - **Stuck modifier keys**: Super/Meta (macOS Cmd) gets stuck on server after Cmd+Tab. Server releases all modifiers on session start. Client does NOT send Super/Meta, releases modifiers on focus loss.
 - **NVENC reconnect black screen**: must recreate encoder between sessions. NVENC only outputs SPS/PPS on first encode after `nvEncInitializeEncoder()`. `force_keyframe()` produces IDR without SPS/PPS → WebCodecs can't decode. Server recreates encoder via `create_encoder()` after each session.
 - **NVENC WebCodecs codec string**: must use `avc1.42c028` (Baseline Level 4.0). NVENC outputs Level 4.0 for 1080p. Previous `avc1.42001f` (Level 3.1) silently rejected 1080p (exceeds level max 720p).
@@ -248,6 +258,7 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | 21 | **NVFBC GPU capture** (`--capture nvfbc`, zero-copy CUdeviceptr) |
 | 22 | **NVFBC→NVENC zero-copy pipeline** (capture+encode ~4ms at 1080p on A40) |
 | 23 | **Windows support** (DXGI capture, OpenH264/NVENC, enigo input) |
+| 27 | **DXGI→NVENC zero-copy** (`--capture dxgi --encoder nvenc`, D3D11 texture, no CPU copy) |
 | 24 | **Auto-start** (Windows: schtasks ONLOGON, Linux: systemd) |
 | 25 | **Self-signed HTTPS** (rcgen, enables WebCodecs on non-localhost) |
 | 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
@@ -264,8 +275,9 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | ~~Windows support~~ | ✅ done | DXGI capture, auto-start via schtasks |
 | ~~Web client WSS fallback~~ | ✅ done | `?ws` URL param, same HTTPS port |
 | ~~Fix WebRTC session disconnect detection~~ | ✅ done | ICE Disconnected → drop ActiveClient → session ends |
-| **Remove dead tile code** | cleanup | encode_zstd, TileUpdate, TileDiffer dirty% threshold — all unused |
-| **Integrate GPU pipeline into server** | full end-to-end | Wire `--capture nvfbc --encoder nvenc` into run_session zero-copy loop |
+| ~~DXGI→NVENC zero-copy~~ | ✅ done | 6fps→47fps on Windows L40 |
+| ~~Make WS default, WebRTC optional~~ | ✅ done | `--features webrtc` + `?rtc` |
+| **Web client auto-reconnect** | UX | WS disconnects under high load (50ms timeout helps but not 100%). Browser should auto-retry. |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
 | **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
 | **WAN testing** | verify real latency | Need cloud VM, `tc netem` for simulating loss/delay |
@@ -317,7 +329,8 @@ NVFBC→NVENC (zero-copy):   4ms  (12x faster)
 | Client threads leak on reconnect (no JoinHandle tracking) | Medium |
 | No graceful shutdown (Ctrl+C) | Low |
 | HTTP handler threads unbounded (no pool) | Medium |
-| WS IO loop 5ms latency floor | Low |
+| WS IO loop 50ms read timeout (was 5ms, increased for stability) | Low |
+| Web client no auto-reconnect on WS disconnect | Medium |
 | Mock server lacks encryption/input | Low |
 | Tile code still in codebase but unused (encode_zstd, TileUpdate messages) | Low |
 
@@ -376,6 +389,8 @@ crates/gpu/src/
   cuda.rs              CUDA driver API: context, memory, memcpy, primary context
   nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 GPU encode via NVENC
   nvfbc.rs             NvfbcCapture (impl FrameCapture): GPU screen capture via NVFBC
+  dxgi.rs              DxgiCapture: DXGI Desktop Duplication → ID3D11Texture2D (Windows)
+  dxgi_nvenc.rs        DxgiNvencPipeline: DXGI capture + NVENC encode zero-copy (Windows)
 
 crates/bench/src/
   main.rs              Encoder benchmark: OpenH264 vs NVENC × resolutions + NVFBC zero-copy
