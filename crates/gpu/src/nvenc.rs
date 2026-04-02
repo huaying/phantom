@@ -226,12 +226,26 @@ impl NvencEncoder {
 
     /// Convert BGRA CPU frame to NV12, upload, and encode.
     fn encode_cpu_frame(&mut self, frame: &Frame) -> Result<EncodedFrame> {
+        let expected = (self.width as usize) * (self.height as usize) * 4;
+        if frame.data.len() != expected {
+            tracing::warn!(
+                "frame data size mismatch: {} != {} ({}x{}x4)",
+                frame.data.len(), expected, self.width, self.height
+            );
+        }
+
         bgra_to_nv12(
             &frame.data,
             self.width as usize,
             self.height as usize,
             &mut self.nv12_buf,
         );
+
+        // Log first frame's Y plane stats for debugging
+        if self.frame_idx == 0 {
+            let y_avg = self.nv12_buf[..1000].iter().map(|&v| v as u32).sum::<u32>() / 1000;
+            tracing::info!(y_avg, bgra_first_4 = ?&frame.data[..4], "NV12 conversion debug");
+        }
 
         unsafe { self.cuda.ctx_push(self.ctx)? };
         self.cuda.memcpy_htod(self.device_buf, &self.nv12_buf)?;
