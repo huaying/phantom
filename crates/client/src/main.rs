@@ -1,4 +1,6 @@
 mod decode_h264;
+#[cfg(target_os = "macos")]
+mod decode_videotoolbox;
 mod decode_zstd;
 mod display_winit;
 mod input_capture;
@@ -84,7 +86,7 @@ enum AppState {
 
 struct Session {
     display: display_winit::WinitDisplay,
-    h264_decoder: decode_h264::OpenH264Decoder,
+    h264_decoder: Box<dyn phantom_core::encode::FrameDecoder>,
     tile_decoder: decode_zstd::ZstdDecoder,
     frame_rx: mpsc::Receiver<Message>,
     input_tx: mpsc::Sender<Message>,
@@ -183,9 +185,26 @@ impl App {
             Err(e) => { tracing::error!("display init failed: {e}"); return; }
         };
 
-        let h264_decoder = match decode_h264::OpenH264Decoder::new(width, height) {
-            Ok(d) => d,
-            Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+        let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
+            #[cfg(target_os = "macos")]
+            match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
+                Ok(d) => {
+                    tracing::info!("using VideoToolbox hardware decoder");
+                    Box::new(d)
+                }
+                Err(e) => {
+                    tracing::warn!("VideoToolbox init failed ({e}), falling back to OpenH264");
+                    match decode_h264::OpenH264Decoder::new(width, height) {
+                        Ok(d) => Box::new(d),
+                        Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            match decode_h264::OpenH264Decoder::new(width, height) {
+                Ok(d) => Box::new(d),
+                Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+            }
         };
 
         let connected = Arc::new(AtomicBool::new(true));
