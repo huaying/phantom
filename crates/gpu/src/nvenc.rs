@@ -385,7 +385,7 @@ impl NvencEncoder {
         result
     }
 
-    fn read_bitstream(&self) -> Result<EncodedFrame> {
+    fn read_bitstream(&mut self) -> Result<EncodedFrame> {
         let mut lock = NvEncLockBitstream::zeroed();
         lock.set_version();
         lock.set_output_bitstream(self.output_buf);
@@ -399,12 +399,32 @@ impl NvencEncoder {
         let size = lock.bitstream_size() as usize;
         let ptr = lock.bitstream_ptr();
         let pic_type = lock.picture_type();
-        let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        let mut data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
         let is_keyframe = pic_type == NV_ENC_PIC_TYPE_IDR || pic_type == NV_ENC_PIC_TYPE_I;
 
         // Unlock
         if let Some(f) = self.api.unlock_bitstream() {
             unsafe { f(self.encoder, self.output_buf) };
+        }
+
+        // NVENC only outputs SPS/PPS on the very first encode after init.
+        // Save it, and prepend to any subsequent keyframe that lacks it.
+        if is_keyframe {
+            let has_sps = data.windows(5).any(|w|
+                w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
+            if has_sps && self.sps_pps.is_empty() {
+                // Save everything before the IDR slice (SPS + PPS NALs)
+                if let Some(idr_pos) = data.windows(5).position(|w|
+                    w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 5) {
+                    self.sps_pps = data[..idr_pos].to_vec();
+                    tracing::debug!(sps_pps_len = self.sps_pps.len(), "saved SPS/PPS from first keyframe");
+                }
+            } else if !has_sps && !self.sps_pps.is_empty() {
+                // Prepend saved SPS/PPS
+                let mut with_sps = self.sps_pps.clone();
+                with_sps.extend_from_slice(&data);
+                data = with_sps;
+            }
         }
 
         Ok(EncodedFrame {

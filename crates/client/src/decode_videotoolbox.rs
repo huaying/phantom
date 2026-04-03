@@ -1,7 +1,7 @@
 //! H.264 hardware decoder using Apple VideoToolbox (macOS only).
 //! Decode time: ~0.5ms vs ~10ms with OpenH264 software decode.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use phantom_core::encode::FrameDecoder;
 use std::ffi::c_void;
 use std::ptr;
@@ -190,32 +190,46 @@ impl VideoToolboxDecoder {
     }
 
     /// Extract SPS and PPS NAL units from an Annex B keyframe.
+    /// Handles both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
     fn extract_sps_pps(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         let mut sps = None;
         let mut pps = None;
+
+        // Find all NAL unit start positions
+        let mut nal_starts: Vec<usize> = Vec::new();
         let mut i = 0;
-        while i + 4 < data.len() {
-            if data[i..i + 4] == [0, 0, 0, 1] {
-                let nal_type = data[i + 4] & 0x1f;
-                // Find end of this NAL unit (next start code or end of data)
-                let start = i + 4;
-                let mut end = data.len();
-                for j in (start + 1)..data.len().saturating_sub(3) {
-                    if data[j..j + 4] == [0, 0, 0, 1] || data[j..j + 3] == [0, 0, 1] {
-                        end = j;
-                        break;
-                    }
-                }
-                match nal_type {
-                    7 => sps = Some(data[start..end].to_vec()), // SPS
-                    8 => pps = Some(data[start..end].to_vec()), // PPS
-                    _ => {}
-                }
-                i = end;
+        while i + 2 < data.len() {
+            if i + 3 < data.len() && data[i..i + 4] == [0, 0, 0, 1] {
+                nal_starts.push(i + 4);
+                i += 4;
+            } else if data[i..i + 3] == [0, 0, 1] {
+                nal_starts.push(i + 3);
+                i += 3;
             } else {
                 i += 1;
             }
         }
+
+        for (idx, &start) in nal_starts.iter().enumerate() {
+            if start >= data.len() { continue; }
+            let nal_type = data[start] & 0x1f;
+            let end = if idx + 1 < nal_starts.len() {
+                // Find the start code before the next NAL
+                let next = nal_starts[idx + 1];
+                if next >= 4 && data[next - 4..next - 1] == [0, 0, 0] { next - 4 }
+                else if next >= 3 { next - 3 }
+                else { next }
+            } else {
+                data.len()
+            };
+            match nal_type {
+                7 => sps = Some(data[start..end].to_vec()),
+                8 => pps = Some(data[start..end].to_vec()),
+                _ => {}
+            }
+            if sps.is_some() && pps.is_some() { break; }
+        }
+
         (sps, pps)
     }
 
@@ -300,7 +314,7 @@ impl VideoToolboxDecoder {
 
         while i < data.len() {
             // Find start code (00 00 00 01 or 00 00 01)
-            let (sc_len, nal_start) = if i + 4 <= data.len() && data[i..i + 4] == [0, 0, 0, 1] {
+            let (_sc_len, nal_start) = if i + 4 <= data.len() && data[i..i + 4] == [0, 0, 0, 1] {
                 (4, i + 4)
             } else if i + 3 <= data.len() && data[i..i + 3] == [0, 0, 1] {
                 (3, i + 3)
@@ -377,6 +391,12 @@ unsafe extern "C" fn vt_decode_callback(
 impl FrameDecoder for VideoToolboxDecoder {
     fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>> {
         // Extract SPS/PPS from keyframes
+        if data.len() > 10 {
+            let hex: String = data.iter().take(20).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+            if self.sps.is_empty() {
+                tracing::info!(len = data.len(), hex, "first frame bytes (looking for SPS)");
+            }
+        }
         let (sps, pps) = Self::extract_sps_pps(data);
         if let Some(s) = sps {
             if s != self.sps {

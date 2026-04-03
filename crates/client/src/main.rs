@@ -12,7 +12,6 @@ use clap::Parser;
 use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
 use phantom_core::decode::Decoder;
-use phantom_core::encode::FrameDecoder;
 use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
@@ -38,6 +37,9 @@ struct Args {
     no_encrypt: bool,
     #[arg(long, default_value = "tcp")]
     transport: String,
+    /// Video decoder: auto (default), openh264 (CPU), videotoolbox (macOS GPU).
+    #[arg(long, default_value = "auto")]
+    decoder: String,
 }
 
 fn main() -> Result<()> {
@@ -69,6 +71,7 @@ fn main() -> Result<()> {
     let mut app = App {
         args_connect: args.connect,
         args_transport: args.transport,
+        args_decoder: args.decoder,
         encryption_key,
         state: AppState::Disconnected,
         backoff: Duration::from_millis(500),
@@ -99,11 +102,13 @@ struct Session {
     clipboard_poll: Instant,
     stats_time: Instant,
     stats_video: u64,
+    stats_decode_ms: f64,
 }
 
 struct App {
     args_connect: String,
     args_transport: String,
+    args_decoder: String,
     encryption_key: Option<[u8; 32]>,
     state: AppState,
     backoff: Duration,
@@ -185,19 +190,30 @@ impl App {
             Err(e) => { tracing::error!("display init failed: {e}"); return; }
         };
 
+        let decoder_name = &self.args_decoder;
         let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
             #[cfg(target_os = "macos")]
-            match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
-                Ok(d) => {
-                    tracing::info!("using VideoToolbox hardware decoder");
-                    Box::new(d)
-                }
-                Err(e) => {
-                    tracing::warn!("VideoToolbox init failed ({e}), falling back to OpenH264");
-                    match decode_h264::OpenH264Decoder::new(width, height) {
-                        Ok(d) => Box::new(d),
-                        Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+            if decoder_name == "auto" || decoder_name == "videotoolbox" {
+                match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
+                    Ok(d) => {
+                        tracing::info!("using VideoToolbox hardware decoder");
+                        Box::new(d)
                     }
+                    Err(e) => {
+                        tracing::warn!("VideoToolbox init failed ({e}), falling back to OpenH264");
+                        match decode_h264::OpenH264Decoder::new(width, height) {
+                            Ok(d) => Box::new(d),
+                            Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+                        }
+                    }
+                }
+            } else {
+                match decode_h264::OpenH264Decoder::new(width, height) {
+                    Ok(d) => {
+                        tracing::info!("using OpenH264 software decoder");
+                        Box::new(d)
+                    }
+                    Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -242,6 +258,7 @@ impl App {
             clipboard_poll: Instant::now(),
             stats_time: Instant::now(),
             stats_video: 0,
+            stats_decode_ms: 0.0,
         });
     }
 }
@@ -272,8 +289,11 @@ impl ApplicationHandler for App {
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
                         Message::VideoFrame { frame, .. } => {
+                            let decode_start = std::time::Instant::now();
                             match session.h264_decoder.decode_frame(&frame.data) {
                                 Ok(rgb32) => {
+                                    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                                    session.stats_decode_ms += decode_ms;
                                     last_decoded = Some(rgb32);
                                     session.stats_video += 1;
                                 }
@@ -331,12 +351,17 @@ impl ApplicationHandler for App {
                 // Stats
                 if session.stats_time.elapsed() >= Duration::from_secs(5) {
                     let elapsed = session.stats_time.elapsed().as_secs_f64();
+                    let avg_decode = if session.stats_video > 0 {
+                        session.stats_decode_ms / session.stats_video as f64
+                    } else { 0.0 };
                     tracing::info!(
                         video_fps = format_args!("{:.1}", session.stats_video as f64 / elapsed),
+                        decode_avg_ms = format_args!("{:.2}", avg_decode),
                         "stats"
                     );
                     session.stats_time = Instant::now();
                     session.stats_video = 0;
+                    session.stats_decode_ms = 0.0;
                 }
             }
         }

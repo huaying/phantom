@@ -788,10 +788,6 @@ fn run_session(
     let mut sent_first_frame = false;
     let mut sent_first_frame_encoded = false;
     let mut last_keyframe_time = Instant::now();
-    // SPS/PPS header from first keyframe. NVENC only includes SPS/PPS on the
-    // very first encode — subsequent force_keyframe IDRs lack it. We save it
-    // and prepend to any keyframe that doesn't start with SPS (NAL type 7).
-    let mut saved_sps_pps: Option<Vec<u8>> = None;
 
     // Nudge the screen to force DXGI to return a frame on static desktops.
     // Without this, Windows DXGI Desktop Duplication never returns a first frame
@@ -891,27 +887,9 @@ fn run_session(
                 if last_keyframe_time.elapsed() >= Duration::from_secs(2) || !sent_first_frame_encoded {
                     video_encoder.force_keyframe();
                 }
-                let mut encoded = video_encoder.encode_frame(&frame)?;
+                let encoded = video_encoder.encode_frame(&frame)?;
                 if encoded.is_keyframe {
                     last_keyframe_time = Instant::now();
-                    // Extract SPS/PPS from first keyframe (NVENC only includes it once)
-                    let has_sps = encoded.data.windows(4).any(|w|
-                        w == [0, 0, 0, 1]) && encoded.data.windows(5).any(|w|
-                        w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
-                    if has_sps && saved_sps_pps.is_none() {
-                        // Save everything before the IDR slice (NAL type 5)
-                        if let Some(idr_pos) = encoded.data.windows(5).position(|w|
-                            w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 5) {
-                            saved_sps_pps = Some(encoded.data[..idr_pos].to_vec());
-                        }
-                    } else if !has_sps {
-                        // Prepend saved SPS/PPS to keyframe that lacks it
-                        if let Some(ref sps) = saved_sps_pps {
-                            let mut data = sps.clone();
-                            data.extend_from_slice(&encoded.data);
-                            encoded.data = data;
-                        }
-                    }
                     if !sent_first_frame_encoded {
                         tracing::info!(size = encoded.data.len(), "first keyframe sent");
                     }
