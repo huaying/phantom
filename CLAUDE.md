@@ -232,7 +232,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (27)
+## Implemented Features (28)
 
 | # | Feature |
 |---|---------|
@@ -260,6 +260,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 22 | **NVFBC→NVENC zero-copy pipeline** (capture+encode ~4ms at 1080p on A40) |
 | 23 | **Windows support** (DXGI capture, OpenH264/NVENC, enigo input) |
 | 27 | **DXGI→NVENC zero-copy** (`--capture dxgi --encoder nvenc`, D3D11 texture, no CPU copy) |
+| 28 | **VideoToolbox hardware decode** (macOS native client, ~0.5ms vs ~10ms OpenH264) |
 | 24 | **Auto-start** (Windows: schtasks ONLOGON, Linux: systemd) |
 | 25 | **Self-signed HTTPS** (rcgen, enables WebCodecs on non-localhost) |
 | 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
@@ -374,7 +375,8 @@ crates/client/src/
   main.rs              winit ApplicationHandler, reconnect loop, transport selection
   display_winit.rs     softbuffer rendering, coordinate mapping, cursor overlay
   input_capture.rs     winit KeyCode → phantom KeyCode mapping
-  decode_h264.rs       OpenH264Decoder (impl FrameDecoder)
+  decode_h264.rs       OpenH264Decoder (impl FrameDecoder, CPU fallback)
+  decode_videotoolbox.rs  VideoToolbox hardware decoder (macOS, Annex B→AVCC)
   decode_zstd.rs       ZstdDecoder (impl Decoder)
   transport_tcp.rs     TCP client: Plain/Encrypted, split
   transport_quic.rs    QUIC client: quinn, skip cert verification
