@@ -6,27 +6,36 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Linux server + client (gnu — musl can't compile OpenH264 C++)
+          # Linux x86_64 server + client (gnu — musl can't compile OpenH264 C++)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             suffix: linux-x86_64
             build_server: true
             build_client: true
 
-          # macOS ARM (client only — server needs Linux for capture)
+          # Windows x86_64 server + client
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: windows-x86_64
+            build_server: true
+            build_client: true
+
+          # macOS ARM (client only — server needs X11/DXGI for capture)
           - target: aarch64-apple-darwin
             os: macos-latest
             suffix: macos-aarch64
             build_server: false
             build_client: true
 
-          # macOS x86_64 (via Rosetta on ARM runner)
+          # macOS x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
             suffix: macos-x86_64
@@ -46,25 +55,30 @@ jobs:
         if: contains(matrix.target, 'linux')
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm
 
-      # Build WASM for server (Linux only)
+      # Build WASM for server (Linux only — Windows builds without web-client)
       - name: Build WASM
-        if: matrix.build_server
+        if: "matrix.build_server && !contains(matrix.target, 'windows')"
         run: |
           cargo install wasm-pack
           wasm-pack build crates/web --target web --no-typescript
 
-      # Build server
-      - name: Build server
-        if: matrix.build_server
+      # Build server (Linux: with embedded web client; Windows: without)
+      - name: Build server (with web client)
+        if: "matrix.build_server && !contains(matrix.target, 'windows')"
         run: cargo build --release --target ${{ matrix.target }} -p phantom-server
+
+      - name: Build server (without web client)
+        if: matrix.build_server && contains(matrix.target, 'windows')
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features
 
       # Build client
       - name: Build client
         if: matrix.build_client
         run: cargo build --release --target ${{ matrix.target }} -p phantom-client
 
-      # Rename and upload
-      - name: Package binaries
+      # Package — Unix
+      - name: Package binaries (Unix)
+        if: "!contains(matrix.target, 'windows')"
         run: |
           mkdir -p dist
           if [ "${{ matrix.build_server }}" = "true" ]; then
@@ -74,14 +88,53 @@ jobs:
             cp target/${{ matrix.target }}/release/phantom-client dist/phantom-client-${{ matrix.suffix }}
           fi
 
+      # Package — Windows
+      - name: Package binaries (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          if ("${{ matrix.build_server }}" -eq "true") {
+            Copy-Item "target/${{ matrix.target }}/release/phantom-server.exe" "dist/phantom-server-${{ matrix.suffix }}.exe"
+          }
+          if ("${{ matrix.build_client }}" -eq "true") {
+            Copy-Item "target/${{ matrix.target }}/release/phantom-client.exe" "dist/phantom-client-${{ matrix.suffix }}.exe"
+          }
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.suffix }}
           path: dist/*
 
+  # Build and push Docker image to GitHub Container Registry
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+
   release:
-    needs: build
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -100,4 +153,23 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
+          body: |
+            ## Install
+
+            **Linux / macOS:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
+            ```
+
+            **Windows (PowerShell):**
+            ```powershell
+            irm https://raw.githubusercontent.com/huaying/phantom/main/install.ps1 | iex
+            ```
+
+            **Docker:**
+            ```bash
+            docker run --rm -p 9900:9900 ghcr.io/huaying/phantom:latest
+            ```
+
+            See [README](https://github.com/huaying/phantom#installation) for more options.

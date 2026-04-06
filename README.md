@@ -15,6 +15,55 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 - **Auto-reconnect** — exponential backoff (native client)
 - **Windows + Linux** — DXGI (Windows) / X11 (Linux) capture, auto-start support
 
+## Installation
+
+### One-line install
+
+**Linux / macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/huaying/phantom/main/install.ps1 | iex
+```
+
+### Download pre-built binaries
+
+Grab the latest binaries from [GitHub Releases](https://github.com/huaying/phantom/releases):
+
+| Platform | Server | Client |
+|----------|--------|--------|
+| Linux x86_64 | `phantom-server-linux-x86_64` | `phantom-client-linux-x86_64` |
+| Windows x86_64 | `phantom-server-windows-x86_64.exe` | `phantom-client-windows-x86_64.exe` |
+| macOS ARM | — | `phantom-client-macos-aarch64` |
+| macOS x86_64 | — | `phantom-client-macos-x86_64` |
+
+```bash
+# Example: download and run on Linux
+chmod +x phantom-server-linux-x86_64
+./phantom-server-linux-x86_64 --transport web --no-encrypt
+```
+
+### Docker
+
+```bash
+docker run --rm -p 9900:9900 ghcr.io/huaying/phantom:latest
+# → open https://127.0.0.1:9900
+```
+
+Or build locally:
+
+```bash
+docker build -t phantom .
+docker run --rm -p 9900:9900 -e PHANTOM_HOST=127.0.0.1 phantom server-web
+```
+
+### Build from source
+
+See [Building](#building) below.
+
 ## Quick Start
 
 ### Web Client (recommended)
