@@ -227,12 +227,13 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 - **NVENC set_repeat_sps_pps offset**: offset 152 in NvEncConfig is unreliable across drivers. Driver 537 (L40) ignores it, driver 550 (A40) returns INVALID_PARAM. Do NOT use — use SPS/PPS save+prepend instead.
 - **NVENC WebCodecs codec string**: must use `avc1.42c028` (Baseline Level 4.0). NVENC outputs Level 4.0 for 1080p. Previous `avc1.42001f` (Level 3.1) silently rejected 1080p (exceeds level max 720p).
 - **Stale xdotool processes**: bench code spawns `xdotool mousemove` loops. Always `pkill -f xdotool` after bench testing — leftover loops send random mouse coordinates causing phantom cursor drift.
+- **QUIC ALPN mismatch**: server sets `alpn_protocols = ["phantom"]` but client must also set it. Without matching ALPN, TLS handshake fails with "peer doesn't support any known protocol". Fixed in e4487ec.
 - **GNOME input**: enigo (XTest) works on GNOME when no other processes interfere. Previous "GNOME broken" diagnosis was caused by stale xdotool processes, not Mutter.
 - **WASM feature flag**: `--no-default-features` builds server without WASM (for GPU-only VMs without wasm-pack).
 
 ---
 
-## Implemented Features (29)
+## Implemented Features (31)
 
 | # | Feature |
 |---|---------|
@@ -265,6 +266,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 24 | **Auto-start** (Windows: schtasks ONLOGON, Linux: systemd) |
 | 25 | **Self-signed HTTPS** (rcgen, enables WebCodecs on non-localhost) |
 | 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
+| 30 | **Cross-platform release pipeline** (GitHub Actions: Linux/Windows/macOS/Docker, install.sh, install.ps1) |
+| 31 | **QUIC ALPN fix** (client was missing ALPN protocol, QUIC never worked before this fix) |
 
 ---
 
