@@ -26,10 +26,11 @@ impl QuicClientTransport {
                 .context("create client endpoint")?;
 
             // Accept any server certificate (like SSH first-connect)
-            let tls_config = rustls::ClientConfig::builder()
+            let mut tls_config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
                 .with_no_client_auth();
+            tls_config.alpn_protocols = vec![b"phantom".to_vec()];
 
             let mut client_config = quinn::ClientConfig::new(Arc::new(
                 quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
