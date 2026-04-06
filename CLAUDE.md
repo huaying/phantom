@@ -232,7 +232,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (28)
+## Implemented Features (29)
 
 | # | Feature |
 |---|---------|
@@ -260,7 +260,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 22 | **NVFBC→NVENC zero-copy pipeline** (capture+encode ~4ms at 1080p on A40) |
 | 23 | **Windows support** (DXGI capture, OpenH264/NVENC, enigo input) |
 | 27 | **DXGI→NVENC zero-copy** (`--capture dxgi --encoder nvenc`, D3D11 texture, no CPU copy) |
-| 28 | **VideoToolbox hardware decode** (macOS native client, ~0.5ms vs ~10ms OpenH264) |
+| 28 | **VideoToolbox hardware decode** (macOS native client, 2-2.5x faster at 4K) |
+| 29 | **4K support** (bilinear downscale, aspect-ratio letterbox, coordinate mapping) |
 | 24 | **Auto-start** (Windows: schtasks ONLOGON, Linux: systemd) |
 | 25 | **Self-signed HTTPS** (rcgen, enables WebCodecs on non-localhost) |
 | 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
