@@ -391,12 +391,6 @@ unsafe extern "C" fn vt_decode_callback(
 impl FrameDecoder for VideoToolboxDecoder {
     fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>> {
         // Extract SPS/PPS from keyframes
-        if data.len() > 10 {
-            let hex: String = data.iter().take(20).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-            if self.sps.is_empty() {
-                tracing::info!(len = data.len(), hex, "first frame bytes (looking for SPS)");
-            }
-        }
         let (sps, pps) = Self::extract_sps_pps(data);
         if let Some(s) = sps {
             if s != self.sps {

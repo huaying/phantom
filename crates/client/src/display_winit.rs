@@ -84,15 +84,18 @@ impl WinitDisplay {
     }
 
     /// Draw local cursor and present framebuffer to screen.
+    /// If window is smaller than server resolution, downscale with nearest-neighbor.
     pub fn present(&mut self, cursor_pos: Option<PhysicalPosition<f64>>) -> Result<()> {
-        let w = self.server_width;
-        let h = self.server_height;
+        let win_size = self.window.inner_size();
+        let dst_w = win_size.width;
+        let dst_h = win_size.height;
 
-        // Resize surface to match server resolution
+        if dst_w == 0 || dst_h == 0 { return Ok(()); }
+
         self.surface
             .resize(
-                NonZeroU32::new(w).context("zero width")?,
-                NonZeroU32::new(h).context("zero height")?,
+                NonZeroU32::new(dst_w).context("zero width")?,
+                NonZeroU32::new(dst_h).context("zero height")?,
             )
             .map_err(|e| anyhow::anyhow!("resize surface: {e}"))?;
 
@@ -101,13 +104,62 @@ impl WinitDisplay {
             .buffer_mut()
             .map_err(|e| anyhow::anyhow!("get buffer: {e}"))?;
 
-        // Copy our framebuffer to the surface
-        let len = sb.len().min(self.buffer.len());
-        sb[..len].copy_from_slice(&self.buffer[..len]);
+        let src_w = self.server_width as usize;
+        let src_h = self.server_height as usize;
+
+        if dst_w as usize == src_w && dst_h as usize == src_h {
+            // No scaling needed — direct copy
+            let len = sb.len().min(self.buffer.len());
+            sb[..len].copy_from_slice(&self.buffer[..len]);
+        } else {
+            // Maintain aspect ratio with letterboxing
+            let src_aspect = src_w as f64 / src_h as f64;
+            let dst_aspect = dst_w as f64 / dst_h as f64;
+            let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
+                // Pillarbox (black bars top/bottom)
+                let rw = dst_w as usize;
+                let rh = (dst_w as f64 / src_aspect) as usize;
+                (rw, rh, 0, (dst_h as usize - rh) / 2)
+            } else {
+                // Letterbox (black bars left/right)
+                let rh = dst_h as usize;
+                let rw = (dst_h as f64 * src_aspect) as usize;
+                (rw, rh, (dst_w as usize - rw) / 2, 0)
+            };
+
+            // Clear to black
+            sb.fill(0);
+
+            // Bilinear downscale into the render area
+            for dy in 0..render_h {
+                let sy_f = dy as f64 * (src_h - 1) as f64 / (render_h - 1).max(1) as f64;
+                let sy0 = sy_f as usize;
+                let sy1 = (sy0 + 1).min(src_h - 1);
+                let fy = sy_f - sy0 as f64;
+
+                for dx in 0..render_w {
+                    let sx_f = dx as f64 * (src_w - 1) as f64 / (render_w - 1).max(1) as f64;
+                    let sx0 = sx_f as usize;
+                    let sx1 = (sx0 + 1).min(src_w - 1);
+                    let fx = sx_f - sx0 as f64;
+
+                    let p00 = self.buffer[sy0 * src_w + sx0];
+                    let p10 = self.buffer[sy0 * src_w + sx1];
+                    let p01 = self.buffer[sy1 * src_w + sx0];
+                    let p11 = self.buffer[sy1 * src_w + sx1];
+
+                    let pixel = bilinear(p00, p10, p01, p11, fx, fy);
+                    let dst_idx = (offset_y + dy) * dst_w as usize + (offset_x + dx);
+                    if dst_idx < sb.len() {
+                        sb[dst_idx] = pixel;
+                    }
+                }
+            }
+        }
 
         // Draw cursor overlay
         if let Some(pos) = cursor_pos {
-            draw_cursor(&mut sb, w as usize, h as usize, pos.x as i32, pos.y as i32);
+            draw_cursor(&mut sb, dst_w as usize, dst_h as usize, pos.x as i32, pos.y as i32);
         }
 
         sb.present()
@@ -115,15 +167,32 @@ impl WinitDisplay {
         Ok(())
     }
 
-    /// Map physical cursor position to server coordinates.
+    /// Map physical cursor position to server coordinates, accounting for
+    /// aspect-ratio letterboxing.
     pub fn map_to_server(&self, pos: PhysicalPosition<f64>) -> (i32, i32) {
         let win_size = self.window.inner_size();
-        let scale_x = self.server_width as f64 / win_size.width as f64;
-        let scale_y = self.server_height as f64 / win_size.height as f64;
-        (
-            (pos.x * scale_x).clamp(0.0, self.server_width as f64 - 1.0) as i32,
-            (pos.y * scale_y).clamp(0.0, self.server_height as f64 - 1.0) as i32,
-        )
+        let dst_w = win_size.width as f64;
+        let dst_h = win_size.height as f64;
+        let src_w = self.server_width as f64;
+        let src_h = self.server_height as f64;
+
+        if dst_w == 0.0 || dst_h == 0.0 { return (0, 0); }
+
+        let src_aspect = src_w / src_h;
+        let dst_aspect = dst_w / dst_h;
+        let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
+            let rw = dst_w;
+            let rh = dst_w / src_aspect;
+            (rw, rh, 0.0, (dst_h - rh) / 2.0)
+        } else {
+            let rh = dst_h;
+            let rw = dst_h * src_aspect;
+            (rw, rh, (dst_w - rw) / 2.0, 0.0)
+        };
+
+        let x = ((pos.x - offset_x) / render_w * src_w).clamp(0.0, src_w - 1.0) as i32;
+        let y = ((pos.y - offset_y) / render_h * src_h).clamp(0.0, src_h - 1.0) as i32;
+        (x, y)
     }
 }
 
@@ -174,6 +243,22 @@ const CURSOR_BITMAP: [u8; CURSOR_W * CURSOR_H] = [
     2,0,0,0,0,0,2,1,2,0,0,0,
     0,0,0,0,0,0,0,2,0,0,0,0,
 ];
+
+/// Bilinear interpolation of four pixels.
+fn bilinear(p00: u32, p10: u32, p01: u32, p11: u32, fx: f64, fy: f64) -> u32 {
+    let mix = |c0: u32, c1: u32, c2: u32, c3: u32, shift: u32| -> u32 {
+        let v00 = ((c0 >> shift) & 0xFF) as f64;
+        let v10 = ((c1 >> shift) & 0xFF) as f64;
+        let v01 = ((c2 >> shift) & 0xFF) as f64;
+        let v11 = ((c3 >> shift) & 0xFF) as f64;
+        let top = v00 + (v10 - v00) * fx;
+        let bot = v01 + (v11 - v01) * fx;
+        (top + (bot - top) * fy).clamp(0.0, 255.0) as u32
+    };
+    (mix(p00, p10, p01, p11, 16) << 16)
+        | (mix(p00, p10, p01, p11, 8) << 8)
+        | mix(p00, p10, p01, p11, 0)
+}
 
 fn draw_cursor(buffer: &mut [u32], buf_w: usize, buf_h: usize, x: i32, y: i32) {
     for cy in 0..CURSOR_H {
