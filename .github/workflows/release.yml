@@ -29,6 +29,14 @@ jobs:
             build_server: true
             build_client: true
 
+          # Linux aarch64 (cross-compiled — for AWS Graviton, Ampere, etc.)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            suffix: linux-aarch64
+            build_server: true
+            build_client: true
+            cross: true
+
           # macOS ARM (client only — server needs X11/DXGI for capture)
           - target: aarch64-apple-darwin
             os: macos-latest
@@ -51,25 +59,46 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # Linux: install X11 dev libs + nasm (for OpenH264 assembly)
-      - name: Install Linux dependencies
-        if: contains(matrix.target, 'linux')
+      # Linux x86_64: install X11 dev libs + nasm (for OpenH264 assembly)
+      - name: Install Linux dependencies (x86_64)
+        if: contains(matrix.target, 'linux') && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm
 
-      # Build WASM for server (Linux only — Windows builds without web-client)
+      # Linux aarch64: cross-compilation toolchain
+      - name: Install Linux cross-compile dependencies (aarch64)
+        if: matrix.cross
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libxcb1-dev:arm64 libxcb-shm0-dev:arm64 libxcb-randr0-dev:arm64 libxdo-dev:arm64 nasm
+      - name: Set cross-compile env
+        if: matrix.cross
+        run: |
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+
+      # Build WASM for server (Linux native only — Windows and cross-compile build without web-client)
       - name: Build WASM
-        if: "matrix.build_server && !contains(matrix.target, 'windows')"
+        if: matrix.build_server && !contains(matrix.target, 'windows') && !matrix.cross
         run: |
           cargo install wasm-pack
           wasm-pack build crates/web --target web --no-typescript
 
-      # Build server (Linux: with embedded web client; Windows: without)
+      # Build server (Linux native: with embedded web client)
       - name: Build server (with web client)
-        if: "matrix.build_server && !contains(matrix.target, 'windows')"
+        if: matrix.build_server && !contains(matrix.target, 'windows') && !matrix.cross
         run: cargo build --release --target ${{ matrix.target }} -p phantom-server
 
+      # Build server (Windows and cross-compile: without web client)
       - name: Build server (without web client)
-        if: matrix.build_server && contains(matrix.target, 'windows')
+        if: matrix.build_server && (contains(matrix.target, 'windows') || matrix.cross)
         run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features
 
       # Build client
