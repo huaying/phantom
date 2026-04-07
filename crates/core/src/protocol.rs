@@ -3,6 +3,15 @@ use crate::frame::PixelFormat;
 use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
+/// Current protocol version. Bump when adding/changing Message variants.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Audio codec identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    Opus,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum Message {
     /// Server → Client: initial handshake.
@@ -10,6 +19,14 @@ pub enum Message {
         width: u32,
         height: u32,
         format: PixelFormat,
+        /// Protocol version (added in v2). Defaults to 1 if absent (bincode
+        /// will deserialize old Hello payloads where this field is missing
+        /// as the default value).
+        #[serde(default = "default_protocol_version_1")]
+        protocol_version: u32,
+        /// Whether the server will send AudioFrame messages.
+        #[serde(default)]
+        audio: bool,
     },
 
     /// Server → Client: H.264/AV1 encoded full frame (lossy, during motion).
@@ -35,6 +52,21 @@ pub enum Message {
 
     Ping,
     Pong,
+
+    /// Server → Client: encoded audio chunk.
+    AudioFrame {
+        codec: AudioCodec,
+        /// Sample rate in Hz (typically 48000 for Opus).
+        sample_rate: u32,
+        /// Number of channels (1 = mono, 2 = stereo).
+        channels: u8,
+        /// Encoded audio data (one Opus frame = 20ms).
+        data: Vec<u8>,
+    },
+}
+
+fn default_protocol_version_1() -> u32 {
+    1
 }
 
 // -- Wire framing: [u32 big-endian length][bincode payload] --
@@ -78,17 +110,48 @@ mod tests {
 
     #[test]
     fn roundtrip_hello() {
-        let msg = Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8 };
+        let msg = Message::Hello {
+            width: 1920,
+            height: 1080,
+            format: PixelFormat::Bgra8,
+            protocol_version: PROTOCOL_VERSION,
+            audio: true,
+        };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
         let decoded = read_message(&mut cursor).unwrap();
         match decoded {
-            Message::Hello { width, height, .. } => {
+            Message::Hello { width, height, protocol_version, audio, .. } => {
                 assert_eq!(width, 1920);
                 assert_eq!(height, 1080);
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(audio);
             }
             _ => panic!("expected Hello"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_audio_frame() {
+        let msg = Message::AudioFrame {
+            codec: super::AudioCodec::Opus,
+            sample_rate: 48000,
+            channels: 2,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        let decoded = read_message(&mut cursor).unwrap();
+        match decoded {
+            Message::AudioFrame { codec, sample_rate, channels, data } => {
+                assert_eq!(codec, super::AudioCodec::Opus);
+                assert_eq!(sample_rate, 48000);
+                assert_eq!(channels, 2);
+                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            _ => panic!("expected AudioFrame"),
         }
     }
 

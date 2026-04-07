@@ -40,6 +40,8 @@ fn main() -> Result<()> {
             width: WIDTH,
             height: HEIGHT,
             format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
         },
     )?;
 

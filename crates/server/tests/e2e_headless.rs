@@ -44,6 +44,8 @@ fn headless_e2e_h264_over_tcp() {
                 width,
                 height,
                 format: PixelFormat::Bgra8,
+                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+                audio: false,
             },
         )
         .unwrap();
@@ -175,6 +177,8 @@ fn headless_e2e_encrypted_tcp() {
             width,
             height,
             format: PixelFormat::Bgra8,
+                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+                audio: false,
         })
         .unwrap();
         writer.write_encrypted(&payload).unwrap();

@@ -191,6 +191,8 @@ impl SessionRunner {
             width,
             height,
             format: phantom_core::frame::PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
         })?;
         tracing::info!(width, height, "session started");
 

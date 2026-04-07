@@ -116,6 +116,8 @@ fn hello_message_roundtrip() {
         width: 1920,
         height: 1080,
         format: PixelFormat::Bgra8,
+        protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+        audio: false,
     };
 
     let mut buf = Vec::new();
