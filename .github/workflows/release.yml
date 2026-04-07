@@ -15,8 +15,9 @@ jobs:
       matrix:
         include:
           # Linux x86_64 server + client (gnu — musl can't compile OpenH264 C++)
+          # Use ubuntu-22.04 for glibc 2.35 compatibility (ubuntu-latest = 24.04 = glibc 2.39)
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             suffix: linux-x86_64
             build_server: true
             build_client: true
