@@ -2,6 +2,7 @@ mod capture_scrap;
 mod encode_h264;
 mod encode_zstd;
 mod input_injector;
+mod session;
 mod transport_quic;
 mod transport_tcp;
 #[cfg(feature = "webrtc")]
@@ -10,17 +11,12 @@ mod transport_ws;
 
 use anyhow::Result;
 use clap::Parser;
-use phantom_core::capture::FrameCapture;
-use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
-use phantom_core::encode::{Encoder, FrameEncoder};
-use phantom_core::frame::{Frame, PixelFormat};
-use phantom_core::input::InputEvent;
-use phantom_core::protocol::Message;
+use phantom_core::encode::FrameEncoder;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "phantom-server", about = "Phantom remote desktop server")]
@@ -58,14 +54,6 @@ struct Args {
     /// Remove auto-start registration.
     #[arg(long)]
     uninstall: bool,
-}
-
-/// Messages from the network receive thread to the main loop.
-enum InboundEvent {
-    Input(InputEvent),
-    Clipboard(String),
-    PasteText(String),
-    Disconnected,
 }
 
 fn main() -> Result<()> {
@@ -136,10 +124,8 @@ fn main() -> Result<()> {
             Err(e) => {
                 tracing::warn!("GPU pipeline init failed, falling back to CPU: {e}");
                 use_gpu_pipeline = false;
-                // Fall back to nvenc+scrap (GPU encode, CPU capture) if possible
                 if gpu_probe.has_nvenc {
                     capture_name = "scrap".to_string();
-                    // encoder stays nvenc
                 } else {
                     encoder_name = "openh264".to_string();
                     capture_name = "scrap".to_string();
@@ -182,31 +168,58 @@ fn main() -> Result<()> {
 
     let (width, height) = if use_gpu_pipeline {
         #[cfg(target_os = "linux")]
-        { (gpu.as_ref().unwrap().width, gpu.as_ref().unwrap().height) }
+        {
+            (
+                gpu.as_ref().unwrap().width,
+                gpu.as_ref().unwrap().height,
+            )
+        }
         #[cfg(target_os = "windows")]
-        { (gpu_win.as_ref().unwrap().width, gpu_win.as_ref().unwrap().height) }
+        {
+            (
+                gpu_win.as_ref().unwrap().width,
+                gpu_win.as_ref().unwrap().height,
+            )
+        }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        { unreachable!() }
+        {
+            unreachable!()
+        }
     } else {
         capture.as_ref().unwrap().resolution()
     };
 
     let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
-        Some(create_encoder(&encoder_name, width, height, args.fps as f32, args.bitrate)?)
+        Some(create_encoder(
+            &encoder_name,
+            width,
+            height,
+            args.fps as f32,
+            args.bitrate,
+        )?)
     } else {
         None
     };
     let mut differ = TileDiffer::new();
 
-    // Parse transport list (comma-separated)
+    // ── Transport listeners ─────────────────────────────────────────────────
+
     let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
+    let (conn_tx, conn_rx) =
+        mpsc::channel::<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)>();
 
-    // Channel for accepted connections from any transport
-    let (conn_tx, conn_rx) = mpsc::channel::<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)>();
-
-    let base_port: u16 = args.listen.rsplit(':').next()
-        .and_then(|p| p.parse().ok()).unwrap_or(9900);
-    let listen_host: String = args.listen.rsplit_once(':').map(|x| x.0).unwrap_or("0.0.0.0").to_string();
+    let base_port: u16 = args
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9900);
+    let listen_host: String = args
+        .listen
+        .rsplit_once(':')
+        .map(|x| x.0)
+        .unwrap_or("0.0.0.0")
+        .to_string();
 
     for transport in &transports {
         match *transport {
@@ -215,110 +228,163 @@ fn main() -> Result<()> {
                 let tcp_listener = transport_tcp::TcpServerTransport::bind(&tcp_addr)?;
                 let tx = conn_tx.clone();
                 let enc_key = encryption_key;
-                std::thread::Builder::new().name("tcp-accept".into()).spawn(move || {
-                    loop {
+                std::thread::Builder::new()
+                    .name("tcp-accept".into())
+                    .spawn(move || loop {
                         match tcp_listener.accept_tcp() {
                             Ok(conn) => {
                                 let pair = if let Some(ref key) = enc_key {
                                     match conn.split_encrypted(key) {
-                                        Ok((s, r)) => (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>),
-                                        Err(e) => { tracing::warn!("TCP encrypted handshake failed: {e}"); continue; }
+                                        Ok((s, r)) => (
+                                            Box::new(s) as Box<dyn MessageSender>,
+                                            Box::new(r) as Box<dyn MessageReceiver>,
+                                        ),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "TCP encrypted handshake failed: {e}"
+                                            );
+                                            continue;
+                                        }
                                     }
                                 } else {
                                     match conn.split() {
-                                        Ok((s, r)) => (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>),
-                                        Err(e) => { tracing::warn!("TCP split failed: {e}"); continue; }
+                                        Ok((s, r)) => (
+                                            Box::new(s) as Box<dyn MessageSender>,
+                                            Box::new(r) as Box<dyn MessageReceiver>,
+                                        ),
+                                        Err(e) => {
+                                            tracing::warn!("TCP split failed: {e}");
+                                            continue;
+                                        }
                                     }
                                 };
-                                if tx.send(pair).is_err() { break; }
+                                if tx.send(pair).is_err() {
+                                    break;
+                                }
                             }
-                            Err(e) => { tracing::warn!("TCP accept error: {e}"); }
+                            Err(e) => {
+                                tracing::warn!("TCP accept error: {e}");
+                            }
                         }
-                    }
-                })?;
+                    })?;
             }
             "web" => {
-                let web_port = if transports.len() > 1 { base_port + 1 } else { base_port };
-                let ws_transport = transport_ws::WebServerTransport::start(
-                    web_port, web_port + 1, web_port + 2,
-                )?;
+                let web_port = if transports.len() > 1 {
+                    base_port + 1
+                } else {
+                    base_port
+                };
+                let ws_transport =
+                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2)?;
                 tracing::info!("open https://localhost:{web_port} in browser");
                 let tx = conn_tx.clone();
-                std::thread::Builder::new().name("web-accept".into()).spawn(move || {
-                    loop {
+                std::thread::Builder::new()
+                    .name("web-accept".into())
+                    .spawn(move || loop {
                         let result = {
                             #[cfg(feature = "webrtc")]
-                            { ws_transport.accept_any() }
+                            {
+                                ws_transport.accept_any()
+                            }
                             #[cfg(not(feature = "webrtc"))]
-                            { ws_transport.accept_ws() }
+                            {
+                                ws_transport.accept_ws()
+                            }
                         };
                         match result {
-                            Ok(pair) => { if tx.send(pair).is_err() { break; } }
-                            Err(e) => { tracing::warn!("WebSocket accept error: {e}"); }
+                            Ok(pair) => {
+                                if tx.send(pair).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("WebSocket accept error: {e}");
+                            }
                         }
-                    }
-                })?;
+                    })?;
             }
             "quic" => {
                 let quic_addr = format!("{listen_host}:{base_port}");
                 let quic_listener = transport_quic::QuicServerTransport::bind(&quic_addr)?;
                 let tx = conn_tx.clone();
-                std::thread::Builder::new().name("quic-accept".into()).spawn(move || {
-                    loop {
+                std::thread::Builder::new()
+                    .name("quic-accept".into())
+                    .spawn(move || loop {
                         match quic_listener.accept() {
                             Ok((s, r)) => {
-                                let pair = (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>);
-                                if tx.send(pair).is_err() { break; }
+                                let pair = (
+                                    Box::new(s) as Box<dyn MessageSender>,
+                                    Box::new(r) as Box<dyn MessageReceiver>,
+                                );
+                                if tx.send(pair).is_err() {
+                                    break;
+                                }
                             }
-                            Err(e) => { tracing::warn!("QUIC accept error: {e}"); }
+                            Err(e) => {
+                                tracing::warn!("QUIC accept error: {e}");
+                            }
                         }
-                    }
-                })?;
+                    })?;
             }
             other => anyhow::bail!("unknown transport '{other}'. Available: tcp, web, quic"),
         }
     }
-    // Drop the original sender so conn_rx doesn't block forever when all threads die
     drop(conn_tx);
+
+    // ── Main accept loop ────────────────────────────────────────────────────
 
     loop {
         tracing::info!("waiting for client...");
 
-        let (sender, receiver) = conn_rx.recv()
+        let (sender, receiver) = conn_rx
+            .recv()
             .map_err(|_| anyhow::anyhow!("all transport listeners shut down"))?;
 
         #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
-            run_session_gpu(
-                &mut gpu.capture, &mut gpu.encoder,
-                sender, receiver, frame_interval,
+            session::run_session_gpu(
+                &mut gpu.capture,
+                &mut gpu.encoder,
+                sender,
+                receiver,
+                frame_interval,
             )
         } else {
-            run_session(
+            session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
-                sender, receiver, frame_interval, quality_delay,
+                sender,
+                receiver,
+                frame_interval,
+                quality_delay,
             )
         };
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
-            run_session_dxgi(gw, sender, receiver, frame_interval)
+            session::run_session_dxgi(gw, sender, receiver, frame_interval)
         } else {
-            run_session(
+            session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
-                sender, receiver, frame_interval, quality_delay,
+                sender,
+                receiver,
+                frame_interval,
+                quality_delay,
             )
         };
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let result = run_session(
+        let result = session::run_session_cpu(
             &mut **capture.as_mut().unwrap(),
             &mut **video_encoder.as_mut().unwrap(),
             &mut differ,
-            sender, receiver, frame_interval, quality_delay,
+            sender,
+            receiver,
+            frame_interval,
+            quality_delay,
         );
+
         if let Err(e) = result {
             tracing::warn!("session ended: {e}");
             differ.reset();
@@ -342,72 +408,9 @@ fn main() -> Result<()> {
     }
 }
 
-struct QualityState {
-    last_motion: Instant,
-    lossless_sent: bool,
-    delay: Duration,
-}
-
-impl QualityState {
-    fn new(delay: Duration) -> Self {
-        Self { last_motion: Instant::now(), lossless_sent: false, delay }
-    }
-    fn on_motion(&mut self) {
-        self.last_motion = Instant::now();
-        self.lossless_sent = false;
-    }
-    fn should_send_lossless(&self) -> bool {
-        !self.lossless_sent && self.last_motion.elapsed() >= self.delay
-    }
-    fn mark_lossless_sent(&mut self) { self.lossless_sent = true; }
-}
-
-/// Simple congestion tracker: measures send throughput and skips frames if falling behind.
-struct CongestionTracker {
-    /// Target: one frame interval worth of sending.
-    frame_interval: Duration,
-    /// Consecutive slow frames.
-    slow_frames: u32,
-    /// Current skip-every-N (1 = no skip, 2 = skip every other, etc.)
-    skip_ratio: u32,
-    frame_counter: u64,
-}
-
-impl CongestionTracker {
-    fn new(frame_interval: Duration) -> Self {
-        Self {
-            frame_interval,
-            slow_frames: 0,
-            skip_ratio: 1,
-            frame_counter: 0,
-        }
-    }
-
-    fn should_skip_frame(&mut self) -> bool {
-        self.frame_counter += 1;
-        if self.skip_ratio <= 1 { return false; }
-        !self.frame_counter.is_multiple_of(self.skip_ratio as u64)
-    }
-
-    fn on_frame_sent(&mut self, send_duration: Duration) {
-        if send_duration > self.frame_interval * 2 {
-            self.slow_frames += 1;
-            if self.slow_frames > 3 && self.skip_ratio < 4 {
-                self.skip_ratio += 1;
-                tracing::info!(skip_ratio = self.skip_ratio, "reducing frame rate (congestion)");
-            }
-        } else {
-            if self.slow_frames > 0 { self.slow_frames -= 1; }
-            if self.slow_frames == 0 && self.skip_ratio > 1 {
-                self.skip_ratio -= 1;
-                tracing::info!(skip_ratio = self.skip_ratio, "increasing frame rate (recovered)");
-            }
-        }
-    }
-}
+// ── GPU pipeline struct (Linux) ─────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-/// GPU zero-copy pipeline: NVFBC capture + NVENC encode, no CPU involvement.
 struct GpuPipeline {
     capture: phantom_gpu::nvfbc::NvfbcCapture,
     encoder: phantom_gpu::nvenc::NvencEncoder,
@@ -435,7 +438,6 @@ impl GpuPipeline {
         )?;
         let (sw, sh) = capture.resolution();
 
-        // Grab one frame to get actual dimensions (may differ from screen size)
         let first = loop {
             std::thread::sleep(Duration::from_millis(20));
             match capture.grab_cuda() {
@@ -447,21 +449,33 @@ impl GpuPipeline {
         let (width, height) = (first.width, first.height);
         tracing::info!(screen_w = sw, screen_h = sh, width, height, "NVFBC→NVENC GPU pipeline");
 
-        // Release NVFBC context, init NVENC with shared primary context
         capture.release_context()?;
         let encoder = unsafe {
             phantom_gpu::nvenc::NvencEncoder::with_context(
-                std::sync::Arc::clone(&cuda), primary_ctx, false, width, height, fps, bitrate_kbps,
+                std::sync::Arc::clone(&cuda),
+                primary_ctx,
+                false,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
             )?
         };
 
-        Ok(Self { capture, encoder, cuda, ctx: primary_ctx, width, height, fps, bitrate: bitrate_kbps })
+        Ok(Self {
+            capture,
+            encoder,
+            cuda,
+            ctx: primary_ctx,
+            width,
+            height,
+            fps,
+            bitrate: bitrate_kbps,
+        })
     }
 
-    /// Recreate NVENC encoder for a fresh session (clears stale reference frames).
     fn reset_for_new_session(&mut self) -> Result<()> {
         self.capture.reset_session()?;
-        // Drop old encoder and create fresh one
         self.encoder = unsafe {
             phantom_gpu::nvenc::NvencEncoder::with_context(
                 std::sync::Arc::clone(&self.cuda),
@@ -478,7 +492,8 @@ impl GpuPipeline {
     }
 }
 
-/// Create the screen capture backend based on --capture flag (CPU path only).
+// ── Factory functions ───────────────────────────────────────────────────────
+
 fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
     match name {
         "scrap" => {
@@ -491,155 +506,12 @@ fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapt
     }
 }
 
-/// Windows DXGI→NVENC zero-copy session loop.
-#[cfg(target_os = "windows")]
-fn run_session_dxgi(
-    pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
-    mut sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-) -> Result<()> {
-    pipeline.force_keyframe();
-    let (width, height) = (pipeline.width, pipeline.height);
-    sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
-    tracing::info!(width, height, "DXGI→NVENC session started");
-
-    let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
-    std::thread::spawn(move || { receive_loop(receiver, event_tx); });
-
-    let mut injector = input_injector::InputInjector::new().ok();
-    hide_remote_cursor();
-
-    let mut clipboard = ClipboardTracker::new();
-    let mut arboard = arboard::Clipboard::new().ok();
-    let mut clipboard_poll = Instant::now();
-    let mut sequence: u64 = 0;
-    let mut stats_time = Instant::now();
-    let mut stats_frames: u64 = 0;
-    let mut stats_bytes: u64 = 0;
-    let mut keepalive_time = Instant::now();
-    let mut had_input = false;
-    let mut last_keyframe_time = Instant::now();
-
-    loop {
-        let loop_start = Instant::now();
-
-        // Process inbound events
-        loop {
-            match event_rx.try_recv() {
-                Ok(InboundEvent::Input(event)) => {
-                    if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
-                    had_input = true;
-                }
-                Ok(InboundEvent::Clipboard(text)) => {
-                    if clipboard.on_remote_update(&text) {
-                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                    }
-                }
-                Ok(InboundEvent::PasteText(text)) => {
-                    if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                    clipboard.on_remote_update(&text);
-                    if let Some(ref mut inj) = injector {
-                        let _ = inj.type_text(&text);
-                        had_input = true;
-                    }
-                }
-                Ok(InboundEvent::Disconnected) => anyhow::bail!("client disconnected"),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("client disconnected"),
-            }
-        }
-
-        // Clipboard polling
-        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
-            clipboard_poll = Instant::now();
-            if let Some(ref mut ab) = arboard {
-                if let Ok(text) = ab.get_text() {
-                    if let Some(changed) = clipboard.check_local_change(&text) {
-                        sender.send_msg(&Message::ClipboardSync(changed))?;
-                    }
-                }
-            }
-        }
-
-        // Periodic keyframe
-        if last_keyframe_time.elapsed() >= Duration::from_secs(2) {
-            pipeline.force_keyframe();
-        }
-
-        // Capture + encode (zero-copy, all GPU)
-        match pipeline.capture_and_encode()? {
-            Some(encoded) => {
-                if encoded.is_keyframe {
-                    last_keyframe_time = Instant::now();
-                }
-                stats_bytes += encoded.data.len() as u64;
-                stats_frames += 1;
-                sequence += 1;
-                sender.send_msg(&Message::VideoFrame { sequence, frame: Box::new(encoded) })?;
-            }
-            None => {
-                // No new frame (static desktop) — short sleep and retry,
-                // don't waste a full frame_interval waiting.
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-        }
-
-        // Stats
-        if stats_time.elapsed() >= Duration::from_secs(5) {
-            let elapsed = stats_time.elapsed().as_secs_f64();
-            tracing::info!(
-                fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
-                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
-                "stats (DXGI→NVENC)"
-            );
-            stats_time = Instant::now();
-            stats_frames = 0;
-            stats_bytes = 0;
-        }
-
-        // Keepalive
-        if keepalive_time.elapsed() >= Duration::from_secs(1) {
-            keepalive_time = Instant::now();
-            if sender.send_msg(&Message::Ping).is_err() {
-                anyhow::bail!("connection lost (keepalive failed)");
-            }
-        }
-
-        // Frame pacing
-        while loop_start.elapsed() < frame_interval {
-            // Process input between sleeps
-            while let Ok(event) = event_rx.try_recv() {
-                match event {
-                    InboundEvent::Input(input) => {
-                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
-                        had_input = true;
-                    }
-                    InboundEvent::Clipboard(text) => {
-                        if clipboard.on_remote_update(&text) {
-                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        }
-                    }
-                    InboundEvent::PasteText(text) => {
-                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        clipboard.on_remote_update(&text);
-                        if let Some(ref mut inj) = injector {
-                            let _ = inj.type_text(&text);
-                            had_input = true;
-                        }
-                    }
-                    InboundEvent::Disconnected => anyhow::bail!("client disconnected"),
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-/// Create the video encoder based on --encoder flag (CPU path only).
 fn create_encoder(
-    name: &str, width: u32, height: u32, fps: f32, bitrate_kbps: u32,
+    name: &str,
+    width: u32,
+    height: u32,
+    fps: f32,
+    bitrate_kbps: u32,
 ) -> Result<Box<dyn FrameEncoder>> {
     match name {
         "openh264" => {
@@ -648,466 +520,16 @@ fn create_encoder(
         }
         "nvenc" => {
             let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
-            let enc = phantom_gpu::nvenc::NvencEncoder::new(
-                cuda, 0, width, height, fps as u32, bitrate_kbps,
-            )?;
+            let enc =
+                phantom_gpu::nvenc::NvencEncoder::new(cuda, 0, width, height, fps as u32, bitrate_kbps)?;
             Ok(Box::new(enc))
         }
-        other => anyhow::bail!(
-            "unknown encoder '{other}'. Available: openh264, nvenc"
-        ),
+        other => anyhow::bail!("unknown encoder '{other}'. Available: openh264, nvenc"),
     }
 }
 
-#[cfg(target_os = "linux")]
-/// GPU zero-copy session loop: NVFBC grab → NVENC encode → send.
-/// No tile differ or smart encoding — NVENC at ~4ms is fast enough for every frame.
-fn run_session_gpu(
-    capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
-    encoder: &mut phantom_gpu::nvenc::NvencEncoder,
-    mut sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-) -> Result<()> {
-    use phantom_core::encode::FrameEncoder;
+// ── Auto-start install/uninstall ────────────────────────────────────────────
 
-    encoder.force_keyframe();
-    let (width, height) = encoder.dimensions();
-    sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
-    tracing::info!(width, height, "GPU session started");
-
-    let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
-    std::thread::spawn(move || { receive_loop(receiver, event_tx); });
-
-    let mut injector = input_injector::InputInjector::new().ok();
-
-    hide_remote_cursor();
-
-    let mut clipboard = ClipboardTracker::new();
-    let mut arboard = arboard::Clipboard::new().ok();
-    let mut clipboard_poll = Instant::now();
-    let mut sequence: u64 = 0;
-    let mut stats_time = Instant::now();
-    let mut stats_frames: u64 = 0;
-    let mut stats_bytes: u64 = 0;
-    let mut keepalive_time = Instant::now();
-    let mut had_input = false;
-    // Track consecutive no-frame grabs to back off polling
-    let mut no_frame_count: u32 = 0;
-
-    loop {
-        let loop_start = Instant::now();
-
-        // Process inbound events
-        loop {
-            match event_rx.try_recv() {
-                Ok(InboundEvent::Input(event)) => {
-                    if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
-                    had_input = true;
-                }
-                Ok(InboundEvent::Clipboard(text)) => {
-                    if clipboard.on_remote_update(&text) {
-                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                    }
-                }
-                Ok(InboundEvent::PasteText(text)) => {
-                    if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                    clipboard.on_remote_update(&text);
-                    if let Some(ref mut inj) = injector {
-                        let _ = inj.type_text(&text);
-                        had_input = true;
-                    }
-                }
-                Ok(InboundEvent::Disconnected) => anyhow::bail!("client disconnected"),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("client disconnected"),
-            }
-        }
-
-        // Clipboard polling
-        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
-            clipboard_poll = Instant::now();
-            if let Some(ref mut ab) = arboard {
-                if let Ok(text) = ab.get_text() {
-                    if let Some(changed) = clipboard.check_local_change(&text) {
-                        sender.send_msg(&Message::ClipboardSync(changed))?;
-                    }
-                }
-            }
-        }
-
-        // GPU capture → encode → send (zero-copy)
-        // After input, give the screen a moment to update then grab.
-        if had_input {
-            std::thread::sleep(Duration::from_millis(2));
-            had_input = false;
-            no_frame_count = 0; // reset backoff
-        }
-
-        capture.bind_context()?;
-        let gpu_frame = capture.grab_cuda();
-        let _ = capture.release_context();
-
-        match gpu_frame {
-            Ok(Some(f)) => {
-                no_frame_count = 0;
-                let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
-                let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
-                stats_bytes += encoded.data.len() as u64;
-                stats_frames += 1;
-                sequence += 1;
-                sender.send_msg(&Message::VideoFrame {
-                    sequence,
-                    frame: Box::new(encoded),
-                })?;
-            }
-            Ok(None) => {
-                // No new frame — back off slightly to avoid busy-spinning
-                no_frame_count += 1;
-                if no_frame_count > 5 {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("GPU grab error: {e}");
-            }
-        }
-
-        // Stats
-        if stats_time.elapsed() >= Duration::from_secs(5) {
-            let elapsed = stats_time.elapsed().as_secs_f64();
-            tracing::info!(
-                fps = format_args!("{:.1}", stats_frames as f64 / elapsed),
-                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
-                "GPU stats"
-            );
-            stats_time = Instant::now();
-            stats_frames = 0;
-            stats_bytes = 0;
-        }
-
-        // Keepalive
-        if keepalive_time.elapsed() >= Duration::from_secs(1) {
-            keepalive_time = Instant::now();
-            if sender.send_msg(&Message::Ping).is_err() {
-                anyhow::bail!("connection lost (keepalive failed)");
-            }
-        }
-
-        // Frame pacing
-        while loop_start.elapsed() < frame_interval {
-            while let Ok(event) = event_rx.try_recv() {
-                match event {
-                    InboundEvent::Input(input) => {
-                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
-                        had_input = true;
-                    }
-                    InboundEvent::Clipboard(text) => {
-                        if clipboard.on_remote_update(&text) {
-                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        }
-                    }
-                    InboundEvent::PasteText(text) => {
-                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        clipboard.on_remote_update(&text);
-                        if let Some(ref mut inj) = injector {
-                            let _ = inj.type_text(&text);
-                            had_input = true;
-                        }
-                    }
-                    InboundEvent::Disconnected => anyhow::bail!("client disconnected"),
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-fn run_session(
-    capture: &mut dyn FrameCapture,
-    video_encoder: &mut dyn FrameEncoder,
-    differ: &mut TileDiffer,
-    mut sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-    quality_delay: Duration,
-) -> Result<()> {
-    // New client needs a keyframe to start decoding
-    video_encoder.force_keyframe();
-    differ.reset();
-    // Reset capturer so DXGI returns a fresh frame (Windows: stale after idle)
-    let _ = capture.reset();
-
-    let (width, height) = capture.resolution();
-
-    sender.send_msg(&Message::Hello { width, height, format: PixelFormat::Bgra8 })?;
-    tracing::info!(width, height, "session started");
-
-    let (event_tx, event_rx) = mpsc::channel::<InboundEvent>();
-    std::thread::spawn(move || { receive_loop(receiver, event_tx); });
-
-    let mut injector = input_injector::InputInjector::new().ok();
-
-    // Hide remote cursor — client renders its own local cursor.
-    // This prevents mouse movement from causing dirty tiles on the server.
-    hide_remote_cursor();
-
-    let mut zstd_encoder = encode_zstd::ZstdEncoder::new(3);
-    let mut quality = QualityState::new(quality_delay);
-    let mut congestion = CongestionTracker::new(frame_interval);
-    let mut clipboard = ClipboardTracker::new();
-    let mut arboard = arboard::Clipboard::new().ok();
-    let mut clipboard_poll = Instant::now();
-
-    let mut sequence: u64 = 0;
-    let mut stats_time = Instant::now();
-    let mut keepalive_time = Instant::now();
-    let mut stats_h264: u64 = 0;
-    let mut stats_tiles: u64 = 0;
-    let mut stats_lossless: u64 = 0;
-    let mut stats_bytes: u64 = 0;
-    let mut last_frame: Option<Frame> = None;
-    let mut had_input = false;
-    let mut sent_first_frame = false;
-    let mut sent_first_frame_encoded = false;
-    let mut last_keyframe_time = Instant::now();
-
-    // Nudge the screen to force DXGI to return a frame on static desktops.
-    // Without this, Windows DXGI Desktop Duplication never returns a first frame
-    // if nothing has changed on screen since the last session.
-    if let Some(ref mut inj) = injector {
-        use phantom_core::input::InputEvent;
-        let _ = inj.inject(&InputEvent::MouseMove { x: 0, y: 0 });
-        let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
-    }
-
-    loop {
-        let loop_start = Instant::now();
-
-        // Process inbound events (input + clipboard from client)
-        loop {
-            match event_rx.try_recv() {
-                Ok(InboundEvent::Input(event)) => {
-                    if let Some(ref mut inj) = injector { let _ = inj.inject(&event); }
-                    had_input = true;
-                }
-                Ok(InboundEvent::Clipboard(text)) => {
-                    if clipboard.on_remote_update(&text) {
-                        if let Some(ref mut ab) = arboard {
-                            let _ = ab.set_text(&text);
-                        }
-                    }
-                }
-                Ok(InboundEvent::PasteText(text)) => {
-                    // Set clipboard AND type it out
-                    if let Some(ref mut ab) = arboard {
-                        let _ = ab.set_text(&text);
-                    }
-                    clipboard.on_remote_update(&text);
-                    if let Some(ref mut inj) = injector {
-                        let _ = inj.type_text(&text);
-                        had_input = true;
-                    }
-                    tracing::debug!("paste: {} chars", text.len());
-                }
-                Ok(InboundEvent::Disconnected) => {
-                    anyhow::bail!("client disconnected");
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    anyhow::bail!("client disconnected");
-                }
-            }
-        }
-
-        // Poll local clipboard every 250ms
-        if clipboard_poll.elapsed() >= Duration::from_millis(250) {
-            clipboard_poll = Instant::now();
-            if let Some(ref mut ab) = arboard {
-                if let Ok(text) = ab.get_text() {
-                    if let Some(changed) = clipboard.check_local_change(&text) {
-                        sender.send_msg(&Message::ClipboardSync(changed))?;
-                    }
-                }
-            }
-        }
-
-        // Capture
-        let frame = match capture.capture()? {
-            Some(f) => f,
-            None => {
-                if quality.should_send_lossless() {
-                    if let Some(ref f) = last_frame {
-                        send_lossless_update(&mut *sender, &mut zstd_encoder, f, &mut sequence)?;
-                        quality.mark_lossless_sent();
-                        stats_lossless += 1;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-        };
-
-        // First frame must always be encoded (keyframe for client decoder).
-        // After that, encode on input or screen changes.
-        let changed = !sent_first_frame || had_input || differ.has_changes(&frame);
-        if changed {
-            sent_first_frame = true;
-            had_input = false;
-            let dirty_tiles = differ.diff(&frame);
-            quality.on_motion();
-
-            if congestion.should_skip_frame() {
-                last_frame = Some(frame);
-                continue;
-            }
-
-            // Always encode full H.264 frame when there are changes.
-            // Tile mode caused visual tearing when mixed with H.264 over high latency.
-            if !dirty_tiles.is_empty() {
-                // Periodic keyframe every 2s — recovers from lost frames on
-                // unreliable WebRTC DataChannel. Also handles first-frame guarantee.
-                if last_keyframe_time.elapsed() >= Duration::from_secs(2) || !sent_first_frame_encoded {
-                    video_encoder.force_keyframe();
-                }
-                let encoded = video_encoder.encode_frame(&frame)?;
-                if encoded.is_keyframe {
-                    last_keyframe_time = Instant::now();
-                    if !sent_first_frame_encoded {
-                        tracing::info!(size = encoded.data.len(), "first keyframe sent");
-                    }
-                }
-                sent_first_frame_encoded = true;
-                stats_bytes += encoded.data.len() as u64;
-                stats_h264 += 1;
-                sequence += 1;
-                let send_start = Instant::now();
-                sender.send_msg(&Message::VideoFrame { sequence, frame: Box::new(encoded) })?;
-                congestion.on_frame_sent(send_start.elapsed());
-            }
-
-            last_frame = Some(frame);
-        }
-
-        if stats_time.elapsed() >= Duration::from_secs(5) {
-            let elapsed = stats_time.elapsed().as_secs_f64();
-            tracing::info!(
-                h264 = format_args!("{:.1}/s", stats_h264 as f64 / elapsed),
-                tiles = format_args!("{:.1}/s", stats_tiles as f64 / elapsed),
-                lossless = stats_lossless,
-                bw = format_args!("{:.1} KB/s", stats_bytes as f64 / elapsed / 1024.0),
-                "stats"
-            );
-            stats_time = Instant::now();
-            stats_h264 = 0;
-            stats_tiles = 0;
-            stats_lossless = 0;
-            stats_bytes = 0;
-
-        }
-
-        // Keepalive every 1s: detect dead connection (channel dropped on browser refresh)
-        if keepalive_time.elapsed() >= Duration::from_secs(1) {
-            keepalive_time = Instant::now();
-            if sender.send_msg(&Message::Ping).is_err() {
-                anyhow::bail!("connection lost (keepalive failed)");
-            }
-        }
-
-        // Frame pacing: sleep in small increments, processing input between each.
-        while loop_start.elapsed() < frame_interval {
-            while let Ok(event) = event_rx.try_recv() {
-                match event {
-                    InboundEvent::Input(input) => {
-                        if let Some(ref mut inj) = injector { let _ = inj.inject(&input); }
-                        had_input = true; // will force encode next iteration
-                    }
-                    InboundEvent::Clipboard(text) => {
-                        if clipboard.on_remote_update(&text) {
-                            if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        }
-                    }
-                    InboundEvent::PasteText(text) => {
-                        if let Some(ref mut ab) = arboard { let _ = ab.set_text(&text); }
-                        clipboard.on_remote_update(&text);
-                        if let Some(ref mut inj) = injector {
-                            let _ = inj.type_text(&text);
-                            had_input = true;
-                        }
-                    }
-                    InboundEvent::Disconnected => {
-                        anyhow::bail!("client disconnected");
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-fn send_lossless_update(
-    sender: &mut dyn MessageSender, encoder: &mut encode_zstd::ZstdEncoder,
-    frame: &Frame, sequence: &mut u64,
-) -> Result<usize> {
-    // Use a fresh differ to get ALL tiles (first frame = all dirty).
-    // Don't touch the main differ's state.
-    let mut fresh = TileDiffer::new();
-    let all_tiles = fresh.diff(frame);
-    let encoded = encoder.encode_tiles(&all_tiles)?;
-    let total_bytes: usize = encoded.iter().map(|t| t.data.len()).sum();
-    *sequence += 1;
-    sender.send_msg(&Message::TileUpdate { sequence: *sequence, tiles: Box::new(encoded) })?;
-    Ok(total_bytes)
-}
-
-fn receive_loop(mut receiver: Box<dyn MessageReceiver>, tx: mpsc::Sender<InboundEvent>) {
-    loop {
-        match receiver.recv_msg() {
-            Ok(Message::Input(event)) => { let _ = tx.send(InboundEvent::Input(event)); }
-            Ok(Message::ClipboardSync(text)) => { let _ = tx.send(InboundEvent::Clipboard(text)); }
-            Ok(Message::PasteText(text)) => { let _ = tx.send(InboundEvent::PasteText(text)); }
-            Ok(_) => {}
-            Err(_) => { let _ = tx.send(InboundEvent::Disconnected); break; }
-        }
-    }
-}
-
-/// Hide the remote OS cursor so mouse movement doesn't cause dirty tiles.
-/// Client renders its own local cursor instead.
-fn hide_remote_cursor() {
-    #[cfg(target_os = "linux")]
-    {
-        // Create a 1x1 transparent cursor using xdotool/unclutter or xfixes
-        // Try multiple methods in order of preference
-        if std::process::Command::new("unclutter")
-            .args(["-idle", "0", "-root"])
-            .spawn()
-            .is_ok()
-        {
-            tracing::info!("remote cursor hidden (unclutter)");
-            return;
-        }
-
-        // Fallback: use xdotool to set blank cursor on root window
-        if std::process::Command::new("xdotool")
-            .args(["search", "--name", ".*"])
-            .output()
-            .is_ok()
-        {
-            // xdotool can't directly hide cursor, but we tried
-            tracing::debug!("xdotool available but cursor hiding limited");
-        }
-
-        tracing::debug!("could not hide remote cursor (install 'unclutter' for best results)");
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        tracing::debug!("remote cursor hiding not implemented for this OS");
-    }
-}
-
-/// Install phantom-server to auto-start on login.
 fn install_autostart() -> Result<()> {
     use anyhow::Context;
     let exe = std::env::current_exe().context("get current exe path")?;
@@ -1116,15 +538,19 @@ fn install_autostart() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: create a scheduled task that runs at logon in the interactive session
         let status = std::process::Command::new("schtasks")
             .args([
-                "/Create", "/TN", "PhantomServer",
-                "/TR", &format!("\"{exe_str}\" --no-encrypt --transport web"),
-                "/SC", "ONLOGON",
-                "/RL", "HIGHEST",
-                "/IT",  // interactive — runs in the user's desktop session
-                "/F",   // force overwrite
+                "/Create",
+                "/TN",
+                "PhantomServer",
+                "/TR",
+                &format!("\"{exe_str}\" --no-encrypt --transport web"),
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+                "/IT",
+                "/F",
             ])
             .status()
             .context("schtasks")?;
@@ -1139,7 +565,6 @@ fn install_autostart() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        // Linux: install systemd user service
         let service = format!(
             "[Unit]\nDescription=Phantom Remote Desktop Server\nAfter=graphical.target\n\n\
              [Service]\nType=simple\nExecStart={exe_str}\nRestart=always\nRestartSec=3\n\
@@ -1169,7 +594,6 @@ fn install_autostart() -> Result<()> {
     Ok(())
 }
 
-/// Remove auto-start registration.
 fn uninstall_autostart() -> Result<()> {
     #[allow(unused_imports)]
     use anyhow::Context;
