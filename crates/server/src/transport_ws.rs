@@ -141,11 +141,8 @@ impl WebServerTransport {
                             Err(_) => return,
                         };
                         let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
-                        match handle_http_rw_rtc(&mut stream, rtc_tx, candidate_addr) {
-                            Ok(HttpResult::WsUpgrade) => {
-                                spawn_ws_connection(stream, ws_tx);
-                            }
-                            _ => {}
+                        if let Ok(HttpResult::WsUpgrade) = handle_http_rw_rtc(&mut stream, rtc_tx, candidate_addr) {
+                            spawn_ws_connection(stream, ws_tx);
                         }
                     });
                 }
