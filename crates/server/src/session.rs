@@ -18,6 +18,8 @@ use phantom_core::protocol::AudioCodec;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ── Inbound events from the network receive thread ──────────────────────────
@@ -155,6 +157,9 @@ pub struct SessionRunner {
     pub had_input: bool,
     pub frame_interval: Duration,
     pub last_keyframe_time: Instant,
+    /// Set to true by the accept loop when a new client connects.
+    /// The session loop checks this and exits cleanly.
+    pub cancel: Arc<AtomicBool>,
     /// Audio capture thread + receiver (None if audio feature disabled or init failed).
     #[cfg(feature = "audio")]
     pub audio_rx: Option<mpsc::Receiver<crate::audio_capture::AudioChunk>>,
@@ -171,6 +176,7 @@ impl SessionRunner {
         width: u32,
         height: u32,
         frame_interval: Duration,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
         let event_rx = spawn_receive_thread(receiver);
         let injector = InputInjector::new().ok();
@@ -207,6 +213,7 @@ impl SessionRunner {
             had_input: false,
             frame_interval,
             last_keyframe_time: Instant::now(),
+            cancel,
             #[cfg(feature = "audio")]
             audio_rx,
             #[cfg(feature = "audio")]
@@ -225,6 +232,11 @@ impl SessionRunner {
         hide_remote_cursor();
 
         Ok(runner)
+    }
+
+    /// Check if the session has been cancelled (new client replaced us).
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Drain all pending inbound events (input, clipboard, paste).
@@ -400,6 +412,7 @@ impl SessionRunner {
 // ── Session entry points (one per pipeline) ─────────────────────────────────
 
 /// CPU session: scrap capture + openh264/nvenc encode + tile differ + lossless.
+#[allow(clippy::too_many_arguments)]
 pub fn run_session_cpu(
     capture: &mut dyn phantom_core::capture::FrameCapture,
     video_encoder: &mut dyn FrameEncoder,
@@ -408,13 +421,14 @@ pub fn run_session_cpu(
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
     quality_delay: Duration,
+    cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     video_encoder.force_keyframe();
     differ.reset();
     let _ = capture.reset();
 
     let (width, height) = capture.resolution();
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval)?;
+    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
 
     // Nudge the screen for DXGI (Windows) — harmless on Linux.
     if let Some(ref mut inj) = runner.injector {
@@ -430,6 +444,7 @@ pub fn run_session_cpu(
     let mut sent_first_frame_encoded = false;
 
     loop {
+        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
         let loop_start = Instant::now();
 
         runner.pump_events()?;
@@ -493,16 +508,18 @@ pub fn run_session_gpu(
     sender: Box<dyn MessageSender>,
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
+    cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();
     let (width, height) = encoder.dimensions();
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval)?;
+    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
 
     let mut no_frame_count: u32 = 0;
 
     loop {
+        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
         let loop_start = Instant::now();
 
         runner.pump_events()?;
@@ -551,12 +568,14 @@ pub fn run_session_dxgi(
     sender: Box<dyn MessageSender>,
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
+    cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval)?;
+    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
 
     loop {
+        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
         let loop_start = Instant::now();
 
         runner.pump_events()?;

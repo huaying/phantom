@@ -17,6 +17,8 @@ use phantom_core::crypto;
 use phantom_core::encode::FrameEncoder;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -57,6 +59,8 @@ struct Args {
     #[arg(long)]
     uninstall: bool,
 }
+
+type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -208,7 +212,7 @@ fn main() -> Result<()> {
 
     let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
     let (conn_tx, conn_rx) =
-        mpsc::channel::<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)>();
+        mpsc::channel::<ConnectionPair>();
 
     let base_port: u16 = args
         .listen
@@ -333,14 +337,52 @@ fn main() -> Result<()> {
     }
     drop(conn_tx);
 
-    // ── Main accept loop ────────────────────────────────────────────────────
+    // ── Main accept loop (with session replacement) ─────────────────────────
+    //
+    // A "doorbell" thread blocks on conn_rx. When a new client arrives, it
+    // parks the connection in `pending` and sets `cancel` so the active
+    // session exits within one frame (~33ms). The main loop then picks up
+    // the parked connection and starts a new session.
+
+    let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
+    let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    {
+        let conn_rx = Arc::clone(&conn_rx);
+        let pending = Arc::clone(&pending);
+        let cancel = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("doorbell".into())
+            .spawn(move || loop {
+                let pair = { conn_rx.lock().unwrap().recv() };
+                match pair {
+                    Ok(conn) => {
+                        // Replace any previously queued (but not yet consumed) connection
+                        *pending.lock().unwrap() = Some(conn);
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    Err(_) => break,
+                }
+            })
+            .expect("spawn doorbell thread");
+    }
 
     loop {
         tracing::info!("waiting for client...");
 
-        let (sender, receiver) = conn_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("all transport listeners shut down"))?;
+        // Block until a connection is available
+        let (sender, receiver) = loop {
+            if let Some(conn) = pending.lock().unwrap().take() {
+                break conn;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Reset cancel for the new session
+        cancel.store(false, Ordering::Relaxed);
+        let session_cancel = Arc::clone(&cancel);
 
         #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
@@ -350,6 +392,7 @@ fn main() -> Result<()> {
                 sender,
                 receiver,
                 frame_interval,
+                session_cancel,
             )
         } else {
             session::run_session_cpu(
@@ -360,11 +403,12 @@ fn main() -> Result<()> {
                 receiver,
                 frame_interval,
                 quality_delay,
+                session_cancel,
             )
         };
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
-            session::run_session_dxgi(gw, sender, receiver, frame_interval)
+            session::run_session_dxgi(gw, sender, receiver, frame_interval, session_cancel)
         } else {
             session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
@@ -374,6 +418,7 @@ fn main() -> Result<()> {
                 receiver,
                 frame_interval,
                 quality_delay,
+                session_cancel,
             )
         };
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -385,6 +430,7 @@ fn main() -> Result<()> {
             receiver,
             frame_interval,
             quality_delay,
+            session_cancel,
         );
 
         if let Err(e) = result {
