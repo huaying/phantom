@@ -194,10 +194,10 @@ impl App {
             Err(e) => { tracing::error!("display init failed: {e}"); return; }
         };
 
-        let decoder_name = &self.args_decoder;
+        let _decoder_name = &self.args_decoder;
         let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
             #[cfg(target_os = "macos")]
-            if decoder_name == "auto" || decoder_name == "videotoolbox" {
+            if _decoder_name == "auto" || _decoder_name == "videotoolbox" {
                 match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
                     Ok(d) => {
                         tracing::info!("using VideoToolbox hardware decoder");
