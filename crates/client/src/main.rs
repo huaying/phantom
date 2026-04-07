@@ -98,6 +98,8 @@ struct Session {
     connected: Arc<AtomicBool>,
     /// Set to true when server sends a Disconnect message (don't reconnect).
     server_kicked: Arc<AtomicBool>,
+    /// Shutdown handle to close the TCP connection and unblock the recv thread.
+    shutdown_handle: Option<transport_tcp::TcpShutdownHandle>,
     cursor_pos: Option<PhysicalPosition<f64>>,
     last_sent_mouse: (i32, i32),
     modifiers: winit::event::Modifiers,
@@ -109,6 +111,15 @@ struct Session {
     stats_decode_ms: f64,
     /// Send Opus packets to audio playback thread (None if no audio).
     audio_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Shutdown the TCP connection to unblock the recv thread's blocking read.
+        if let Some(ref handle) = self.shutdown_handle {
+            handle.shutdown();
+        }
+    }
 }
 
 struct App {
@@ -130,25 +141,26 @@ impl App {
 
         tracing::info!(addr = %self.args_connect, "connecting...");
 
-        let result: Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> =
+        let result: Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>, Option<transport_tcp::TcpShutdownHandle>)> =
             if self.args_transport == "quic" {
                 match transport_quic::QuicClientTransport::new()
                     .and_then(|q| q.connect(&self.args_connect))
                 {
-                    Ok((s, r)) => Ok((Box::new(s), Box::new(r))),
+                    Ok((s, r)) => Ok((Box::new(s), Box::new(r), None)),
                     Err(e) => Err(e),
                 }
             } else {
                 match transport_tcp::TcpClientTransport::new(&self.args_connect).connect_tcp() {
                     Ok(conn) => {
+                        let shutdown_handle = conn.shutdown_handle().ok();
                         if let Some(ref key) = self.encryption_key {
                             match conn.split_encrypted(key) {
-                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _)),
+                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
                                 Err(e) => Err(e),
                             }
                         } else {
                             match conn.split() {
-                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _)),
+                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
                                 Err(e) => Err(e),
                             }
                         }
@@ -157,7 +169,7 @@ impl App {
                 }
             };
 
-        let (mut sender, mut receiver) = match result {
+        let (mut sender, mut receiver, shutdown_handle) = match result {
             Ok(pair) => {
                 self.backoff = Duration::from_millis(500);
                 pair
@@ -254,27 +266,35 @@ impl App {
         let (frame_tx, frame_rx) = mpsc::channel();
         let recv_connected = connected.clone();
         let recv_kicked = server_kicked.clone();
-        std::thread::spawn(move || {
-            while let Ok(msg) = receiver.recv_msg() {
-                if let Message::Disconnect { reason } = &msg {
-                    tracing::info!("server disconnected us: {reason}");
-                    recv_kicked.store(true, Ordering::Relaxed);
-                    recv_connected.store(false, Ordering::Relaxed);
-                    break;
+        std::thread::Builder::new()
+            .name("client-recv".into())
+            .spawn(move || {
+                while let Ok(msg) = receiver.recv_msg() {
+                    if let Message::Disconnect { reason } = &msg {
+                        tracing::info!("server disconnected us: {reason}");
+                        recv_kicked.store(true, Ordering::Relaxed);
+                        recv_connected.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    if frame_tx.send(msg).is_err() { break; }
                 }
-                if frame_tx.send(msg).is_err() { break; }
-            }
-            recv_connected.store(false, Ordering::Relaxed);
-        });
+                recv_connected.store(false, Ordering::Relaxed);
+                tracing::debug!("recv thread exiting");
+            })
+            .expect("spawn recv thread");
 
         let (input_tx, input_rx) = mpsc::channel::<Message>();
         let send_connected = connected.clone();
-        std::thread::spawn(move || {
-            while let Ok(msg) = input_rx.recv() {
-                if sender.send_msg(&msg).is_err() { break; }
-            }
-            send_connected.store(false, Ordering::Relaxed);
-        });
+        std::thread::Builder::new()
+            .name("client-send".into())
+            .spawn(move || {
+                while let Ok(msg) = input_rx.recv() {
+                    if sender.send_msg(&msg).is_err() { break; }
+                }
+                send_connected.store(false, Ordering::Relaxed);
+                tracing::debug!("send thread exiting");
+            })
+            .expect("spawn send thread");
 
         self.state = AppState::Connected(Session {
             display,
@@ -284,6 +304,7 @@ impl App {
             input_tx,
             connected,
             server_kicked,
+            shutdown_handle,
             cursor_pos: None,
             last_sent_mouse: (-1, -1),
             modifiers: winit::event::Modifiers::default(),

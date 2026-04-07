@@ -2,7 +2,20 @@ use anyhow::{Context, Result};
 use phantom_core::crypto::{EncryptedReader, EncryptedWriter};
 use phantom_core::protocol::{self, Message};
 use phantom_core::transport::{ClientTransport, Connection, MessageReceiver, MessageSender};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
+
+/// A handle that can shutdown the underlying TCP stream from any thread.
+/// Calling `shutdown()` unblocks any blocking `read_exact()` calls on the stream.
+pub struct TcpShutdownHandle {
+    stream: TcpStream,
+}
+
+impl TcpShutdownHandle {
+    /// Shutdown both halves of the TCP connection.
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
 
 pub struct TcpClientTransport {
     addr: String,
@@ -33,6 +46,13 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
+    /// Get a shutdown handle that can be used to close the connection from another thread.
+    pub fn shutdown_handle(&self) -> Result<TcpShutdownHandle> {
+        Ok(TcpShutdownHandle {
+            stream: self.stream.try_clone().context("clone TcpStream for shutdown handle")?,
+        })
+    }
+
     pub fn split(self) -> Result<(PlainSender, PlainReceiver)> {
         let read_stream = self.stream.try_clone().context("clone TcpStream")?;
         Ok((
