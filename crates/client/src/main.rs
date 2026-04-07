@@ -4,6 +4,8 @@ mod decode_videotoolbox;
 mod decode_zstd;
 mod display_winit;
 mod input_capture;
+#[cfg(feature = "audio")]
+mod audio_playback;
 mod transport_quic;
 mod transport_tcp;
 
@@ -103,6 +105,8 @@ struct Session {
     stats_time: Instant,
     stats_video: u64,
     stats_decode_ms: f64,
+    /// Send Opus packets to audio playback thread (None if no audio).
+    audio_tx: Option<mpsc::SyncSender<Vec<u8>>>,
 }
 
 struct App {
@@ -164,10 +168,10 @@ impl App {
         };
 
         // Read Hello
-        let (width, height) = match receiver.recv_msg() {
-            Ok(Message::Hello { width, height, .. }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
-                tracing::info!(width, height, "connected");
-                (width, height)
+        let (width, height, server_audio) = match receiver.recv_msg() {
+            Ok(Message::Hello { width, height, audio, .. }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
+                tracing::info!(width, height, audio, "connected");
+                (width, height, audio)
             }
             Ok(_) => { tracing::warn!("bad Hello"); return; }
             Err(e) => { tracing::warn!("handshake failed: {e}"); return; }
@@ -225,6 +229,25 @@ impl App {
 
         let connected = Arc::new(AtomicBool::new(true));
 
+        // Start audio playback if server supports it
+        #[cfg(feature = "audio")]
+        let audio_tx: Option<mpsc::SyncSender<Vec<u8>>> = if server_audio {
+            match audio_playback::start_playback(48000, 2) {
+                Ok(tx) => Some(tx),
+                Err(e) => {
+                    tracing::warn!("audio playback init failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "audio"))]
+        let audio_tx: Option<mpsc::SyncSender<Vec<u8>>> = {
+            let _ = server_audio;
+            None
+        };
+
         let (frame_tx, frame_rx) = mpsc::channel();
         let recv_connected = connected.clone();
         std::thread::spawn(move || {
@@ -259,6 +282,7 @@ impl App {
             stats_time: Instant::now(),
             stats_video: 0,
             stats_decode_ms: 0.0,
+            audio_tx,
         });
     }
 }
@@ -308,6 +332,11 @@ impl ApplicationHandler for App {
                         }
                         Message::TileUpdate { .. } => last_tiles = Some(msg),
                         Message::ClipboardSync(t) => clipboard_msgs.push(t),
+                        Message::AudioFrame { data, .. } => {
+                            if let Some(ref audio_tx) = session.audio_tx {
+                                let _ = audio_tx.try_send(data);
+                            }
+                        }
                         _ => {}
                     }
                 }

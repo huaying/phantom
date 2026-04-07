@@ -13,6 +13,8 @@ use phantom_core::encode::{EncodedFrame, Encoder, FrameEncoder};
 use phantom_core::frame::Frame;
 use phantom_core::input::InputEvent;
 use phantom_core::protocol::Message;
+#[cfg(feature = "audio")]
+use phantom_core::protocol::AudioCodec;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::mpsc;
@@ -153,11 +155,16 @@ pub struct SessionRunner {
     pub had_input: bool,
     pub frame_interval: Duration,
     pub last_keyframe_time: Instant,
+    /// Audio capture thread + receiver (None if audio feature disabled or init failed).
+    #[cfg(feature = "audio")]
+    pub audio_rx: Option<mpsc::Receiver<crate::audio_capture::AudioChunk>>,
+    #[cfg(feature = "audio")]
+    pub _audio_capture: Option<crate::audio_capture::AudioCapture>,
 }
 
 impl SessionRunner {
     /// Create a new session runner, spawn the receive thread, send Hello, and
-    /// hide the remote cursor.
+    /// hide the remote cursor. Optionally starts audio capture.
     pub fn new(
         sender: Box<dyn MessageSender>,
         receiver: Box<dyn MessageReceiver>,
@@ -169,6 +176,21 @@ impl SessionRunner {
         let injector = InputInjector::new().ok();
         let clipboard = ClipboardTracker::new();
         let arboard = arboard::Clipboard::new().ok();
+
+        // Start audio capture (best-effort: don't fail session if audio unavailable)
+        #[cfg(feature = "audio")]
+        let (audio_capture, audio_rx) = match crate::audio_capture::AudioCapture::start() {
+            Ok((capture, rx)) => (Some(capture), Some(rx)),
+            Err(e) => {
+                tracing::warn!("audio capture unavailable: {e}");
+                (None, None)
+            }
+        };
+
+        #[cfg(feature = "audio")]
+        let has_audio = audio_rx.is_some();
+        #[cfg(not(feature = "audio"))]
+        let has_audio = false;
 
         let mut runner = Self {
             sender,
@@ -185,6 +207,10 @@ impl SessionRunner {
             had_input: false,
             frame_interval,
             last_keyframe_time: Instant::now(),
+            #[cfg(feature = "audio")]
+            audio_rx,
+            #[cfg(feature = "audio")]
+            _audio_capture: audio_capture,
         };
 
         runner.sender.send_msg(&Message::Hello {
@@ -192,9 +218,9 @@ impl SessionRunner {
             height,
             format: phantom_core::frame::PixelFormat::Bgra8,
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
-            audio: false,
+            audio: has_audio,
         })?;
-        tracing::info!(width, height, "session started");
+        tracing::info!(width, height, audio = has_audio, "session started");
 
         hide_remote_cursor();
 
@@ -344,6 +370,31 @@ impl SessionRunner {
         self.had_input = false;
         v
     }
+
+    /// Send any pending audio frames to the client.
+    /// Returns the number of audio frames sent.
+    pub fn drain_audio(&mut self) -> Result<u32> {
+        #[cfg(feature = "audio")]
+        {
+            let mut count = 0u32;
+            if let Some(ref rx) = self.audio_rx {
+                while let Ok(chunk) = rx.try_recv() {
+                    self.sender.send_msg(&Message::AudioFrame {
+                        codec: AudioCodec::Opus,
+                        sample_rate: chunk.sample_rate,
+                        channels: chunk.channels,
+                        data: chunk.data,
+                    })?;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            Ok(0)
+        }
+    }
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -427,6 +478,7 @@ pub fn run_session_cpu(
             last_frame = Some(frame);
         }
 
+        runner.drain_audio()?;
         runner.log_stats("stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -485,6 +537,7 @@ pub fn run_session_gpu(
             }
         }
 
+        runner.drain_audio()?;
         runner.log_stats("GPU stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -525,6 +578,7 @@ pub fn run_session_dxgi(
             }
         }
 
+        runner.drain_audio()?;
         runner.log_stats("stats (DXGI→NVENC)");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;

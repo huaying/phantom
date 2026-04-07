@@ -3,6 +3,8 @@ mod encode_h264;
 mod encode_zstd;
 mod input_injector;
 mod session;
+#[cfg(feature = "audio")]
+mod audio_capture;
 mod transport_quic;
 mod transport_tcp;
 #[cfg(feature = "webrtc")]
