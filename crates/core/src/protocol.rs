@@ -63,6 +63,11 @@ pub enum Message {
         /// Encoded audio data (one Opus frame = 20ms).
         data: Vec<u8>,
     },
+
+    /// Server → Client: graceful disconnect with reason.
+    Disconnect {
+        reason: String,
+    },
 }
 
 fn default_protocol_version_1() -> u32 {
@@ -183,6 +188,18 @@ mod tests {
         write_message(&mut buf, &Message::Ping).unwrap();
         let mut cursor = Cursor::new(&buf);
         assert!(matches!(read_message(&mut cursor).unwrap(), Message::Ping));
+    }
+
+    #[test]
+    fn roundtrip_disconnect() {
+        let msg = Message::Disconnect { reason: "replaced by new client".to_string() };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::Disconnect { reason } => assert_eq!(reason, "replaced by new client"),
+            _ => panic!("expected Disconnect"),
+        }
     }
 
     #[test]
