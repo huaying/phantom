@@ -96,6 +96,8 @@ struct Session {
     frame_rx: mpsc::Receiver<Message>,
     input_tx: mpsc::Sender<Message>,
     connected: Arc<AtomicBool>,
+    /// Set to true when server sends a Disconnect message (don't reconnect).
+    server_kicked: Arc<AtomicBool>,
     cursor_pos: Option<PhysicalPosition<f64>>,
     last_sent_mouse: (i32, i32),
     modifiers: winit::event::Modifiers,
@@ -228,6 +230,7 @@ impl App {
         };
 
         let connected = Arc::new(AtomicBool::new(true));
+        let server_kicked = Arc::new(AtomicBool::new(false));
 
         // Start audio playback if server supports it
         #[cfg(feature = "audio")]
@@ -250,8 +253,15 @@ impl App {
 
         let (frame_tx, frame_rx) = mpsc::channel();
         let recv_connected = connected.clone();
+        let recv_kicked = server_kicked.clone();
         std::thread::spawn(move || {
             while let Ok(msg) = receiver.recv_msg() {
+                if let Message::Disconnect { reason } = &msg {
+                    tracing::info!("server disconnected us: {reason}");
+                    recv_kicked.store(true, Ordering::Relaxed);
+                    recv_connected.store(false, Ordering::Relaxed);
+                    break;
+                }
                 if frame_tx.send(msg).is_err() { break; }
             }
             recv_connected.store(false, Ordering::Relaxed);
@@ -273,6 +283,7 @@ impl App {
             frame_rx,
             input_tx,
             connected,
+            server_kicked,
             cursor_pos: None,
             last_sent_mouse: (-1, -1),
             modifiers: winit::event::Modifiers::default(),
@@ -300,6 +311,11 @@ impl ApplicationHandler for App {
             AppState::Connected(session) => {
                 // Check disconnect
                 if !session.connected.load(Ordering::Relaxed) {
+                    if session.server_kicked.load(Ordering::Relaxed) {
+                        tracing::info!("server replaced this session, exiting");
+                        event_loop.exit();
+                        return;
+                    }
                     tracing::info!("disconnected, will reconnect...");
                     self.state = AppState::Disconnected;
                     return;

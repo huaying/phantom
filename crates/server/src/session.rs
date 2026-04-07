@@ -239,6 +239,22 @@ impl SessionRunner {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    /// Send a Disconnect message to the client (best-effort, ignores errors).
+    pub fn send_disconnect(&mut self, reason: &str) {
+        let _ = self.sender.send_msg(&Message::Disconnect {
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Check if cancelled and, if so, send Disconnect before bailing.
+    pub fn check_cancelled(&mut self) -> Result<()> {
+        if self.is_cancelled() {
+            self.send_disconnect("replaced by new client");
+            anyhow::bail!("replaced by new client");
+        }
+        Ok(())
+    }
+
     /// Drain all pending inbound events (input, clipboard, paste).
     /// Returns `Err` if the client disconnected.
     pub fn pump_events(&mut self) -> Result<()> {
@@ -444,7 +460,7 @@ pub fn run_session_cpu(
     let mut sent_first_frame_encoded = false;
 
     loop {
-        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
+        runner.check_cancelled()?;
         let loop_start = Instant::now();
 
         runner.pump_events()?;
@@ -519,7 +535,7 @@ pub fn run_session_gpu(
     let mut no_frame_count: u32 = 0;
 
     loop {
-        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
+        runner.check_cancelled()?;
         let loop_start = Instant::now();
 
         runner.pump_events()?;
@@ -575,7 +591,7 @@ pub fn run_session_dxgi(
     let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
 
     loop {
-        if runner.is_cancelled() { anyhow::bail!("replaced by new client"); }
+        runner.check_cancelled()?;
         let loop_start = Instant::now();
 
         runner.pump_events()?;
