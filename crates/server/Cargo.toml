@@ -7,6 +7,7 @@ edition = "2021"
 default = ["web-client"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
+audio = ["libpulse-binding", "libpulse-simple-binding", "audiopus"]
 
 [dependencies]
 phantom-core = { path = "../core" }
@@ -30,3 +31,7 @@ enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"
 phantom-gpu = { path = "../gpu" }
+# Audio: PulseAudio capture + Opus encoding (optional, enabled by default on Linux)
+libpulse-binding = { version = "2", optional = true }
+libpulse-simple-binding = { version = "2", optional = true }
+audiopus = { version = "0.3.0-rc.0", optional = true }

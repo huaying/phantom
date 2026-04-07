@@ -28,6 +28,8 @@ fn tcp_hello_roundtrip() {
             width: 1920,
             height: 1080,
             format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
         };
         protocol::write_message(&mut stream, &hello).unwrap();
         let reply = protocol::read_message(&mut stream).unwrap();
@@ -113,6 +115,8 @@ fn tcp_bidirectional_input_and_video() {
                 width: 1920,
                 height: 1080,
                 format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
             },
         )
         .unwrap();
@@ -285,6 +289,8 @@ mod crypto_tests {
                     width: 3840,
                     height: 2160,
                     format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
                 },
             );
 
@@ -329,6 +335,8 @@ mod crypto_tests {
                     width: 1920,
                     height: 1080,
                     format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
                 },
             );
         });

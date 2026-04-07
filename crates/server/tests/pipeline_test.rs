@@ -216,7 +216,7 @@ fn h264_pframe_smaller_than_keyframe() {
 #[test]
 fn protocol_message_roundtrip() {
     let messages = vec![
-        Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8 },
+        Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8, protocol_version: phantom_core::protocol::PROTOCOL_VERSION, audio: false },
         Message::Ping,
         Message::Pong,
         Message::TileUpdate { sequence: 42, tiles: Box::new(vec![]) },
