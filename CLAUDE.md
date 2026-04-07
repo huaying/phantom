@@ -94,7 +94,7 @@ Browser creates offer → POST /rtc → server returns answer. Single HTTP round
 ### str0m (sans-IO WebRTC)
 Pure Rust, ~15K lines, no tokio for WebRTC path. We provide UDP socket, str0m provides logic. Official `chat.rs` pattern: one socket, one run_loop, demux via `rtc.accepts()`.
 
-**CRITICAL: str0m SCTP cannot deliver messages >16KB reliably.** Regardless of reliable/ordered settings, large DataChannel messages (e.g. 70KB H.264 keyframe) silently fail. Root cause unknown (possibly SCTP congestion window, internal buffer limits, or fragmentation bugs). Workaround: application-level chunking — split messages >16KB into chunks with `[u32 total_len LE][payload]` header, reassemble on client via `ChunkAssembler`.
+**CRITICAL: str0m SCTP cannot deliver messages >16KB reliably.** Regardless of reliable/ordered settings, large DataChannel messages (e.g. 70KB H.264 keyframe) silently fail. Root cause: str0m's `ch.write()` returns `Ok(false)` when the 128KB cross-stream SCTP buffer is full, and phantom was ignoring this return value (`let _ = ch.write(...)`). Fix: proper backpressure using `set_buffered_amount_low_threshold()` + `Event::ChannelBufferedAmountLow` to pause/resume writes, with per-channel pending queues for chunks that couldn't be written immediately.
 
 ### Always H.264 full frames (tile mode removed)
 Tile-based rendering (zstd per-tile) was removed — caused visual tearing when mixed with H.264 over high latency. Now every frame change triggers a full H.264 encode. TileDiffer still used to detect whether the screen changed (skips encode on static frames).
@@ -330,7 +330,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | Item | Severity |
 |------|----------|
 | ~~WebRTC session zombie~~ — fixed: ICE Disconnected → drop ActiveClient → channels disconnect → session ends | ✅ Fixed |
-| **str0m SCTP drops large messages** — `ch.write()` silently fails for >16KB messages. Chunking workaround in place but root cause unknown. | **High** |
+| ~~**str0m SCTP drops large messages**~~ — Root cause: `ch.write()` returns `Ok(false)` when buffer full, was being ignored. Fixed with proper backpressure (buffered_amount_low_threshold + pending queues). | ✅ Fixed |
 | **Server single-session** — only one client at a time. New connections queue until current session ends. Need proper session replacement. | Medium |
 | BGRA→YUV via `pixel_f32()` (slow per-pixel callback) | Medium |
 | Client threads leak on reconnect (no JoinHandle tracking) | Medium |
