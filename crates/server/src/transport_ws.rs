@@ -172,11 +172,8 @@ impl WebServerTransport {
                             Err(_) => return,
                         };
                         let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
-                        match handle_http_rw(&mut stream) {
-                            Ok(HttpResult::WsUpgrade) => {
-                                spawn_ws_connection(stream, ws_tx);
-                            }
-                            _ => {}
+                        if let Ok(HttpResult::WsUpgrade) = handle_http_rw(&mut stream) {
+                            spawn_ws_connection(stream, ws_tx);
                         }
                     });
                 }

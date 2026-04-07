@@ -38,16 +38,17 @@ struct Args {
     #[arg(long)]
     no_encrypt: bool,
 
-    /// Video encoder: openh264 (CPU, default), nvenc (NVIDIA GPU).
-    #[arg(long, default_value = "openh264")]
+    /// Video encoder: auto (default, probes GPU), openh264 (CPU), nvenc (NVIDIA GPU).
+    #[arg(long, default_value = "auto")]
     encoder: String,
 
-    /// Screen capture: scrap (CPU, default), nvfbc (NVIDIA GPU).
-    #[arg(long, default_value = "scrap")]
+    /// Screen capture: auto (default, probes GPU), scrap (CPU), nvfbc (NVIDIA GPU).
+    #[arg(long, default_value = "auto")]
     capture: String,
 
-    /// Transport protocol: tcp (default) or quic (UDP, better for WAN).
-    #[arg(long, default_value = "tcp")]
+    /// Transport protocol(s), comma-separated: tcp, web, quic.
+    /// Default: tcp,web (listens on both TCP and HTTPS/WebSocket).
+    #[arg(long, default_value = "tcp,web")]
     transport: String,
 
     /// Install as auto-start (Windows: logon task, Linux: systemd service).
@@ -104,24 +105,69 @@ fn main() -> Result<()> {
         Some(key)
     };
 
+    // Hardware probe: resolve "auto" encoder and capture
+    let gpu_probe = phantom_gpu::probe::probe();
+    let mut encoder_name = if args.encoder == "auto" {
+        gpu_probe.best_encoder().to_string()
+    } else {
+        args.encoder.clone()
+    };
+    let mut capture_name = if args.capture == "auto" {
+        gpu_probe.best_capture().to_string()
+    } else {
+        args.capture.clone()
+    };
+    tracing::info!(encoder = %encoder_name, capture = %capture_name, "configuration resolved");
+
     // GPU zero-copy pipeline detection
     #[cfg(target_os = "linux")]
-    let use_gpu_pipeline = args.capture == "nvfbc" && args.encoder == "nvenc";
+    let mut use_gpu_pipeline = capture_name == "nvfbc" && encoder_name == "nvenc";
     #[cfg(target_os = "windows")]
-    let use_gpu_pipeline = args.capture == "dxgi" && args.encoder == "nvenc";
+    let mut use_gpu_pipeline = capture_name == "dxgi" && encoder_name == "nvenc";
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let use_gpu_pipeline = false;
 
     // GPU zero-copy pipeline (Linux: NVFBC→NVENC, Windows: DXGI→NVENC)
+    // Falls back gracefully if init fails (e.g. NVFBC not supported on virtual display)
     #[cfg(target_os = "linux")]
     let mut gpu = if use_gpu_pipeline {
-        Some(GpuPipeline::new(args.fps, args.bitrate)?)
+        match GpuPipeline::new(args.fps, args.bitrate) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!("GPU pipeline init failed, falling back to CPU: {e}");
+                use_gpu_pipeline = false;
+                // Fall back to nvenc+scrap (GPU encode, CPU capture) if possible
+                if gpu_probe.has_nvenc {
+                    capture_name = "scrap".to_string();
+                    // encoder stays nvenc
+                } else {
+                    encoder_name = "openh264".to_string();
+                    capture_name = "scrap".to_string();
+                }
+                tracing::info!(encoder = %encoder_name, capture = %capture_name, "fallback configuration");
+                None
+            }
+        }
     } else {
         None
     };
     #[cfg(target_os = "windows")]
     let mut gpu_win = if use_gpu_pipeline {
-        Some(phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(args.fps, args.bitrate)?)
+        match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(args.fps, args.bitrate) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!("DXGI pipeline init failed, falling back to CPU: {e}");
+                use_gpu_pipeline = false;
+                if gpu_probe.has_nvenc {
+                    capture_name = "scrap".to_string();
+                } else {
+                    encoder_name = "openh264".to_string();
+                    capture_name = "scrap".to_string();
+                }
+                tracing::info!(encoder = %encoder_name, capture = %capture_name, "fallback configuration");
+                None
+            }
+        }
     } else {
         None
     };
@@ -129,7 +175,7 @@ fn main() -> Result<()> {
     let _gpu: Option<()> = None;
 
     let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
-        Some(create_capture(&args.capture)?)
+        Some(create_capture(&capture_name)?)
     } else {
         None
     };
@@ -146,63 +192,100 @@ fn main() -> Result<()> {
     };
 
     let mut video_encoder: Option<Box<dyn FrameEncoder>> = if !use_gpu_pipeline {
-        Some(create_encoder(&args.encoder, width, height, args.fps as f32, args.bitrate)?)
+        Some(create_encoder(&encoder_name, width, height, args.fps as f32, args.bitrate)?)
     } else {
         None
     };
     let mut differ = TileDiffer::new();
 
-    // Build transport based on --transport flag
-    let tcp_listener;
-    let quic_listener;
-    let ws_listener: Option<transport_ws::WebServerTransport>;
-    match args.transport.as_str() {
-        "tcp" => {
-            tcp_listener = Some(transport_tcp::TcpServerTransport::bind(&args.listen)?);
-            quic_listener = None;
-            ws_listener = None;
+    // Parse transport list (comma-separated)
+    let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
+
+    // Channel for accepted connections from any transport
+    let (conn_tx, conn_rx) = mpsc::channel::<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)>();
+
+    let base_port: u16 = args.listen.rsplit(':').next()
+        .and_then(|p| p.parse().ok()).unwrap_or(9900);
+    let listen_host: String = args.listen.rsplit_once(':').map(|x| x.0).unwrap_or("0.0.0.0").to_string();
+
+    for transport in &transports {
+        match *transport {
+            "tcp" => {
+                let tcp_addr = format!("{listen_host}:{base_port}");
+                let tcp_listener = transport_tcp::TcpServerTransport::bind(&tcp_addr)?;
+                let tx = conn_tx.clone();
+                let enc_key = encryption_key;
+                std::thread::Builder::new().name("tcp-accept".into()).spawn(move || {
+                    loop {
+                        match tcp_listener.accept_tcp() {
+                            Ok(conn) => {
+                                let pair = if let Some(ref key) = enc_key {
+                                    match conn.split_encrypted(key) {
+                                        Ok((s, r)) => (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>),
+                                        Err(e) => { tracing::warn!("TCP encrypted handshake failed: {e}"); continue; }
+                                    }
+                                } else {
+                                    match conn.split() {
+                                        Ok((s, r)) => (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>),
+                                        Err(e) => { tracing::warn!("TCP split failed: {e}"); continue; }
+                                    }
+                                };
+                                if tx.send(pair).is_err() { break; }
+                            }
+                            Err(e) => { tracing::warn!("TCP accept error: {e}"); }
+                        }
+                    }
+                })?;
+            }
+            "web" => {
+                let web_port = if transports.len() > 1 { base_port + 1 } else { base_port };
+                let ws_transport = transport_ws::WebServerTransport::start(
+                    web_port, web_port + 1, web_port + 2,
+                )?;
+                tracing::info!("open https://localhost:{web_port} in browser");
+                let tx = conn_tx.clone();
+                std::thread::Builder::new().name("web-accept".into()).spawn(move || {
+                    loop {
+                        let result = {
+                            #[cfg(feature = "webrtc")]
+                            { ws_transport.accept_any() }
+                            #[cfg(not(feature = "webrtc"))]
+                            { ws_transport.accept_ws() }
+                        };
+                        match result {
+                            Ok(pair) => { if tx.send(pair).is_err() { break; } }
+                            Err(e) => { tracing::warn!("WebSocket accept error: {e}"); }
+                        }
+                    }
+                })?;
+            }
+            "quic" => {
+                let quic_addr = format!("{listen_host}:{base_port}");
+                let quic_listener = transport_quic::QuicServerTransport::bind(&quic_addr)?;
+                let tx = conn_tx.clone();
+                std::thread::Builder::new().name("quic-accept".into()).spawn(move || {
+                    loop {
+                        match quic_listener.accept() {
+                            Ok((s, r)) => {
+                                let pair = (Box::new(s) as Box<dyn MessageSender>, Box::new(r) as Box<dyn MessageReceiver>);
+                                if tx.send(pair).is_err() { break; }
+                            }
+                            Err(e) => { tracing::warn!("QUIC accept error: {e}"); }
+                        }
+                    }
+                })?;
+            }
+            other => anyhow::bail!("unknown transport '{other}'. Available: tcp, web, quic"),
         }
-        "quic" => {
-            tcp_listener = None;
-            quic_listener = Some(transport_quic::QuicServerTransport::bind(&args.listen)?);
-            ws_listener = None;
-        }
-        "web" => {
-            tcp_listener = None;
-            quic_listener = None;
-            let port: u16 = args.listen.rsplit(':').next()
-                .and_then(|p| p.parse().ok()).unwrap_or(9900);
-            ws_listener = Some(transport_ws::WebServerTransport::start(
-                port, port + 1, port + 2,
-            )?);
-            tracing::info!("open http://localhost:{port} in browser");
-        }
-        other => anyhow::bail!("unknown transport '{other}'. Available: tcp, quic, web"),
     }
+    // Drop the original sender so conn_rx doesn't block forever when all threads die
+    drop(conn_tx);
 
     loop {
         tracing::info!("waiting for client...");
 
-        let (sender, receiver): (Box<dyn MessageSender>, Box<dyn MessageReceiver>) =
-            if let Some(ref ws) = ws_listener {
-                // Default: WebSocket. With --features webrtc: accept either WS or WebRTC.
-                #[cfg(feature = "webrtc")]
-                { ws.accept_any()? }
-                #[cfg(not(feature = "webrtc"))]
-                { ws.accept_ws()? }
-            } else if let Some(ref quic) = quic_listener {
-                let (s, r) = quic.accept()?;
-                (Box::new(s), Box::new(r))
-            } else {
-                let conn = tcp_listener.as_ref().unwrap().accept_tcp()?;
-                if let Some(ref key) = encryption_key {
-                    let (s, r) = conn.split_encrypted(key)?;
-                    (Box::new(s), Box::new(r))
-                } else {
-                    let (s, r) = conn.split()?;
-                    (Box::new(s), Box::new(r))
-                }
-            };
+        let (sender, receiver) = conn_rx.recv()
+            .map_err(|_| anyhow::anyhow!("all transport listeners shut down"))?;
 
         #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
