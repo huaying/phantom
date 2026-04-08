@@ -10,27 +10,90 @@ pub struct ScrapCapture {
     capturer: Capturer,
     width: u32,
     height: u32,
+    display_index: usize,
 }
 
 impl ScrapCapture {
+    /// Create a capturer for the primary display.
+    #[allow(dead_code)]
     pub fn new() -> Result<Self> {
-        let display = Display::primary().context("failed to get primary display")?;
+        Self::with_display(0)
+    }
+
+    /// Create a capturer for a specific display by index.
+    ///
+    /// Index 0 is the primary display. Use `list_displays()` to enumerate.
+    pub fn with_display(index: usize) -> Result<Self> {
+        let displays = Display::all().context("failed to enumerate displays")?;
+        if displays.is_empty() {
+            anyhow::bail!("no displays found");
+        }
+        if index >= displays.len() {
+            anyhow::bail!(
+                "display index {index} out of range (found {} display{})",
+                displays.len(),
+                if displays.len() == 1 { "" } else { "s" }
+            );
+        }
+
+        let display = displays.into_iter().nth(index).unwrap();
         let width = display.width() as u32;
         let height = display.height() as u32;
         let capturer = Capturer::new(display).context("failed to create capturer")?;
-        tracing::info!(width, height, "ScrapCapture initialized");
-        Ok(Self { capturer, width, height })
+        tracing::info!(index, width, height, "ScrapCapture initialized");
+        Ok(Self { capturer, width, height, display_index: index })
     }
 
     /// Recreate the capturer. Resets DXGI Desktop Duplication state so the
     /// next capture() call returns a frame even on a static desktop.
     pub fn reset(&mut self) -> Result<()> {
-        let display = Display::primary().context("failed to get primary display")?;
+        let displays = Display::all().context("failed to enumerate displays")?;
+        let index = self.display_index.min(displays.len().saturating_sub(1));
+        let display = displays.into_iter().nth(index)
+            .context("display disappeared during reset")?;
         self.width = display.width() as u32;
         self.height = display.height() as u32;
         self.capturer = Capturer::new(display).context("failed to recreate capturer")?;
-        tracing::debug!("ScrapCapture reset");
+        self.display_index = index;
+        tracing::debug!(index, "ScrapCapture reset");
         Ok(())
+    }
+
+    /// List all available displays with their index and resolution.
+    pub fn list_displays() -> Result<Vec<DisplayInfo>> {
+        let displays = Display::all().context("failed to enumerate displays")?;
+        Ok(displays
+            .iter()
+            .enumerate()
+            .map(|(i, d)| DisplayInfo {
+                index: i,
+                width: d.width() as u32,
+                height: d.height() as u32,
+                is_primary: i == 0,
+            })
+            .collect())
+    }
+}
+
+/// Information about an available display.
+#[derive(Debug, Clone)]
+pub struct DisplayInfo {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
+impl std::fmt::Display for DisplayInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Display {}: {}x{}{}",
+            self.index,
+            self.width,
+            self.height,
+            if self.is_primary { " (primary)" } else { "" }
+        )
     }
 }
 
