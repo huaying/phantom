@@ -3,6 +3,7 @@ use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use tungstenite::WebSocket;
 
@@ -10,6 +11,47 @@ use tungstenite::WebSocket;
 use std::sync::Mutex;
 #[cfg(feature = "webrtc")]
 use std::time::Instant;
+
+/// Maximum concurrent HTTP/WS handler threads.
+const MAX_CONNECTIONS: usize = 16;
+
+/// Keep-alive idle timeout: close the connection if no new request arrives
+/// within this duration.
+const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum requests served on a single keep-alive connection before we close
+/// it (prevents a single connection from monopolising a pool slot forever).
+const MAX_REQUESTS_PER_CONN: usize = 100;
+
+// ── Connection pool guard ───────────────────────────────────────────────────
+
+/// RAII guard that increments on creation and decrements on drop, keeping
+/// the active-connection count accurate regardless of how the handler exits.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    /// Try to acquire a slot. Returns `None` if the pool is full.
+    fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= MAX_CONNECTIONS {
+                return None;
+            }
+            if counter
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self(Arc::clone(counter)));
+            }
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Load or generate a self-signed TLS cert for HTTPS (enables WebCodecs on non-localhost).
 /// Cert is persisted to ~/.phantom_cert.pem + ~/.phantom_key.pem so the browser
@@ -102,6 +144,9 @@ impl WebServerTransport {
         // Channel for WS connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
 
+        // Shared connection counter for the thread pool
+        let conn_count = Arc::new(AtomicUsize::new(0));
+
         // --- WebRTC setup (only when feature enabled) ---
         #[cfg(feature = "webrtc")]
         let (rtc_session, rtc_notify) = {
@@ -129,22 +174,54 @@ impl WebServerTransport {
             let http_listener = TcpListener::bind(&http_addr).context("bind HTTPS")?;
             tracing::info!(addr = %http_addr, "HTTPS server (static + POST /rtc + WSS)");
 
+            let pool = conn_count.clone();
             std::thread::spawn(move || {
                 for tcp_stream in http_listener.incoming().flatten() {
+                    let guard = match ConnGuard::try_acquire(&pool) {
+                        Some(g) => g,
+                        None => {
+                            // Pool full — reject with 503
+                            tracing::warn!("connection pool full ({MAX_CONNECTIONS}), rejecting");
+                            let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                    };
+
                     let tls = tls_acceptor.clone();
                     let rtc_tx = rtc_tx.clone();
                     let ws_tx = ws_tx.clone();
                     let candidate_addr = candidate_addr;
-                    std::thread::spawn(move || {
-                        let conn = match rustls::ServerConnection::new(tls) {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
-                        if let Ok(HttpResult::WsUpgrade) = handle_http_rw_rtc(&mut stream, rtc_tx, candidate_addr) {
-                            spawn_ws_connection(stream, ws_tx);
-                        }
-                    });
+                    std::thread::Builder::new()
+                        .name("http-handler".into())
+                        .spawn(move || {
+                            let _guard = guard; // held until this thread exits
+                            let conn = match rustls::ServerConnection::new(tls) {
+                                Ok(c) => c,
+                                Err(_) => return,
+                            };
+                            let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+
+                            // Set read timeout for keep-alive idle detection
+                            let _ = stream.sock.set_read_timeout(Some(KEEPALIVE_TIMEOUT));
+
+                            // Keep-alive loop: serve multiple requests on the same TLS connection
+                            for _req_num in 0..MAX_REQUESTS_PER_CONN {
+                                match handle_http_rw_rtc(&mut stream, &rtc_tx, candidate_addr) {
+                                    Ok(HttpResult::WsUpgrade) => {
+                                        // WebSocket takes over — exit the keep-alive loop
+                                        spawn_ws_connection(stream, ws_tx);
+                                        return;
+                                    }
+                                    Ok(HttpResult::Done) => {
+                                        // Request served, loop back for next request (keep-alive)
+                                        continue;
+                                    }
+                                    Ok(HttpResult::Close) => break,
+                                    Err(_) => break, // read timeout, client closed, or error
+                                }
+                            }
+                        })
+                        .ok();
                 }
             });
 
@@ -159,20 +236,45 @@ impl WebServerTransport {
             let http_listener = TcpListener::bind(&http_addr).context("bind HTTPS")?;
             tracing::info!(addr = %http_addr, "HTTPS server (static + WSS)");
 
+            let pool = conn_count.clone();
             std::thread::spawn(move || {
                 for tcp_stream in http_listener.incoming().flatten() {
+                    let guard = match ConnGuard::try_acquire(&pool) {
+                        Some(g) => g,
+                        None => {
+                            tracing::warn!("connection pool full ({MAX_CONNECTIONS}), rejecting");
+                            let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                    };
+
                     let tls = tls_acceptor.clone();
                     let ws_tx = ws_tx.clone();
-                    std::thread::spawn(move || {
-                        let conn = match rustls::ServerConnection::new(tls) {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
-                        if let Ok(HttpResult::WsUpgrade) = handle_http_rw(&mut stream) {
-                            spawn_ws_connection(stream, ws_tx);
-                        }
-                    });
+                    std::thread::Builder::new()
+                        .name("http-handler".into())
+                        .spawn(move || {
+                            let _guard = guard;
+                            let conn = match rustls::ServerConnection::new(tls) {
+                                Ok(c) => c,
+                                Err(_) => return,
+                            };
+                            let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+
+                            let _ = stream.sock.set_read_timeout(Some(KEEPALIVE_TIMEOUT));
+
+                            for _req_num in 0..MAX_REQUESTS_PER_CONN {
+                                match handle_http_rw(&mut stream) {
+                                    Ok(HttpResult::WsUpgrade) => {
+                                        spawn_ws_connection(stream, ws_tx);
+                                        return;
+                                    }
+                                    Ok(HttpResult::Done) => continue,
+                                    Ok(HttpResult::Close) => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        })
+                        .ok();
                 }
             });
         }
@@ -214,8 +316,22 @@ impl WebServerTransport {
 // --- HTTP handling ---
 
 enum HttpResult {
+    /// Request served; connection may be reused (keep-alive).
     Done,
+    /// Client requested `Connection: close` or a non-keepalive response was sent.
+    Close,
+    /// WebSocket upgrade — caller must hand off the connection.
     WsUpgrade,
+}
+
+/// Check whether the client sent `Connection: close`.
+fn wants_close(request: &str) -> bool {
+    request
+        .lines()
+        .any(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower.starts_with("connection:") && lower.contains("close")
+        })
 }
 
 /// HTTP handler WITHOUT WebRTC (no POST /rtc).
@@ -225,10 +341,16 @@ fn handle_http_rw(
 ) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
+    if n == 0 {
+        // Client closed the connection
+        anyhow::bail!("client closed");
+    }
     buf.truncate(n);
     let request = String::from_utf8_lossy(&buf);
     let raw_path = request.split_whitespace().nth(1).unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
+
+    let close = wants_close(&request);
 
     // WebSocket upgrade
     let request_lower = request.to_ascii_lowercase();
@@ -236,24 +358,33 @@ fn handle_http_rw(
         return send_ws_upgrade(stream, &request);
     }
 
-    serve_static(stream, path)?;
-    Ok(HttpResult::Done)
+    serve_static(stream, path, !close)?;
+    if close {
+        Ok(HttpResult::Close)
+    } else {
+        Ok(HttpResult::Done)
+    }
 }
 
 /// HTTP handler WITH WebRTC (POST /rtc + static + WSS upgrade).
 #[cfg(feature = "webrtc")]
 fn handle_http_rw_rtc(
     stream: &mut (impl Read + Write),
-    rtc_tx: mpsc::Sender<str0m::Rtc>,
+    rtc_tx: &mpsc::Sender<str0m::Rtc>,
     candidate_addr: std::net::SocketAddr,
 ) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
+    if n == 0 {
+        anyhow::bail!("client closed");
+    }
     buf.truncate(n);
     let request = String::from_utf8_lossy(&buf);
     let method = request.split_whitespace().next().unwrap_or("GET");
     let raw_path = request.split_whitespace().nth(1).unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
+
+    let close = wants_close(&request);
 
     // WebSocket upgrade
     let request_lower = request.to_ascii_lowercase();
@@ -281,22 +412,32 @@ fn handle_http_rw_rtc(
             rtc_tx.send(rtc).map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
 
             let resp_body = answer_json.to_string();
+            let conn_header = if close { "close" } else { "keep-alive" };
             write!(stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: {conn_header}\r\n\r\n",
                 resp_body.len()
             )?;
             stream.write_all(resp_body.as_bytes())?;
+            stream.flush()?;
             tracing::info!("SDP offer/answer exchanged via POST /rtc");
         }
         ("OPTIONS", "/rtc") => {
+            let conn_header = if close { "close" } else { "keep-alive" };
             write!(stream,
-                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: {conn_header}\r\n\r\n"
             )?;
+            stream.flush()?;
         }
-        _ => { serve_static(stream, path)?; }
+        _ => {
+            serve_static(stream, path, !close)?;
+        }
     }
-    stream.flush()?;
-    Ok(HttpResult::Done)
+
+    if close {
+        Ok(HttpResult::Close)
+    } else {
+        Ok(HttpResult::Done)
+    }
 }
 
 fn send_ws_upgrade(stream: &mut (impl Read + Write), request: &str) -> Result<HttpResult> {
@@ -313,15 +454,17 @@ fn send_ws_upgrade(stream: &mut (impl Read + Write), request: &str) -> Result<Ht
     Ok(HttpResult::WsUpgrade)
 }
 
-fn serve_static(stream: &mut (impl Read + Write), path: &str) -> Result<()> {
+/// Serve a static file response with keep-alive or close semantics.
+fn serve_static(stream: &mut (impl Read + Write), path: &str, keep_alive: bool) -> Result<()> {
     let (status, content_type, body): (&str, &str, &[u8]) = match path {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         "/phantom_web.js" => ("200 OK", "application/javascript", WASM_JS),
         "/phantom_web_bg.wasm" => ("200 OK", "application/wasm", WASM_BIN),
         _ => ("404 Not Found", "text/plain", b"404 Not Found"),
     };
+    let conn_header = if keep_alive { "keep-alive" } else { "close" };
     write!(stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: {conn_header}\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)?;
