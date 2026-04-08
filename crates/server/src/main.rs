@@ -53,6 +53,14 @@ struct Args {
     #[arg(long, default_value = "tcp,web")]
     transport: String,
 
+    /// Display index to capture (0 = primary). Use --list-displays to see available displays.
+    #[arg(long, default_value_t = 0)]
+    display: usize,
+
+    /// List available displays and exit.
+    #[arg(long)]
+    list_displays: bool,
+
     /// Install as auto-start (Windows: logon task, Linux: systemd service).
     #[arg(long)]
     install: bool,
@@ -96,6 +104,26 @@ fn main() -> Result<()> {
             }
         })
         .expect("failed to set Ctrl+C handler");
+    }
+
+    if args.list_displays {
+        match capture_scrap::ScrapCapture::list_displays() {
+            Ok(displays) => {
+                if displays.is_empty() {
+                    println!("No displays found.");
+                } else {
+                    println!("Available displays:");
+                    for d in &displays {
+                        println!("  {d}");
+                    }
+                    println!("\nUse --display N to capture a specific display.");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to enumerate displays: {e}");
+            }
+        }
+        return Ok(());
     }
 
     if args.install {
@@ -152,7 +180,7 @@ fn main() -> Result<()> {
     } else {
         args.capture.clone()
     };
-    tracing::info!(encoder = %encoder_name, capture = %capture_name, "configuration resolved");
+    tracing::info!(encoder = %encoder_name, capture = %capture_name, display = args.display, "configuration resolved");
 
     // GPU zero-copy pipeline detection
     #[cfg(target_os = "linux")]
@@ -208,7 +236,7 @@ fn main() -> Result<()> {
     let _gpu: Option<()> = None;
 
     let mut capture: Option<Box<dyn phantom_core::capture::FrameCapture>> = if !use_gpu_pipeline {
-        Some(create_capture(&capture_name)?)
+        Some(create_capture(&capture_name, args.display)?)
     } else {
         None
     };
@@ -614,14 +642,17 @@ impl GpuPipeline {
 
 // ── Factory functions ───────────────────────────────────────────────────────
 
-fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
+fn create_capture(name: &str, display_index: usize) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
     match name {
         "scrap" => {
-            let cap = capture_scrap::ScrapCapture::new()?;
+            let cap = capture_scrap::ScrapCapture::with_display(display_index)?;
             Ok(Box::new(cap))
         }
         #[cfg(feature = "wayland")]
         "pipewire" => {
+            if display_index != 0 {
+                tracing::warn!("PipeWire capture: --display is ignored (portal handles display selection)");
+            }
             let cap = capture_pipewire::PipeWireCapture::new()?;
             Ok(Box::new(cap))
         }
