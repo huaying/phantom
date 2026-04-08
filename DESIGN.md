@@ -31,10 +31,12 @@ All transports implement `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`. 
 
 | Transport | Use Case | Protocol |
 |-----------|----------|----------|
-| WSS (default web) | Browser client | WebSocket over TLS, same HTTPS port |
+| WSS (default web) | Browser client | WebSocket over TLS, same HTTPS port, HTTP/1.1 keep-alive |
 | WebRTC DataChannel | Future NAT traversal | SCTP/DTLS/UDP, `--features webrtc` |
 | TCP | Native client (LAN) | Raw TCP, optional ChaCha20 encryption |
 | QUIC | Native client (WAN) | UDP, built-in TLS, no HOL blocking |
+
+The HTTPS server uses HTTP/1.1 keep-alive to reuse TLS connections across multiple requests (e.g., loading index.html + .js + .wasm in one connection). A bounded connection pool (16 max threads) prevents thread explosion under load.
 
 ### Web Client
 

@@ -4,7 +4,7 @@
 
 Phantom is a high-performance, open-source remote desktop built in Rust. Target: Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text), single binary deployment, browser + native access.
 
-~17,000 lines Rust (across 7 crates), 21 tests, MIT license. Runs on Linux + Windows.
+~17,000 lines Rust (across 7 crates), 76 tests, MIT license. Runs on Linux + Windows.
 
 ## Build Commands
 
@@ -13,7 +13,7 @@ cargo build --release                                    # native (WSS web trans
 cargo build --release --features webrtc                  # native + WebRTC DataChannel support
 wasm-pack build crates/web --target web --no-typescript  # WASM (must run BEFORE server build!)
 cargo build --release -p phantom-server                  # server embeds WASM via include_bytes!
-cargo test                                               # 21 tests
+cargo test                                               # 76 tests (unit + integration + WAN simulation)
 cargo clippy --release                                   # must be zero warnings
 
 # GPU benchmarks (requires NVIDIA GPU + DISPLAY=:0)
@@ -155,8 +155,8 @@ All NVIDIA libraries loaded at runtime via dlopen — compiles on any machine, G
 
 **NVENC encoder flow** (CPU input path):
 ```
-Frame.data (BGRA CPU) → bgra_to_nv12 (CPU) → cuMemcpyHtoD → NVENC encode (GPU) → H.264 bytes
-~10ms at 1080p
+Frame.data (BGRA CPU) → bgra_to_nv12 (CPU, AVX2 SIMD) → cuMemcpyHtoD → NVENC encode (GPU) → H.264 bytes
+~8ms at 1080p (was ~10ms before SIMD)
 ```
 
 **NVFBC→NVENC zero-copy flow** (all GPU):
@@ -233,7 +233,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (31)
+## Implemented Features (34)
 
 | # | Feature |
 |---|---------|
@@ -268,6 +268,9 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 26 | **WASM pkg in repo** (Windows builds without wasm-pack) |
 | 30 | **Cross-platform release pipeline** (GitHub Actions: Linux/Windows/macOS/Docker, install.sh, install.ps1) |
 | 31 | **QUIC ALPN fix** (client was missing ALPN protocol, QUIC never worked before this fix) |
+| 32 | **HTTP keep-alive + connection pool** (reuses TLS connections, bounded 16-thread pool, 30s idle timeout) |
+| 33 | **AVX2 SIMD color conversion** (BGRA→NV12 2.8x, YUV→RGB32 3.4x faster, runtime-detected, scalar fallback) |
+| 34 | **WAN simulation tests** (8 E2E tests: 0–300ms RTT, jitter, encrypted, keepalive, session replacement) |
 
 ---
 
@@ -287,7 +290,9 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | **Multi-transport** | UX | Support TCP + WSS simultaneously (currently one at a time) |
 | **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
 | **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
-| **WAN testing** | verify real latency | Need cloud VM, `tc netem` for simulating loss/delay |
+| ~~**WAN testing**~~ | ✅ done | Simulated latency/jitter E2E tests (0–300ms RTT, 8 tests) |
+| ~~**HTTP keep-alive + pool**~~ | ✅ done | Reuses TLS connections, bounded 16-thread pool |
+| ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV, 2.8–3.4x speedup at 1080p |
 
 ### Host Performance
 | Task | Impact |
@@ -296,7 +301,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | x264 via FFmpeg | 2-3x better compression than OpenH264 |
 | AV1 encoding (NVENC/SVT-AV1) | 30% better than H.264 |
 | DMA-BUF/KMS capture | Linux zero-copy |
-| SIMD color conversion | 4x faster YUV↔RGB |
+| ~~SIMD color conversion~~ | ✅ Done — AVX2 BGRA→NV12 2.8x, YUV→RGB 3.4x (runtime-detected, scalar fallback) |
 
 ### Native Client Performance
 | Task | Impact |
@@ -332,10 +337,10 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~WebRTC session zombie~~ — fixed: ICE Disconnected → drop ActiveClient → channels disconnect → session ends | ✅ Fixed |
 | ~~**str0m SCTP drops large messages**~~ — Root cause: `ch.write()` returns `Ok(false)` when buffer full, was being ignored. Fixed with proper backpressure (buffered_amount_low_threshold + pending queues). | ✅ Fixed |
 | **Server single-session** — only one client at a time. New connections queue until current session ends. Need proper session replacement. | Medium |
-| BGRA→YUV via `pixel_f32()` (slow per-pixel callback) | Medium |
-| Client threads leak on reconnect (no JoinHandle tracking) | Medium |
+| ~~BGRA→YUV via `pixel_f32()` (slow per-pixel callback)~~ | ✅ Fixed — AVX2 SIMD, 2.8–3.4x speedup |
+| ~~Client threads leak on reconnect (no JoinHandle tracking)~~ | ✅ Fixed — TcpShutdownHandle + shutdown(Both) on Drop |
 | No graceful shutdown (Ctrl+C) | Low |
-| HTTP handler threads unbounded (no pool) | Medium |
+| ~~HTTP handler threads unbounded (no pool)~~ | ✅ Fixed — bounded 16-thread pool + ConnGuard RAII |
 | WS IO loop 50ms read timeout (was 5ms, increased for stability) | Low |
 | ~~Web client no auto-reconnect~~ — fixed: exponential backoff | ✅ Fixed |
 | Server single-transport — TCP or WSS, not both simultaneously | Medium |
@@ -359,7 +364,7 @@ crates/core/src/
   frame.rs        Frame struct, PixelFormat
   input.rs        InputEvent, KeyCode, MouseButton
   clipboard.rs    ClipboardTracker (echo-loop prevention)
-  color.rs        BGRA↔YUV420 conversion (BT.601)
+  color.rs        BGRA↔YUV420/NV12 conversion (BT.601, AVX2 SIMD + scalar fallback)
   crypto.rs       ChaCha20-Poly1305 EncryptedWriter/Reader (feature-gated)
 
 crates/server/src/
@@ -371,9 +376,10 @@ crates/server/src/
   input_injector.rs    enigo: mouse/keyboard injection + type_text for paste, modifier release
   transport_tcp.rs     TCP: Plain/Encrypted sender/receiver, split via try_clone
   transport_quic.rs    QUIC: quinn, self-signed TLS, keep-alive
-  transport_ws.rs      WebServerTransport: HTTPS static + WSS upgrade (same port) + WebRTC POST /rtc
+  transport_ws.rs      WebServerTransport: HTTPS static + WSS upgrade (same port) + WebRTC POST /rtc + HTTP keep-alive + connection pool
   transport_webrtc.rs  str0m 0.18 run_loop, ActiveClient, chunked writes (>16KB), 1ms polling
   bin/mock_server.rs   Animated H.264 frames without screen capture
+  tests/wan_test.rs    WAN simulation: TCP proxy with configurable delay/jitter, 8 E2E tests
 
 crates/client/src/
   main.rs              winit ApplicationHandler, reconnect loop, transport selection
@@ -396,7 +402,7 @@ crates/gpu/src/
   dl.rs                Runtime dlopen/dlsym abstraction (no build-time NVIDIA dep)
   sys.rs               C FFI types: CUDA, NVENC (SDK 12.1), NVFBC (v1.8/1.9 compat)
   cuda.rs              CUDA driver API: context, memory, memcpy, primary context
-  nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 GPU encode via NVENC
+  nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 GPU encode via NVENC (uses phantom_core::color for BGRA→NV12)
   nvfbc.rs             NvfbcCapture (impl FrameCapture): GPU screen capture via NVFBC
   dxgi.rs              DxgiCapture: DXGI Desktop Duplication → ID3D11Texture2D (Windows)
   dxgi_nvenc.rs        DxgiNvencPipeline: DXGI capture + NVENC encode zero-copy (Windows)
