@@ -20,7 +20,7 @@ use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "phantom-server", about = "Phantom remote desktop server")]
@@ -71,6 +71,30 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ── Graceful shutdown signal (Ctrl+C / SIGTERM) ─────────────────────────
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // We'll register the session cancel flag later so the signal handler
+    // can also cancel an active session immediately.
+    let shutdown_cancel: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        let shutdown_cancel = Arc::clone(&shutdown_cancel);
+        ctrlc::set_handler(move || {
+            if shutdown.swap(true, Ordering::SeqCst) {
+                // Second signal → force exit immediately
+                eprintln!("\nForced exit.");
+                std::process::exit(1);
+            }
+            eprintln!("\nShutting down (press Ctrl+C again to force)...");
+            // Cancel any active session so it exits promptly
+            if let Some(ref cancel) = *shutdown_cancel.lock().unwrap() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .expect("failed to set Ctrl+C handler");
+    }
 
     if args.install {
         return install_autostart();
@@ -370,19 +394,38 @@ fn main() -> Result<()> {
     }
 
     loop {
+        // Check shutdown before waiting for next client
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown signal received, stopping accept loop");
+            break;
+        }
+
         tracing::info!("waiting for client...");
 
-        // Block until a connection is available
-        let (sender, receiver) = loop {
+        // Block until a connection is available (or shutdown)
+        let conn = loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break None;
+            }
             if let Some(conn) = pending.lock().unwrap().take() {
-                break conn;
+                break Some(conn);
             }
             std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let (sender, receiver) = match conn {
+            Some(c) => c,
+            None => {
+                tracing::info!("shutdown signal received, stopping accept loop");
+                break;
+            }
         };
 
         // Reset cancel for the new session
         cancel.store(false, Ordering::Relaxed);
         let session_cancel = Arc::clone(&cancel);
+        // Register with signal handler so Ctrl+C cancels active session
+        *shutdown_cancel.lock().unwrap() = Some(Arc::clone(&cancel));
 
         #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
@@ -454,6 +497,18 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    // ── Shutdown complete ───────────────────────────────────────────────────
+    // Set cancel to ensure any lingering session thread exits
+    cancel.store(true, Ordering::Relaxed);
+
+    // Give threads a moment to clean up (max 2s)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tracing::info!("goodbye 👋");
+    Ok(())
 }
 
 // ── GPU pipeline struct (Linux) ─────────────────────────────────────────────

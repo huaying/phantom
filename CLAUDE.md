@@ -339,7 +339,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~**Server single-session**~~ — Fixed: session replacement implemented. New client sends doorbell, server cancels old session via AtomicBool, sends Disconnect message, old client exits cleanly. Takeover ~68ms. (PR #6, #7) | ✅ Fixed |
 | ~~BGRA→YUV via `pixel_f32()` (slow per-pixel callback)~~ | ✅ Fixed — AVX2 SIMD, 2.8–3.4x speedup |
 | ~~Client threads leak on reconnect (no JoinHandle tracking)~~ | ✅ Fixed — TcpShutdownHandle + shutdown(Both) on Drop |
-| No graceful shutdown (Ctrl+C) | Low |
+| ~~No graceful shutdown (Ctrl+C)~~ | ✅ Fixed — ctrlc handler sets shutdown flag, cancels active session, 2s cleanup window, double Ctrl+C force exits |
 | ~~HTTP handler threads unbounded (no pool)~~ | ✅ Fixed — bounded 16-thread pool + ConnGuard RAII |
 | WS IO loop 50ms read timeout (was 5ms, increased for stability) | Low |
 | ~~Web client no auto-reconnect~~ — fixed: exponential backoff | ✅ Fixed |
