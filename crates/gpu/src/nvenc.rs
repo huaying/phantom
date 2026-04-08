@@ -234,7 +234,7 @@ impl NvencEncoder {
             );
         }
 
-        bgra_to_nv12(
+        phantom_core::color::bgra_to_nv12(
             &frame.data,
             self.width as usize,
             self.height as usize,
@@ -475,6 +475,7 @@ impl Drop for NvencEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phantom_core::color::bgra_to_nv12;
 
     #[test]
     fn bgra_to_nv12_solid_white() {
@@ -536,29 +537,4 @@ mod tests {
     }
 }
 
-/// Convert BGRA to NV12 (BT.601) into a pre-allocated buffer.
-/// NV12 layout: Y plane (w*h) followed by interleaved UV plane (w*h/2).
-fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize, nv12: &mut [u8]) {
-    let (y_plane, uv_plane) = nv12.split_at_mut(width * height);
 
-    for row in 0..height {
-        for col in 0..width {
-            let idx = (row * width + col) * 4;
-            let b = bgra[idx] as i32;
-            let g = bgra[idx + 1] as i32;
-            let r = bgra[idx + 2] as i32;
-
-            // BT.601 full range
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[row * width + col] = y.clamp(0, 255) as u8;
-
-            if row % 2 == 0 && col % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                let uv_idx = (row / 2) * width + col;
-                uv_plane[uv_idx] = u.clamp(0, 255) as u8;
-                uv_plane[uv_idx + 1] = v.clamp(0, 255) as u8;
-            }
-        }
-    }
-}
