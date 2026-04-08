@@ -287,9 +287,9 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~DXGI→NVENC zero-copy~~ | ✅ done | 6fps→47fps on Windows L40 |
 | ~~Make WS default, WebRTC optional~~ | ✅ done | `--features webrtc` + `?rtc` |
 | ~~Web client auto-reconnect~~ | ✅ done | Exponential backoff 1s→5s cap, resets decoder state |
-| **Multi-transport** | UX | Support TCP + WSS simultaneously (currently one at a time) |
-| **Hardware probe** | auto-detect GPU at startup | Select best encoder/capture automatically |
-| **Audio forwarding** | meetings, media | PulseAudio capture → Opus encode → WebRTC/native |
+| ~~**Multi-transport**~~ | ✅ done | `--transport tcp,web` runs TCP:9900 + HTTPS:9901 simultaneously (PR #3) |
+| ~~**Hardware probe**~~ | ✅ done | `--encoder auto` / `--capture auto` auto-detects GPU at startup (PR #3) |
+| ~~**Audio forwarding**~~ | ✅ done | PulseAudio → Opus 48kHz stereo, `--features audio` (PR #6) |
 | ~~**WAN testing**~~ | ✅ done | Simulated latency/jitter E2E tests (0–300ms RTT, 8 tests) |
 | ~~**HTTP keep-alive + pool**~~ | ✅ done | Reuses TLS connections, bounded 16-thread pool |
 | ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV, 2.8–3.4x speedup at 1080p |
@@ -336,14 +336,14 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 |------|----------|
 | ~~WebRTC session zombie~~ — fixed: ICE Disconnected → drop ActiveClient → channels disconnect → session ends | ✅ Fixed |
 | ~~**str0m SCTP drops large messages**~~ — Root cause: `ch.write()` returns `Ok(false)` when buffer full, was being ignored. Fixed with proper backpressure (buffered_amount_low_threshold + pending queues). | ✅ Fixed |
-| **Server single-session** — only one client at a time. New connections queue until current session ends. Need proper session replacement. | Medium |
+| ~~**Server single-session**~~ — Fixed: session replacement implemented. New client sends doorbell, server cancels old session via AtomicBool, sends Disconnect message, old client exits cleanly. Takeover ~68ms. (PR #6, #7) | ✅ Fixed |
 | ~~BGRA→YUV via `pixel_f32()` (slow per-pixel callback)~~ | ✅ Fixed — AVX2 SIMD, 2.8–3.4x speedup |
 | ~~Client threads leak on reconnect (no JoinHandle tracking)~~ | ✅ Fixed — TcpShutdownHandle + shutdown(Both) on Drop |
 | No graceful shutdown (Ctrl+C) | Low |
 | ~~HTTP handler threads unbounded (no pool)~~ | ✅ Fixed — bounded 16-thread pool + ConnGuard RAII |
 | WS IO loop 50ms read timeout (was 5ms, increased for stability) | Low |
 | ~~Web client no auto-reconnect~~ — fixed: exponential backoff | ✅ Fixed |
-| Server single-transport — TCP or WSS, not both simultaneously | Medium |
+| ~~Server single-transport~~ — TCP or WSS, not both simultaneously | ✅ Fixed — `--transport tcp,web` (PR #3) |
 | Mock server lacks encryption/input | Low |
 | Tile code still in codebase but unused (encode_zstd, TileUpdate messages) | Low |
 
