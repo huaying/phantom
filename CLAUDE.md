@@ -315,7 +315,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | Task | Impact |
 |------|--------|
 | ~~Make WS default, WebRTC optional~~ | ✅ done — WS default, `--features webrtc` + `?rtc` for WebRTC |
-| Wayland capture (PipeWire) | modern Linux |
+| ~~Wayland capture (PipeWire)~~ | ✅ done — `--features wayland` or `--capture pipewire`, auto-detected on Wayland sessions via XDG Portal + PipeWire |
 | Multi-monitor | dev setups |
 | File transfer | drag-and-drop |
 | NAT traversal (STUN/TURN) | firewall bypass |
