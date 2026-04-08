@@ -1,4 +1,6 @@
 mod capture_scrap;
+#[cfg(feature = "wayland")]
+mod capture_pipewire;
 mod encode_h264;
 mod encode_zstd;
 mod input_injector;
@@ -42,7 +44,7 @@ struct Args {
     #[arg(long, default_value = "auto")]
     encoder: String,
 
-    /// Screen capture: auto (default, probes GPU), scrap (CPU), nvfbc (NVIDIA GPU).
+    /// Screen capture: auto (default, probes GPU/Wayland), scrap (CPU/X11), nvfbc (NVIDIA GPU), pipewire (Wayland).
     #[arg(long, default_value = "auto")]
     capture: String,
 
@@ -131,7 +133,22 @@ fn main() -> Result<()> {
         args.encoder.clone()
     };
     let mut capture_name = if args.capture == "auto" {
-        gpu_probe.best_capture().to_string()
+        // On Wayland sessions, prefer PipeWire capture (if feature enabled)
+        #[cfg(feature = "wayland")]
+        {
+            if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+                || std::env::var("WAYLAND_DISPLAY").is_ok()
+            {
+                tracing::info!("Wayland session detected, using PipeWire capture");
+                "pipewire".to_string()
+            } else {
+                gpu_probe.best_capture().to_string()
+            }
+        }
+        #[cfg(not(feature = "wayland"))]
+        {
+            gpu_probe.best_capture().to_string()
+        }
     } else {
         args.capture.clone()
     };
@@ -603,9 +620,19 @@ fn create_capture(name: &str) -> Result<Box<dyn phantom_core::capture::FrameCapt
             let cap = capture_scrap::ScrapCapture::new()?;
             Ok(Box::new(cap))
         }
-        other => anyhow::bail!(
-            "unknown capture '{other}'. Available: scrap, nvfbc (use with --encoder nvenc for GPU pipeline)"
-        ),
+        #[cfg(feature = "wayland")]
+        "pipewire" => {
+            let cap = capture_pipewire::PipeWireCapture::new()?;
+            Ok(Box::new(cap))
+        }
+        other => {
+            let available = if cfg!(feature = "wayland") {
+                "scrap, pipewire, nvfbc"
+            } else {
+                "scrap, nvfbc (use with --encoder nvenc for GPU pipeline)"
+            };
+            anyhow::bail!("unknown capture '{other}'. Available: {available}")
+        }
     }
 }
 
