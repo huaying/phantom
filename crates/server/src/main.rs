@@ -180,6 +180,12 @@ fn main() -> Result<()> {
     } else {
         args.capture.clone()
     };
+    // If encoder is explicitly non-GPU but capture resolved to a GPU-only method, fix it
+    if encoder_name == "openh264" && (capture_name == "nvfbc" || capture_name == "dxgi") {
+        tracing::info!("encoder is openh264, overriding capture from {} to scrap", capture_name);
+        capture_name = "scrap".to_string();
+    }
+
     tracing::info!(encoder = %encoder_name, capture = %capture_name, display = args.display, "configuration resolved");
 
     // GPU zero-copy pipeline detection
