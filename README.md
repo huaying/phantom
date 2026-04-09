@@ -6,15 +6,22 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 
 - **H.264 streaming** with periodic keyframes and lossless refinement after 2s idle
 - **GPU acceleration** — NVENC encoding + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
+- **Audio forwarding** — PulseAudio → Opus 48kHz stereo → client playback
+- **File transfer** — bidirectional, chunked streaming with SHA-256 integrity verification
+- **Multi-monitor** — `--display N` to select monitor, `--list-displays` to enumerate
+- **Hardware auto-detect** — `--encoder auto` probes GPU and picks best encoder/capture
+- **Multi-transport** — `--transport tcp,web` serves TCP and HTTPS/WebSocket simultaneously
 - **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264 decode
-- **WebRTC DataChannel** (optional, `--features webrtc`) — for future NAT traversal
 - **Native client** — winit + softbuffer with local cursor rendering
 - **QUIC/UDP transport** — for native client, no head-of-line blocking
 - **Encrypted by default** — ChaCha20-Poly1305 (TCP) or TLS (QUIC) or DTLS (WebRTC)
 - **Clipboard sync** — bidirectional, with Ctrl+V paste injection
+- **Session replacement** — new client seamlessly takes over active session
+- **Graceful shutdown** — Ctrl+C / SIGTERM clean exit
 - **Auto-reconnect** — exponential backoff (native client)
 - **HTTP keep-alive + connection pool** — reuses TLS connections, bounded thread pool (16 max)
 - **SIMD color conversion** — AVX2-accelerated BGRA↔YUV (2.8–3.4x faster than scalar)
+- **Wayland capture** — PipeWire + XDG Desktop Portal (compile-tested)
 - **WAN tested** — verified under simulated latency (0–300ms RTT), jitter, and session replacement
 - **Windows + Linux** — DXGI (Windows) / X11 (Linux) capture, auto-start support
 
@@ -124,19 +131,30 @@ Native Client                        Server                         Web Client (
 
 ```
 --listen <addr>              Listen address (default: 0.0.0.0:9900)
---transport <tcp|quic|web>   Transport protocol (default: tcp)
+--transport <transports>     Comma-separated: tcp, web, quic (default: tcp,web)
 --fps <n>                    Target FPS (default: 30)
 --bitrate <kbps>             H.264 bitrate (default: 5000)
 --quality-delay-ms <ms>      Lossless update delay (default: 2000)
---encoder <openh264|nvenc>   Video encoder (default: openh264)
---capture <scrap|dxgi|nvfbc> Screen capture (default: scrap)
+--encoder <auto|openh264|nvenc>  Video encoder (default: auto)
+--capture <auto|scrap|nvfbc|pipewire>  Screen capture (default: auto)
+--display <n>                Display index to capture (default: 0)
+--list-displays              List available displays and exit
+--send-file <path>           Send a file to the first connected client
 --key <hex>                  Encryption key (auto-generated if omitted)
 --no-encrypt                 Disable encryption
 --install / --uninstall      Auto-start (Windows: schtasks, Linux: systemd)
 ```
 
-Environment variables:
-- `PHANTOM_HOST` — IP for WebRTC ICE candidate (default: auto-detect)
+### Client Options
+
+```
+--connect <addr>             Server address (default: 127.0.0.1:9900)
+--transport <tcp|quic>       Transport protocol (default: tcp)
+--decoder <auto|openh264|videotoolbox>  Video decoder (default: auto)
+--send-file <path>           Send a file to the server after connecting
+--key <hex>                  Encryption key (from server output)
+--no-encrypt                 Disable encryption
+```
 
 ## Performance
 
@@ -171,8 +189,8 @@ cargo build --release --features webrtc
 # Build WASM web client (pre-built pkg checked into repo)
 wasm-pack build crates/web --target web --no-typescript
 
-# Run tests (76 tests: unit, integration, WAN simulation)
-cargo test
+# Run tests (91 tests: unit, integration, E2E, WAN simulation)
+cargo test --features audio
 ```
 
 ## Project Structure
@@ -180,11 +198,11 @@ cargo test
 ```
 phantom/
 ├── crates/
-│   ├── core/      Traits, protocol, frame, input, clipboard, SIMD color conversion, crypto
-│   ├── server/    Capture, encode, input inject, TCP/QUIC/WSS transports, WAN tests
-│   ├── client/    Decode, winit display, input capture, reconnect
+│   ├── core/      Traits, protocol, frame, input, clipboard, file transfer, SIMD color, crypto
+│   ├── server/    Capture, encode, input inject, file transfer, TCP/QUIC/WSS transports
+│   ├── client/    Decode, winit display, input capture, file transfer, reconnect
 │   ├── web/       WASM client (WebCodecs, Canvas, WebSocket/WebRTC)
-│   ├── gpu/       NVENC, NVFBC (Linux), DXGI capture (Windows), CUDA
+│   ├── gpu/       NVENC, NVFBC (Linux), DXGI capture (Windows), CUDA, hardware probe
 │   └── bench/     Encoder benchmark (OpenH264 vs NVENC)
 ├── Dockerfile     XFCE desktop test environment
 ├── CLAUDE.md      Developer guide
@@ -195,14 +213,18 @@ phantom/
 
 See [CLAUDE.md](CLAUDE.md) for the full roadmap. Key next steps:
 
-- ~~Audio forwarding~~ ✅ PulseAudio capture → Opus → browser playback
+- ~~Audio forwarding~~ ✅ PulseAudio → Opus → client playback
 - ~~Hardware probe~~ ✅ Auto-detect best encoder/capture at startup
 - ~~SIMD color conversion~~ ✅ AVX2-accelerated BGRA↔YUV (2.8–3.4x speedup)
-- ~~HTTP connection pool~~ ✅ Keep-alive + bounded thread pool for web transport
-- ~~WAN testing~~ ✅ Simulated latency/jitter E2E tests (0–300ms RTT)
+- ~~Multi-monitor~~ ✅ `--display N` and `--list-displays`
+- ~~File transfer~~ ✅ Bidirectional, chunked, SHA-256 verified
+- ~~Session replacement~~ ✅ Seamless client takeover
+- ~~Graceful shutdown~~ ✅ Clean Ctrl+C / SIGTERM handling
+- ~~Wayland capture~~ ✅ PipeWire + XDG Desktop Portal (compile-tested)
+- **Hardware decode** — NVDEC (Linux), VideoToolbox (macOS) client-side
+- **AV1 encoder** — better compression ratio at same bitrate
+- **QUIC unreliable datagrams** — lower latency for WAN
 - **VAAPI/AMF GPU encoding** — AMD/Intel GPU encode support
-- **Wayland capture** — PipeWire for modern Linux desktops
-- **Multi-monitor** — support for multi-display setups
 - **NAT traversal** — STUN/TURN for firewall bypass
 
 ## License

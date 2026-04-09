@@ -493,6 +493,18 @@ impl SessionRunner {
     }
 }
 
+// ── Session configuration ───────────────────────────────────────────────────
+
+/// Configuration for starting a session, avoids long parameter lists.
+pub struct SessionConfig<'a> {
+    pub sender: Box<dyn MessageSender>,
+    pub receiver: Box<dyn MessageReceiver>,
+    pub frame_interval: Duration,
+    pub quality_delay: Duration,
+    pub cancel: Arc<AtomicBool>,
+    pub send_file: Option<&'a std::path::Path>,
+}
+
 // ── Session entry points (one per pipeline) ─────────────────────────────────
 
 /// CPU session: scrap capture + openh264/nvenc encode + tile differ + lossless.
@@ -501,22 +513,19 @@ pub fn run_session_cpu(
     capture: &mut dyn phantom_core::capture::FrameCapture,
     video_encoder: &mut dyn FrameEncoder,
     differ: &mut TileDiffer,
-    sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-    quality_delay: Duration,
-    cancel: Arc<AtomicBool>,
-    send_file: Option<&std::path::Path>,
+    cfg: SessionConfig<'_>,
 ) -> Result<()> {
     video_encoder.force_keyframe();
     differ.reset();
     let _ = capture.reset();
 
     let (width, height) = capture.resolution();
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+    let mut runner = SessionRunner::new(
+        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+    )?;
 
     // Send file if requested via --send-file
-    if let Some(path) = send_file {
+    if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
             tracing::error!("failed to initiate file send: {e}");
         }
@@ -529,8 +538,8 @@ pub fn run_session_cpu(
     }
 
     let mut zstd_encoder = ZstdEncoder::new(3);
-    let mut quality = QualityState::new(quality_delay);
-    let mut congestion = CongestionTracker::new(frame_interval);
+    let mut quality = QualityState::new(cfg.quality_delay);
+    let mut congestion = CongestionTracker::new(cfg.frame_interval);
     let mut last_frame: Option<Frame> = None;
     let mut sent_first_frame = false;
     let mut sent_first_frame_encoded = false;
@@ -598,19 +607,17 @@ pub fn run_session_cpu(
 pub fn run_session_gpu(
     capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
     encoder: &mut phantom_gpu::nvenc::NvencEncoder,
-    sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-    cancel: Arc<AtomicBool>,
-    send_file: Option<&std::path::Path>,
+    cfg: SessionConfig<'_>,
 ) -> Result<()> {
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();
     let (width, height) = encoder.dimensions();
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+    let mut runner = SessionRunner::new(
+        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+    )?;
 
-    if let Some(path) = send_file {
+    if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
             tracing::error!("failed to initiate file send: {e}");
         }
@@ -666,17 +673,15 @@ pub fn run_session_gpu(
 #[cfg(target_os = "windows")]
 pub fn run_session_dxgi(
     pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
-    sender: Box<dyn MessageSender>,
-    receiver: Box<dyn MessageReceiver>,
-    frame_interval: Duration,
-    cancel: Arc<AtomicBool>,
-    send_file: Option<&std::path::Path>,
+    cfg: SessionConfig<'_>,
 ) -> Result<()> {
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
-    let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+    let mut runner = SessionRunner::new(
+        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+    )?;
 
-    if let Some(path) = send_file {
+    if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
             tracing::error!("failed to initiate file send: {e}");
         }

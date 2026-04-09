@@ -8,10 +8,12 @@ use phantom_core::file_transfer::{
     FileTransferManager, IncrementalHasher, CHUNK_SIZE,
 };
 use phantom_core::protocol::Message;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Download directory for files received from the server.
 fn download_dir() -> PathBuf {
@@ -42,9 +44,11 @@ pub enum FileSendEvent {
 /// Handles file transfers on the client side.
 pub struct ClientFileTransfer {
     manager: FileTransferManager,
-    receivers: std::collections::HashMap<u64, FileReceiver>,
+    receivers: HashMap<u64, FileReceiver>,
     send_event_rx: mpsc::Receiver<FileSendEvent>,
     send_event_tx: mpsc::Sender<FileSendEvent>,
+    /// Signals for send threads waiting for FileAccept.
+    accept_signals: HashMap<u64, Arc<(Mutex<bool>, Condvar)>>,
 }
 
 struct FileReceiver {
@@ -61,9 +65,10 @@ impl ClientFileTransfer {
         let (tx, rx) = mpsc::channel();
         Self {
             manager: FileTransferManager::new(),
-            receivers: std::collections::HashMap::new(),
+            receivers: HashMap::new(),
             send_event_rx: rx,
             send_event_tx: tx,
+            accept_signals: HashMap::new(),
         }
     }
 
@@ -166,6 +171,12 @@ impl ClientFileTransfer {
     /// Handle a FileAccept from the server (they accepted our offer to send).
     pub fn on_file_accept(&mut self, transfer_id: u64) {
         self.manager.on_accept(transfer_id);
+        if let Some(signal) = self.accept_signals.remove(&transfer_id) {
+            let (lock, cvar) = &*signal;
+            let mut accepted = lock.lock().unwrap();
+            *accepted = true;
+            cvar.notify_one();
+        }
     }
 
     /// Start sending a file to the server.
@@ -182,12 +193,26 @@ impl ClientFileTransfer {
         let file_path = path.to_path_buf();
         let event_tx = self.send_event_tx.clone();
 
-        // Spawn background thread
+        // Create accept signal
+        let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        self.accept_signals.insert(transfer_id, Arc::clone(&signal));
+
+        // Spawn background thread — waits for accept signal before sending
         std::thread::Builder::new()
             .name(format!("file-send-{transfer_id}"))
             .spawn(move || {
-                // Small delay to allow accept to arrive
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let (lock, cvar) = &*signal;
+                let accepted = lock.lock().unwrap();
+                let result = cvar
+                    .wait_timeout_while(accepted, std::time::Duration::from_secs(30), |a| !*a)
+                    .unwrap();
+                if !*result.0 {
+                    let _ = event_tx.send(FileSendEvent::Error(
+                        transfer_id,
+                        "file offer not accepted within 30s".to_string(),
+                    ));
+                    return;
+                }
 
                 if let Err(e) = send_file_chunks(transfer_id, &file_path, &event_tx) {
                     let _ = event_tx.send(FileSendEvent::Error(

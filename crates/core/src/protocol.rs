@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 /// Current protocol version. Bump when adding/changing Message variants.
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// Minimum protocol version we can interoperate with.
+/// Versions below this are rejected at handshake.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
+
 /// Audio codec identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioCodec {

@@ -191,10 +191,27 @@ impl App {
             }
         };
 
-        // Read Hello
+        // Read Hello and check protocol version
         let (width, height, server_audio) = match receiver.recv_msg() {
-            Ok(Message::Hello { width, height, audio, .. }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
-                tracing::info!(width, height, audio, "connected");
+            Ok(Message::Hello { width, height, audio, protocol_version, .. })
+                if width > 0 && width <= 8192 && height > 0 && height <= 8192 =>
+            {
+                if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
+                    tracing::error!(
+                        server_version = protocol_version,
+                        min = phantom_core::protocol::MIN_PROTOCOL_VERSION,
+                        "server protocol too old, please upgrade the server"
+                    );
+                    return;
+                }
+                if protocol_version > phantom_core::protocol::PROTOCOL_VERSION {
+                    tracing::warn!(
+                        server_version = protocol_version,
+                        client_version = phantom_core::protocol::PROTOCOL_VERSION,
+                        "server is newer, some features may not work"
+                    );
+                }
+                tracing::info!(width, height, audio, protocol_version, "connected");
                 (width, height, audio)
             }
             Ok(_) => { tracing::warn!("bad Hello"); return; }

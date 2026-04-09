@@ -491,39 +491,45 @@ fn main() -> Result<()> {
             session::run_session_gpu(
                 &mut gpu.capture,
                 &mut gpu.encoder,
-                sender,
-                receiver,
-                frame_interval,
-                session_cancel,
-                send_file_path.as_deref(),
+                session::SessionConfig {
+                    sender, receiver, frame_interval,
+                    quality_delay,
+                    cancel: session_cancel,
+                    send_file: send_file_path.as_deref(),
+                },
             )
         } else {
             session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
-                sender,
-                receiver,
-                frame_interval,
-                quality_delay,
-                session_cancel,
-                send_file_path.as_deref(),
+                session::SessionConfig {
+                    sender, receiver, frame_interval, quality_delay,
+                    cancel: session_cancel,
+                    send_file: send_file_path.as_deref(),
+                },
             )
         };
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
-            session::run_session_dxgi(gw, sender, receiver, frame_interval, session_cancel, send_file_path.as_deref())
+            session::run_session_dxgi(
+                gw,
+                session::SessionConfig {
+                    sender, receiver, frame_interval, quality_delay,
+                    cancel: session_cancel,
+                    send_file: send_file_path.as_deref(),
+                },
+            )
         } else {
             session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
-                sender,
-                receiver,
-                frame_interval,
-                quality_delay,
-                session_cancel,
-                send_file_path.as_deref(),
+                session::SessionConfig {
+                    sender, receiver, frame_interval, quality_delay,
+                    cancel: session_cancel,
+                    send_file: send_file_path.as_deref(),
+                },
             )
         };
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -531,12 +537,11 @@ fn main() -> Result<()> {
             &mut **capture.as_mut().unwrap(),
             &mut **video_encoder.as_mut().unwrap(),
             &mut differ,
-            sender,
-            receiver,
-            frame_interval,
-            quality_delay,
-            session_cancel,
-            send_file_path.as_deref(),
+            session::SessionConfig {
+                sender, receiver, frame_interval, quality_delay,
+                cancel: session_cancel,
+                send_file: send_file_path.as_deref(),
+            },
         );
 
         if let Err(e) = result {
