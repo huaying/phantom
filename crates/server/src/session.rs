@@ -28,6 +28,11 @@ pub enum InboundEvent {
     Input(InputEvent),
     Clipboard(String),
     PasteText(String),
+    FileOffer { transfer_id: u64, name: String, size: u64 },
+    FileAccept { transfer_id: u64 },
+    FileCancel { transfer_id: u64, reason: String },
+    FileChunk { transfer_id: u64, offset: u64, data: Vec<u8> },
+    FileDone { transfer_id: u64, sha256: [u8; 32] },
     Disconnected,
 }
 
@@ -50,6 +55,21 @@ pub fn spawn_receive_thread(
                     }
                     Ok(Message::PasteText(text)) => {
                         let _ = tx.send(InboundEvent::PasteText(text));
+                    }
+                    Ok(Message::FileOffer { transfer_id, name, size }) => {
+                        let _ = tx.send(InboundEvent::FileOffer { transfer_id, name, size });
+                    }
+                    Ok(Message::FileAccept { transfer_id }) => {
+                        let _ = tx.send(InboundEvent::FileAccept { transfer_id });
+                    }
+                    Ok(Message::FileCancel { transfer_id, reason }) => {
+                        let _ = tx.send(InboundEvent::FileCancel { transfer_id, reason });
+                    }
+                    Ok(Message::FileChunk { transfer_id, offset, data }) => {
+                        let _ = tx.send(InboundEvent::FileChunk { transfer_id, offset, data });
+                    }
+                    Ok(Message::FileDone { transfer_id, sha256 }) => {
+                        let _ = tx.send(InboundEvent::FileDone { transfer_id, sha256 });
                     }
                     Ok(_) => {}
                     Err(_) => {
@@ -165,6 +185,8 @@ pub struct SessionRunner {
     pub audio_rx: Option<mpsc::Receiver<crate::audio_capture::AudioChunk>>,
     #[cfg(feature = "audio")]
     pub _audio_capture: Option<crate::audio_capture::AudioCapture>,
+    /// File transfer handler.
+    pub file_transfer: crate::file_transfer::ServerFileTransfer,
 }
 
 impl SessionRunner {
@@ -218,6 +240,7 @@ impl SessionRunner {
             audio_rx,
             #[cfg(feature = "audio")]
             _audio_capture: audio_capture,
+            file_transfer: crate::file_transfer::ServerFileTransfer::new(),
         };
 
         runner.sender.send_msg(&Message::Hello {
@@ -283,6 +306,36 @@ impl SessionRunner {
                         self.had_input = true;
                     }
                     tracing::debug!("paste: {} chars", text.len());
+                }
+                Ok(InboundEvent::FileOffer { transfer_id, name, size }) => {
+                    match self.file_transfer.on_file_offer(transfer_id, &name, size) {
+                        Ok(reply) => {
+                            let _ = self.sender.send_msg(&reply);
+                        }
+                        Err(e) => {
+                            tracing::error!(transfer_id, "failed to accept file offer: {e}");
+                            let _ = self.sender.send_msg(&Message::FileCancel {
+                                transfer_id,
+                                reason: format!("{e}"),
+                            });
+                        }
+                    }
+                }
+                Ok(InboundEvent::FileAccept { transfer_id }) => {
+                    self.file_transfer.on_file_accept(transfer_id);
+                }
+                Ok(InboundEvent::FileCancel { transfer_id, reason }) => {
+                    self.file_transfer.on_file_cancel(transfer_id, &reason);
+                }
+                Ok(InboundEvent::FileChunk { transfer_id, offset, data }) => {
+                    if let Err(e) = self.file_transfer.on_file_chunk(transfer_id, offset, &data) {
+                        tracing::error!(transfer_id, "file chunk error: {e}");
+                    }
+                }
+                Ok(InboundEvent::FileDone { transfer_id, sha256 }) => {
+                    if let Err(e) = self.file_transfer.on_file_done(transfer_id, &sha256) {
+                        tracing::error!(transfer_id, "file done error: {e}");
+                    }
                 }
                 Ok(InboundEvent::Disconnected) => {
                     anyhow::bail!("client disconnected");
@@ -423,6 +476,21 @@ impl SessionRunner {
             Ok(0)
         }
     }
+
+    /// Drain pending file transfer messages and send them to the client.
+    pub fn drain_file_transfers(&mut self) -> Result<()> {
+        let msgs = self.file_transfer.drain_send_events();
+        for msg in msgs {
+            self.sender.send_msg(&msg)?;
+        }
+        Ok(())
+    }
+
+    /// Initiate sending a file to the connected client.
+    /// The file is read and sent in a background thread.
+    pub fn send_file(&mut self, path: &std::path::Path) -> Result<u64> {
+        self.file_transfer.initiate_send(path)
+    }
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -438,6 +506,7 @@ pub fn run_session_cpu(
     frame_interval: Duration,
     quality_delay: Duration,
     cancel: Arc<AtomicBool>,
+    send_file: Option<&std::path::Path>,
 ) -> Result<()> {
     video_encoder.force_keyframe();
     differ.reset();
@@ -445,6 +514,13 @@ pub fn run_session_cpu(
 
     let (width, height) = capture.resolution();
     let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+
+    // Send file if requested via --send-file
+    if let Some(path) = send_file {
+        if let Err(e) = runner.send_file(path) {
+            tracing::error!("failed to initiate file send: {e}");
+        }
+    }
 
     // Nudge the screen for DXGI (Windows) — harmless on Linux.
     if let Some(ref mut inj) = runner.injector {
@@ -510,6 +586,7 @@ pub fn run_session_cpu(
         }
 
         runner.drain_audio()?;
+        runner.drain_file_transfers()?;
         runner.log_stats("stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -525,12 +602,19 @@ pub fn run_session_gpu(
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
     cancel: Arc<AtomicBool>,
+    send_file: Option<&std::path::Path>,
 ) -> Result<()> {
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();
     let (width, height) = encoder.dimensions();
     let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+
+    if let Some(path) = send_file {
+        if let Err(e) = runner.send_file(path) {
+            tracing::error!("failed to initiate file send: {e}");
+        }
+    }
 
     let mut no_frame_count: u32 = 0;
 
@@ -571,6 +655,7 @@ pub fn run_session_gpu(
         }
 
         runner.drain_audio()?;
+        runner.drain_file_transfers()?;
         runner.log_stats("GPU stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -585,10 +670,17 @@ pub fn run_session_dxgi(
     receiver: Box<dyn MessageReceiver>,
     frame_interval: Duration,
     cancel: Arc<AtomicBool>,
+    send_file: Option<&std::path::Path>,
 ) -> Result<()> {
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
     let mut runner = SessionRunner::new(sender, receiver, width, height, frame_interval, cancel)?;
+
+    if let Some(path) = send_file {
+        if let Err(e) = runner.send_file(path) {
+            tracing::error!("failed to initiate file send: {e}");
+        }
+    }
 
     loop {
         runner.check_cancelled()?;
@@ -614,6 +706,7 @@ pub fn run_session_dxgi(
         }
 
         runner.drain_audio()?;
+        runner.drain_file_transfers()?;
         runner.log_stats("stats (DXGI→NVENC)");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;

@@ -4,7 +4,7 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Audio codec identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +67,39 @@ pub enum Message {
     /// Server → Client: graceful disconnect with reason.
     Disconnect {
         reason: String,
+    },
+
+    // ── File transfer (v3) ──────────────────────────────────────────────
+
+    /// Bidirectional: offer to send a file.
+    FileOffer {
+        transfer_id: u64,
+        name: String,
+        size: u64,
+    },
+
+    /// Bidirectional: accept a file offer.
+    FileAccept {
+        transfer_id: u64,
+    },
+
+    /// Bidirectional: reject/cancel a file transfer.
+    FileCancel {
+        transfer_id: u64,
+        reason: String,
+    },
+
+    /// Bidirectional: a chunk of file data.
+    FileChunk {
+        transfer_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+
+    /// Bidirectional: file transfer complete (with SHA-256 for integrity).
+    FileDone {
+        transfer_id: u64,
+        sha256: [u8; 32],
     },
 }
 
@@ -199,6 +232,62 @@ mod tests {
         match read_message(&mut cursor).unwrap() {
             Message::Disconnect { reason } => assert_eq!(reason, "replaced by new client"),
             _ => panic!("expected Disconnect"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_file_offer() {
+        let msg = Message::FileOffer {
+            transfer_id: 42,
+            name: "test.txt".to_string(),
+            size: 1024,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::FileOffer { transfer_id, name, size } => {
+                assert_eq!(transfer_id, 42);
+                assert_eq!(name, "test.txt");
+                assert_eq!(size, 1024);
+            }
+            _ => panic!("expected FileOffer"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_file_chunk() {
+        let msg = Message::FileChunk {
+            transfer_id: 7,
+            offset: 256000,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::FileChunk { transfer_id, offset, data } => {
+                assert_eq!(transfer_id, 7);
+                assert_eq!(offset, 256000);
+                assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            _ => panic!("expected FileChunk"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_file_done() {
+        let hash = [0xABu8; 32];
+        let msg = Message::FileDone { transfer_id: 99, sha256: hash };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::FileDone { transfer_id, sha256 } => {
+                assert_eq!(transfer_id, 99);
+                assert_eq!(sha256, hash);
+            }
+            _ => panic!("expected FileDone"),
         }
     }
 

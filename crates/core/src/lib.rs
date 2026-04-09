@@ -6,6 +6,7 @@ pub mod color;
 pub mod crypto;
 pub mod encode;
 pub mod decode;
+pub mod file_transfer;
 pub mod transport;
 pub mod display;
 pub mod protocol;

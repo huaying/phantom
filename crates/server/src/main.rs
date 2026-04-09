@@ -3,6 +3,7 @@ mod capture_scrap;
 mod capture_pipewire;
 mod encode_h264;
 mod encode_zstd;
+mod file_transfer;
 mod input_injector;
 mod session;
 #[cfg(feature = "audio")]
@@ -68,6 +69,10 @@ struct Args {
     /// Remove auto-start registration.
     #[arg(long)]
     uninstall: bool,
+
+    /// Send a file to the first client that connects.
+    #[arg(long)]
+    send_file: Option<String>,
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
@@ -412,6 +417,9 @@ fn main() -> Result<()> {
     }
     drop(conn_tx);
 
+    // Resolve --send-file path once
+    let send_file_path = args.send_file.as_ref().map(std::path::PathBuf::from);
+
     // ── Main accept loop (with session replacement) ─────────────────────────
     //
     // A "doorbell" thread blocks on conn_rx. When a new client arrives, it
@@ -487,6 +495,7 @@ fn main() -> Result<()> {
                 receiver,
                 frame_interval,
                 session_cancel,
+                send_file_path.as_deref(),
             )
         } else {
             session::run_session_cpu(
@@ -498,11 +507,12 @@ fn main() -> Result<()> {
                 frame_interval,
                 quality_delay,
                 session_cancel,
+                send_file_path.as_deref(),
             )
         };
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
-            session::run_session_dxgi(gw, sender, receiver, frame_interval, session_cancel)
+            session::run_session_dxgi(gw, sender, receiver, frame_interval, session_cancel, send_file_path.as_deref())
         } else {
             session::run_session_cpu(
                 &mut **capture.as_mut().unwrap(),
@@ -513,6 +523,7 @@ fn main() -> Result<()> {
                 frame_interval,
                 quality_delay,
                 session_cancel,
+                send_file_path.as_deref(),
             )
         };
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -525,6 +536,7 @@ fn main() -> Result<()> {
             frame_interval,
             quality_delay,
             session_cancel,
+            send_file_path.as_deref(),
         );
 
         if let Err(e) = result {

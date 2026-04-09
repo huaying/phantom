@@ -3,6 +3,7 @@ mod decode_h264;
 mod decode_videotoolbox;
 mod decode_zstd;
 mod display_winit;
+mod file_transfer;
 mod input_capture;
 #[cfg(feature = "audio")]
 mod audio_playback;
@@ -42,6 +43,9 @@ struct Args {
     /// Video decoder: auto (default), openh264 (CPU), videotoolbox (macOS GPU).
     #[arg(long, default_value = "auto")]
     decoder: String,
+    /// Send a file to the server after connecting.
+    #[arg(long)]
+    send_file: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -78,6 +82,8 @@ fn main() -> Result<()> {
         state: AppState::Disconnected,
         backoff: Duration::from_millis(500),
         last_connect_attempt: Instant::now() - Duration::from_secs(10),
+        send_file: args.send_file,
+        send_file_initiated: false,
     };
 
     event_loop.run_app(&mut app).map_err(|e| anyhow::anyhow!("{e}"))
@@ -111,6 +117,8 @@ struct Session {
     stats_decode_ms: f64,
     /// Send Opus packets to audio playback thread (None if no audio).
     audio_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// File transfer handler.
+    file_xfer: file_transfer::ClientFileTransfer,
 }
 
 impl Drop for Session {
@@ -130,6 +138,8 @@ struct App {
     state: AppState,
     backoff: Duration,
     last_connect_attempt: Instant,
+    send_file: Option<String>,
+    send_file_initiated: bool,
 }
 
 impl App {
@@ -315,6 +325,7 @@ impl App {
             stats_video: 0,
             stats_decode_ms: 0.0,
             audio_tx,
+            file_xfer: file_transfer::ClientFileTransfer::new(),
         });
     }
 }
@@ -340,6 +351,22 @@ impl ApplicationHandler for App {
                     tracing::info!("disconnected, will reconnect...");
                     self.state = AppState::Disconnected;
                     return;
+                }
+
+                // Initiate --send-file if specified (once per connection)
+                if !self.send_file_initiated {
+                    if let Some(ref path_str) = self.send_file {
+                        let path = std::path::Path::new(path_str);
+                        match session.file_xfer.initiate_send(path) {
+                            Ok((_id, offer)) => {
+                                let _ = session.input_tx.send(offer);
+                            }
+                            Err(e) => {
+                                tracing::error!("--send-file failed: {e}");
+                            }
+                        }
+                    }
+                    self.send_file_initiated = true;
                 }
 
                 // Process received frames — decode every VideoFrame to maintain
@@ -372,6 +399,36 @@ impl ApplicationHandler for App {
                         Message::AudioFrame { data, .. } => {
                             if let Some(ref audio_tx) = session.audio_tx {
                                 let _ = audio_tx.try_send(data);
+                            }
+                        }
+                        Message::FileOffer { transfer_id, name, size } => {
+                            match session.file_xfer.on_file_offer(transfer_id, &name, size) {
+                                Ok(reply) => {
+                                    let _ = session.input_tx.send(reply);
+                                }
+                                Err(e) => {
+                                    tracing::error!(transfer_id, "failed to accept file: {e}");
+                                    let _ = session.input_tx.send(Message::FileCancel {
+                                        transfer_id,
+                                        reason: format!("{e}"),
+                                    });
+                                }
+                            }
+                        }
+                        Message::FileAccept { transfer_id } => {
+                            session.file_xfer.on_file_accept(transfer_id);
+                        }
+                        Message::FileCancel { transfer_id, reason } => {
+                            session.file_xfer.on_file_cancel(transfer_id, &reason);
+                        }
+                        Message::FileChunk { transfer_id, offset, data } => {
+                            if let Err(e) = session.file_xfer.on_file_chunk(transfer_id, offset, &data) {
+                                tracing::error!(transfer_id, "file chunk error: {e}");
+                            }
+                        }
+                        Message::FileDone { transfer_id, sha256 } => {
+                            if let Err(e) = session.file_xfer.on_file_done(transfer_id, &sha256) {
+                                tracing::error!(transfer_id, "file done error: {e}");
                             }
                         }
                         _ => {}
@@ -413,6 +470,11 @@ impl ApplicationHandler for App {
 
                 // Present
                 let _ = session.display.present(session.cursor_pos);
+
+                // Drain file transfer outbound messages
+                for msg in session.file_xfer.drain_send_events() {
+                    let _ = session.input_tx.send(msg);
+                }
 
                 // Stats
                 if session.stats_time.elapsed() >= Duration::from_secs(5) {
