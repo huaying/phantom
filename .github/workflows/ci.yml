@@ -12,14 +12,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev
+      - name: Format
+        run: cargo fmt --all -- --check
       - name: Build WASM (needed for server)
         run: |
           cargo install wasm-pack
           wasm-pack build crates/web --target web --no-typescript
-      - name: Check
+      - name: Clippy
         run: cargo clippy --workspace -- -D warnings
       - name: Test
         run: cargo test --workspace
