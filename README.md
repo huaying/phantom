@@ -190,8 +190,8 @@ cargo build --release --features webrtc
 # Build WASM web client (pre-built pkg checked into repo)
 wasm-pack build crates/web --target web --no-typescript
 
-# Run tests (94 tests: unit, integration, E2E, WAN simulation)
-cargo test --features audio
+# Run tests (95 tests: unit, integration, E2E, WAN simulation)
+cargo test
 ```
 
 ## Project Structure
