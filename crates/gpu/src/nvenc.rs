@@ -35,6 +35,12 @@ pub struct NvencEncoder {
     sps_pps: Vec<u8>,
     owns_ctx: bool,
     _nvenc_lib: DynLib,
+    /// Current bitrate (kbps) for runtime reconfiguration.
+    bitrate_kbps: u32,
+    /// Saved init params for reconfiguration.
+    init_params: NvEncInitializeParams,
+    /// Saved encode config for reconfiguration.
+    encode_config: NvEncConfig,
 }
 
 // NVENC encoder handle is not thread-safe, but we only use it from one thread.
@@ -214,6 +220,9 @@ impl NvencEncoder {
             sps_pps: Vec::new(),
             owns_ctx,
             _nvenc_lib: nvenc_lib,
+            bitrate_kbps,
+            init_params,
+            encode_config: config,
         })
     }
 
@@ -461,6 +470,52 @@ impl FrameEncoder for NvencEncoder {
 
     fn force_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        if kbps == self.bitrate_kbps {
+            return Ok(());
+        }
+
+        let f = self
+            .api
+            .reconfigure_encoder()
+            .context("nvEncReconfigureEncoder not available")?;
+
+        // Update the encode config with new bitrate
+        self.encode_config.set_avg_bitrate(kbps * 1000);
+        self.encode_config.set_max_bitrate(kbps * 1000 * 2);
+
+        // Point init_params at the updated config
+        self.init_params
+            .set_encode_config(self.encode_config.as_mut_ptr());
+
+        // Build reconfigure params
+        let mut reconfig = NvEncReconfigureParams::zeroed();
+        reconfig.set_version();
+        reconfig.set_init_params_from(&self.init_params);
+        reconfig.set_force_idr(true);
+
+        let status = unsafe { f(self.encoder, reconfig.as_mut_ptr()) };
+        if status != NV_ENC_SUCCESS {
+            bail!(
+                "nvEncReconfigureEncoder failed: {} ({})",
+                nvenc_status_name(status),
+                status
+            );
+        }
+
+        tracing::info!(
+            old_kbps = self.bitrate_kbps,
+            new_kbps = kbps,
+            "NVENC bitrate reconfigured"
+        );
+        self.bitrate_kbps = kbps;
+        Ok(())
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
     }
 }
 

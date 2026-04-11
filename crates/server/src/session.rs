@@ -162,7 +162,7 @@ impl QualityState {
 pub struct CongestionTracker {
     frame_interval: Duration,
     slow_frames: u32,
-    skip_ratio: u32,
+    pub(crate) skip_ratio: u32,
     frame_counter: u64,
 }
 
@@ -206,6 +206,91 @@ impl CongestionTracker {
                 );
             }
         }
+    }
+}
+
+// ── Adaptive bitrate controller ─────────────────────────────────────────────
+
+/// Dynamically adjusts encoder bitrate based on RTT and congestion.
+///
+/// Strategy:
+/// - RTT > 100ms or congested → decrease bitrate (×0.7)
+/// - RTT < 50ms and stable for 10s → increase bitrate (×1.2)
+/// - Clamped to \[min_kbps, max_kbps\]
+/// - Changes at most once per 5s (hysteresis)
+pub struct AdaptiveBitrate {
+    current_kbps: u32,
+    min_kbps: u32,
+    max_kbps: u32,
+    last_change: Instant,
+    stable_since: Option<Instant>,
+}
+
+impl AdaptiveBitrate {
+    pub fn new(initial_kbps: u32) -> Self {
+        Self {
+            current_kbps: initial_kbps,
+            min_kbps: 500,
+            max_kbps: initial_kbps * 3,
+            last_change: Instant::now(),
+            stable_since: None,
+        }
+    }
+
+    /// Evaluate whether to change bitrate. Returns Some(new_kbps) if a change is needed.
+    pub fn evaluate(&mut self, rtt_us: Option<u64>, congestion_skip_ratio: u32) -> Option<u32> {
+        // Don't change more than once every 5s
+        if self.last_change.elapsed() < Duration::from_secs(5) {
+            return None;
+        }
+
+        let rtt_ms = rtt_us.map(|us| us as f64 / 1000.0).unwrap_or(0.0);
+
+        // Decrease: high RTT or congested
+        if rtt_ms > 100.0 || congestion_skip_ratio > 1 {
+            let new = ((self.current_kbps as f64 * 0.7) as u32).max(self.min_kbps);
+            if new < self.current_kbps {
+                self.stable_since = None;
+                return Some(new);
+            }
+        }
+
+        // Track stability (low RTT, no congestion)
+        if rtt_ms > 0.0 && rtt_ms < 50.0 && congestion_skip_ratio <= 1 {
+            if self.stable_since.is_none() {
+                self.stable_since = Some(Instant::now());
+            }
+            // Increase: stable for 10s and below max
+            if let Some(since) = self.stable_since {
+                if since.elapsed() >= Duration::from_secs(10) && self.current_kbps < self.max_kbps {
+                    let new = ((self.current_kbps as f64 * 1.2) as u32).min(self.max_kbps);
+                    if new > self.current_kbps {
+                        self.stable_since = Some(Instant::now());
+                        return Some(new);
+                    }
+                }
+            }
+        } else {
+            self.stable_since = None;
+        }
+
+        None
+    }
+
+    /// Apply a bitrate change. Call after set_bitrate_kbps succeeds on the encoder.
+    pub fn apply(&mut self, new_kbps: u32) {
+        tracing::info!(
+            from = self.current_kbps,
+            to = new_kbps,
+            "adaptive bitrate change"
+        );
+        self.current_kbps = new_kbps;
+        self.last_change = Instant::now();
+    }
+
+    #[allow(dead_code)]
+    pub fn current_kbps(&self) -> u32 {
+        self.current_kbps
     }
 }
 
@@ -502,6 +587,22 @@ impl SessionRunner {
         self.stats_encode_us += dur.as_micros() as u64;
     }
 
+    /// Check adaptive bitrate and update encoder if needed.
+    /// Call this in the stats period (every ~5s).
+    pub fn adapt_bitrate(
+        &self,
+        abr: &mut AdaptiveBitrate,
+        congestion: &CongestionTracker,
+        encoder: &mut dyn FrameEncoder,
+    ) {
+        if let Some(new_kbps) = abr.evaluate(self.rtt_us, congestion.skip_ratio) {
+            match encoder.set_bitrate_kbps(new_kbps) {
+                Ok(()) => abr.apply(new_kbps),
+                Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
+            }
+        }
+    }
+
     /// Log stats every 5s and send Stats message to client.
     pub fn log_stats(&mut self, label: &str) {
         if self.stats_time.elapsed() >= Duration::from_secs(5) {
@@ -654,6 +755,7 @@ pub fn run_session_cpu(
     let mut zstd_encoder = ZstdEncoder::new(3);
     let mut quality = QualityState::new(cfg.quality_delay);
     let mut congestion = CongestionTracker::new(cfg.frame_interval);
+    let mut abr = AdaptiveBitrate::new(video_encoder.bitrate_kbps().max(5000));
     let mut last_frame: Option<Frame> = None;
     let mut sent_first_frame = false;
     let mut sent_first_frame_encoded = false;
@@ -712,6 +814,7 @@ pub fn run_session_cpu(
 
         runner.drain_audio()?;
         runner.drain_file_transfers()?;
+        runner.adapt_bitrate(&mut abr, &congestion, video_encoder);
         runner.log_stats("stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -745,6 +848,9 @@ pub fn run_session_gpu(
     }
 
     let mut no_frame_count: u32 = 0;
+    let mut abr = AdaptiveBitrate::new(encoder.bitrate_kbps().max(5000));
+    // GPU path doesn't use CongestionTracker (no skip), but ABR needs one for the API
+    let congestion = CongestionTracker::new(cfg.frame_interval);
 
     loop {
         runner.check_cancelled()?;
@@ -786,6 +892,7 @@ pub fn run_session_gpu(
 
         runner.drain_audio()?;
         runner.drain_file_transfers()?;
+        runner.adapt_bitrate(&mut abr, &congestion, encoder);
         runner.log_stats("GPU stats");
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
@@ -955,5 +1062,66 @@ mod tests {
             ct.on_frame_sent(Duration::from_millis(200));
         }
         assert_eq!(ct.skip_ratio, 4, "skip_ratio should cap at 4");
+    }
+
+    #[test]
+    fn abr_no_change_initially() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        // Within the 5s hysteresis window — should not change
+        assert!(abr.evaluate(Some(200_000), 1).is_none());
+    }
+
+    #[test]
+    fn abr_decreases_on_high_rtt() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        // Force past the 5s hysteresis
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        // RTT = 150ms → should decrease
+        let new = abr.evaluate(Some(150_000), 1);
+        assert!(new.is_some());
+        let new_kbps = new.unwrap();
+        assert!(new_kbps < 5000, "should decrease: got {new_kbps}");
+        assert_eq!(new_kbps, 3500); // 5000 * 0.7 = 3500
+    }
+
+    #[test]
+    fn abr_decreases_on_congestion() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        // Good RTT but congested
+        let new = abr.evaluate(Some(30_000), 2);
+        assert!(new.is_some());
+        assert!(new.unwrap() < 5000);
+    }
+
+    #[test]
+    fn abr_respects_minimum() {
+        let mut abr = AdaptiveBitrate::new(500);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        // Already at minimum — should not go below 500
+        let new = abr.evaluate(Some(200_000), 1);
+        assert!(new.is_none()); // 500 * 0.7 = 350, but clamped to 500 = same
+    }
+
+    #[test]
+    fn abr_no_increase_without_stability() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        // Good RTT but just started — stable_since is None, need 10s stability
+        let new = abr.evaluate(Some(20_000), 1);
+        assert!(new.is_none());
+    }
+
+    #[test]
+    fn abr_increases_after_stability() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        abr.stable_since = Some(Instant::now() - Duration::from_secs(15));
+        // Good RTT + stable for >10s → should increase
+        let new = abr.evaluate(Some(20_000), 1);
+        assert!(new.is_some());
+        let new_kbps = new.unwrap();
+        assert!(new_kbps > 5000, "should increase: got {new_kbps}");
+        assert_eq!(new_kbps, 6000); // 5000 * 1.2 = 6000
     }
 }

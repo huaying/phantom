@@ -277,6 +277,39 @@ impl NvEncInitializeParams {
     }
 }
 
+// --- NV_ENC_RECONFIGURE_PARAMS (1824 bytes) ---
+// Layout: u32 version (0), u32 reInitEncodeParams offset=4 is actually
+// NV_ENC_INITIALIZE_PARAMS embedded at offset 8, then flags at 1816.
+// Simplified: version(4) + padding(4) + NV_ENC_INITIALIZE_PARAMS(1808) + flags(8) = 1824
+opaque_struct!(NvEncReconfigureParams, 1824);
+
+impl NvEncReconfigureParams {
+    pub fn set_version(&mut self) {
+        // NV_ENC_RECONFIGURE_PARAMS_VER = NV_ENCODE_API_STRUCT_VER(1)
+        self.write_u32(0, sv(1) | (1 << 31));
+    }
+
+    /// Copy the initialize params into the embedded field (offset 8).
+    pub fn set_init_params_from(&mut self, params: &NvEncInitializeParams) {
+        let src = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 1808) };
+        // Write into our data starting at offset 8
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr() as *mut u8, 1824) };
+        dst[8..8 + 1808].copy_from_slice(src);
+    }
+
+    /// Set resetEncoder flag (offset 1816, bit 0). Resets internal state.
+    pub fn set_reset_encoder(&mut self, v: bool) {
+        self.write_u32(1816, if v { 1 } else { 0 });
+    }
+
+    /// Set forceIDR flag (offset 1816, bit 1).
+    pub fn set_force_idr(&mut self, v: bool) {
+        let current = self.read_u32(1816);
+        let new = if v { current | 2 } else { current & !2 };
+        self.write_u32(1816, new);
+    }
+}
+
 // --- NV_ENC_CONFIG (3584 bytes) ---
 opaque_struct!(NvEncConfig, 3584);
 
@@ -507,6 +540,11 @@ pub type FnDestroyBitstreamBuffer =
 
 pub type FnDestroyEncoder = unsafe extern "C" fn(encoder: *mut c_void) -> NVENCSTATUS;
 
+/// nvEncReconfigureEncoder — dynamically change encoder parameters (bitrate, etc.)
+/// Takes encoder handle + pointer to NV_ENC_RECONFIGURE_PARAMS.
+pub type FnReconfigureEncoder =
+    unsafe extern "C" fn(encoder: *mut c_void, params: *mut c_void) -> NVENCSTATUS;
+
 impl NvEncFunctionList {
     pub fn set_version(&mut self) {
         self.write_u32(0, NV_ENCODE_API_FUNCTION_LIST_VER);
@@ -611,6 +649,14 @@ impl NvEncFunctionList {
     }
     pub fn destroy_encoder(&self) -> Option<FnDestroyEncoder> {
         let p = self.read_u64(224);
+        if p == 0 {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(p) })
+        }
+    }
+    pub fn reconfigure_encoder(&self) -> Option<FnReconfigureEncoder> {
+        let p = self.read_u64(232);
         if p == 0 {
             None
         } else {

@@ -28,6 +28,7 @@ pub struct OpenH264Encoder {
     encoder: Encoder,
     width: u32,
     height: u32,
+    bitrate_kbps: u32,
 }
 
 impl OpenH264Encoder {
@@ -53,6 +54,7 @@ impl OpenH264Encoder {
             encoder,
             width,
             height,
+            bitrate_kbps,
         })
     }
 }
@@ -82,5 +84,33 @@ impl FrameEncoder for OpenH264Encoder {
 
     fn force_keyframe(&mut self) {
         self.encoder.force_intra_frame();
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        if kbps == self.bitrate_kbps {
+            return Ok(());
+        }
+        // OpenH264 doesn't support runtime reconfiguration,
+        // so we recreate the encoder with the new bitrate.
+        let fps = 30.0; // TODO: store fps in struct
+        let config = EncoderConfig::new()
+            .max_frame_rate(fps)
+            .set_bitrate_bps(kbps * 1000)
+            .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
+            .enable_skip_frame(true);
+        let api = openh264::OpenH264API::from_source();
+        self.encoder =
+            Encoder::with_api_config(api, config).context("failed to recreate OpenH264 encoder")?;
+        tracing::info!(
+            old_kbps = self.bitrate_kbps,
+            new_kbps = kbps,
+            "OpenH264 bitrate reconfigured"
+        );
+        self.bitrate_kbps = kbps;
+        Ok(())
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
     }
 }

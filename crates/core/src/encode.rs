@@ -49,6 +49,18 @@ pub trait FrameEncoder: Send {
 
     /// Force next frame to be a keyframe (e.g., on client reconnect).
     fn force_keyframe(&mut self);
+
+    /// Dynamically update the target bitrate (kbps).
+    /// Returns Ok(()) if the encoder supports it, Err if not.
+    fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
+        // Default: not supported
+        anyhow::bail!("runtime bitrate change not supported by this encoder")
+    }
+
+    /// Get the current target bitrate in kbps.
+    fn bitrate_kbps(&self) -> u32 {
+        0
+    }
 }
 
 /// Full-frame video decoder.
