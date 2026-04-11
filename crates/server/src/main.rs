@@ -1,13 +1,13 @@
-mod capture_scrap;
+#[cfg(feature = "audio")]
+mod audio_capture;
 #[cfg(feature = "wayland")]
 mod capture_pipewire;
+mod capture_scrap;
 mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
 mod input_injector;
 mod session;
-#[cfg(feature = "audio")]
-mod audio_capture;
 mod transport_quic;
 mod transport_tcp;
 #[cfg(feature = "webrtc")]
@@ -20,9 +20,9 @@ use phantom_core::crypto;
 use phantom_core::encode::FrameEncoder;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -187,7 +187,10 @@ fn main() -> Result<()> {
     };
     // If encoder is explicitly non-GPU but capture resolved to a GPU-only method, fix it
     if encoder_name == "openh264" && (capture_name == "nvfbc" || capture_name == "dxgi") {
-        tracing::info!("encoder is openh264, overriding capture from {} to scrap", capture_name);
+        tracing::info!(
+            "encoder is openh264, overriding capture from {} to scrap",
+            capture_name
+        );
         capture_name = "scrap".to_string();
     }
 
@@ -255,10 +258,7 @@ fn main() -> Result<()> {
     let (width, height) = if use_gpu_pipeline {
         #[cfg(target_os = "linux")]
         {
-            (
-                gpu.as_ref().unwrap().width,
-                gpu.as_ref().unwrap().height,
-            )
+            (gpu.as_ref().unwrap().width, gpu.as_ref().unwrap().height)
         }
         #[cfg(target_os = "windows")]
         {
@@ -291,8 +291,7 @@ fn main() -> Result<()> {
     // ── Transport listeners ─────────────────────────────────────────────────
 
     let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
-    let (conn_tx, conn_rx) =
-        mpsc::channel::<ConnectionPair>();
+    let (conn_tx, conn_rx) = mpsc::channel::<ConnectionPair>();
 
     let base_port: u16 = args
         .listen
@@ -326,9 +325,7 @@ fn main() -> Result<()> {
                                             Box::new(r) as Box<dyn MessageReceiver>,
                                         ),
                                         Err(e) => {
-                                            tracing::warn!(
-                                                "TCP encrypted handshake failed: {e}"
-                                            );
+                                            tracing::warn!("TCP encrypted handshake failed: {e}");
                                             continue;
                                         }
                                     }
@@ -492,7 +489,9 @@ fn main() -> Result<()> {
                 &mut gpu.capture,
                 &mut gpu.encoder,
                 session::SessionConfig {
-                    sender, receiver, frame_interval,
+                    sender,
+                    receiver,
+                    frame_interval,
                     quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
@@ -504,7 +503,10 @@ fn main() -> Result<()> {
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
                 session::SessionConfig {
-                    sender, receiver, frame_interval, quality_delay,
+                    sender,
+                    receiver,
+                    frame_interval,
+                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                 },
@@ -515,7 +517,10 @@ fn main() -> Result<()> {
             session::run_session_dxgi(
                 gw,
                 session::SessionConfig {
-                    sender, receiver, frame_interval, quality_delay,
+                    sender,
+                    receiver,
+                    frame_interval,
+                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                 },
@@ -526,7 +531,10 @@ fn main() -> Result<()> {
                 &mut **video_encoder.as_mut().unwrap(),
                 &mut differ,
                 session::SessionConfig {
-                    sender, receiver, frame_interval, quality_delay,
+                    sender,
+                    receiver,
+                    frame_interval,
+                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                 },
@@ -538,7 +546,10 @@ fn main() -> Result<()> {
             &mut **video_encoder.as_mut().unwrap(),
             &mut differ,
             session::SessionConfig {
-                sender, receiver, frame_interval, quality_delay,
+                sender,
+                receiver,
+                frame_interval,
+                quality_delay,
                 cancel: session_cancel,
                 send_file: send_file_path.as_deref(),
             },
@@ -618,7 +629,13 @@ impl GpuPipeline {
             }
         };
         let (width, height) = (first.width, first.height);
-        tracing::info!(screen_w = sw, screen_h = sh, width, height, "NVFBC→NVENC GPU pipeline");
+        tracing::info!(
+            screen_w = sw,
+            screen_h = sh,
+            width,
+            height,
+            "NVFBC→NVENC GPU pipeline"
+        );
 
         capture.release_context()?;
         let encoder = unsafe {
@@ -665,7 +682,10 @@ impl GpuPipeline {
 
 // ── Factory functions ───────────────────────────────────────────────────────
 
-fn create_capture(name: &str, display_index: usize) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
+fn create_capture(
+    name: &str,
+    display_index: usize,
+) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
     match name {
         "scrap" => {
             let cap = capture_scrap::ScrapCapture::with_display(display_index)?;
@@ -674,7 +694,9 @@ fn create_capture(name: &str, display_index: usize) -> Result<Box<dyn phantom_co
         #[cfg(feature = "wayland")]
         "pipewire" => {
             if display_index != 0 {
-                tracing::warn!("PipeWire capture: --display is ignored (portal handles display selection)");
+                tracing::warn!(
+                    "PipeWire capture: --display is ignored (portal handles display selection)"
+                );
             }
             let cap = capture_pipewire::PipeWireCapture::new()?;
             Ok(Box::new(cap))
@@ -704,8 +726,14 @@ fn create_encoder(
         }
         "nvenc" => {
             let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
-            let enc =
-                phantom_gpu::nvenc::NvencEncoder::new(cuda, 0, width, height, fps as u32, bitrate_kbps)?;
+            let enc = phantom_gpu::nvenc::NvencEncoder::new(
+                cuda,
+                0,
+                width,
+                height,
+                fps as u32,
+                bitrate_kbps,
+            )?;
             Ok(Box::new(enc))
         }
         other => anyhow::bail!("unknown encoder '{other}'. Available: openh264, nvenc"),

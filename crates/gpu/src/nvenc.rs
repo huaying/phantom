@@ -83,11 +83,11 @@ impl NvencEncoder {
         let names = &["libnvidia-encode.so.1", "libnvidia-encode.so"];
         #[cfg(windows)]
         let names = &["nvEncodeAPI64.dll"];
-        let nvenc_lib = DynLib::open(names)
-            .context("failed to load libnvidia-encode")?;
+        let nvenc_lib = DynLib::open(names).context("failed to load libnvidia-encode")?;
 
         let create_instance: FnNvEncodeAPICreateInstance = unsafe {
-            nvenc_lib.sym("NvEncodeAPICreateInstance")
+            nvenc_lib
+                .sym("NvEncodeAPICreateInstance")
                 .context("NvEncodeAPICreateInstance symbol not found")?
         };
 
@@ -109,7 +109,9 @@ impl NvencEncoder {
         session_params.set_api_version();
 
         let mut encoder: *mut c_void = std::ptr::null_mut();
-        let f = api.open_encode_session_ex().context("nvEncOpenEncodeSessionEx is null")?;
+        let f = api
+            .open_encode_session_ex()
+            .context("nvEncOpenEncodeSessionEx is null")?;
         let status = unsafe { f(session_params.as_mut_ptr(), &mut encoder) };
         if status != NV_ENC_SUCCESS {
             bail!("nvEncOpenEncodeSessionEx failed: {status}");
@@ -120,7 +122,8 @@ impl NvencEncoder {
         preset_config.set_version();
         preset_config.set_config_version();
 
-        let f = api.get_encode_preset_config_ex()
+        let f = api
+            .get_encode_preset_config_ex()
             .context("nvEncGetEncodePresetConfigEx is null")?;
         let status = unsafe {
             f(
@@ -161,7 +164,9 @@ impl NvencEncoder {
         init_params.set_encode_config(config.as_mut_ptr());
         init_params.set_tuning_info(NV_ENC_TUNING_INFO_LOW_LATENCY);
 
-        let f = api.initialize_encoder().context("nvEncInitializeEncoder is null")?;
+        let f = api
+            .initialize_encoder()
+            .context("nvEncInitializeEncoder is null")?;
         let status = unsafe { f(encoder, init_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
             bail!("nvEncInitializeEncoder failed: {status}");
@@ -170,7 +175,9 @@ impl NvencEncoder {
         // Create output bitstream buffer
         let mut buf_params = NvEncCreateBitstreamBuffer::zeroed();
         buf_params.set_version();
-        let f = api.create_bitstream_buffer().context("nvEncCreateBitstreamBuffer is null")?;
+        let f = api
+            .create_bitstream_buffer()
+            .context("nvEncCreateBitstreamBuffer is null")?;
         let status = unsafe { f(encoder, buf_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
             bail!("nvEncCreateBitstreamBuffer failed: {status}");
@@ -184,7 +191,10 @@ impl NvencEncoder {
         cuda.ctx_pop()?;
 
         tracing::info!(
-            width, height, fps, bitrate_kbps,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
             "NVENC H.264 encoder initialized (GPU)"
         );
 
@@ -230,7 +240,10 @@ impl NvencEncoder {
         if frame.data.len() != expected {
             tracing::warn!(
                 "frame data size mismatch: {} != {} ({}x{}x4)",
-                frame.data.len(), expected, self.width, self.height
+                frame.data.len(),
+                expected,
+                self.width,
+                self.height
             );
         }
 
@@ -255,16 +268,9 @@ impl NvencEncoder {
     }
 
     /// Register a CUDA device pointer with NVENC, map, encode, read bitstream.
-    fn encode_registered(
-        &mut self,
-        device_ptr: CUdeviceptr,
-        pitch: u32,
-    ) -> Result<EncodedFrame> {
+    fn encode_registered(&mut self, device_ptr: CUdeviceptr, pitch: u32) -> Result<EncodedFrame> {
         if pitch < self.width {
-            bail!(
-                "invalid NV12 pitch: {pitch} < width {}",
-                self.width
-            );
+            bail!("invalid NV12 pitch: {pitch} < width {}", self.width);
         }
 
         // Only push context if it's not already current (avoids deadlock with NVFBC)
@@ -297,7 +303,9 @@ impl NvencEncoder {
         let f = self.api.register_resource().context("register_resource")?;
         let status = unsafe { f(self.encoder, reg.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            if need_push { self.cuda.ctx_pop()?; }
+            if need_push {
+                self.cuda.ctx_pop()?;
+            }
             bail!(
                 "nvEncRegisterResource failed: status={} ({}) width={} height={} pitch={}",
                 status,
@@ -314,14 +322,19 @@ impl NvencEncoder {
         map.set_version();
         map.set_registered_resource(registered);
 
-        let f = self.api.map_input_resource().context("map_input_resource")?;
+        let f = self
+            .api
+            .map_input_resource()
+            .context("map_input_resource")?;
         let status = unsafe { f(self.encoder, map.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
             // Cleanup: unregister
             if let Some(f) = self.api.unregister_resource() {
                 unsafe { f(self.encoder, registered) };
             }
-            if need_push { self.cuda.ctx_pop()?; }
+            if need_push {
+                self.cuda.ctx_pop()?;
+            }
             bail!(
                 "nvEncMapInputResource failed: status={} ({})",
                 status,
@@ -410,14 +423,20 @@ impl NvencEncoder {
         // NVENC only outputs SPS/PPS on the very first encode after init.
         // Save it, and prepend to any subsequent keyframe that lacks it.
         if is_keyframe {
-            let has_sps = data.windows(5).any(|w|
-                w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
+            let has_sps = data
+                .windows(5)
+                .any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
             if has_sps && self.sps_pps.is_empty() {
                 // Save everything before the IDR slice (SPS + PPS NALs)
-                if let Some(idr_pos) = data.windows(5).position(|w|
-                    w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 5) {
+                if let Some(idr_pos) = data
+                    .windows(5)
+                    .position(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 5)
+                {
                     self.sps_pps = data[..idr_pos].to_vec();
-                    tracing::debug!(sps_pps_len = self.sps_pps.len(), "saved SPS/PPS from first keyframe");
+                    tracing::debug!(
+                        sps_pps_len = self.sps_pps.len(),
+                        "saved SPS/PPS from first keyframe"
+                    );
                 }
             } else if !has_sps && !self.sps_pps.is_empty() {
                 // Prepend saved SPS/PPS
@@ -492,7 +511,10 @@ mod tests {
         // UV should be ~128 (neutral chroma)
         let uv = &nv12[w * h..];
         let uv_avg = uv.iter().map(|&v| v as u32).sum::<u32>() / uv.len() as u32;
-        assert!(uv_avg > 120 && uv_avg < 136, "UV avg={uv_avg}, expected ~128");
+        assert!(
+            uv_avg > 120 && uv_avg < 136,
+            "UV avg={uv_avg}, expected ~128"
+        );
     }
 
     #[test]
@@ -536,5 +558,3 @@ mod tests {
         assert!(result.is_ok(), "NVENC init failed: {:?}", result.err());
     }
 }
-
-

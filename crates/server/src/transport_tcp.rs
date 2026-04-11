@@ -10,8 +10,7 @@ pub struct TcpServerTransport {
 
 impl TcpServerTransport {
     pub fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .with_context(|| format!("failed to bind {addr}"))?;
+        let listener = TcpListener::bind(addr).with_context(|| format!("failed to bind {addr}"))?;
         tracing::info!(addr, "TCP server listening");
         Ok(Self { listener })
     }
@@ -39,8 +38,12 @@ impl TcpConnection {
     pub fn split(self) -> Result<(PlainSender, PlainReceiver)> {
         let read_stream = self.stream.try_clone().context("clone TcpStream")?;
         Ok((
-            PlainSender { stream: self.stream },
-            PlainReceiver { stream: read_stream },
+            PlainSender {
+                stream: self.stream,
+            },
+            PlainReceiver {
+                stream: read_stream,
+            },
         ))
     }
 

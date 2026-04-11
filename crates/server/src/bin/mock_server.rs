@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 struct BgraFrame<'a>(&'a [u8], usize, usize);
 impl openh264::formats::RGBSource for BgraFrame<'_> {
-    fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+    fn dimensions(&self) -> (usize, usize) {
+        (self.1, self.2)
+    }
     fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
         let i = (y * self.1 + x) * 4;
-        (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+        (self.0[i + 2] as f32, self.0[i + 1] as f32, self.0[i] as f32)
     }
 }
 

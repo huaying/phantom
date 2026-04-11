@@ -1,3 +1,5 @@
+#[cfg(feature = "audio")]
+mod audio_playback;
 mod decode_h264;
 #[cfg(target_os = "macos")]
 mod decode_videotoolbox;
@@ -5,8 +7,6 @@ mod decode_zstd;
 mod display_winit;
 mod file_transfer;
 mod input_capture;
-#[cfg(feature = "audio")]
-mod audio_playback;
 mod transport_quic;
 mod transport_tcp;
 
@@ -93,7 +93,9 @@ fn main() -> Result<()> {
         send_file_initiated: false,
     };
 
-    event_loop.run_app(&mut app).map_err(|e| anyhow::anyhow!("{e}"))
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -158,33 +160,32 @@ impl App {
 
         tracing::info!(addr = %self.args_connect, "connecting...");
 
-        let result: ConnectResult =
-            if self.args_transport == "quic" {
-                match transport_quic::QuicClientTransport::new()
-                    .and_then(|q| q.connect(&self.args_connect))
-                {
-                    Ok((s, r)) => Ok((Box::new(s), Box::new(r), None)),
-                    Err(e) => Err(e),
-                }
-            } else {
-                match transport_tcp::TcpClientTransport::new(&self.args_connect).connect_tcp() {
-                    Ok(conn) => {
-                        let shutdown_handle = conn.shutdown_handle().ok();
-                        if let Some(ref key) = self.encryption_key {
-                            match conn.split_encrypted(key) {
-                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            match conn.split() {
-                                Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
-                                Err(e) => Err(e),
-                            }
+        let result: ConnectResult = if self.args_transport == "quic" {
+            match transport_quic::QuicClientTransport::new()
+                .and_then(|q| q.connect(&self.args_connect))
+            {
+                Ok((s, r)) => Ok((Box::new(s), Box::new(r), None)),
+                Err(e) => Err(e),
+            }
+        } else {
+            match transport_tcp::TcpClientTransport::new(&self.args_connect).connect_tcp() {
+                Ok(conn) => {
+                    let shutdown_handle = conn.shutdown_handle().ok();
+                    if let Some(ref key) = self.encryption_key {
+                        match conn.split_encrypted(key) {
+                            Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        match conn.split() {
+                            Ok((s, r)) => Ok((Box::new(s) as _, Box::new(r) as _, shutdown_handle)),
+                            Err(e) => Err(e),
                         }
                     }
-                    Err(e) => Err(e),
                 }
-            };
+                Err(e) => Err(e),
+            }
+        };
 
         let (mut sender, mut receiver, shutdown_handle) = match result {
             Ok(pair) => {
@@ -192,7 +193,10 @@ impl App {
                 pair
             }
             Err(e) => {
-                tracing::warn!("connect failed: {e}, retry in {:.1}s", self.backoff.as_secs_f32());
+                tracing::warn!(
+                    "connect failed: {e}, retry in {:.1}s",
+                    self.backoff.as_secs_f32()
+                );
                 self.backoff = (self.backoff * 2).min(Duration::from_secs(10));
                 return;
             }
@@ -200,9 +204,13 @@ impl App {
 
         // Read Hello and check protocol version
         let (width, height, server_audio) = match receiver.recv_msg() {
-            Ok(Message::Hello { width, height, audio, protocol_version, .. })
-                if width > 0 && width <= 8192 && height > 0 && height <= 8192 =>
-            {
+            Ok(Message::Hello {
+                width,
+                height,
+                audio,
+                protocol_version,
+                ..
+            }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
                 if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
                     tracing::error!(
                         server_version = protocol_version,
@@ -221,8 +229,14 @@ impl App {
                 tracing::info!(width, height, audio, protocol_version, "connected");
                 (width, height, audio)
             }
-            Ok(_) => { tracing::warn!("bad Hello"); return; }
-            Err(e) => { tracing::warn!("handshake failed: {e}"); return; }
+            Ok(_) => {
+                tracing::warn!("bad Hello");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("handshake failed: {e}");
+                return;
+            }
         };
 
         // Create window
@@ -239,7 +253,10 @@ impl App {
 
         let display = match display_winit::WinitDisplay::new(window.clone(), width, height) {
             Ok(d) => d,
-            Err(e) => { tracing::error!("display init failed: {e}"); return; }
+            Err(e) => {
+                tracing::error!("display init failed: {e}");
+                return;
+            }
         };
 
         let _decoder_name = &self.args_decoder;
@@ -255,7 +272,10 @@ impl App {
                         tracing::warn!("VideoToolbox init failed ({e}), falling back to OpenH264");
                         match decode_h264::OpenH264Decoder::new(width, height) {
                             Ok(d) => Box::new(d),
-                            Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+                            Err(e) => {
+                                tracing::error!("decoder init failed: {e}");
+                                return;
+                            }
                         }
                     }
                 }
@@ -265,13 +285,19 @@ impl App {
                         tracing::info!("using OpenH264 software decoder");
                         Box::new(d)
                     }
-                    Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+                    Err(e) => {
+                        tracing::error!("decoder init failed: {e}");
+                        return;
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
             match decode_h264::OpenH264Decoder::new(width, height) {
                 Ok(d) => Box::new(d),
-                Err(e) => { tracing::error!("decoder init failed: {e}"); return; }
+                Err(e) => {
+                    tracing::error!("decoder init failed: {e}");
+                    return;
+                }
             }
         };
 
@@ -310,7 +336,9 @@ impl App {
                         recv_connected.store(false, Ordering::Relaxed);
                         break;
                     }
-                    if frame_tx.send(msg).is_err() { break; }
+                    if frame_tx.send(msg).is_err() {
+                        break;
+                    }
                 }
                 recv_connected.store(false, Ordering::Relaxed);
                 tracing::debug!("recv thread exiting");
@@ -323,7 +351,9 @@ impl App {
             .name("client-send".into())
             .spawn(move || {
                 while let Ok(msg) = input_rx.recv() {
-                    if sender.send_msg(&msg).is_err() { break; }
+                    if sender.send_msg(&msg).is_err() {
+                        break;
+                    }
                 }
                 send_connected.store(false, Ordering::Relaxed);
                 tracing::debug!("send thread exiting");
@@ -428,32 +458,46 @@ impl ApplicationHandler for App {
                         Message::Ping => {
                             let _ = session.input_tx.send(Message::Pong);
                         }
-                        Message::FileOffer { transfer_id, name, size } => {
-                            match session.file_xfer.on_file_offer(transfer_id, &name, size) {
-                                Ok(reply) => {
-                                    let _ = session.input_tx.send(reply);
-                                }
-                                Err(e) => {
-                                    tracing::error!(transfer_id, "failed to accept file: {e}");
-                                    let _ = session.input_tx.send(Message::FileCancel {
-                                        transfer_id,
-                                        reason: format!("{e}"),
-                                    });
-                                }
+                        Message::FileOffer {
+                            transfer_id,
+                            name,
+                            size,
+                        } => match session.file_xfer.on_file_offer(transfer_id, &name, size) {
+                            Ok(reply) => {
+                                let _ = session.input_tx.send(reply);
                             }
-                        }
+                            Err(e) => {
+                                tracing::error!(transfer_id, "failed to accept file: {e}");
+                                let _ = session.input_tx.send(Message::FileCancel {
+                                    transfer_id,
+                                    reason: format!("{e}"),
+                                });
+                            }
+                        },
                         Message::FileAccept { transfer_id } => {
                             session.file_xfer.on_file_accept(transfer_id);
                         }
-                        Message::FileCancel { transfer_id, reason } => {
+                        Message::FileCancel {
+                            transfer_id,
+                            reason,
+                        } => {
                             session.file_xfer.on_file_cancel(transfer_id, &reason);
                         }
-                        Message::FileChunk { transfer_id, offset, data } => {
-                            if let Err(e) = session.file_xfer.on_file_chunk(transfer_id, offset, &data) {
+                        Message::FileChunk {
+                            transfer_id,
+                            offset,
+                            data,
+                        } => {
+                            if let Err(e) =
+                                session.file_xfer.on_file_chunk(transfer_id, offset, &data)
+                            {
                                 tracing::error!(transfer_id, "file chunk error: {e}");
                             }
                         }
-                        Message::FileDone { transfer_id, sha256 } => {
+                        Message::FileDone {
+                            transfer_id,
+                            sha256,
+                        } => {
                             if let Err(e) = session.file_xfer.on_file_done(transfer_id, &sha256) {
                                 tracing::error!(transfer_id, "file done error: {e}");
                             }
@@ -508,7 +552,9 @@ impl ApplicationHandler for App {
                     let elapsed = session.stats_time.elapsed().as_secs_f64();
                     let avg_decode = if session.stats_video > 0 {
                         session.stats_decode_ms / session.stats_video as f64
-                    } else { 0.0 };
+                    } else {
+                        0.0
+                    };
                     tracing::info!(
                         video_fps = format_args!("{:.1}", session.stats_video as f64 / elapsed),
                         decode_avg_ms = format_args!("{:.2}", avg_decode),
@@ -528,7 +574,9 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let AppState::Connected(session) = &mut self.state else { return };
+        let AppState::Connected(session) = &mut self.state else {
+            return;
+        };
 
         match event {
             WindowEvent::CloseRequested => {
@@ -537,7 +585,9 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => {
                 session.modifiers = mods;
             }
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 // Intercept Cmd+V (Mac) / Ctrl+V → paste clipboard as typed text
                 let mods = session.modifiers.state();
                 let is_paste = key_event.state == winit::event::ElementState::Pressed
@@ -559,7 +609,9 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if let Some(input) = input_capture::key_event(&key_event.physical_key, key_event.state) {
+                if let Some(input) =
+                    input_capture::key_event(&key_event.physical_key, key_event.state)
+                {
                     let _ = session.input_tx.send(Message::Input(input));
                 }
             }
@@ -570,9 +622,9 @@ impl ApplicationHandler for App {
                 let (lx, ly) = session.last_sent_mouse;
                 if sx != lx || sy != ly {
                     session.last_sent_mouse = (sx, sy);
-                    let _ = session.input_tx.send(Message::Input(
-                        input_capture::mouse_move_event(sx, sy),
-                    ));
+                    let _ = session
+                        .input_tx
+                        .send(Message::Input(input_capture::mouse_move_event(sx, sy)));
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -587,12 +639,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(false) => {
                 // Release all modifiers when window loses focus to prevent stuck keys.
-                for key in [KeyCode::LeftShift, KeyCode::RightShift,
-                            KeyCode::LeftCtrl, KeyCode::RightCtrl,
-                            KeyCode::LeftAlt, KeyCode::RightAlt] {
-                    let _ = session.input_tx.send(Message::Input(
-                        InputEvent::Key { key, pressed: false },
-                    ));
+                for key in [
+                    KeyCode::LeftShift,
+                    KeyCode::RightShift,
+                    KeyCode::LeftCtrl,
+                    KeyCode::RightCtrl,
+                    KeyCode::LeftAlt,
+                    KeyCode::RightAlt,
+                ] {
+                    let _ = session.input_tx.send(Message::Input(InputEvent::Key {
+                        key,
+                        pressed: false,
+                    }));
                 }
             }
             _ => {}

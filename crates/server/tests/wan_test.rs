@@ -6,7 +6,6 @@
 ///   keepalive under delay, encrypted streams under loss, and session replacement
 ///
 /// These tests use the actual protocol and codec paths (not mocks).
-
 use phantom_core::encode::{EncodedFrame, VideoCodec};
 use phantom_core::frame::PixelFormat;
 use phantom_core::protocol::{self, Message};
@@ -33,27 +32,52 @@ struct WanProfile {
 
 impl WanProfile {
     fn lan() -> Self {
-        Self { delay_ms: 0, jitter_ms: 0, drop_rate: 0.0, bandwidth_bps: 0 }
+        Self {
+            delay_ms: 0,
+            jitter_ms: 0,
+            drop_rate: 0.0,
+            bandwidth_bps: 0,
+        }
     }
 
     fn broadband() -> Self {
         // ~30ms RTT, low jitter, no loss, 50 Mbps
-        Self { delay_ms: 15, jitter_ms: 2, drop_rate: 0.0, bandwidth_bps: 50_000_000 }
+        Self {
+            delay_ms: 15,
+            jitter_ms: 2,
+            drop_rate: 0.0,
+            bandwidth_bps: 50_000_000,
+        }
     }
 
     fn lossy_wifi() -> Self {
         // ~20ms RTT, some jitter, 2% loss
-        Self { delay_ms: 10, jitter_ms: 8, drop_rate: 0.02, bandwidth_bps: 20_000_000 }
+        Self {
+            delay_ms: 10,
+            jitter_ms: 8,
+            drop_rate: 0.02,
+            bandwidth_bps: 20_000_000,
+        }
     }
 
     fn high_latency() -> Self {
         // ~200ms RTT (intercontinental), small jitter, no loss
-        Self { delay_ms: 100, jitter_ms: 10, drop_rate: 0.0, bandwidth_bps: 10_000_000 }
+        Self {
+            delay_ms: 100,
+            jitter_ms: 10,
+            drop_rate: 0.0,
+            bandwidth_bps: 10_000_000,
+        }
     }
 
     fn terrible() -> Self {
         // ~300ms RTT, high jitter, 5% loss, 2 Mbps
-        Self { delay_ms: 150, jitter_ms: 50, drop_rate: 0.05, bandwidth_bps: 2_000_000 }
+        Self {
+            delay_ms: 150,
+            jitter_ms: 50,
+            drop_rate: 0.05,
+            bandwidth_bps: 2_000_000,
+        }
     }
 
     fn effective_delay(&self) -> Duration {
@@ -73,7 +97,9 @@ impl WanProfile {
         }
         // Deterministic "random" drop based on sequence number
         // This makes tests reproducible
-        let hash = seq.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let hash = seq
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let threshold = (self.drop_rate * u64::MAX as f64) as u64;
         hash < threshold
     }
@@ -98,9 +124,7 @@ fn start_wan_proxy(
         .name("wan-proxy-accept".into())
         .spawn(move || {
             // Set a timeout so we can check the stop flag
-            listener
-                .set_nonblocking(false)
-                .ok();
+            listener.set_nonblocking(false).ok();
 
             while !stop.load(Ordering::Relaxed) {
                 // Use a short timeout to allow checking stop flag
@@ -232,11 +256,7 @@ impl openh264::formats::RGBSource for BgraFrame<'_> {
 
 /// Run a full server→proxy→client E2E test under the given WAN profile.
 /// Returns (frames_received, total_time, avg_frame_latency).
-fn run_wan_e2e(
-    profile: WanProfile,
-    num_frames: u32,
-    label: &str,
-) -> (u32, Duration, Duration) {
+fn run_wan_e2e(profile: WanProfile, num_frames: u32, label: &str) -> (u32, Duration, Duration) {
     let width = 320u32;
     let height = 240u32;
 
@@ -331,7 +351,11 @@ fn run_wan_e2e(
             // Receive Hello
             let msg = protocol::read_message(&mut reader).unwrap();
             match msg {
-                Message::Hello { width: w, height: h, .. } => {
+                Message::Hello {
+                    width: w,
+                    height: h,
+                    ..
+                } => {
                     assert_eq!(w, width);
                     assert_eq!(h, height);
                 }
@@ -429,7 +453,10 @@ fn wan_lossy_wifi() {
     );
     // TCP retransmits, so all frames should eventually arrive
     // (our proxy doesn't drop TCP segments, it just delays them — true loss would need raw sockets)
-    assert_eq!(received, 60, "TCP handles retransmission — all frames should arrive");
+    assert_eq!(
+        received, 60,
+        "TCP handles retransmission — all frames should arrive"
+    );
 }
 
 #[test]
@@ -441,7 +468,10 @@ fn wan_terrible_network() {
         avg_lat.as_secs_f64() * 1000.0
     );
     // Should still get all frames — TCP reliable delivery
-    assert_eq!(received, 20, "terrible network should still deliver all frames (TCP)");
+    assert_eq!(
+        received, 20,
+        "terrible network should still deliver all frames (TCP)"
+    );
 }
 
 #[test]
@@ -475,8 +505,7 @@ fn wan_encrypted_high_latency() {
 
         // Send 10 clipboard sync messages (small, fast)
         for i in 0..10 {
-            let payload =
-                bincode::serialize(&Message::ClipboardSync(format!("msg-{i}"))).unwrap();
+            let payload = bincode::serialize(&Message::ClipboardSync(format!("msg-{i}"))).unwrap();
             writer.write_encrypted(&payload).unwrap();
             thread::sleep(Duration::from_millis(50));
         }
@@ -521,7 +550,10 @@ fn wan_encrypted_high_latency() {
     thread::sleep(Duration::from_millis(200));
 
     eprintln!("Encrypted + 200ms RTT: {received}/10 messages received");
-    assert_eq!(received, 10, "encrypted messages should all arrive over high-latency link");
+    assert_eq!(
+        received, 10,
+        "encrypted messages should all arrive over high-latency link"
+    );
 }
 
 #[test]
@@ -762,6 +794,12 @@ fn wan_session_replacement_under_latency() {
         "Session replacement: client1={c1_frames} frames + disconnect={c1_disconnect}, client2={c2_frames} frames"
     );
     assert!(c1_disconnect, "client1 should receive Disconnect message");
-    assert!(c1_frames >= 3, "client1 should receive some frames before disconnect");
-    assert!(c2_frames >= 3, "client2 should receive frames after taking over");
+    assert!(
+        c1_frames >= 3,
+        "client1 should receive some frames before disconnect"
+    );
+    assert!(
+        c2_frames >= 3,
+        "client2 should receive frames after taking over"
+    );
 }

@@ -44,7 +44,12 @@ struct CMTime {
     epoch: i64,
 }
 
-const K_CM_TIME_INVALID: CMTime = CMTime { value: 0, timescale: 0, flags: 0, epoch: 0 };
+const K_CM_TIME_INVALID: CMTime = CMTime {
+    value: 0,
+    timescale: 0,
+    flags: 0,
+    epoch: 0,
+};
 
 #[allow(non_snake_case)]
 type VTDecompressionOutputCallback = unsafe extern "C" fn(
@@ -69,11 +74,17 @@ extern "C" {
     static kCFAllocatorNull: CFAllocatorRef;
     fn CFRelease(cf: CFTypeRef);
     fn CFDictionaryCreateMutable(
-        allocator: CFAllocatorRef, capacity: isize,
-        key_callbacks: *const c_void, value_callbacks: *const c_void,
+        allocator: CFAllocatorRef,
+        capacity: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
     ) -> CFMutableDictionaryRef;
     fn CFDictionarySetValue(dict: CFMutableDictionaryRef, key: CFTypeRef, value: CFTypeRef);
-    fn CFNumberCreate(allocator: CFAllocatorRef, the_type: isize, value_ptr: *const c_void) -> CFNumberRef;
+    fn CFNumberCreate(
+        allocator: CFAllocatorRef,
+        the_type: isize,
+        value_ptr: *const c_void,
+    ) -> CFNumberRef;
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
 }
@@ -177,7 +188,11 @@ unsafe impl Send for VideoToolboxDecoder {}
 
 impl VideoToolboxDecoder {
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        tracing::info!(width, height, "VideoToolbox decoder created (waiting for SPS/PPS)");
+        tracing::info!(
+            width,
+            height,
+            "VideoToolbox decoder created (waiting for SPS/PPS)"
+        );
         Ok(Self {
             session: ptr::null_mut(),
             format_desc: ptr::null_mut(),
@@ -211,14 +226,20 @@ impl VideoToolboxDecoder {
         }
 
         for (idx, &start) in nal_starts.iter().enumerate() {
-            if start >= data.len() { continue; }
+            if start >= data.len() {
+                continue;
+            }
             let nal_type = data[start] & 0x1f;
             let end = if idx + 1 < nal_starts.len() {
                 // Find the start code before the next NAL
                 let next = nal_starts[idx + 1];
-                if next >= 4 && data[next - 4..next - 1] == [0, 0, 0] { next - 4 }
-                else if next >= 3 { next - 3 }
-                else { next }
+                if next >= 4 && data[next - 4..next - 1] == [0, 0, 0] {
+                    next - 4
+                } else if next >= 3 {
+                    next - 3
+                } else {
+                    next
+                }
             } else {
                 data.len()
             };
@@ -227,7 +248,9 @@ impl VideoToolboxDecoder {
                 8 => pps = Some(data[start..end].to_vec()),
                 _ => {}
             }
-            if sps.is_some() && pps.is_some() { break; }
+            if sps.is_some() && pps.is_some() {
+                break;
+            }
         }
 
         (sps, pps)
@@ -261,15 +284,22 @@ impl VideoToolboxDecoder {
 
             // Create image buffer attributes requesting BGRA output
             let attrs = CFDictionaryCreateMutable(
-                kCFAllocatorDefault, 0,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks,
+                kCFAllocatorDefault,
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
             );
             let pixel_format = K_CV_PIXEL_FORMAT_TYPE_32BGRA;
             let pixel_format_num = CFNumberCreate(
-                kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE,
+                kCFAllocatorDefault,
+                K_CF_NUMBER_SINT32_TYPE,
                 &pixel_format as *const i32 as *const c_void,
             );
-            CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey as CFTypeRef, pixel_format_num as CFTypeRef);
+            CFDictionarySetValue(
+                attrs,
+                kCVPixelBufferPixelFormatTypeKey as CFTypeRef,
+                pixel_format_num as CFTypeRef,
+            );
             CFRelease(pixel_format_num as CFTypeRef);
 
             // Create output callback
@@ -300,7 +330,8 @@ impl VideoToolboxDecoder {
             self.session = session;
             self.format_desc = format_desc;
             tracing::info!(
-                width = self.width, height = self.height,
+                width = self.width,
+                height = self.height,
                 "VideoToolbox H.264 hardware decoder initialized"
             );
             Ok(())
@@ -326,7 +357,9 @@ impl VideoToolboxDecoder {
             // Find end of NAL (next start code or end)
             let mut nal_end = data.len();
             for j in nal_start..data.len().saturating_sub(3) {
-                if data[j..j + 4] == [0, 0, 0, 1] || (j + 3 <= data.len() && data[j..j + 3] == [0, 0, 1]) {
+                if data[j..j + 4] == [0, 0, 0, 1]
+                    || (j + 3 <= data.len() && data[j..j + 3] == [0, 0, 1])
+                {
                     nal_end = j;
                     break;
                 }
@@ -484,7 +517,9 @@ impl FrameDecoder for VideoToolboxDecoder {
             VTDecompressionSessionWaitForAsynchronousFrames(self.session);
 
             // Get decoded frame from shared buffer
-            let frame = self.decoded_frame.lock()
+            let frame = self
+                .decoded_frame
+                .lock()
                 .map_err(|_| anyhow::anyhow!("decoded_frame mutex poisoned"))?
                 .take();
             match frame {

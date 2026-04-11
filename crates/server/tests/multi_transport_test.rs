@@ -80,12 +80,20 @@ fn multi_transport_port_assignment() {
     let transports = vec!["tcp", "web"];
 
     // When multiple transports, web gets base_port + 1
-    let web_port = if transports.len() > 1 { base_port + 1 } else { base_port };
+    let web_port = if transports.len() > 1 {
+        base_port + 1
+    } else {
+        base_port
+    };
     assert_eq!(web_port, 9901);
 
     // When single transport, web gets base_port
     let single = vec!["web"];
-    let web_port_single = if single.len() > 1 { base_port + 1 } else { base_port };
+    let web_port_single = if single.len() > 1 {
+        base_port + 1
+    } else {
+        base_port
+    };
     assert_eq!(web_port_single, 9900);
 }
 
@@ -93,8 +101,11 @@ fn multi_transport_port_assignment() {
 #[test]
 fn listen_address_parsing() {
     let addr = "0.0.0.0:9900";
-    let base_port: u16 = addr.rsplit(':').next()
-        .and_then(|p| p.parse().ok()).unwrap_or(9900);
+    let base_port: u16 = addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9900);
     let host: &str = addr.rsplit_once(':').map(|x| x.0).unwrap_or("0.0.0.0");
 
     assert_eq!(base_port, 9900);
@@ -102,8 +113,11 @@ fn listen_address_parsing() {
 
     // IPv6
     let addr6 = "127.0.0.1:8080";
-    let port6: u16 = addr6.rsplit(':').next()
-        .and_then(|p| p.parse().ok()).unwrap_or(9900);
+    let port6: u16 = addr6
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9900);
     assert_eq!(port6, 8080);
 }
 

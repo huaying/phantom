@@ -37,7 +37,12 @@ impl NvfbcCapture {
         Self::with_options(cuda, ctx, buffer_format, false)
     }
 
-    pub fn with_options(cuda: Arc<CudaLib>, ctx: CUcontext, buffer_format: u32, with_cursor: bool) -> Result<Self> {
+    pub fn with_options(
+        cuda: Arc<CudaLib>,
+        ctx: CUcontext,
+        buffer_format: u32,
+        with_cursor: bool,
+    ) -> Result<Self> {
         let lib = DynLib::open(&["libnvidia-fbc.so.1", "libnvidia-fbc.so"])
             .context("failed to load libnvidia-fbc")?;
 
@@ -57,7 +62,10 @@ impl NvfbcCapture {
         let mut status_params = NvFbcGetStatusParams::new();
         let status = unsafe { (api.get_status)(handle, status_params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
-            bail!("NvFBCGetStatus failed: {}", nvfbc_error_detail(&api, handle, status));
+            bail!(
+                "NvFBCGetStatus failed: {}",
+                nvfbc_error_detail(&api, handle, status)
+            );
         }
 
         let runtime_version = status_params.nvfbc_version();
@@ -92,7 +100,8 @@ impl NvfbcCapture {
         }
 
         tracing::info!(
-            width, height,
+            width,
+            height,
             format = match buffer_format {
                 NVFBC_BUFFER_FORMAT_BGRA => "BGRA",
                 NVFBC_BUFFER_FORMAT_NV12 => "NV12",
@@ -133,17 +142,24 @@ impl NvfbcCapture {
         session_params.set_push_model(NVFBC_FALSE);
         session_params.set_sampling_rate_ms(16);
 
-        let status = unsafe { (self.api.create_capture_session)(self.handle, session_params.as_mut_ptr()) };
+        let status =
+            unsafe { (self.api.create_capture_session)(self.handle, session_params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             let _ = self.release_context();
-            bail!("NvFBCCreateCaptureSession (reset) failed: {}", nvfbc_error_detail(&self.api, self.handle, status));
+            bail!(
+                "NvFBCCreateCaptureSession (reset) failed: {}",
+                nvfbc_error_detail(&self.api, self.handle, status)
+            );
         }
 
         let mut setup = NvFbcToCudaSetupParams::new(self._buffer_format);
         let status = unsafe { (self.api.to_cuda_setup)(self.handle, setup.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             let _ = self.release_context();
-            bail!("NvFBCToCudaSetUp (reset) failed: {}", nvfbc_error_detail(&self.api, self.handle, status));
+            bail!(
+                "NvFBCToCudaSetUp (reset) failed: {}",
+                nvfbc_error_detail(&self.api, self.handle, status)
+            );
         }
 
         let _ = self.release_context();
@@ -320,7 +336,11 @@ impl Drop for NvfbcCapture {
     }
 }
 
-fn nvfbc_error_detail(api: &NvFbcFunctionList, handle: NVFBC_SESSION_HANDLE, status: NVFBCSTATUS) -> String {
+fn nvfbc_error_detail(
+    api: &NvFbcFunctionList,
+    handle: NVFBC_SESSION_HANDLE,
+    status: NVFBCSTATUS,
+) -> String {
     let msg_ptr = unsafe { (api.get_last_error_str)(handle) };
     if msg_ptr.is_null() {
         return format!("status={status}");
@@ -338,16 +358,28 @@ fn nvfbc_error_detail(api: &NvFbcFunctionList, handle: NVFBC_SESSION_HANDLE, sta
 fn load_nvfbc_api(lib: &DynLib) -> Result<NvFbcFunctionList> {
     unsafe {
         Ok(NvFbcFunctionList {
-            get_last_error_str: lib.sym("NvFBCGetLastErrorStr").context("NvFBCGetLastErrorStr")?,
+            get_last_error_str: lib
+                .sym("NvFBCGetLastErrorStr")
+                .context("NvFBCGetLastErrorStr")?,
             create_handle: lib.sym("NvFBCCreateHandle").context("NvFBCCreateHandle")?,
-            destroy_handle: lib.sym("NvFBCDestroyHandle").context("NvFBCDestroyHandle")?,
+            destroy_handle: lib
+                .sym("NvFBCDestroyHandle")
+                .context("NvFBCDestroyHandle")?,
             get_status: lib.sym("NvFBCGetStatus").context("NvFBCGetStatus")?,
-            create_capture_session: lib.sym("NvFBCCreateCaptureSession").context("NvFBCCreateCaptureSession")?,
-            destroy_capture_session: lib.sym("NvFBCDestroyCaptureSession").context("NvFBCDestroyCaptureSession")?,
+            create_capture_session: lib
+                .sym("NvFBCCreateCaptureSession")
+                .context("NvFBCCreateCaptureSession")?,
+            destroy_capture_session: lib
+                .sym("NvFBCDestroyCaptureSession")
+                .context("NvFBCDestroyCaptureSession")?,
             to_cuda_setup: lib.sym("NvFBCToCudaSetUp").context("NvFBCToCudaSetUp")?,
-            to_cuda_grab_frame: lib.sym("NvFBCToCudaGrabFrame").context("NvFBCToCudaGrabFrame")?,
+            to_cuda_grab_frame: lib
+                .sym("NvFBCToCudaGrabFrame")
+                .context("NvFBCToCudaGrabFrame")?,
             bind_context: lib.sym("NvFBCBindContext").context("NvFBCBindContext")?,
-            release_context: lib.sym("NvFBCReleaseContext").context("NvFBCReleaseContext")?,
+            release_context: lib
+                .sym("NvFBCReleaseContext")
+                .context("NvFBCReleaseContext")?,
         })
     }
 }

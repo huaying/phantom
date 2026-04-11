@@ -38,7 +38,10 @@ pub fn run_loop(
     // One UDP socket for the entire server lifetime
     let socket = match UdpSocket::bind(format!("0.0.0.0:{}", candidate_addr.port())) {
         Ok(s) => s,
-        Err(e) => { tracing::error!("bind UDP: {e}"); return; }
+        Err(e) => {
+            tracing::error!("bind UDP: {e}");
+            return;
+        }
     };
     let _ = socket.set_read_timeout(Some(Duration::from_millis(1)));
     let mut buf = vec![0u8; 65535];
@@ -68,8 +71,11 @@ pub fn run_loop(
         // 2. Clean up disconnected client
         if let Some(ref client) = active {
             if !client.rtc.is_alive() || client.ice_disconnected {
-                tracing::info!("WebRTC client disconnected (alive={}, ice_disconnected={})",
-                    client.rtc.is_alive(), client.ice_disconnected);
+                tracing::info!(
+                    "WebRTC client disconnected (alive={}, ice_disconnected={})",
+                    client.rtc.is_alive(),
+                    client.ice_disconnected
+                );
                 active = None;
             }
         }
@@ -88,7 +94,9 @@ pub fn run_loop(
         // 4. Read UDP socket
         match socket.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                let Ok(contents) = (&buf[..n]).try_into() else { continue };
+                let Ok(contents) = (&buf[..n]).try_into() else {
+                    continue;
+                };
                 let input = Input::Receive(
                     Instant::now(),
                     str0m::net::Receive {
@@ -103,8 +111,9 @@ pub fn run_loop(
                     let _ = client.rtc.handle_input(input);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => {}
         }
 
@@ -125,7 +134,10 @@ struct PendingQueue {
 
 impl PendingQueue {
     fn new() -> Self {
-        Self { queue: VecDeque::new(), paused: false }
+        Self {
+            queue: VecDeque::new(),
+            paused: false,
+        }
     }
 }
 
@@ -151,11 +163,15 @@ impl ActiveClient {
     fn new(rtc: Rtc) -> Self {
         Self {
             rtc,
-            video_id: None, input_id: None, control_id: None,
+            video_id: None,
+            input_id: None,
+            control_id: None,
             channels_ready: false,
             ice_disconnected: false,
-            video_rx: None, control_out_rx: None,
-            input_in_tx: None, control_in_tx: None,
+            video_rx: None,
+            control_out_rx: None,
+            input_in_tx: None,
+            control_in_tx: None,
             video_pending: PendingQueue::new(),
             control_pending: PendingQueue::new(),
         }
@@ -218,8 +234,10 @@ impl ActiveClient {
                     _ => {}
                 }
 
-                if self.video_id.is_some() && self.input_id.is_some()
-                    && self.control_id.is_some() && !self.channels_ready
+                if self.video_id.is_some()
+                    && self.input_id.is_some()
+                    && self.control_id.is_some()
+                    && !self.channels_ready
                 {
                     tracing::info!("all 3 DataChannels open — session ready");
                     self.channels_ready = true;
@@ -238,8 +256,14 @@ impl ActiveClient {
 
                     // Overwrite any stale session — main thread always gets the latest
                     *session_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((
-                        WebRtcSender { video_tx, control_tx: ctrl_out_tx },
-                        WebRtcReceiver { input_rx: input_in_rx, control_rx: ctrl_in_rx },
+                        WebRtcSender {
+                            video_tx,
+                            control_tx: ctrl_out_tx,
+                        },
+                        WebRtcReceiver {
+                            input_rx: input_in_rx,
+                            control_rx: ctrl_in_rx,
+                        },
                     ));
                     let _ = notify_tx.send(());
                 }
@@ -277,7 +301,9 @@ impl ActiveClient {
 
     /// Drain outgoing session data into DataChannels, respecting backpressure.
     fn drain_outgoing(&mut self) {
-        if !self.channels_ready { return; }
+        if !self.channels_ready {
+            return;
+        }
 
         // First: try to flush any pending chunks from previous iterations
         if let Some(vid) = self.video_id {
@@ -288,10 +314,14 @@ impl ActiveClient {
         }
 
         // Then: pull new messages from session loop
-        let video_msgs: Vec<Vec<u8>> = self.video_rx.as_ref()
+        let video_msgs: Vec<Vec<u8>> = self
+            .video_rx
+            .as_ref()
             .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
             .unwrap_or_default();
-        let ctrl_msgs: Vec<Vec<u8>> = self.control_out_rx.as_ref()
+        let ctrl_msgs: Vec<Vec<u8>> = self
+            .control_out_rx
+            .as_ref()
             .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
             .unwrap_or_default();
 
@@ -311,7 +341,10 @@ impl ActiveClient {
     /// Splits large messages into chunks. If a write is rejected (buffer full),
     /// remaining chunks are queued and we wait for BufferedAmountLow.
     fn write_with_backpressure(
-        &mut self, channel_id: ChannelId, data: &[u8], pending: &mut PendingRef,
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        pending: &mut PendingRef,
     ) {
         let pending_q = match pending {
             PendingRef::Video => &mut self.video_pending,
@@ -482,20 +515,29 @@ impl MessageSender for WebRtcSender {
         let payload = bincode::serialize(msg).context("serialize")?;
         match msg {
             // Video data (including Hello) → video DC (reliable + ordered)
-            Message::Hello { .. } | Message::VideoFrame { .. } | Message::TileUpdate { .. } | Message::AudioFrame { .. } => {
-                self.video_tx.try_send(payload)
+            Message::Hello { .. }
+            | Message::VideoFrame { .. }
+            | Message::TileUpdate { .. }
+            | Message::AudioFrame { .. } => {
+                self.video_tx
+                    .try_send(payload)
                     .map_err(|e| match e {
                         mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
-                        mpsc::TrySendError::Full(_) => { /* backpressure */ anyhow::anyhow!("") },
+                        mpsc::TrySendError::Full(_) => {
+                            /* backpressure */
+                            anyhow::anyhow!("")
+                        }
                     })
                     .or(Ok(()))
             }
-            _ => self.control_tx.try_send(payload)
-                    .map_err(|e| match e {
-                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
-                        mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
-                    })
-                    .or(Ok(())),
+            _ => self
+                .control_tx
+                .try_send(payload)
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
+                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                })
+                .or(Ok(())),
         }
     }
 }

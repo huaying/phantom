@@ -9,10 +9,10 @@
 //! Feature-gated behind `wayland` feature flag.
 //! Requires: libpipewire-0.3-dev, xdg-desktop-portal running.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use phantom_core::capture::FrameCapture;
 use phantom_core::frame::{Frame, PixelFormat};
-use std::os::fd::{FromRawFd, OwnedFd, IntoRawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,12 +50,17 @@ impl PipeWireCapture {
         tracing::info!("initializing PipeWire Wayland capture");
 
         // Step 1: Create portal session and get PipeWire fd + node id
-        let portal = create_portal_session()
-            .context("failed to create XDG ScreenCast portal session")?;
+        let portal =
+            create_portal_session().context("failed to create XDG ScreenCast portal session")?;
 
         let width = portal.width;
         let height = portal.height;
-        tracing::info!(width, height, node_id = portal.pw_node_id, "portal session created");
+        tracing::info!(
+            width,
+            height,
+            node_id = portal.pw_node_id,
+            "portal session created"
+        );
 
         let frame_buffer: Arc<Mutex<Option<FrameData>>> = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(false));
@@ -101,7 +106,9 @@ impl PipeWireCapture {
 
 impl FrameCapture for PipeWireCapture {
     fn capture(&mut self) -> Result<Option<Frame>> {
-        let mut guard = self.frame_buffer.lock()
+        let mut guard = self
+            .frame_buffer
+            .lock()
             .map_err(|_| anyhow::anyhow!("PipeWire frame buffer mutex poisoned"))?;
         match guard.take() {
             Some(fd) => {
@@ -124,7 +131,9 @@ impl FrameCapture for PipeWireCapture {
     }
 
     fn reset(&mut self) -> Result<()> {
-        let mut guard = self.frame_buffer.lock()
+        let mut guard = self
+            .frame_buffer
+            .lock()
             .map_err(|_| anyhow::anyhow!("PipeWire frame buffer mutex poisoned"))?;
         *guard = None;
         Ok(())
@@ -156,10 +165,7 @@ fn create_portal_session() -> Result<PortalSession> {
 
     // CreateSession
     let mut create_opts: HashMap<String, Variant<Box<dyn RefArg>>> = HashMap::new();
-    create_opts.insert(
-        "handle_token".into(),
-        Variant(Box::new(token.clone())),
-    );
+    create_opts.insert("handle_token".into(), Variant(Box::new(token.clone())));
     create_opts.insert(
         "session_handle_token".into(),
         Variant(Box::new(session_token.clone())),
@@ -183,9 +189,7 @@ fn create_portal_session() -> Result<PortalSession> {
         .unwrap_or_else(|| {
             format!(
                 "/org/freedesktop/portal/desktop/session/{}/{}",
-                conn.unique_name()
-                    .trim_start_matches(':')
-                    .replace('.', "_"),
+                conn.unique_name().trim_start_matches(':').replace('.', "_"),
                 session_token
             )
         });
@@ -240,9 +244,7 @@ fn create_portal_session() -> Result<PortalSession> {
         .context("no 'streams' in Start response")?;
 
     // streams is a(ua{sv}) — array of (node_id, properties)
-    let streams_iter = streams
-        .as_iter()
-        .context("streams is not iterable")?;
+    let streams_iter = streams.as_iter().context("streams is not iterable")?;
 
     let mut node_id: Option<u32> = None;
     let mut width = 1920u32;
@@ -271,8 +273,12 @@ fn create_portal_session() -> Result<PortalSession> {
                                     if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
                                         if key.as_str() == Some("size") {
                                             if let Some(mut size_iter) = val.as_iter() {
-                                                if let (Some(w), Some(h)) = (size_iter.next(), size_iter.next()) {
-                                                    if let (Some(w), Some(h)) = (w.as_u64(), h.as_u64()) {
+                                                if let (Some(w), Some(h)) =
+                                                    (size_iter.next(), size_iter.next())
+                                                {
+                                                    if let (Some(w), Some(h)) =
+                                                        (w.as_u64(), h.as_u64())
+                                                    {
                                                         width = w as u32;
                                                         height = h as u32;
                                                     }
@@ -351,7 +357,10 @@ fn wait_for_portal_response(
                                 // Parse: (u, a{sv})
                                 let (response_code, results): (
                                     u32,
-                                    std::collections::HashMap<String, dbus::arg::Variant<Box<dyn RefArg>>>,
+                                    std::collections::HashMap<
+                                        String,
+                                        dbus::arg::Variant<Box<dyn RefArg>>,
+                                    >,
                                 ) = msg.read2().context("failed to parse Response signal")?;
 
                                 if response_code != 0 {
@@ -387,10 +396,10 @@ fn run_pipewire_stream(
 
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoop::new(None)
-        .context("failed to create PipeWire MainLoop")?;
-    let context = pw::context::Context::new(&mainloop)
-        .context("failed to create PipeWire Context")?;
+    let mainloop =
+        pw::main_loop::MainLoop::new(None).context("failed to create PipeWire MainLoop")?;
+    let context =
+        pw::context::Context::new(&mainloop).context("failed to create PipeWire Context")?;
 
     // Connect using the portal's file descriptor
     let core = context
@@ -438,9 +447,18 @@ fn run_pipewire_stream(
             Choice,
             Range,
             Rectangle,
-            pw::spa::utils::Rectangle { width: 1920, height: 1080 },
-            pw::spa::utils::Rectangle { width: 1, height: 1 },
-            pw::spa::utils::Rectangle { width: 7680, height: 4320 }
+            pw::spa::utils::Rectangle {
+                width: 1920,
+                height: 1080
+            },
+            pw::spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            pw::spa::utils::Rectangle {
+                width: 7680,
+                height: 4320
+            }
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFramerate,
@@ -461,8 +479,9 @@ fn run_pipewire_stream(
     .0
     .into_inner();
 
-    let mut params = [pw::spa::pod::Pod::from_bytes(&values)
-        .context("failed to create PipeWire format pod")?];
+    let mut params = [
+        pw::spa::pod::Pod::from_bytes(&values).context("failed to create PipeWire format pod")?
+    ];
 
     let fb = frame_buffer;
     let run = running;

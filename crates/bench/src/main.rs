@@ -37,7 +37,13 @@ fn make_frame(w: u32, h: u32) -> Frame {
             data[i + 3] = 255;
         }
     }
-    Frame { width: w, height: h, format: PixelFormat::Bgra8, data, timestamp: Instant::now() }
+    Frame {
+        width: w,
+        height: h,
+        format: PixelFormat::Bgra8,
+        data,
+        timestamp: Instant::now(),
+    }
 }
 
 struct BenchResult {
@@ -65,7 +71,12 @@ fn bench(rounds: usize, mut f: impl FnMut() -> usize) -> BenchResult {
     let p50_ms = times[times.len() / 2];
     let p95_ms = times[(times.len() as f64 * 0.95) as usize];
     let avg_bytes = total_bytes / rounds;
-    BenchResult { avg_ms, p50_ms, p95_ms, avg_bytes }
+    BenchResult {
+        avg_ms,
+        p50_ms,
+        p95_ms,
+        avg_bytes,
+    }
 }
 
 /// Wrapper for OpenH264 encoder using the openh264 crate directly.
@@ -103,11 +114,19 @@ impl OpenH264Bench {
             .enable_skip_frame(true);
         let api = openh264::OpenH264API::from_source();
         let encoder = openh264::encoder::Encoder::with_api_config(api, config)?;
-        Ok(Self { encoder, width: width as usize, height: height as usize })
+        Ok(Self {
+            encoder,
+            width: width as usize,
+            height: height as usize,
+        })
     }
 
     fn encode(&mut self, frame: &Frame) -> Result<usize> {
-        let src = BgraSource { data: &frame.data, width: self.width, height: self.height };
+        let src = BgraSource {
+            data: &frame.data,
+            width: self.width,
+            height: self.height,
+        };
         let yuv = openh264::formats::YUVBuffer::from_rgb_source(src);
         let bs = self.encoder.encode(&yuv)?;
         Ok(bs.to_vec().len())
@@ -134,9 +153,7 @@ fn main() {
     // Header
     println!(
         "{:<10} {:>8}  {:>10} {:>8} {:>8} {:>8}  {:>10} {:>8} {:>8} {:>8}",
-        "Res", "Bitrate",
-        "OpenH264", "avg", "p50", "p95",
-        "NVENC", "avg", "p50", "p95",
+        "Res", "Bitrate", "OpenH264", "avg", "p50", "p95", "NVENC", "avg", "p50", "p95",
     );
     println!("{}", "-".repeat(110));
 
@@ -157,23 +174,30 @@ fn main() {
             };
 
             // --- NVENC ---
-            let nvenc = cuda.as_ref().and_then(|c| {
-                NvencEncoder::new(Arc::clone(c), 0, w, h, 30, bitrate).ok()
-            }).map(|mut enc| {
-                bench(ROUNDS, || {
-                    enc.encode_frame(&frame).map(|ef| ef.data.len()).unwrap_or(0)
-                })
-            });
+            let nvenc = cuda
+                .as_ref()
+                .and_then(|c| NvencEncoder::new(Arc::clone(c), 0, w, h, 30, bitrate).ok())
+                .map(|mut enc| {
+                    bench(ROUNDS, || {
+                        enc.encode_frame(&frame)
+                            .map(|ef| ef.data.len())
+                            .unwrap_or(0)
+                    })
+                });
 
             // Print row
             let oh264_str = match &oh264 {
-                Some(r) => format!("{:>6} B/f {:>6.2}ms {:>6.2}ms {:>6.2}ms",
-                    r.avg_bytes, r.avg_ms, r.p50_ms, r.p95_ms),
+                Some(r) => format!(
+                    "{:>6} B/f {:>6.2}ms {:>6.2}ms {:>6.2}ms",
+                    r.avg_bytes, r.avg_ms, r.p50_ms, r.p95_ms
+                ),
                 None => format!("{:>38}", "N/A"),
             };
             let nvenc_str = match &nvenc {
-                Some(r) => format!("{:>6} B/f {:>6.2}ms {:>6.2}ms {:>6.2}ms",
-                    r.avg_bytes, r.avg_ms, r.p50_ms, r.p95_ms),
+                Some(r) => format!(
+                    "{:>6} B/f {:>6.2}ms {:>6.2}ms {:>6.2}ms",
+                    r.avg_bytes, r.avg_ms, r.p50_ms, r.p95_ms
+                ),
                 None => format!("{:>38}", "N/A"),
             };
             println!("{label:<10} {:>5}k  {oh264_str}  {nvenc_str}", bitrate);
@@ -189,12 +213,19 @@ fn main() {
         let dev = cuda.device_get(0).unwrap();
         let primary_ctx = match cuda.primary_ctx_retain(dev) {
             Ok(c) => c,
-            Err(e) => { println!("  primary_ctx_retain failed: {e}\n"); println!("done."); return; }
+            Err(e) => {
+                println!("  primary_ctx_retain failed: {e}\n");
+                println!("done.");
+                return;
+            }
         };
         unsafe { cuda.ctx_push(primary_ctx) }.ok();
 
         match phantom_gpu::nvfbc::NvfbcCapture::with_options(
-            Arc::clone(cuda), primary_ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12, true, // with_cursor for bench
+            Arc::clone(cuda),
+            primary_ctx,
+            phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12,
+            true, // with_cursor for bench
         ) {
             Ok(mut cap) => {
                 let (sw, sh) = cap.resolution();
@@ -213,8 +244,14 @@ fn main() {
                 let first = loop {
                     match cap.grab_cuda() {
                         Ok(Some(f)) => break f,
-                        Ok(None) => { std::thread::sleep(std::time::Duration::from_millis(10)); }
-                        Err(e) => { println!("  grab failed: {e}"); println!("\ndone."); return; }
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            println!("  grab failed: {e}");
+                            println!("\ndone.");
+                            return;
+                        }
                     }
                 };
                 let (fw, fh) = (first.width, first.height);
@@ -224,7 +261,15 @@ fn main() {
                 // Init NVENC sharing primary context
                 cap.release_context().ok();
                 match unsafe {
-                    NvencEncoder::with_context(Arc::clone(cuda), primary_ctx, false, fw, fh, 30, 5000)
+                    NvencEncoder::with_context(
+                        Arc::clone(cuda),
+                        primary_ctx,
+                        false,
+                        fw,
+                        fh,
+                        30,
+                        5000,
+                    )
                 } {
                     Ok(mut enc) => {
                         // Warmup
@@ -278,9 +323,21 @@ fn main() {
                             let p50 = |v: &[f64]| v[v.len() / 2];
 
                             println!("  frames captured: {n}/{ROUNDS}");
-                            println!("  capture:  avg {:.2}ms  p50 {:.2}ms", avg(&cap_times), p50(&cap_times));
-                            println!("  encode:   avg {:.2}ms  p50 {:.2}ms", avg(&enc_times), p50(&enc_times));
-                            println!("  total:    avg {:.2}ms  p50 {:.2}ms", avg(&total_times), p50(&total_times));
+                            println!(
+                                "  capture:  avg {:.2}ms  p50 {:.2}ms",
+                                avg(&cap_times),
+                                p50(&cap_times)
+                            );
+                            println!(
+                                "  encode:   avg {:.2}ms  p50 {:.2}ms",
+                                avg(&enc_times),
+                                p50(&enc_times)
+                            );
+                            println!(
+                                "  total:    avg {:.2}ms  p50 {:.2}ms",
+                                avg(&total_times),
+                                p50(&total_times)
+                            );
                             println!("  avg size: {} B/f", encoded / n);
                         }
                     }
@@ -291,7 +348,9 @@ fn main() {
         }
 
         // Kill any xdotool processes spawned by this bench
-        let _ = std::process::Command::new("pkill").args(["-f", "xdotool mousemove"]).status();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "xdotool mousemove"])
+            .status();
 
         cuda.ctx_pop().ok();
         cuda.primary_ctx_release(dev);

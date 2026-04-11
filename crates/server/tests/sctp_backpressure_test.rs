@@ -17,13 +17,20 @@ fn chunk_framing_large_message() {
     let chunks = chunk_message(&data, chunk_size);
 
     // Each chunk has 4-byte header + payload
-    assert!(chunks.len() >= 5, "70KB / ~16KB = at least 5 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 5,
+        "70KB / ~16KB = at least 5 chunks, got {}",
+        chunks.len()
+    );
 
     // Verify framing: each chunk starts with [total_len as u32 LE]
     for chunk in &chunks {
         assert!(chunk.len() <= chunk_size);
         let total = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
-        assert_eq!(total, 70_000, "total_len header should be original message size");
+        assert_eq!(
+            total, 70_000,
+            "total_len header should be original message size"
+        );
     }
 
     // Reassemble and verify

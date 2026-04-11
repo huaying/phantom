@@ -7,9 +7,9 @@
 //! encoded Opus frames through an mpsc channel.
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 /// Encoded audio chunk ready to be sent as an AudioFrame message.
@@ -53,22 +53,20 @@ impl AudioCapture {
         let source_ref = source_name.as_deref();
 
         let pa = psimple::Simple::new(
-            None,                              // default server
-            "phantom-server",                  // app name
-            pulse::stream::Direction::Record,  // recording
-            source_ref,                        // device: monitor source or None for default
-            "desktop-audio",                   // stream description
+            None,                             // default server
+            "phantom-server",                 // app name
+            pulse::stream::Direction::Record, // recording
+            source_ref,                       // device: monitor source or None for default
+            "desktop-audio",                  // stream description
             &spec,
-            None,                              // default channel map
-            None,                              // default buffer attrs
+            None, // default channel map
+            None, // default buffer attrs
         )
         .map_err(|e| anyhow::anyhow!("PulseAudio connect failed: {e}"))?;
 
         info!(
             source = source_ref.unwrap_or("default"),
-            sample_rate,
-            channels,
-            "audio capture started"
+            sample_rate, channels, "audio capture started"
         );
 
         // Create Opus encoder

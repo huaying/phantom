@@ -32,12 +32,18 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         match phantom_gpu::nvfbc::NvfbcCapture::new(
-            Arc::clone(&cuda), primary_ctx, phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12,
+            Arc::clone(&cuda),
+            primary_ctx,
+            phantom_gpu::sys::NVFBC_BUFFER_FORMAT_NV12,
         ) {
             Ok(mut cap) => {
                 let (sw, sh) = cap.resolution();
                 let rv = cap.runtime_version();
-                println!("  screen: {sw}x{sh}, NVFBC v{}.{}", (rv >> 8) & 0xff, rv & 0xff);
+                println!(
+                    "  screen: {sw}x{sh}, NVFBC v{}.{}",
+                    (rv >> 8) & 0xff,
+                    rv & 0xff
+                );
 
                 let current_after_nvfbc = cuda.ctx_get_current().unwrap_or(std::ptr::null_mut());
                 println!(
@@ -58,7 +64,10 @@ fn main() {
                     match cap.grab_cuda() {
                         Ok(Some(f)) => break f,
                         Ok(None) => continue,
-                        Err(e) => { println!("  grab failed: {e}"); return; }
+                        Err(e) => {
+                            println!("  grab failed: {e}");
+                            return;
+                        }
                     }
                 };
                 // Release NVFBC context so NVENC can init
@@ -68,7 +77,15 @@ fn main() {
                 println!("  frame: {fw}x{fh}, inferred_pitch={first_pitch}\n");
 
                 match unsafe {
-                    NvencEncoder::with_context(Arc::clone(&cuda), shared_ctx, false, fw, fh, 30, 5000)
+                    NvencEncoder::with_context(
+                        Arc::clone(&cuda),
+                        shared_ctx,
+                        false,
+                        fw,
+                        fh,
+                        30,
+                        5000,
+                    )
                 } {
                     Ok(mut enc) => {
                         for i in 0..10 {

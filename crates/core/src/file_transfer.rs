@@ -68,27 +68,33 @@ impl FileTransferManager {
     /// Register an outbound offer (we want to send a file).
     pub fn offer_send(&mut self, name: String, size: u64) -> u64 {
         let id = next_transfer_id();
-        self.transfers.insert(id, TransferInfo {
-            transfer_id: id,
-            name,
-            size,
-            state: TransferState::Offered,
-            direction: TransferDirection::Sending,
-            bytes_transferred: 0,
-        });
+        self.transfers.insert(
+            id,
+            TransferInfo {
+                transfer_id: id,
+                name,
+                size,
+                state: TransferState::Offered,
+                direction: TransferDirection::Sending,
+                bytes_transferred: 0,
+            },
+        );
         id
     }
 
     /// Register an inbound offer (remote wants to send us a file).
     pub fn on_offer_received(&mut self, transfer_id: u64, name: String, size: u64) {
-        self.transfers.insert(transfer_id, TransferInfo {
+        self.transfers.insert(
             transfer_id,
-            name,
-            size,
-            state: TransferState::Offered,
-            direction: TransferDirection::Receiving,
-            bytes_transferred: 0,
-        });
+            TransferInfo {
+                transfer_id,
+                name,
+                size,
+                state: TransferState::Offered,
+                direction: TransferDirection::Receiving,
+                bytes_transferred: 0,
+            },
+        );
     }
 
     /// Mark a transfer as accepted.
@@ -139,9 +145,8 @@ impl FileTransferManager {
 
     /// Remove completed/cancelled transfers.
     pub fn cleanup(&mut self) {
-        self.transfers.retain(|_, t| {
-            t.state != TransferState::Done && t.state != TransferState::Cancelled
-        });
+        self.transfers
+            .retain(|_, t| t.state != TransferState::Done && t.state != TransferState::Cancelled);
     }
 }
 
@@ -159,7 +164,9 @@ pub fn sha256_file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
         let n = file.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().into())
@@ -172,7 +179,9 @@ pub struct IncrementalHasher {
 
 impl IncrementalHasher {
     pub fn new() -> Self {
-        Self { hasher: Sha256::new() }
+        Self {
+            hasher: Sha256::new(),
+        }
     }
 
     pub fn update(&mut self, data: &[u8]) {

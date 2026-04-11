@@ -9,10 +9,7 @@ use tracing::{info, warn};
 
 /// Start the audio playback pipeline. Returns a sender that accepts raw Opus
 /// packets. Drop the sender to stop playback.
-pub fn start_playback(
-    sample_rate: u32,
-    channels: u8,
-) -> Result<mpsc::SyncSender<Vec<u8>>> {
+pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender<Vec<u8>>> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let opus_channels = match channels {
@@ -35,7 +32,9 @@ pub fn start_playback(
     // Ring buffer: decoded PCM samples flow from decoder thread → cpal callback.
     // Size: ~200ms of audio at 48kHz stereo (enough to absorb jitter).
     let ring_size = (sample_rate as usize) * (channels as usize) * 200 / 1000;
-    let ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<f32>::with_capacity(ring_size)));
+    let ring = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::<f32>::with_capacity(ring_size),
+    ));
     let ring_writer = std::sync::Arc::clone(&ring);
 
     // Opus packets come in here
@@ -90,7 +89,8 @@ pub fn start_playback(
 
     // cpal output stream: pulls from ring buffer
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
 
     let config = cpal::StreamConfig {
@@ -100,23 +100,25 @@ pub fn start_playback(
     };
 
     let ring_reader = std::sync::Arc::clone(&ring);
-    let stream = device.build_output_stream(
-        &config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if let Ok(mut ring) = ring_reader.lock() {
-                for sample in data.iter_mut() {
-                    *sample = ring.pop_front().unwrap_or(0.0);
+    let stream = device
+        .build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if let Ok(mut ring) = ring_reader.lock() {
+                    for sample in data.iter_mut() {
+                        *sample = ring.pop_front().unwrap_or(0.0);
+                    }
+                } else {
+                    // Mutex poisoned — output silence
+                    data.fill(0.0);
                 }
-            } else {
-                // Mutex poisoned — output silence
-                data.fill(0.0);
-            }
-        },
-        move |err| {
-            warn!("audio output error: {err}");
-        },
-        None,
-    ).context("build audio output stream")?;
+            },
+            move |err| {
+                warn!("audio output error: {err}");
+            },
+            None,
+        )
+        .context("build audio output stream")?;
 
     stream.play().context("start audio playback")?;
 

@@ -36,13 +36,20 @@ impl ScrapCapture {
             );
         }
 
-        let display = displays.into_iter().nth(index)
+        let display = displays
+            .into_iter()
+            .nth(index)
             .context("display disappeared during enumeration")?;
         let width = display.width() as u32;
         let height = display.height() as u32;
         let capturer = Capturer::new(display).context("failed to create capturer")?;
         tracing::info!(index, width, height, "ScrapCapture initialized");
-        Ok(Self { capturer, width, height, display_index: index })
+        Ok(Self {
+            capturer,
+            width,
+            height,
+            display_index: index,
+        })
     }
 
     /// Recreate the capturer. Resets DXGI Desktop Duplication state so the
@@ -50,7 +57,9 @@ impl ScrapCapture {
     pub fn reset(&mut self) -> Result<()> {
         let displays = Display::all().context("failed to enumerate displays")?;
         let index = self.display_index.min(displays.len().saturating_sub(1));
-        let display = displays.into_iter().nth(index)
+        let display = displays
+            .into_iter()
+            .nth(index)
             .context("display disappeared during reset")?;
         self.width = display.width() as u32;
         self.height = display.height() as u32;

@@ -22,10 +22,9 @@ impl QuicClientTransport {
 
         let conn = self.rt.block_on(async {
             // Client endpoint: bind to any local port
-            let mut endpoint = Endpoint::client(
-                "0.0.0.0:0".parse().expect("hardcoded address is valid"),
-            )
-                .context("create client endpoint")?;
+            let mut endpoint =
+                Endpoint::client("0.0.0.0:0".parse().expect("hardcoded address is valid"))
+                    .context("create client endpoint")?;
 
             // Accept any server certificate (like SSH first-connect)
             let mut tls_config = rustls::ClientConfig::builder()
@@ -36,7 +35,7 @@ impl QuicClientTransport {
 
             let mut client_config = quinn::ClientConfig::new(Arc::new(
                 quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-                    .map_err(|e| anyhow::anyhow!("QUIC client config: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("QUIC client config: {e}"))?,
             ));
 
             // Keep connection alive
@@ -46,7 +45,8 @@ impl QuicClientTransport {
 
             endpoint.set_default_client_config(client_config);
 
-            let conn = endpoint.connect(server_addr, "phantom")
+            let conn = endpoint
+                .connect(server_addr, "phantom")
                 .context("initiate QUIC connection")?
                 .await
                 .context("QUIC handshake failed")?;
@@ -57,14 +57,22 @@ impl QuicClientTransport {
 
         // Accept the bidirectional stream opened by the server
         let (send_stream, recv_stream) = self.rt.block_on(async {
-            conn.accept_bi().await.context("accept bidirectional stream from server")
+            conn.accept_bi()
+                .await
+                .context("accept bidirectional stream from server")
         })?;
 
         // Note: server opens the stream, client accepts. The send/recv are swapped:
         // server's send = client's recv, server's recv = client's send
         Ok((
-            QuicSender { rt: self.rt.clone(), stream: send_stream },
-            QuicReceiver { rt: self.rt.clone(), stream: recv_stream },
+            QuicSender {
+                rt: self.rt.clone(),
+                stream: send_stream,
+            },
+            QuicReceiver {
+                rt: self.rt.clone(),
+                stream: recv_stream,
+            },
         ))
     }
 }
@@ -95,14 +103,18 @@ impl MessageReceiver for QuicReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
         self.rt.block_on(async {
             let mut len_buf = [0u8; 4];
-            self.stream.read_exact(&mut len_buf).await
+            self.stream
+                .read_exact(&mut len_buf)
+                .await
                 .context("read message length")?;
             let len = u32::from_be_bytes(len_buf) as usize;
             if len > 64 * 1024 * 1024 {
                 anyhow::bail!("message too large ({len} bytes)");
             }
             let mut payload = vec![0u8; len];
-            self.stream.read_exact(&mut payload).await
+            self.stream
+                .read_exact(&mut payload)
+                .await
                 .context("read message payload")?;
             bincode::deserialize(&payload).context("deserialize")
         })
@@ -127,14 +139,18 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 
     fn verify_tls12_signature(
-        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
-        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())

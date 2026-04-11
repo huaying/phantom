@@ -2,14 +2,14 @@ use phantom_core::encode::{TileEncoding, VideoCodec};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 use phantom_core::protocol::Message;
 use phantom_core::tile::TILE_SIZE;
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
     console, CanvasRenderingContext2d, HtmlCanvasElement, KeyboardEvent, MessageEvent, MouseEvent,
     WebSocket, WheelEvent,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
 
 // -- WebCodecs bindings (not in web-sys yet) --
 
@@ -39,11 +39,18 @@ struct ChunkAssembler {
 }
 
 impl ChunkAssembler {
-    fn new() -> Self { Self { buf: Vec::new(), expected: 0 } }
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            expected: 0,
+        }
+    }
 
     fn feed(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if self.expected == 0 {
-            if data.len() < 4 { return Some(data.to_vec()); }
+            if data.len() < 4 {
+                return Some(data.to_vec());
+            }
             let total = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
             if total > 16_384 && total > data.len() {
                 self.expected = total;
@@ -59,7 +66,11 @@ impl ChunkAssembler {
         }
         let payload = if data.len() >= 4 {
             let hdr = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            if hdr == self.expected { &data[4..] } else { data }
+            if hdr == self.expected {
+                &data[4..]
+            } else {
+                data
+            }
         } else {
             data
         };
@@ -101,13 +112,25 @@ pub fn main() {
     let document = window.document().unwrap();
 
     // Default: WebSocket. Add ?rtc to URL for WebRTC DataChannel mode.
-    let use_rtc = window.location().search().unwrap_or_default().contains("rtc");
+    let use_rtc = window
+        .location()
+        .search()
+        .unwrap_or_default()
+        .contains("rtc");
     let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
     console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
 
-    let canvas: HtmlCanvasElement = document.get_element_by_id("screen").unwrap()
-        .dyn_into().unwrap();
-    let ctx: CanvasRenderingContext2d = canvas.get_context("2d").unwrap().unwrap().dyn_into().unwrap();
+    let canvas: HtmlCanvasElement = document
+        .get_element_by_id("screen")
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let ctx: CanvasRenderingContext2d = canvas
+        .get_context("2d")
+        .unwrap()
+        .unwrap()
+        .dyn_into()
+        .unwrap();
 
     let state = Rc::new(RefCell::new(AppState {
         ctx,
@@ -137,7 +160,10 @@ pub fn main() {
 }
 
 fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
-    use web_sys::{RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcSdpType, RtcSessionDescriptionInit};
+    use web_sys::{
+        RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcSdpType,
+        RtcSessionDescriptionInit,
+    };
 
     let config = RtcConfiguration::new();
     let pc = match RtcPeerConnection::new_with_configuration(&config) {
@@ -214,7 +240,10 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         // Create offer
         let offer = match wasm_bindgen_futures::JsFuture::from(pc2.create_offer()).await {
             Ok(o) => o,
-            Err(e) => { console::error_1(&format!("createOffer: {:?}", e).into()); return; }
+            Err(e) => {
+                console::error_1(&format!("createOffer: {:?}", e).into());
+                return;
+            }
         };
         let sdp = js_sys::Reflect::get(&offer, &"sdp".into()).unwrap();
         let sdp_str: String = sdp.as_string().unwrap_or_default();
@@ -222,7 +251,8 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         // Set local description
         let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
         desc.set_sdp(&sdp_str);
-        if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_local_description(&desc)).await {
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_local_description(&desc)).await
+        {
             console::error_1(&format!("setLocalDescription: {:?}", e).into());
             return;
         }
@@ -239,10 +269,15 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         request_init.set_headers(&headers);
 
         let resp = match wasm_bindgen_futures::JsFuture::from(
-            window.fetch_with_str_and_init("/rtc", &request_init)
-        ).await {
+            window.fetch_with_str_and_init("/rtc", &request_init),
+        )
+        .await
+        {
             Ok(r) => r,
-            Err(e) => { console::error_1(&format!("POST /rtc failed: {:?}", e).into()); return; }
+            Err(e) => {
+                console::error_1(&format!("POST /rtc failed: {:?}", e).into());
+                return;
+            }
         };
 
         let resp: web_sys::Response = resp.dyn_into().unwrap();
@@ -253,7 +288,10 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
 
         let json = match wasm_bindgen_futures::JsFuture::from(resp.json().unwrap()).await {
             Ok(j) => j,
-            Err(e) => { console::error_1(&format!("parse answer: {:?}", e).into()); return; }
+            Err(e) => {
+                console::error_1(&format!("parse answer: {:?}", e).into());
+                return;
+            }
         };
 
         // Set remote description (answer)
@@ -261,7 +299,9 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         let answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         answer_desc.set_sdp(&answer_sdp.as_string().unwrap_or_default());
 
-        if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_remote_description(&answer_desc)).await {
+        if let Err(e) =
+            wasm_bindgen_futures::JsFuture::from(pc2.set_remote_description(&answer_desc)).await
+        {
             console::error_1(&format!("setRemoteDescription: {:?}", e).into());
             return;
         }
@@ -277,7 +317,11 @@ fn ws_url() -> String {
     let window = web_sys::window().unwrap();
     let location = window.location();
     let host = location.host().unwrap_or_default();
-    let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+    let protocol = if location.protocol().unwrap_or_default() == "https:" {
+        "wss"
+    } else {
+        "ws"
+    };
     format!("{protocol}://{host}/ws")
 }
 
@@ -325,7 +369,9 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
         let s = state.clone();
         let next_retry = (retry_ms * 2).min(5000); // cap at 5s
         let cb = Closure::<dyn FnMut()>::new(move || {
-            console::warn_1(&format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into());
+            console::warn_1(
+                &format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into(),
+            );
             // Reset state for fresh session
             {
                 let mut st = s.borrow_mut();
@@ -360,7 +406,8 @@ fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
     });
     let window = web_sys::window().unwrap();
     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-        cb.as_ref().unchecked_ref(), delay_ms as i32,
+        cb.as_ref().unchecked_ref(),
+        delay_ms as i32,
     );
     cb.forget();
 }
@@ -374,7 +421,12 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
     };
 
     match msg {
-        Message::Hello { width, height, protocol_version, .. } => {
+        Message::Hello {
+            width,
+            height,
+            protocol_version,
+            ..
+        } => {
             if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
                 console::error_1(&format!(
                     "Server protocol version {protocol_version} is too old (minimum: {}). Please upgrade the server.",
@@ -388,7 +440,9 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     phantom_core::protocol::PROTOCOL_VERSION
                 ).into());
             }
-            console::log_1(&format!("Server: {width}x{height} (protocol v{protocol_version})").into());
+            console::log_1(
+                &format!("Server: {width}x{height} (protocol v{protocol_version})").into(),
+            );
             let mut s = state.borrow_mut();
             s.server_width = width;
             s.server_height = height;
@@ -398,32 +452,58 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             setup_decoder(state, width, height);
         }
         Message::VideoFrame { sequence, frame } => {
-            if frame.codec != VideoCodec::H264 || frame.data.is_empty() { return; }
+            if frame.codec != VideoCodec::H264 || frame.data.is_empty() {
+                return;
+            }
             let mut s = state.borrow_mut();
             let is_key = h264_has_idr(&frame.data);
             // Log first few frames for debugging
             if s.frame_count < 5 {
-                let hex: String = frame.data.iter().take(32).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                console::log_1(&format!("frame #{}: {} bytes, kf={}, idr={}, hex=[{}]", s.frame_count, frame.data.len(), frame.is_keyframe, is_key, hex).into());
+                let hex: String = frame
+                    .data
+                    .iter()
+                    .take(32)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                console::log_1(
+                    &format!(
+                        "frame #{}: {} bytes, kf={}, idr={}, hex=[{}]",
+                        s.frame_count,
+                        frame.data.len(),
+                        frame.is_keyframe,
+                        is_key,
+                        hex
+                    )
+                    .into(),
+                );
             }
             // WebCodecs requires a keyframe before any delta frames can be decoded.
             // Skip delta frames until we receive the first keyframe.
             if !s.got_keyframe && !is_key {
-                console::warn_1(&format!("skipping frame #{} (waiting for keyframe)", s.frame_count).into());
+                console::warn_1(
+                    &format!("skipping frame #{} (waiting for keyframe)", s.frame_count).into(),
+                );
                 s.frame_count += 1;
                 return;
             }
-            if is_key { s.got_keyframe = true; }
+            if is_key {
+                s.got_keyframe = true;
+            }
             s.frame_count += 1;
             s.last_video_sequence = sequence;
             let fc = s.frame_count;
             if let Some(ref decoder) = s.decoder {
                 let data_js = js_sys::Uint8Array::from(frame.data.as_slice());
                 let init = js_sys::Object::new();
-                js_sys::Reflect::set(&init, &"type".into(),
-                    &if is_key { "key" } else { "delta" }.into()).unwrap();
-                js_sys::Reflect::set(&init, &"timestamp".into(),
-                    &(fc as f64 * 33333.0).into()).unwrap();
+                js_sys::Reflect::set(
+                    &init,
+                    &"type".into(),
+                    &if is_key { "key" } else { "delta" }.into(),
+                )
+                .unwrap();
+                js_sys::Reflect::set(&init, &"timestamp".into(), &(fc as f64 * 33333.0).into())
+                    .unwrap();
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
                 decoder.decode(&chunk);
@@ -440,10 +520,13 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 let bgra = match tile.encoding {
                     TileEncoding::Zstd => {
                         let mut dec = match ruzstd::StreamingDecoder::new(tile.data.as_slice()) {
-                            Ok(d) => d, Err(_) => continue,
+                            Ok(d) => d,
+                            Err(_) => continue,
                         };
                         let mut out = Vec::new();
-                        if std::io::Read::read_to_end(&mut dec, &mut out).is_err() { continue; }
+                        if std::io::Read::read_to_end(&mut dec, &mut out).is_err() {
+                            continue;
+                        }
                         out
                     }
                     TileEncoding::Raw => tile.data.clone(),
@@ -451,15 +534,25 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 };
                 let tw = tile.pixel_width as usize;
                 let th = tile.pixel_height as usize;
-                if bgra.len() < tw * th * 4 { continue; }
+                if bgra.len() < tw * th * 4 {
+                    continue;
+                }
                 let mut rgba = vec![0u8; tw * th * 4];
                 for i in 0..tw * th {
-                    rgba[i*4] = bgra[i*4+2]; rgba[i*4+1] = bgra[i*4+1];
-                    rgba[i*4+2] = bgra[i*4]; rgba[i*4+3] = 255;
+                    rgba[i * 4] = bgra[i * 4 + 2];
+                    rgba[i * 4 + 1] = bgra[i * 4 + 1];
+                    rgba[i * 4 + 2] = bgra[i * 4];
+                    rgba[i * 4 + 3] = 255;
                 }
                 let clamped = wasm_bindgen::Clamped(&rgba[..]);
-                if let Ok(img) = web_sys::ImageData::new_with_u8_clamped_array_and_sh(clamped, tw as u32, th as u32) {
-                    let _ = s.ctx.put_image_data(&img, (tile.tile_x * TILE_SIZE) as f64, (tile.tile_y * TILE_SIZE) as f64);
+                if let Ok(img) = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+                    clamped, tw as u32, th as u32,
+                ) {
+                    let _ = s.ctx.put_image_data(
+                        &img,
+                        (tile.tile_x * TILE_SIZE) as f64,
+                        (tile.tile_y * TILE_SIZE) as f64,
+                    );
                 }
             }
         }
@@ -508,7 +601,9 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
     let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |frame: JsValue| {
         let mut count = dc.borrow_mut();
         *count += 1;
-        if *count <= 3 { console::log_1(&format!("Decoded frame #{}", *count).into()); }
+        if *count <= 3 {
+            console::log_1(&format!("Decoded frame #{}", *count).into());
+        }
         let st = s.borrow();
         let w = st.canvas.width();
         let h = st.canvas.height();
@@ -546,16 +641,30 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
 
 // -- Input --
 
-fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: &Rc<RefCell<AppState>>) {
+fn setup_input(
+    canvas: &HtmlCanvasElement,
+    document: &web_sys::Document,
+    state: &Rc<RefCell<AppState>>,
+) {
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
             let st = s.borrow();
-            if st.server_width == 0 || st.server_height == 0 { return; }
-            let (x, y) = map_mouse(&st.canvas, e.client_x() as f64, e.client_y() as f64, st.server_width, st.server_height);
+            if st.server_width == 0 || st.server_height == 0 {
+                return;
+            }
+            let (x, y) = map_mouse(
+                &st.canvas,
+                e.client_x() as f64,
+                e.client_y() as f64,
+                st.server_width,
+                st.server_height,
+            );
             send_input(&st, InputEvent::MouseMove { x, y });
         });
-        canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).unwrap();
+        canvas
+            .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
     for name in &["mousedown", "mouseup"] {
@@ -564,15 +673,30 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
             e.prevent_default();
             let st = s.borrow();
-            let btn = match e.button() { 0 => MouseButton::Left, 1 => MouseButton::Middle, 2 => MouseButton::Right, _ => return };
-            send_input(&st, InputEvent::MouseButton { button: btn, pressed });
+            let btn = match e.button() {
+                0 => MouseButton::Left,
+                1 => MouseButton::Middle,
+                2 => MouseButton::Right,
+                _ => return,
+            };
+            send_input(
+                &st,
+                InputEvent::MouseButton {
+                    button: btn,
+                    pressed,
+                },
+            );
         });
-        canvas.add_event_listener_with_callback(name, cb.as_ref().unchecked_ref()).unwrap();
+        canvas
+            .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
     {
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(|e: MouseEvent| e.prevent_default());
-        canvas.add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref()).unwrap();
+        canvas
+            .add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
     {
@@ -580,9 +704,17 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
             let st = s.borrow();
-            send_input(&st, InputEvent::MouseScroll { dx: e.delta_x() as f32 / 120.0, dy: e.delta_y() as f32 / 120.0 });
+            send_input(
+                &st,
+                InputEvent::MouseScroll {
+                    dx: e.delta_x() as f32 / 120.0,
+                    dy: e.delta_y() as f32 / 120.0,
+                },
+            );
         });
-        canvas.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref()).unwrap();
+        canvas
+            .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
     for name in &["keydown", "keyup"] {
@@ -592,7 +724,9 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
             e.prevent_default();
             let st = s.borrow();
             let code = e.code();
-            if code == "MetaLeft" || code == "MetaRight" { return; }
+            if code == "MetaLeft" || code == "MetaRight" {
+                return;
+            }
             // Paste
             if pressed && code == "KeyV" && (e.ctrl_key() || e.meta_key()) {
                 if let Some(w) = web_sys::window() {
@@ -600,7 +734,8 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
                     let clone_st = st.send_dc.clone();
                     let clone_ws = st.send_ws.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(cb.read_text()).await {
+                        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(cb.read_text()).await
+                        {
                             let text: String = val.as_string().unwrap_or_default();
                             if !text.is_empty() {
                                 let msg = Message::PasteText(text);
@@ -621,7 +756,9 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
                 send_input(&st, InputEvent::Key { key: kc, pressed });
             }
         });
-        document.add_event_listener_with_callback(name, cb.as_ref().unchecked_ref()).unwrap();
+        document
+            .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
 }
@@ -651,9 +788,19 @@ fn map_mouse(canvas: &HtmlCanvasElement, cx: f64, cy: f64, sw: u32, sh: u32) -> 
     let aspect = sw as f64 / sh as f64;
     let css_aspect = rect.width() / rect.height();
     let (rw, rh, ox, oy) = if aspect > css_aspect {
-        (rect.width(), rect.width() / aspect, 0.0, (rect.height() - rect.width() / aspect) / 2.0)
+        (
+            rect.width(),
+            rect.width() / aspect,
+            0.0,
+            (rect.height() - rect.width() / aspect) / 2.0,
+        )
     } else {
-        (rect.height() * aspect, rect.height(), (rect.width() - rect.height() * aspect) / 2.0, 0.0)
+        (
+            rect.height() * aspect,
+            rect.height(),
+            (rect.width() - rect.height() * aspect) / 2.0,
+            0.0,
+        )
     };
     let x = ((cx - rect.left() - ox) / rw * sw as f64).clamp(0.0, sw as f64 - 1.0) as i32;
     let y = ((cy - rect.top() - oy) / rh * sh as f64).clamp(0.0, sh as f64 - 1.0) as i32;
@@ -662,42 +809,89 @@ fn map_mouse(canvas: &HtmlCanvasElement, cx: f64, cy: f64, sw: u32, sh: u32) -> 
 
 fn js_code_to_keycode(code: &str) -> Option<KeyCode> {
     Some(match code {
-        "KeyA" => KeyCode::A, "KeyB" => KeyCode::B, "KeyC" => KeyCode::C,
-        "KeyD" => KeyCode::D, "KeyE" => KeyCode::E, "KeyF" => KeyCode::F,
-        "KeyG" => KeyCode::G, "KeyH" => KeyCode::H, "KeyI" => KeyCode::I,
-        "KeyJ" => KeyCode::J, "KeyK" => KeyCode::K, "KeyL" => KeyCode::L,
-        "KeyM" => KeyCode::M, "KeyN" => KeyCode::N, "KeyO" => KeyCode::O,
-        "KeyP" => KeyCode::P, "KeyQ" => KeyCode::Q, "KeyR" => KeyCode::R,
-        "KeyS" => KeyCode::S, "KeyT" => KeyCode::T, "KeyU" => KeyCode::U,
-        "KeyV" => KeyCode::V, "KeyW" => KeyCode::W, "KeyX" => KeyCode::X,
-        "KeyY" => KeyCode::Y, "KeyZ" => KeyCode::Z,
-        "Digit0" => KeyCode::Key0, "Digit1" => KeyCode::Key1,
-        "Digit2" => KeyCode::Key2, "Digit3" => KeyCode::Key3,
-        "Digit4" => KeyCode::Key4, "Digit5" => KeyCode::Key5,
-        "Digit6" => KeyCode::Key6, "Digit7" => KeyCode::Key7,
-        "Digit8" => KeyCode::Key8, "Digit9" => KeyCode::Key9,
-        "F1" => KeyCode::F1, "F2" => KeyCode::F2, "F3" => KeyCode::F3,
-        "F4" => KeyCode::F4, "F5" => KeyCode::F5, "F6" => KeyCode::F6,
-        "F7" => KeyCode::F7, "F8" => KeyCode::F8, "F9" => KeyCode::F9,
-        "F10" => KeyCode::F10, "F11" => KeyCode::F11, "F12" => KeyCode::F12,
-        "ShiftLeft" => KeyCode::LeftShift, "ShiftRight" => KeyCode::RightShift,
-        "ControlLeft" => KeyCode::LeftCtrl, "ControlRight" => KeyCode::RightCtrl,
-        "AltLeft" => KeyCode::LeftAlt, "AltRight" => KeyCode::RightAlt,
-        "ArrowUp" => KeyCode::Up, "ArrowDown" => KeyCode::Down,
-        "ArrowLeft" => KeyCode::Left, "ArrowRight" => KeyCode::Right,
-        "Home" => KeyCode::Home, "End" => KeyCode::End,
-        "PageUp" => KeyCode::PageUp, "PageDown" => KeyCode::PageDown,
-        "Backspace" => KeyCode::Backspace, "Delete" => KeyCode::Delete,
-        "Tab" => KeyCode::Tab, "Enter" => KeyCode::Enter,
-        "Space" => KeyCode::Space, "Escape" => KeyCode::Escape,
+        "KeyA" => KeyCode::A,
+        "KeyB" => KeyCode::B,
+        "KeyC" => KeyCode::C,
+        "KeyD" => KeyCode::D,
+        "KeyE" => KeyCode::E,
+        "KeyF" => KeyCode::F,
+        "KeyG" => KeyCode::G,
+        "KeyH" => KeyCode::H,
+        "KeyI" => KeyCode::I,
+        "KeyJ" => KeyCode::J,
+        "KeyK" => KeyCode::K,
+        "KeyL" => KeyCode::L,
+        "KeyM" => KeyCode::M,
+        "KeyN" => KeyCode::N,
+        "KeyO" => KeyCode::O,
+        "KeyP" => KeyCode::P,
+        "KeyQ" => KeyCode::Q,
+        "KeyR" => KeyCode::R,
+        "KeyS" => KeyCode::S,
+        "KeyT" => KeyCode::T,
+        "KeyU" => KeyCode::U,
+        "KeyV" => KeyCode::V,
+        "KeyW" => KeyCode::W,
+        "KeyX" => KeyCode::X,
+        "KeyY" => KeyCode::Y,
+        "KeyZ" => KeyCode::Z,
+        "Digit0" => KeyCode::Key0,
+        "Digit1" => KeyCode::Key1,
+        "Digit2" => KeyCode::Key2,
+        "Digit3" => KeyCode::Key3,
+        "Digit4" => KeyCode::Key4,
+        "Digit5" => KeyCode::Key5,
+        "Digit6" => KeyCode::Key6,
+        "Digit7" => KeyCode::Key7,
+        "Digit8" => KeyCode::Key8,
+        "Digit9" => KeyCode::Key9,
+        "F1" => KeyCode::F1,
+        "F2" => KeyCode::F2,
+        "F3" => KeyCode::F3,
+        "F4" => KeyCode::F4,
+        "F5" => KeyCode::F5,
+        "F6" => KeyCode::F6,
+        "F7" => KeyCode::F7,
+        "F8" => KeyCode::F8,
+        "F9" => KeyCode::F9,
+        "F10" => KeyCode::F10,
+        "F11" => KeyCode::F11,
+        "F12" => KeyCode::F12,
+        "ShiftLeft" => KeyCode::LeftShift,
+        "ShiftRight" => KeyCode::RightShift,
+        "ControlLeft" => KeyCode::LeftCtrl,
+        "ControlRight" => KeyCode::RightCtrl,
+        "AltLeft" => KeyCode::LeftAlt,
+        "AltRight" => KeyCode::RightAlt,
+        "ArrowUp" => KeyCode::Up,
+        "ArrowDown" => KeyCode::Down,
+        "ArrowLeft" => KeyCode::Left,
+        "ArrowRight" => KeyCode::Right,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "Backspace" => KeyCode::Backspace,
+        "Delete" => KeyCode::Delete,
+        "Tab" => KeyCode::Tab,
+        "Enter" => KeyCode::Enter,
+        "Space" => KeyCode::Space,
+        "Escape" => KeyCode::Escape,
         "Insert" => KeyCode::Insert,
-        "Minus" => KeyCode::Minus, "Equal" => KeyCode::Equal,
-        "BracketLeft" => KeyCode::LeftBracket, "BracketRight" => KeyCode::RightBracket,
-        "Backslash" => KeyCode::Backslash, "Semicolon" => KeyCode::Semicolon,
-        "Quote" => KeyCode::Apostrophe, "Backquote" => KeyCode::Grave,
-        "Comma" => KeyCode::Comma, "Period" => KeyCode::Period,
-        "Slash" => KeyCode::Slash, "CapsLock" => KeyCode::CapsLock,
-        "NumLock" => KeyCode::NumLock, "ScrollLock" => KeyCode::ScrollLock,
+        "Minus" => KeyCode::Minus,
+        "Equal" => KeyCode::Equal,
+        "BracketLeft" => KeyCode::LeftBracket,
+        "BracketRight" => KeyCode::RightBracket,
+        "Backslash" => KeyCode::Backslash,
+        "Semicolon" => KeyCode::Semicolon,
+        "Quote" => KeyCode::Apostrophe,
+        "Backquote" => KeyCode::Grave,
+        "Comma" => KeyCode::Comma,
+        "Period" => KeyCode::Period,
+        "Slash" => KeyCode::Slash,
+        "CapsLock" => KeyCode::CapsLock,
+        "NumLock" => KeyCode::NumLock,
+        "ScrollLock" => KeyCode::ScrollLock,
         _ => return None,
     })
 }

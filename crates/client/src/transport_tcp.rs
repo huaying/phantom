@@ -23,7 +23,9 @@ pub struct TcpClientTransport {
 
 impl TcpClientTransport {
     pub fn new(addr: &str) -> Self {
-        Self { addr: addr.to_string() }
+        Self {
+            addr: addr.to_string(),
+        }
     }
 
     pub fn connect_tcp(&self) -> Result<TcpConnection> {
@@ -49,15 +51,22 @@ impl TcpConnection {
     /// Get a shutdown handle that can be used to close the connection from another thread.
     pub fn shutdown_handle(&self) -> Result<TcpShutdownHandle> {
         Ok(TcpShutdownHandle {
-            stream: self.stream.try_clone().context("clone TcpStream for shutdown handle")?,
+            stream: self
+                .stream
+                .try_clone()
+                .context("clone TcpStream for shutdown handle")?,
         })
     }
 
     pub fn split(self) -> Result<(PlainSender, PlainReceiver)> {
         let read_stream = self.stream.try_clone().context("clone TcpStream")?;
         Ok((
-            PlainSender { stream: self.stream },
-            PlainReceiver { stream: read_stream },
+            PlainSender {
+                stream: self.stream,
+            },
+            PlainReceiver {
+                stream: read_stream,
+            },
         ))
     }
 

@@ -20,7 +20,11 @@ pub struct GpuProbeResult {
 impl GpuProbeResult {
     /// Best encoder based on what's available.
     pub fn best_encoder(&self) -> &'static str {
-        if self.has_nvenc { "nvenc" } else { "openh264" }
+        if self.has_nvenc {
+            "nvenc"
+        } else {
+            "openh264"
+        }
     }
 
     /// Best capture backend based on what's available.

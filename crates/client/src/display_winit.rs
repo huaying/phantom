@@ -90,7 +90,9 @@ impl WinitDisplay {
         let dst_w = win_size.width;
         let dst_h = win_size.height;
 
-        if dst_w == 0 || dst_h == 0 { return Ok(()); }
+        if dst_w == 0 || dst_h == 0 {
+            return Ok(());
+        }
 
         self.surface
             .resize(
@@ -159,11 +161,16 @@ impl WinitDisplay {
 
         // Draw cursor overlay
         if let Some(pos) = cursor_pos {
-            draw_cursor(&mut sb, dst_w as usize, dst_h as usize, pos.x as i32, pos.y as i32);
+            draw_cursor(
+                &mut sb,
+                dst_w as usize,
+                dst_h as usize,
+                pos.x as i32,
+                pos.y as i32,
+            );
         }
 
-        sb.present()
-            .map_err(|e| anyhow::anyhow!("present: {e}"))?;
+        sb.present().map_err(|e| anyhow::anyhow!("present: {e}"))?;
         Ok(())
     }
 
@@ -176,7 +183,9 @@ impl WinitDisplay {
         let src_w = self.server_width as f64;
         let src_h = self.server_height as f64;
 
-        if dst_w == 0.0 || dst_h == 0.0 { return (0, 0); }
+        if dst_w == 0.0 || dst_h == 0.0 {
+            return (0, 0);
+        }
 
         let src_aspect = src_w / src_h;
         let dst_aspect = dst_w / dst_h;

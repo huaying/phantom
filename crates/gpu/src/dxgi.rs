@@ -2,11 +2,11 @@
 //! Windows only. Zero CPU readback.
 
 use anyhow::{bail, Context, Result};
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::Interface;
+use windows::Win32::Graphics::Dxgi::*;
 
 pub struct DxgiCapture {
     device: ID3D11Device,
@@ -28,7 +28,11 @@ impl DxgiCapture {
             let adapter = factory.EnumAdapters1(0)?;
             let desc = adapter.GetDesc1()?;
             let name = String::from_utf16_lossy(
-                &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())]
+                &desc.Description[..desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len())],
             );
             tracing::info!("DXGI adapter: {name}");
 
@@ -66,7 +70,10 @@ impl DxgiCapture {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: 0,
                 CPUAccessFlags: 0,
@@ -76,9 +83,21 @@ impl DxgiCapture {
             device.CreateTexture2D(&tex_desc, None, Some(&mut staging))?;
             let staging = staging.context("CreateTexture2D returned None")?;
 
-            tracing::info!(width, height, "DXGI Desktop Duplication initialized (GPU zero-copy)");
+            tracing::info!(
+                width,
+                height,
+                "DXGI Desktop Duplication initialized (GPU zero-copy)"
+            );
 
-            Ok(Self { device, context, duplication, staging, width, height, frame_acquired: false })
+            Ok(Self {
+                device,
+                context,
+                duplication,
+                staging,
+                width,
+                height,
+                frame_acquired: false,
+            })
         }
     }
 
@@ -96,9 +115,14 @@ impl DxgiCapture {
 
             // Use frame_interval timeout — blocks until DWM has a new frame.
             // timeout=0 causes busy-loop and misses frames between polls.
-            match self.duplication.AcquireNextFrame(33, &mut frame_info, &mut resource) {
+            match self
+                .duplication
+                .AcquireNextFrame(33, &mut frame_info, &mut resource)
+            {
                 Ok(_) => {}
-                Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT => {
+                    return Ok(false)
+                }
                 Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST => {
                     tracing::warn!("DXGI_ERROR_ACCESS_LOST — recreating");
                     self.recreate()?;
@@ -157,7 +181,9 @@ impl DxgiCapture {
 impl Drop for DxgiCapture {
     fn drop(&mut self) {
         if self.frame_acquired {
-            unsafe { let _ = self.duplication.ReleaseFrame(); }
+            unsafe {
+                let _ = self.duplication.ReleaseFrame();
+            }
         }
     }
 }

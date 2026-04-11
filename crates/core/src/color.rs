@@ -20,14 +20,26 @@ pub fn bgra_to_yuv420(bgra: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec
         if is_x86_feature_detected!("avx2") {
             unsafe {
                 avx2::bgra_to_yuv420_avx2(
-                    bgra, width, height, &mut y_plane, &mut u_plane, &mut v_plane,
+                    bgra,
+                    width,
+                    height,
+                    &mut y_plane,
+                    &mut u_plane,
+                    &mut v_plane,
                 );
             }
             return (y_plane, u_plane, v_plane);
         }
     }
 
-    bgra_to_yuv420_scalar(bgra, width, height, &mut y_plane, &mut u_plane, &mut v_plane);
+    bgra_to_yuv420_scalar(
+        bgra,
+        width,
+        height,
+        &mut y_plane,
+        &mut u_plane,
+        &mut v_plane,
+    );
     (y_plane, u_plane, v_plane)
 }
 
@@ -125,7 +137,16 @@ pub fn yuv420_to_rgb32(
     {
         if is_x86_feature_detected!("avx2") {
             unsafe {
-                avx2::yuv420_to_rgb32_avx2(y, u, v, width, height, y_stride, uv_stride, &mut buffer);
+                avx2::yuv420_to_rgb32_avx2(
+                    y,
+                    u,
+                    v,
+                    width,
+                    height,
+                    y_stride,
+                    uv_stride,
+                    &mut buffer,
+                );
             }
             return buffer;
         }
@@ -192,16 +213,16 @@ mod avx2 {
 
         // Shuffle mask to extract B bytes (indices 0,4,8,12 in each lane)
         let shuf_b = _mm256_setr_epi8(
-            0, -1, 4, -1, 8, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            0, -1, 4, -1, 8, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            0, -1, 4, -1, 8, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, 4, -1, 8, -1, 12,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1,
         );
         let shuf_g = _mm256_setr_epi8(
-            1, -1, 5, -1, 9, -1, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            1, -1, 5, -1, 9, -1, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            1, -1, 5, -1, 9, -1, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, -1, 5, -1, 9, -1, 13,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1,
         );
         let shuf_r = _mm256_setr_epi8(
-            2, -1, 6, -1, 10, -1, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            2, -1, 6, -1, 10, -1, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            2, -1, 6, -1, 10, -1, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, -1, 6, -1, 10, -1, 14,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1,
         );
 
         // Shuffle: each lane gets 4 channel values as 16-bit in the low half
@@ -233,7 +254,13 @@ mod avx2 {
         let yr = _mm_mullo_epi16(r_128, c_r);
         let yg = _mm_mullo_epi16(g_128, c_g);
         let yb = _mm_mullo_epi16(b_128, c_b);
-        let y16 = _mm_add_epi16(_mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(_mm_add_epi16(yr, yg), yb), rnd), 8), off);
+        let y16 = _mm_add_epi16(
+            _mm_srli_epi16(
+                _mm_add_epi16(_mm_add_epi16(_mm_add_epi16(yr, yg), yb), rnd),
+                8,
+            ),
+            off,
+        );
 
         // Pack 16→8 with unsigned saturation
         let y8 = _mm_packus_epi16(y16, y16); // low 8 bytes are our Y values
@@ -276,10 +303,7 @@ mod avx2 {
             // Process Y in chunks of 8 pixels
             let mut col = 0;
             while col + 8 <= width {
-                bgra8_to_y8(
-                    &bgra[row_bgra + col * 4..],
-                    &mut y_plane[row_y + col..],
-                );
+                bgra8_to_y8(&bgra[row_bgra + col * 4..], &mut y_plane[row_y + col..]);
                 col += 8;
             }
             // Scalar tail for remaining pixels
@@ -322,10 +346,7 @@ mod avx2 {
             // SIMD Y computation
             let mut col = 0;
             while col + 8 <= width {
-                bgra8_to_y8(
-                    &bgra[row_bgra + col * 4..],
-                    &mut y_plane[row_y + col..],
-                );
+                bgra8_to_y8(&bgra[row_bgra + col * 4..], &mut y_plane[row_y + col..]);
                 col += 8;
             }
             while col < width {
@@ -414,7 +435,10 @@ mod avx2 {
                 // R = ((298*y + 409*v + 128) >> 8)
                 let r32 = _mm256_srai_epi32(
                     _mm256_add_epi32(
-                        _mm256_add_epi32(_mm256_mullo_epi32(c298, y_val), _mm256_mullo_epi32(c409, v_val)),
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(c298, y_val),
+                            _mm256_mullo_epi32(c409, v_val),
+                        ),
                         c128,
                     ),
                     8,
@@ -423,7 +447,10 @@ mod avx2 {
                 let g32 = _mm256_srai_epi32(
                     _mm256_add_epi32(
                         _mm256_sub_epi32(
-                            _mm256_sub_epi32(_mm256_mullo_epi32(c298, y_val), _mm256_mullo_epi32(c100, u_val)),
+                            _mm256_sub_epi32(
+                                _mm256_mullo_epi32(c298, y_val),
+                                _mm256_mullo_epi32(c100, u_val),
+                            ),
                             _mm256_mullo_epi32(c208, v_val),
                         ),
                         c128,
@@ -433,7 +460,10 @@ mod avx2 {
                 // B = ((298*y + 516*u + 128) >> 8)
                 let b32 = _mm256_srai_epi32(
                     _mm256_add_epi32(
-                        _mm256_add_epi32(_mm256_mullo_epi32(c298, y_val), _mm256_mullo_epi32(c516, u_val)),
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(c298, y_val),
+                            _mm256_mullo_epi32(c516, u_val),
+                        ),
                         c128,
                     ),
                     8,
@@ -446,7 +476,10 @@ mod avx2 {
 
                 // Pack: 0RGB = (R << 16) | (G << 8) | B
                 let rgb = _mm256_or_si256(
-                    _mm256_or_si256(_mm256_slli_epi32(r_clamped, 16), _mm256_slli_epi32(g_clamped, 8)),
+                    _mm256_or_si256(
+                        _mm256_slli_epi32(r_clamped, 16),
+                        _mm256_slli_epi32(g_clamped, 8),
+                    ),
                     b_clamped,
                 );
 
@@ -606,7 +639,10 @@ mod tests {
 
         let uv = &nv12[w * h..];
         let uv_avg = uv.iter().map(|&v| v as u32).sum::<u32>() / uv.len() as u32;
-        assert!(uv_avg > 120 && uv_avg < 136, "UV avg={uv_avg}, expected ~128");
+        assert!(
+            uv_avg > 120 && uv_avg < 136,
+            "UV avg={uv_avg}, expected ~128"
+        );
     }
 
     #[test]
@@ -656,7 +692,11 @@ mod tests {
         }
         let simd_ms = start.elapsed().as_millis();
 
-        let speedup = if simd_ms > 0 { scalar_ms as f64 / simd_ms as f64 } else { f64::INFINITY };
+        let speedup = if simd_ms > 0 {
+            scalar_ms as f64 / simd_ms as f64
+        } else {
+            f64::INFINITY
+        };
         eprintln!(
             "BGRA→NV12 1080p ({rounds} rounds): scalar={scalar_ms}ms, simd={simd_ms}ms, speedup={speedup:.1}x"
         );
@@ -679,7 +719,11 @@ mod tests {
         }
         let simd_ms = start.elapsed().as_millis();
 
-        let speedup = if simd_ms > 0 { scalar_ms as f64 / simd_ms as f64 } else { f64::INFINITY };
+        let speedup = if simd_ms > 0 {
+            scalar_ms as f64 / simd_ms as f64
+        } else {
+            f64::INFINITY
+        };
         eprintln!(
             "YUV→RGB32 1080p ({rounds} rounds): scalar={scalar_ms}ms, simd={simd_ms}ms, speedup={speedup:.1}x"
         );

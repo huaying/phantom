@@ -74,7 +74,6 @@ pub enum Message {
     },
 
     // ── File transfer (v3) ──────────────────────────────────────────────
-
     /// Bidirectional: offer to send a file.
     FileOffer {
         transfer_id: u64,
@@ -164,7 +163,13 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let decoded = read_message(&mut cursor).unwrap();
         match decoded {
-            Message::Hello { width, height, protocol_version, audio, .. } => {
+            Message::Hello {
+                width,
+                height,
+                protocol_version,
+                audio,
+                ..
+            } => {
                 assert_eq!(width, 1920);
                 assert_eq!(height, 1080);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -187,7 +192,12 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let decoded = read_message(&mut cursor).unwrap();
         match decoded {
-            Message::AudioFrame { codec, sample_rate, channels, data } => {
+            Message::AudioFrame {
+                codec,
+                sample_rate,
+                channels,
+                data,
+            } => {
                 assert_eq!(codec, super::AudioCodec::Opus);
                 assert_eq!(sample_rate, 48000);
                 assert_eq!(channels, 2);
@@ -204,7 +214,10 @@ mod tests {
             data: vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x28], // fake SPS
             is_keyframe: true,
         };
-        let msg = Message::VideoFrame { sequence: 42, frame: Box::new(frame) };
+        let msg = Message::VideoFrame {
+            sequence: 42,
+            frame: Box::new(frame),
+        };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
@@ -229,7 +242,9 @@ mod tests {
 
     #[test]
     fn roundtrip_disconnect() {
-        let msg = Message::Disconnect { reason: "replaced by new client".to_string() };
+        let msg = Message::Disconnect {
+            reason: "replaced by new client".to_string(),
+        };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
@@ -250,7 +265,11 @@ mod tests {
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
         match read_message(&mut cursor).unwrap() {
-            Message::FileOffer { transfer_id, name, size } => {
+            Message::FileOffer {
+                transfer_id,
+                name,
+                size,
+            } => {
                 assert_eq!(transfer_id, 42);
                 assert_eq!(name, "test.txt");
                 assert_eq!(size, 1024);
@@ -270,7 +289,11 @@ mod tests {
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
         match read_message(&mut cursor).unwrap() {
-            Message::FileChunk { transfer_id, offset, data } => {
+            Message::FileChunk {
+                transfer_id,
+                offset,
+                data,
+            } => {
                 assert_eq!(transfer_id, 7);
                 assert_eq!(offset, 256000);
                 assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
@@ -282,12 +305,18 @@ mod tests {
     #[test]
     fn roundtrip_file_done() {
         let hash = [0xABu8; 32];
-        let msg = Message::FileDone { transfer_id: 99, sha256: hash };
+        let msg = Message::FileDone {
+            transfer_id: 99,
+            sha256: hash,
+        };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
         let mut cursor = Cursor::new(&buf);
         match read_message(&mut cursor).unwrap() {
-            Message::FileDone { transfer_id, sha256 } => {
+            Message::FileDone {
+                transfer_id,
+                sha256,
+            } => {
                 assert_eq!(transfer_id, 99);
                 assert_eq!(sha256, hash);
             }

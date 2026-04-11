@@ -19,21 +19,27 @@ impl QuicServerTransport {
         let addr: SocketAddr = addr.parse().context("parse address")?;
 
         let (server_config, cert_der) = generate_self_signed_config()?;
-        let endpoint = rt.block_on(async {
-            Endpoint::server(server_config, addr)
-        }).context("bind QUIC endpoint")?;
+        let endpoint = rt
+            .block_on(async { Endpoint::server(server_config, addr) })
+            .context("bind QUIC endpoint")?;
 
         let fingerprint = ring_fingerprint(&cert_der);
         tracing::info!(%addr, fingerprint, "QUIC server listening (self-signed cert)");
 
-        Ok(Self { rt: Arc::new(rt), endpoint })
+        Ok(Self {
+            rt: Arc::new(rt),
+            endpoint,
+        })
     }
 
     /// Accept a connection, return (sender, receiver) on separate streams.
     pub fn accept(&self) -> Result<(QuicSender, QuicReceiver)> {
         let rt = self.rt.clone();
         let conn = rt.block_on(async {
-            let incoming = self.endpoint.accept().await
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
                 .context("no incoming connection")?;
             incoming.await.context("QUIC handshake failed")
         })?;
@@ -42,13 +48,18 @@ impl QuicServerTransport {
         tracing::info!(%peer, "QUIC client connected");
 
         // Open a bidirectional stream for video (server→client) and input (client→server)
-        let (send_stream, recv_stream) = rt.block_on(async {
-            conn.open_bi().await.context("open bidirectional stream")
-        })?;
+        let (send_stream, recv_stream) =
+            rt.block_on(async { conn.open_bi().await.context("open bidirectional stream") })?;
 
         Ok((
-            QuicSender { rt: rt.clone(), stream: send_stream },
-            QuicReceiver { rt: rt.clone(), stream: recv_stream },
+            QuicSender {
+                rt: rt.clone(),
+                stream: send_stream,
+            },
+            QuicReceiver {
+                rt: rt.clone(),
+                stream: recv_stream,
+            },
         ))
     }
 }
@@ -79,14 +90,18 @@ impl MessageReceiver for QuicReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
         self.rt.block_on(async {
             let mut len_buf = [0u8; 4];
-            self.stream.read_exact(&mut len_buf).await
+            self.stream
+                .read_exact(&mut len_buf)
+                .await
                 .context("read message length")?;
             let len = u32::from_be_bytes(len_buf) as usize;
             if len > 64 * 1024 * 1024 {
                 anyhow::bail!("message too large ({len} bytes)");
             }
             let mut payload = vec![0u8; len];
-            self.stream.read_exact(&mut payload).await
+            self.stream
+                .read_exact(&mut payload)
+                .await
                 .context("read message payload")?;
             bincode::deserialize(&payload).context("deserialize")
         })
@@ -114,7 +129,7 @@ fn generate_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
 
     let server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-            .map_err(|e| anyhow::anyhow!("QUIC server config: {e}"))?
+            .map_err(|e| anyhow::anyhow!("QUIC server config: {e}"))?,
     ));
 
     Ok((server_config, cert_der))
@@ -126,7 +141,9 @@ fn ring_fingerprint(cert_der: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, cert_der);
     let mut s = String::new();
     for (i, b) in digest.as_ref().iter().enumerate() {
-        if i > 0 { s.push(':'); }
+        if i > 0 {
+            s.push(':');
+        }
         // write! to String is infallible
         let _ = write!(s, "{:02X}", b);
     }

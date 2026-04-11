@@ -4,8 +4,8 @@
 //! Flow: DXGI capture → ID3D11Texture2D (BGRA, GPU) → NVENC encode → H.264 bytes
 //! Expected latency: ~3ms at 1080p (vs ~20ms with CPU path).
 
-use crate::dxgi::DxgiCapture;
 use crate::dl::DynLib;
+use crate::dxgi::DxgiCapture;
 use crate::sys::*;
 use anyhow::{bail, Context, Result};
 use phantom_core::encode::{EncodedFrame, VideoCodec};
@@ -35,10 +35,11 @@ impl DxgiNvencPipeline {
         let height = capture.height;
 
         // Load NVENC
-        let nvenc_lib = DynLib::open(&["nvEncodeAPI64.dll"])
-            .context("failed to load nvEncodeAPI64.dll")?;
+        let nvenc_lib =
+            DynLib::open(&["nvEncodeAPI64.dll"]).context("failed to load nvEncodeAPI64.dll")?;
         let create_instance: FnNvEncodeAPICreateInstance = unsafe {
-            nvenc_lib.sym("NvEncodeAPICreateInstance")
+            nvenc_lib
+                .sym("NvEncodeAPICreateInstance")
                 .context("NvEncodeAPICreateInstance not found")?
         };
         let mut api = NvEncFunctionList::zeroed();
@@ -56,24 +57,38 @@ impl DxgiNvencPipeline {
         session_params.set_api_version();
 
         let mut encoder: *mut c_void = std::ptr::null_mut();
-        let f = api.open_encode_session_ex().context("nvEncOpenEncodeSessionEx is null")?;
+        let f = api
+            .open_encode_session_ex()
+            .context("nvEncOpenEncodeSessionEx is null")?;
         let status = unsafe { f(session_params.as_mut_ptr(), &mut encoder) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncOpenEncodeSessionEx (D3D11) failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncOpenEncodeSessionEx (D3D11) failed: {}",
+                nvenc_status_name(status)
+            );
         }
 
         // Get preset config
         let mut preset_config = NvEncPresetConfig::zeroed();
         preset_config.set_version();
         preset_config.set_config_version();
-        let f = api.get_encode_preset_config_ex()
+        let f = api
+            .get_encode_preset_config_ex()
             .context("nvEncGetEncodePresetConfigEx is null")?;
         let status = unsafe {
-            f(encoder, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
-              NV_ENC_TUNING_INFO_LOW_LATENCY, preset_config.as_mut_ptr())
+            f(
+                encoder,
+                NV_ENC_CODEC_H264_GUID,
+                NV_ENC_PRESET_P4_GUID,
+                NV_ENC_TUNING_INFO_LOW_LATENCY,
+                preset_config.as_mut_ptr(),
+            )
         };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncGetEncodePresetConfigEx failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncGetEncodePresetConfigEx failed: {}",
+                nvenc_status_name(status)
+            );
         }
 
         // Customize config
@@ -101,19 +116,29 @@ impl DxgiNvencPipeline {
         init_params.set_encode_config(config.as_mut_ptr());
         init_params.set_tuning_info(NV_ENC_TUNING_INFO_LOW_LATENCY);
 
-        let f = api.initialize_encoder().context("nvEncInitializeEncoder is null")?;
+        let f = api
+            .initialize_encoder()
+            .context("nvEncInitializeEncoder is null")?;
         let status = unsafe { f(encoder, init_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncInitializeEncoder (D3D11) failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncInitializeEncoder (D3D11) failed: {}",
+                nvenc_status_name(status)
+            );
         }
 
         // Create output bitstream buffer
         let mut buf_params = NvEncCreateBitstreamBuffer::zeroed();
         buf_params.set_version();
-        let f = api.create_bitstream_buffer().context("nvEncCreateBitstreamBuffer is null")?;
+        let f = api
+            .create_bitstream_buffer()
+            .context("nvEncCreateBitstreamBuffer is null")?;
         let status = unsafe { f(encoder, buf_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncCreateBitstreamBuffer failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncCreateBitstreamBuffer failed: {}",
+                nvenc_status_name(status)
+            );
         }
         let output_buf = buf_params.bitstream_buffer();
 
@@ -127,19 +152,37 @@ impl DxgiNvencPipeline {
         reg.set_buffer_format(NV_ENC_BUFFER_FORMAT_ARGB);
         reg.set_pitch(0); // driver infers from D3D11 texture
 
-        let f = api.register_resource().context("nvEncRegisterResource is null")?;
+        let f = api
+            .register_resource()
+            .context("nvEncRegisterResource is null")?;
         let status = unsafe { f(encoder, reg.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncRegisterResource (D3D11) failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncRegisterResource (D3D11) failed: {}",
+                nvenc_status_name(status)
+            );
         }
         let registered_resource = reg.registered_resource();
 
-        tracing::info!(width, height, fps, bitrate_kbps,
-            "DXGI→NVENC zero-copy pipeline initialized");
+        tracing::info!(
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            "DXGI→NVENC zero-copy pipeline initialized"
+        );
 
         Ok(Self {
-            capture, api, encoder, output_buf, registered_resource,
-            width, height, force_idr: true, frame_idx: 0, _nvenc_lib: nvenc_lib,
+            capture,
+            api,
+            encoder,
+            output_buf,
+            registered_resource,
+            width,
+            height,
+            force_idr: true,
+            frame_idx: 0,
+            _nvenc_lib: nvenc_lib,
         })
     }
 
@@ -153,10 +196,16 @@ impl DxgiNvencPipeline {
         let mut map = NvEncMapInputResource::zeroed();
         map.set_version();
         map.set_registered_resource(self.registered_resource);
-        let f = self.api.map_input_resource().context("nvEncMapInputResource is null")?;
+        let f = self
+            .api
+            .map_input_resource()
+            .context("nvEncMapInputResource is null")?;
         let status = unsafe { f(self.encoder, map.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncMapInputResource failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncMapInputResource failed: {}",
+                nvenc_status_name(status)
+            );
         }
         let mapped = map.mapped_resource();
 
@@ -176,7 +225,10 @@ impl DxgiNvencPipeline {
         }
         self.frame_idx += 1;
 
-        let f = self.api.encode_picture().context("nvEncEncodePicture is null")?;
+        let f = self
+            .api
+            .encode_picture()
+            .context("nvEncEncodePicture is null")?;
         let status = unsafe { f(self.encoder, pic.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
             // Unmap before returning error
@@ -190,7 +242,10 @@ impl DxgiNvencPipeline {
         let mut lock = NvEncLockBitstream::zeroed();
         lock.set_version();
         lock.set_output_bitstream(self.output_buf);
-        let f = self.api.lock_bitstream().context("nvEncLockBitstream is null")?;
+        let f = self
+            .api
+            .lock_bitstream()
+            .context("nvEncLockBitstream is null")?;
         let status = unsafe { f(self.encoder, lock.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS {
             if let Some(f) = self.api.unmap_input_resource() {
@@ -249,7 +304,10 @@ impl DxgiNvencPipeline {
         let f = self.api.open_encode_session_ex().context("open session")?;
         let status = unsafe { f(session_params.as_mut_ptr(), &mut encoder) };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncOpenEncodeSessionEx reset failed: {}", nvenc_status_name(status));
+            bail!(
+                "nvEncOpenEncodeSessionEx reset failed: {}",
+                nvenc_status_name(status)
+            );
         }
         self.encoder = encoder;
 
@@ -257,12 +315,22 @@ impl DxgiNvencPipeline {
         let mut preset_config = NvEncPresetConfig::zeroed();
         preset_config.set_version();
         preset_config.set_config_version();
-        let f = self.api.get_encode_preset_config_ex().context("NVENC API: get_encode_preset_config_ex not loaded")?;
+        let f = self
+            .api
+            .get_encode_preset_config_ex()
+            .context("NVENC API: get_encode_preset_config_ex not loaded")?;
         let status = unsafe {
-            f(self.encoder, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
-              NV_ENC_TUNING_INFO_LOW_LATENCY, preset_config.as_mut_ptr())
+            f(
+                self.encoder,
+                NV_ENC_CODEC_H264_GUID,
+                NV_ENC_PRESET_P4_GUID,
+                NV_ENC_TUNING_INFO_LOW_LATENCY,
+                preset_config.as_mut_ptr(),
+            )
         };
-        if status != NV_ENC_SUCCESS { bail!("preset config failed on reset"); }
+        if status != NV_ENC_SUCCESS {
+            bail!("preset config failed on reset");
+        }
 
         let mut config = preset_config.copy_config();
         config.set_profile_guid(&NV_ENC_H264_PROFILE_BASELINE_GUID);
@@ -287,16 +355,26 @@ impl DxgiNvencPipeline {
         init_params.set_encode_config(config.as_mut_ptr());
         init_params.set_tuning_info(NV_ENC_TUNING_INFO_LOW_LATENCY);
 
-        let f = self.api.initialize_encoder().context("NVENC API: initialize_encoder not loaded")?;
+        let f = self
+            .api
+            .initialize_encoder()
+            .context("NVENC API: initialize_encoder not loaded")?;
         let status = unsafe { f(self.encoder, init_params.as_mut_ptr()) };
-        if status != NV_ENC_SUCCESS { bail!("init encoder failed on reset"); }
+        if status != NV_ENC_SUCCESS {
+            bail!("init encoder failed on reset");
+        }
 
         // Recreate output buffer
         let mut buf_params = NvEncCreateBitstreamBuffer::zeroed();
         buf_params.set_version();
-        let f = self.api.create_bitstream_buffer().context("NVENC API: create_bitstream_buffer not loaded")?;
+        let f = self
+            .api
+            .create_bitstream_buffer()
+            .context("NVENC API: create_bitstream_buffer not loaded")?;
         let status = unsafe { f(self.encoder, buf_params.as_mut_ptr()) };
-        if status != NV_ENC_SUCCESS { bail!("create bitstream failed on reset"); }
+        if status != NV_ENC_SUCCESS {
+            bail!("create bitstream failed on reset");
+        }
         self.output_buf = buf_params.bitstream_buffer();
 
         // Re-register texture
@@ -308,9 +386,14 @@ impl DxgiNvencPipeline {
         reg.set_resource_to_register(self.capture.texture_ptr());
         reg.set_buffer_format(NV_ENC_BUFFER_FORMAT_ARGB);
         reg.set_pitch(0);
-        let f = self.api.register_resource().context("NVENC API: register_resource not loaded")?;
+        let f = self
+            .api
+            .register_resource()
+            .context("NVENC API: register_resource not loaded")?;
         let status = unsafe { f(self.encoder, reg.as_mut_ptr()) };
-        if status != NV_ENC_SUCCESS { bail!("register resource failed on reset"); }
+        if status != NV_ENC_SUCCESS {
+            bail!("register resource failed on reset");
+        }
         self.registered_resource = reg.registered_resource();
 
         self.force_idr = true;

@@ -70,7 +70,10 @@ fn tile_pipeline_roundtrip() {
     assert_eq!(dirty.len(), 4);
 
     let encoded = encoder.encode_tiles(&dirty).unwrap();
-    let msg = Message::TileUpdate { sequence: 1, tiles: Box::new(encoded) };
+    let msg = Message::TileUpdate {
+        sequence: 1,
+        tiles: Box::new(encoded),
+    };
 
     let mut buf = Vec::new();
     protocol::write_message(&mut buf, &msg).unwrap();
@@ -98,10 +101,12 @@ fn h264_encode_decode_roundtrip() {
 
     struct BgraFrame<'a>(&'a [u8], usize, usize);
     impl openh264::formats::RGBSource for BgraFrame<'_> {
-        fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+        fn dimensions(&self) -> (usize, usize) {
+            (self.1, self.2)
+        }
         fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
             let i = (y * self.1 + x) * 4;
-            (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+            (self.0[i + 2] as f32, self.0[i + 1] as f32, self.0[i] as f32)
         }
     }
 
@@ -125,7 +130,15 @@ fn h264_encode_decode_roundtrip() {
     let mut decoder = Decoder::new().unwrap();
     let decoded = decoder.decode(&h264_data).unwrap().unwrap();
     let (y_stride, uv_stride, _) = decoded.strides();
-    let rgb32 = yuv420_to_rgb32(decoded.y(), decoded.u(), decoded.v(), w, h, y_stride, uv_stride);
+    let rgb32 = yuv420_to_rgb32(
+        decoded.y(),
+        decoded.u(),
+        decoded.v(),
+        w,
+        h,
+        y_stride,
+        uv_stride,
+    );
 
     let sample = rgb32[w * h / 2 + w / 2];
     let r = (sample >> 16) & 0xFF;
@@ -143,10 +156,12 @@ fn h264_first_frame_is_keyframe() {
 
     struct BgraFrame<'a>(&'a [u8], usize, usize);
     impl openh264::formats::RGBSource for BgraFrame<'_> {
-        fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+        fn dimensions(&self) -> (usize, usize) {
+            (self.1, self.2)
+        }
         fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
             let i = (y * self.1 + x) * 4;
-            (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+            (self.0[i + 2] as f32, self.0[i + 1] as f32, self.0[i] as f32)
         }
     }
 
@@ -162,19 +177,28 @@ fn h264_first_frame_is_keyframe() {
     let ft = bs.frame_type();
     let data = bs.to_vec();
     eprintln!("First frame: type={ft:?}, size={}", data.len());
-    assert!(matches!(ft, FrameType::IDR | FrameType::I),
-        "First frame should be IDR/I, got {ft:?}");
+    assert!(
+        matches!(ft, FrameType::IDR | FrameType::I),
+        "First frame should be IDR/I, got {ft:?}"
+    );
 
     // After force_intra_frame, next frame must be IDR
     let _bs2 = encoder.encode(&yuv).unwrap().to_vec(); // P-frame
     encoder.force_intra_frame();
     let bs3 = encoder.encode(&yuv).unwrap();
     let ft3 = bs3.frame_type();
-    eprintln!("After force_intra: type={ft3:?}, size={}", bs3.to_vec().len());
-    assert!(matches!(ft3, FrameType::IDR | FrameType::I),
-        "After force_intra_frame should be IDR/I, got {ft3:?}");
+    eprintln!(
+        "After force_intra: type={ft3:?}, size={}",
+        bs3.to_vec().len()
+    );
+    assert!(
+        matches!(ft3, FrameType::IDR | FrameType::I),
+        "After force_intra_frame should be IDR/I, got {ft3:?}"
+    );
     let has_sps = data.windows(4).any(|w| w == [0, 0, 0, 1])
-        && data.windows(5).any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
+        && data
+            .windows(5)
+            .any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
     assert!(has_sps, "Keyframe should contain SPS NAL unit");
 }
 
@@ -185,10 +209,12 @@ fn h264_pframe_smaller_than_keyframe() {
 
     struct BgraFrame<'a>(&'a [u8], usize, usize);
     impl openh264::formats::RGBSource for BgraFrame<'_> {
-        fn dimensions(&self) -> (usize, usize) { (self.1, self.2) }
+        fn dimensions(&self) -> (usize, usize) {
+            (self.1, self.2)
+        }
         fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
             let i = (y * self.1 + x) * 4;
-            (self.0[i+2] as f32, self.0[i+1] as f32, self.0[i] as f32)
+            (self.0[i + 2] as f32, self.0[i + 1] as f32, self.0[i] as f32)
         }
     }
 
@@ -206,20 +232,40 @@ fn h264_pframe_smaller_than_keyframe() {
     let data2 = bs2.to_vec();
 
     let raw_size = w * h * 4;
-    eprintln!("Keyframe: {} bytes ({:.0}x)", data1.len(), raw_size as f64 / data1.len() as f64);
-    eprintln!("P-frame:  {} bytes ({:.0}x)", data2.len(), raw_size as f64 / data2.len() as f64);
+    eprintln!(
+        "Keyframe: {} bytes ({:.0}x)",
+        data1.len(),
+        raw_size as f64 / data1.len() as f64
+    );
+    eprintln!(
+        "P-frame:  {} bytes ({:.0}x)",
+        data2.len(),
+        raw_size as f64 / data2.len() as f64
+    );
 
     assert!(data1.len() > 0);
-    assert!(data2.len() < data1.len(), "P-frame of same content should be smaller than keyframe");
+    assert!(
+        data2.len() < data1.len(),
+        "P-frame of same content should be smaller than keyframe"
+    );
 }
 
 #[test]
 fn protocol_message_roundtrip() {
     let messages = vec![
-        Message::Hello { width: 1920, height: 1080, format: PixelFormat::Bgra8, protocol_version: phantom_core::protocol::PROTOCOL_VERSION, audio: false },
+        Message::Hello {
+            width: 1920,
+            height: 1080,
+            format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
+        },
         Message::Ping,
         Message::Pong,
-        Message::TileUpdate { sequence: 42, tiles: Box::new(vec![]) },
+        Message::TileUpdate {
+            sequence: 42,
+            tiles: Box::new(vec![]),
+        },
         Message::VideoFrame {
             sequence: 1,
             frame: Box::new(EncodedFrame {
@@ -258,11 +304,16 @@ fn diff_detects_single_pixel_change() {
 fn compression_ratio_solid_color() {
     let mut encoder = ZstdEncoder(3);
     let tile = DirtyTile {
-        tile_x: 0, tile_y: 0,
-        pixel_width: 64, pixel_height: 64,
+        tile_x: 0,
+        tile_y: 0,
+        pixel_width: 64,
+        pixel_height: 64,
         data: vec![0x42; 64 * 64 * 4],
     };
     let encoded = encoder.encode_tiles(&[tile]).unwrap();
     let ratio = (64 * 64 * 4) as f64 / encoded[0].data.len() as f64;
-    assert!(ratio > 100.0, "solid color should compress >100x, got {ratio:.1}x");
+    assert!(
+        ratio > 100.0,
+        "solid color should compress >100x, got {ratio:.1}x"
+    );
 }

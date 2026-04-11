@@ -12,14 +12,14 @@ use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::encode::{EncodedFrame, Encoder, FrameEncoder};
 use phantom_core::frame::Frame;
 use phantom_core::input::InputEvent;
-use phantom_core::protocol::Message;
 #[cfg(feature = "audio")]
 use phantom_core::protocol::AudioCodec;
+use phantom_core::protocol::Message;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ── Inbound events from the network receive thread ──────────────────────────
@@ -29,11 +29,27 @@ pub enum InboundEvent {
     Clipboard(String),
     PasteText(String),
     Pong,
-    FileOffer { transfer_id: u64, name: String, size: u64 },
-    FileAccept { transfer_id: u64 },
-    FileCancel { transfer_id: u64, reason: String },
-    FileChunk { transfer_id: u64, offset: u64, data: Vec<u8> },
-    FileDone { transfer_id: u64, sha256: [u8; 32] },
+    FileOffer {
+        transfer_id: u64,
+        name: String,
+        size: u64,
+    },
+    FileAccept {
+        transfer_id: u64,
+    },
+    FileCancel {
+        transfer_id: u64,
+        reason: String,
+    },
+    FileChunk {
+        transfer_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FileDone {
+        transfer_id: u64,
+        sha256: [u8; 32],
+    },
     Disconnected,
 }
 
@@ -45,41 +61,67 @@ pub fn spawn_receive_thread(
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("session-recv".into())
-        .spawn(move || {
-            loop {
-                match receiver.recv_msg() {
-                    Ok(Message::Input(event)) => {
-                        let _ = tx.send(InboundEvent::Input(event));
-                    }
-                    Ok(Message::ClipboardSync(text)) => {
-                        let _ = tx.send(InboundEvent::Clipboard(text));
-                    }
-                    Ok(Message::PasteText(text)) => {
-                        let _ = tx.send(InboundEvent::PasteText(text));
-                    }
-                    Ok(Message::Pong) => {
-                        let _ = tx.send(InboundEvent::Pong);
-                    }
-                    Ok(Message::FileOffer { transfer_id, name, size }) => {
-                        let _ = tx.send(InboundEvent::FileOffer { transfer_id, name, size });
-                    }
-                    Ok(Message::FileAccept { transfer_id }) => {
-                        let _ = tx.send(InboundEvent::FileAccept { transfer_id });
-                    }
-                    Ok(Message::FileCancel { transfer_id, reason }) => {
-                        let _ = tx.send(InboundEvent::FileCancel { transfer_id, reason });
-                    }
-                    Ok(Message::FileChunk { transfer_id, offset, data }) => {
-                        let _ = tx.send(InboundEvent::FileChunk { transfer_id, offset, data });
-                    }
-                    Ok(Message::FileDone { transfer_id, sha256 }) => {
-                        let _ = tx.send(InboundEvent::FileDone { transfer_id, sha256 });
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        let _ = tx.send(InboundEvent::Disconnected);
-                        break;
-                    }
+        .spawn(move || loop {
+            match receiver.recv_msg() {
+                Ok(Message::Input(event)) => {
+                    let _ = tx.send(InboundEvent::Input(event));
+                }
+                Ok(Message::ClipboardSync(text)) => {
+                    let _ = tx.send(InboundEvent::Clipboard(text));
+                }
+                Ok(Message::PasteText(text)) => {
+                    let _ = tx.send(InboundEvent::PasteText(text));
+                }
+                Ok(Message::Pong) => {
+                    let _ = tx.send(InboundEvent::Pong);
+                }
+                Ok(Message::FileOffer {
+                    transfer_id,
+                    name,
+                    size,
+                }) => {
+                    let _ = tx.send(InboundEvent::FileOffer {
+                        transfer_id,
+                        name,
+                        size,
+                    });
+                }
+                Ok(Message::FileAccept { transfer_id }) => {
+                    let _ = tx.send(InboundEvent::FileAccept { transfer_id });
+                }
+                Ok(Message::FileCancel {
+                    transfer_id,
+                    reason,
+                }) => {
+                    let _ = tx.send(InboundEvent::FileCancel {
+                        transfer_id,
+                        reason,
+                    });
+                }
+                Ok(Message::FileChunk {
+                    transfer_id,
+                    offset,
+                    data,
+                }) => {
+                    let _ = tx.send(InboundEvent::FileChunk {
+                        transfer_id,
+                        offset,
+                        data,
+                    });
+                }
+                Ok(Message::FileDone {
+                    transfer_id,
+                    sha256,
+                }) => {
+                    let _ = tx.send(InboundEvent::FileDone {
+                        transfer_id,
+                        sha256,
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = tx.send(InboundEvent::Disconnected);
+                    break;
                 }
             }
         })
@@ -147,7 +189,10 @@ impl CongestionTracker {
             self.slow_frames += 1;
             if self.slow_frames > 3 && self.skip_ratio < 4 {
                 self.skip_ratio += 1;
-                tracing::info!(skip_ratio = self.skip_ratio, "reducing frame rate (congestion)");
+                tracing::info!(
+                    skip_ratio = self.skip_ratio,
+                    "reducing frame rate (congestion)"
+                );
             }
         } else {
             if self.slow_frames > 0 {
@@ -327,32 +372,44 @@ impl SessionRunner {
                         });
                     }
                 }
-                Ok(InboundEvent::FileOffer { transfer_id, name, size }) => {
-                    match self.file_transfer.on_file_offer(transfer_id, &name, size) {
-                        Ok(reply) => {
-                            let _ = self.sender.send_msg(&reply);
-                        }
-                        Err(e) => {
-                            tracing::error!(transfer_id, "failed to accept file offer: {e}");
-                            let _ = self.sender.send_msg(&Message::FileCancel {
-                                transfer_id,
-                                reason: format!("{e}"),
-                            });
-                        }
+                Ok(InboundEvent::FileOffer {
+                    transfer_id,
+                    name,
+                    size,
+                }) => match self.file_transfer.on_file_offer(transfer_id, &name, size) {
+                    Ok(reply) => {
+                        let _ = self.sender.send_msg(&reply);
                     }
-                }
+                    Err(e) => {
+                        tracing::error!(transfer_id, "failed to accept file offer: {e}");
+                        let _ = self.sender.send_msg(&Message::FileCancel {
+                            transfer_id,
+                            reason: format!("{e}"),
+                        });
+                    }
+                },
                 Ok(InboundEvent::FileAccept { transfer_id }) => {
                     self.file_transfer.on_file_accept(transfer_id);
                 }
-                Ok(InboundEvent::FileCancel { transfer_id, reason }) => {
+                Ok(InboundEvent::FileCancel {
+                    transfer_id,
+                    reason,
+                }) => {
                     self.file_transfer.on_file_cancel(transfer_id, &reason);
                 }
-                Ok(InboundEvent::FileChunk { transfer_id, offset, data }) => {
+                Ok(InboundEvent::FileChunk {
+                    transfer_id,
+                    offset,
+                    data,
+                }) => {
                     if let Err(e) = self.file_transfer.on_file_chunk(transfer_id, offset, &data) {
                         tracing::error!(transfer_id, "file chunk error: {e}");
                     }
                 }
-                Ok(InboundEvent::FileDone { transfer_id, sha256 }) => {
+                Ok(InboundEvent::FileDone {
+                    transfer_id,
+                    sha256,
+                }) => {
                     if let Err(e) = self.file_transfer.on_file_done(transfer_id, &sha256) {
                         tracing::error!(transfer_id, "file done error: {e}");
                     }
@@ -547,7 +604,12 @@ pub fn run_session_cpu(
 
     let (width, height) = capture.resolution();
     let mut runner = SessionRunner::new(
-        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+        cfg.sender,
+        cfg.receiver,
+        width,
+        height,
+        cfg.frame_interval,
+        cfg.cancel,
     )?;
 
     // Send file if requested via --send-file
@@ -640,7 +702,12 @@ pub fn run_session_gpu(
     encoder.force_keyframe();
     let (width, height) = encoder.dimensions();
     let mut runner = SessionRunner::new(
-        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+        cfg.sender,
+        cfg.receiver,
+        width,
+        height,
+        cfg.frame_interval,
+        cfg.cancel,
     )?;
 
     if let Some(path) = cfg.send_file {
@@ -704,7 +771,12 @@ pub fn run_session_dxgi(
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
     let mut runner = SessionRunner::new(
-        cfg.sender, cfg.receiver, width, height, cfg.frame_interval, cfg.cancel,
+        cfg.sender,
+        cfg.receiver,
+        width,
+        height,
+        cfg.frame_interval,
+        cfg.cancel,
     )?;
 
     if let Some(path) = cfg.send_file {
@@ -767,9 +839,7 @@ fn hide_remote_cursor() {
             tracing::debug!("xdotool available but cursor hiding limited");
         }
 
-        tracing::debug!(
-            "could not hide remote cursor (install 'unclutter' for best results)"
-        );
+        tracing::debug!("could not hide remote cursor (install 'unclutter' for best results)");
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -826,9 +896,7 @@ mod tests {
         // After 4 slow frames, skip_ratio should be 2
         assert_eq!(ct.skip_ratio, 2);
         // Should skip every other frame
-        let skipped: usize = (0..10)
-            .filter(|_| ct.should_skip_frame())
-            .count();
+        let skipped: usize = (0..10).filter(|_| ct.should_skip_frame()).count();
         assert!(skipped > 0, "should skip some frames under congestion");
     }
 

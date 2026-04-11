@@ -19,7 +19,10 @@ pub fn generate_key_hex() -> String {
 pub fn parse_key_hex(hex_str: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow::anyhow!("invalid hex key: {e}"))?;
     if bytes.len() != 32 {
-        bail!("key must be 32 bytes (64 hex chars), got {} bytes", bytes.len());
+        bail!(
+            "key must be 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        );
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);

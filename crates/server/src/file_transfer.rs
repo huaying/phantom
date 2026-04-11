@@ -4,9 +4,7 @@
 //! Can also send files to the connected client.
 
 use anyhow::Result;
-use phantom_core::file_transfer::{
-    FileTransferManager, IncrementalHasher, CHUNK_SIZE,
-};
+use phantom_core::file_transfer::{FileTransferManager, IncrementalHasher, CHUNK_SIZE};
 use phantom_core::protocol::Message;
 use std::collections::HashMap;
 use std::fs;
@@ -66,12 +64,7 @@ impl ServerFileTransfer {
 
     /// Handle a FileOffer from the client (they want to send us a file).
     /// Returns a FileAccept message to send back.
-    pub fn on_file_offer(
-        &mut self,
-        transfer_id: u64,
-        name: &str,
-        size: u64,
-    ) -> Result<Message> {
+    pub fn on_file_offer(&mut self, transfer_id: u64, name: &str, size: u64) -> Result<Message> {
         // Sanitize filename
         let safe_name = Path::new(name)
             .file_name()
@@ -89,14 +82,17 @@ impl ServerFileTransfer {
         self.manager.on_offer_received(transfer_id, safe_name, size);
         self.manager.on_accept(transfer_id);
 
-        self.receivers.insert(transfer_id, FileReceiver {
-            file,
-            temp_path,
-            final_path,
-            hasher: IncrementalHasher::new(),
-            received: 0,
-            expected: size,
-        });
+        self.receivers.insert(
+            transfer_id,
+            FileReceiver {
+                file,
+                temp_path,
+                final_path,
+                hasher: IncrementalHasher::new(),
+                received: 0,
+                expected: size,
+            },
+        );
 
         tracing::info!(transfer_id, name, size, "file offer accepted");
         Ok(Message::FileAccept { transfer_id })
@@ -218,9 +214,11 @@ impl ServerFileTransfer {
                         return;
                     }
                 };
-                let result = match cvar
-                    .wait_timeout_while(accepted, std::time::Duration::from_secs(30), |a| !*a)
-                {
+                let result = match cvar.wait_timeout_while(
+                    accepted,
+                    std::time::Duration::from_secs(30),
+                    |a| !*a,
+                ) {
                     Ok(r) => r,
                     Err(_) => {
                         let _ = event_tx.send(FileSendEvent::Error(
@@ -239,10 +237,7 @@ impl ServerFileTransfer {
                 }
 
                 if let Err(e) = send_file_chunks(transfer_id, &file_path, &event_tx) {
-                    let _ = event_tx.send(FileSendEvent::Error(
-                        transfer_id,
-                        format!("{e}"),
-                    ));
+                    let _ = event_tx.send(FileSendEvent::Error(transfer_id, format!("{e}")));
                 }
             })?;
 
@@ -257,7 +252,12 @@ impl ServerFileTransfer {
         while let Ok(event) = self.send_event_rx.try_recv() {
             match event {
                 FileSendEvent::Send(msg) => {
-                    if let Message::FileChunk { transfer_id, ref data, .. } = msg {
+                    if let Message::FileChunk {
+                        transfer_id,
+                        ref data,
+                        ..
+                    } = msg
+                    {
                         self.manager.on_chunk(transfer_id, data.len() as u64);
                     }
                     msgs.push(msg);
@@ -288,11 +288,7 @@ impl Default for ServerFileTransfer {
 }
 
 /// Read a file and send it as chunks via the event channel.
-fn send_file_chunks(
-    transfer_id: u64,
-    path: &Path,
-    tx: &mpsc::Sender<FileSendEvent>,
-) -> Result<()> {
+fn send_file_chunks(transfer_id: u64, path: &Path, tx: &mpsc::Sender<FileSendEvent>) -> Result<()> {
     let mut file = fs::File::open(path)?;
     let mut hasher = IncrementalHasher::new();
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -329,7 +325,10 @@ fn unique_path(path: &Path) -> PathBuf {
     }
 
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
     let parent = path.parent().unwrap_or(Path::new("."));
 
     for i in 1u32.. {

@@ -71,8 +71,7 @@ fn headless_e2e_h264_over_tcp() {
 
         for i in 0..num_frames {
             let bgra = generate_test_bgra(width as usize, height as usize, i);
-            let yuv =
-                YUVBuffer::from_rgb_source(BgraFrame(&bgra, width as usize, height as usize));
+            let yuv = YUVBuffer::from_rgb_source(BgraFrame(&bgra, width as usize, height as usize));
             let bitstream = encoder.encode(&yuv).unwrap();
             let h264_data = bitstream.to_vec();
 
@@ -109,7 +108,11 @@ fn headless_e2e_h264_over_tcp() {
         // Receive Hello
         let msg = protocol::read_message(&mut reader).unwrap();
         match msg {
-            Message::Hello { width: w, height: h, .. } => {
+            Message::Hello {
+                width: w,
+                height: h,
+                ..
+            } => {
                 assert_eq!(w, width);
                 assert_eq!(h, height);
             }
@@ -129,7 +132,9 @@ fn headless_e2e_h264_over_tcp() {
             };
 
             match msg {
-                Message::VideoFrame { frame, sequence, .. } => {
+                Message::VideoFrame {
+                    frame, sequence, ..
+                } => {
                     let yuv = decoder.decode(&frame.data).unwrap();
                     if let Some(yuv) = yuv {
                         let (w, h) = yuv.dimensions();
@@ -177,8 +182,8 @@ fn headless_e2e_encrypted_tcp() {
             width,
             height,
             format: PixelFormat::Bgra8,
-                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
-                audio: false,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: false,
         })
         .unwrap();
         writer.write_encrypted(&payload).unwrap();
@@ -197,7 +202,11 @@ fn headless_e2e_encrypted_tcp() {
         let payload = reader.read_decrypted().unwrap();
         let msg: Message = bincode::deserialize(&payload).unwrap();
         match msg {
-            Message::Hello { width: w, height: h, .. } => {
+            Message::Hello {
+                width: w,
+                height: h,
+                ..
+            } => {
                 assert_eq!(w, width);
                 assert_eq!(h, height);
             }

@@ -32,10 +32,7 @@ impl TileDiffer {
 
     /// Quick check: did anything change at all? (Cheap — samples ~64 points.)
     pub fn has_changes(&self, frame: &Frame) -> bool {
-        if !self.initialized
-            || self.width != frame.width
-            || self.height != frame.height
-        {
+        if !self.initialized || self.width != frame.width || self.height != frame.height {
             return true;
         }
 
@@ -248,7 +245,10 @@ mod tests {
         let dirty = differ.diff(&frame);
         assert_eq!(dirty.len(), 4);
 
-        let bottom_right = dirty.iter().find(|t| t.tile_x == 1 && t.tile_y == 1).unwrap();
+        let bottom_right = dirty
+            .iter()
+            .find(|t| t.tile_x == 1 && t.tile_y == 1)
+            .unwrap();
         assert_eq!(bottom_right.pixel_width, 36);
         assert_eq!(bottom_right.pixel_height, 36);
     }
@@ -265,7 +265,10 @@ mod tests {
             }
         }
         let dirty = differ.diff(&frame);
-        let tile_1_0 = dirty.iter().find(|t| t.tile_x == 1 && t.tile_y == 0).unwrap();
+        let tile_1_0 = dirty
+            .iter()
+            .find(|t| t.tile_x == 1 && t.tile_y == 0)
+            .unwrap();
         assert!(tile_1_0.data.iter().all(|&b| b == 0xFF));
     }
 }

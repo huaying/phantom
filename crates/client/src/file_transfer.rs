@@ -4,9 +4,7 @@
 //! Can also send files to the server (e.g., via --send-file).
 
 use anyhow::Result;
-use phantom_core::file_transfer::{
-    FileTransferManager, IncrementalHasher, CHUNK_SIZE,
-};
+use phantom_core::file_transfer::{FileTransferManager, IncrementalHasher, CHUNK_SIZE};
 use phantom_core::protocol::Message;
 use std::collections::HashMap;
 use std::fs;
@@ -74,12 +72,7 @@ impl ClientFileTransfer {
 
     /// Handle a FileOffer from the server (server wants to send us a file).
     /// Returns a FileAccept message to send back.
-    pub fn on_file_offer(
-        &mut self,
-        transfer_id: u64,
-        name: &str,
-        size: u64,
-    ) -> Result<Message> {
+    pub fn on_file_offer(&mut self, transfer_id: u64, name: &str, size: u64) -> Result<Message> {
         let safe_name = Path::new(name)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -96,14 +89,17 @@ impl ClientFileTransfer {
         self.manager.on_offer_received(transfer_id, safe_name, size);
         self.manager.on_accept(transfer_id);
 
-        self.receivers.insert(transfer_id, FileReceiver {
-            file,
-            temp_path,
-            final_path,
-            hasher: IncrementalHasher::new(),
-            received: 0,
-            expected: size,
-        });
+        self.receivers.insert(
+            transfer_id,
+            FileReceiver {
+                file,
+                temp_path,
+                final_path,
+                hasher: IncrementalHasher::new(),
+                received: 0,
+                expected: size,
+            },
+        );
 
         tracing::info!(transfer_id, name, size, "file offer accepted");
         Ok(Message::FileAccept { transfer_id })
@@ -213,9 +209,11 @@ impl ClientFileTransfer {
                         return;
                     }
                 };
-                let result = match cvar
-                    .wait_timeout_while(accepted, std::time::Duration::from_secs(30), |a| !*a)
-                {
+                let result = match cvar.wait_timeout_while(
+                    accepted,
+                    std::time::Duration::from_secs(30),
+                    |a| !*a,
+                ) {
                     Ok(r) => r,
                     Err(_) => {
                         let _ = event_tx.send(FileSendEvent::Error(
@@ -234,10 +232,7 @@ impl ClientFileTransfer {
                 }
 
                 if let Err(e) = send_file_chunks(transfer_id, &file_path, &event_tx) {
-                    let _ = event_tx.send(FileSendEvent::Error(
-                        transfer_id,
-                        format!("{e}"),
-                    ));
+                    let _ = event_tx.send(FileSendEvent::Error(transfer_id, format!("{e}")));
                 }
             })?;
 
@@ -258,7 +253,12 @@ impl ClientFileTransfer {
         while let Ok(event) = self.send_event_rx.try_recv() {
             match event {
                 FileSendEvent::Send(msg) => {
-                    if let Message::FileChunk { transfer_id, ref data, .. } = msg {
+                    if let Message::FileChunk {
+                        transfer_id,
+                        ref data,
+                        ..
+                    } = msg
+                    {
                         self.manager.on_chunk(transfer_id, data.len() as u64);
                     }
                     msgs.push(msg);
@@ -288,11 +288,7 @@ impl Default for ClientFileTransfer {
     }
 }
 
-fn send_file_chunks(
-    transfer_id: u64,
-    path: &Path,
-    tx: &mpsc::Sender<FileSendEvent>,
-) -> Result<()> {
+fn send_file_chunks(transfer_id: u64, path: &Path, tx: &mpsc::Sender<FileSendEvent>) -> Result<()> {
     let mut file = fs::File::open(path)?;
     let mut hasher = IncrementalHasher::new();
     let mut buf = vec![0u8; CHUNK_SIZE];

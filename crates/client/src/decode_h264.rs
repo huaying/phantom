@@ -31,7 +31,10 @@ impl FrameDecoder for OpenH264Decoder {
             .map_err(|e| anyhow::anyhow!("H.264 decode error: {e}"))?;
         let yuv = match maybe_yuv {
             Some(y) => y,
-            None => anyhow::bail!("decoder returned no output frame (data={} bytes)", data.len()),
+            None => anyhow::bail!(
+                "decoder returned no output frame (data={} bytes)",
+                data.len()
+            ),
         };
 
         let (y_stride, uv_stride, _) = yuv.strides();

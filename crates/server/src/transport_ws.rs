@@ -70,15 +70,19 @@ fn make_tls_acceptor() -> Result<Arc<rustls::ServerConfig>> {
         let cert_pem = std::fs::read(&cert_path)?;
         let key_pem = std::fs::read(&key_path)?;
         let cert = rustls_pemfile::certs(&mut &cert_pem[..])
-            .next().ok_or_else(|| anyhow::anyhow!("no cert in PEM"))??;
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])?.ok_or_else(|| anyhow::anyhow!("no key in PEM"))?;
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no cert in PEM"))??;
+        let key = rustls_pemfile::private_key(&mut &key_pem[..])?
+            .ok_or_else(|| anyhow::anyhow!("no key in PEM"))?;
         tracing::info!("loaded TLS cert from {}", cert_path.display());
         (cert, key)
     } else {
         // Generate new cert and save
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-        params.distinguished_name.push(rcgen::DnType::CommonName, "Phantom Remote Desktop");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Phantom Remote Desktop");
         params.subject_alt_names = vec![
             rcgen::SanType::DnsName("localhost".try_into()?),
             rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
@@ -115,14 +119,18 @@ const WASM_JS: &[u8] = include_bytes!("../../web/pkg/phantom_web.js");
 const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
 
 #[cfg(not(feature = "web-client"))]
-const WASM_JS: &[u8] = b"console.error('web client not compiled: build with --features web-client')";
+const WASM_JS: &[u8] =
+    b"console.error('web client not compiled: build with --features web-client')";
 #[cfg(not(feature = "web-client"))]
 const WASM_BIN: &[u8] = b"";
 
 // --- WebRTC types (only when feature enabled) ---
 
 #[cfg(feature = "webrtc")]
-type SessionPair = (super::transport_webrtc::WebRtcSender, super::transport_webrtc::WebRtcReceiver);
+type SessionPair = (
+    super::transport_webrtc::WebRtcSender,
+    super::transport_webrtc::WebRtcReceiver,
+);
 
 #[allow(dead_code)]
 pub struct WebServerTransport {
@@ -300,8 +308,15 @@ impl WebServerTransport {
     #[cfg(feature = "webrtc")]
     pub fn accept_any(&self) -> Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>)> {
         loop {
-            let _ = self.rtc_notify.recv_timeout(std::time::Duration::from_millis(50));
-            if let Some((s, r)) = self.rtc_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = self
+                .rtc_notify
+                .recv_timeout(std::time::Duration::from_millis(50));
+            if let Some((s, r)) = self
+                .rtc_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 tracing::info!("accepted WebRTC client");
                 return Ok((Box::new(s), Box::new(r)));
             }
@@ -326,19 +341,15 @@ enum HttpResult {
 
 /// Check whether the client sent `Connection: close`.
 fn wants_close(request: &str) -> bool {
-    request
-        .lines()
-        .any(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower.starts_with("connection:") && lower.contains("close")
-        })
+    request.lines().any(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.starts_with("connection:") && lower.contains("close")
+    })
 }
 
 /// HTTP handler WITHOUT WebRTC (no POST /rtc).
 #[cfg(not(feature = "webrtc"))]
-fn handle_http_rw(
-    stream: &mut (impl Read + Write),
-) -> Result<HttpResult> {
+fn handle_http_rw(stream: &mut (impl Read + Write)) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
     if n == 0 {
@@ -392,7 +403,11 @@ fn handle_http_rw_rtc(
         return send_ws_upgrade(stream, &request);
     }
 
-    let body_start = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(n);
+    let body_start = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(n);
 
     match (method, path) {
         ("POST", "/rtc") => {
@@ -407,9 +422,12 @@ fn handle_http_rw_rtc(
 
             let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str).context("parse SDP")?;
             let answer = rtc.sdp_api().accept_offer(offer).context("accept offer")?;
-            let answer_json = serde_json::json!({ "type": "answer", "sdp": answer.to_sdp_string() });
+            let answer_json =
+                serde_json::json!({ "type": "answer", "sdp": answer.to_sdp_string() });
 
-            rtc_tx.send(rtc).map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
+            rtc_tx
+                .send(rtc)
+                .map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
 
             let resp_body = answer_json.to_string();
             let conn_header = if close { "close" } else { "keep-alive" };
@@ -441,7 +459,8 @@ fn handle_http_rw_rtc(
 }
 
 fn send_ws_upgrade(stream: &mut (impl Read + Write), request: &str) -> Result<HttpResult> {
-    let key = request.lines()
+    let key = request
+        .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
@@ -476,10 +495,11 @@ fn spawn_ws_connection(
     stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     ws_tx: mpsc::Sender<WsConnection>,
 ) {
-    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-    let ws = tungstenite::WebSocket::from_raw_socket(
-        stream, tungstenite::protocol::Role::Server, None,
-    );
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let ws =
+        tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("WebSocket client connected via HTTPS port");
     let (send_tx, send_rx) = mpsc::channel();
     let (recv_tx, recv_rx) = mpsc::channel();
@@ -506,11 +526,15 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
 ) {
     loop {
         while let Ok(data) = send_rx.try_recv() {
-            if ws.send(tungstenite::Message::Binary(data)).is_err() { return; }
+            if ws.send(tungstenite::Message::Binary(data)).is_err() {
+                return;
+            }
         }
         match ws.read() {
             Ok(tungstenite::Message::Binary(data)) => {
-                if recv_tx.send(data).is_err() { return; }
+                if recv_tx.send(data).is_err() {
+                    return;
+                }
             }
             Ok(tungstenite::Message::Close(_)) => return,
             Ok(_) => {}
@@ -522,15 +546,21 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
     }
 }
 
-pub struct WsSender { tx: mpsc::Sender<Vec<u8>> }
+pub struct WsSender {
+    tx: mpsc::Sender<Vec<u8>>,
+}
 impl MessageSender for WsSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         let payload = bincode::serialize(msg).context("serialize")?;
-        self.tx.send(payload).map_err(|_| anyhow::anyhow!("ws closed"))
+        self.tx
+            .send(payload)
+            .map_err(|_| anyhow::anyhow!("ws closed"))
     }
 }
 
-pub struct WsReceiver { rx: mpsc::Receiver<Vec<u8>> }
+pub struct WsReceiver {
+    rx: mpsc::Receiver<Vec<u8>>,
+}
 impl MessageReceiver for WsReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
         let data = self.rx.recv().context("ws closed")?;

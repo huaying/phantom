@@ -42,8 +42,18 @@ impl OpenH264Encoder {
         let encoder =
             Encoder::with_api_config(api, config).context("failed to create OpenH264 encoder")?;
 
-        tracing::info!(width, height, fps, bitrate_kbps, "OpenH264 encoder initialized");
-        Ok(Self { encoder, width, height })
+        tracing::info!(
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            "OpenH264 encoder initialized"
+        );
+        Ok(Self {
+            encoder,
+            width,
+            height,
+        })
     }
 }
 
@@ -52,7 +62,11 @@ impl FrameEncoder for OpenH264Encoder {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        let bgra = BgraFrame { data: &frame.data, width: w, height: h };
+        let bgra = BgraFrame {
+            data: &frame.data,
+            width: w,
+            height: h,
+        };
         let yuv = YUVBuffer::from_rgb_source(bgra);
 
         let bitstream = self.encoder.encode(&yuv).context("H.264 encode failed")?;

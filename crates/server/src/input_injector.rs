@@ -44,7 +44,11 @@ impl InputInjector {
                     MouseButton::Right => Button::Right,
                     MouseButton::Middle => Button::Middle,
                 };
-                let dir = if *pressed { Direction::Press } else { Direction::Release };
+                let dir = if *pressed {
+                    Direction::Press
+                } else {
+                    Direction::Release
+                };
                 self.enigo
                     .button(btn, dir)
                     .map_err(|e| anyhow::anyhow!("mouse button: {e}"))?;
@@ -64,7 +68,11 @@ impl InputInjector {
             }
             InputEvent::Key { key, pressed } => {
                 if let Some(enigo_key) = keycode_to_enigo(*key) {
-                    let dir = if *pressed { Direction::Press } else { Direction::Release };
+                    let dir = if *pressed {
+                        Direction::Press
+                    } else {
+                        Direction::Release
+                    };
                     self.enigo
                         .key(enigo_key, dir)
                         .map_err(|e| anyhow::anyhow!("key: {e}"))?;
