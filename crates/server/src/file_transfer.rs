@@ -169,9 +169,10 @@ impl ServerFileTransfer {
         // Signal the send thread to start
         if let Some(signal) = self.accept_signals.remove(&transfer_id) {
             let (lock, cvar) = &*signal;
-            let mut accepted = lock.lock().unwrap();
-            *accepted = true;
-            cvar.notify_one();
+            if let Ok(mut accepted) = lock.lock() {
+                *accepted = true;
+                cvar.notify_one();
+            }
         }
     }
 
@@ -207,10 +208,28 @@ impl ServerFileTransfer {
             .spawn(move || {
                 // Wait for FileAccept (up to 30s)
                 let (lock, cvar) = &*signal;
-                let accepted = lock.lock().unwrap();
-                let result = cvar
+                let accepted = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        let _ = event_tx.send(FileSendEvent::Error(
+                            transfer_id,
+                            "accept signal mutex poisoned".to_string(),
+                        ));
+                        return;
+                    }
+                };
+                let result = match cvar
                     .wait_timeout_while(accepted, std::time::Duration::from_secs(30), |a| !*a)
-                    .unwrap();
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = event_tx.send(FileSendEvent::Error(
+                            transfer_id,
+                            "accept signal mutex poisoned during wait".to_string(),
+                        ));
+                        return;
+                    }
+                };
                 if !*result.0 {
                     let _ = event_tx.send(FileSendEvent::Error(
                         transfer_id,

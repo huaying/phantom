@@ -22,7 +22,9 @@ impl QuicClientTransport {
 
         let conn = self.rt.block_on(async {
             // Client endpoint: bind to any local port
-            let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+            let mut endpoint = Endpoint::client(
+                "0.0.0.0:0".parse().expect("hardcoded address is valid"),
+            )
                 .context("create client endpoint")?;
 
             // Accept any server certificate (like SSH first-connect)

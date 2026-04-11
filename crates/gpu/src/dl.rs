@@ -15,7 +15,8 @@ impl DynLib {
     /// Open a shared library by name. Tries each name in order.
     pub fn open(names: &[&str]) -> anyhow::Result<Self> {
         for name in names {
-            let c_name = CString::new(*name).unwrap();
+            let c_name = CString::new(*name)
+                .map_err(|_| anyhow::anyhow!("library name contains null byte: {name}"))?;
             let handle = unsafe { lib_open(c_name.as_ptr()) };
             if !handle.is_null() {
                 tracing::debug!("loaded {name}");
@@ -32,7 +33,8 @@ impl DynLib {
     /// Caller must ensure the symbol has the correct type `T`.
     pub unsafe fn sym<T>(&self, name: &str) -> anyhow::Result<T> {
         assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
-        let c_name = CString::new(name).unwrap();
+        let c_name = CString::new(name)
+            .map_err(|_| anyhow::anyhow!("symbol name contains null byte: {name}"))?;
         let ptr = unsafe { lib_sym(self.handle, c_name.as_ptr()) };
         if ptr.is_null() {
             let err = unsafe { last_error() };

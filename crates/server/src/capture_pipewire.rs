@@ -101,7 +101,8 @@ impl PipeWireCapture {
 
 impl FrameCapture for PipeWireCapture {
     fn capture(&mut self) -> Result<Option<Frame>> {
-        let mut guard = self.frame_buffer.lock().unwrap();
+        let mut guard = self.frame_buffer.lock()
+            .map_err(|_| anyhow::anyhow!("PipeWire frame buffer mutex poisoned"))?;
         match guard.take() {
             Some(fd) => {
                 self.width = fd.width;
@@ -123,7 +124,8 @@ impl FrameCapture for PipeWireCapture {
     }
 
     fn reset(&mut self) -> Result<()> {
-        let mut guard = self.frame_buffer.lock().unwrap();
+        let mut guard = self.frame_buffer.lock()
+            .map_err(|_| anyhow::anyhow!("PipeWire frame buffer mutex poisoned"))?;
         *guard = None;
         Ok(())
     }
@@ -556,12 +558,14 @@ fn run_pipewire_stream(
                             buf
                         };
 
-                        *fb.lock().unwrap() = Some(FrameData {
-                            data: buf,
-                            width: w,
-                            height: h,
-                            timestamp: Instant::now(),
-                        });
+                        if let Ok(mut guard) = fb.lock() {
+                            *guard = Some(FrameData {
+                                data: buf,
+                                width: w,
+                                height: h,
+                                timestamp: Instant::now(),
+                            });
+                        }
                     }
                 }
             }

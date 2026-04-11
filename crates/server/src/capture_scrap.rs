@@ -36,7 +36,8 @@ impl ScrapCapture {
             );
         }
 
-        let display = displays.into_iter().nth(index).unwrap();
+        let display = displays.into_iter().nth(index)
+            .context("display disappeared during enumeration")?;
         let width = display.width() as u32;
         let height = display.height() as u32;
         let capturer = Capturer::new(display).context("failed to create capturer")?;

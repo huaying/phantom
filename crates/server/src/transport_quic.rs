@@ -127,7 +127,8 @@ fn ring_fingerprint(cert_der: &[u8]) -> String {
     let mut s = String::new();
     for (i, b) in digest.as_ref().iter().enumerate() {
         if i > 0 { s.push(':'); }
-        write!(s, "{:02X}", b).unwrap();
+        // write! to String is infallible
+        let _ = write!(s, "{:02X}", b);
     }
     s
 }

@@ -23,6 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Result of a successful connection attempt: sender, receiver, and optional TCP shutdown handle.
+type ConnectResult = Result<(
+    Box<dyn MessageSender>,
+    Box<dyn MessageReceiver>,
+    Option<transport_tcp::TcpShutdownHandle>,
+)>;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
@@ -151,7 +158,7 @@ impl App {
 
         tracing::info!(addr = %self.args_connect, "connecting...");
 
-        let result: Result<(Box<dyn MessageSender>, Box<dyn MessageReceiver>, Option<transport_tcp::TcpShutdownHandle>)> =
+        let result: ConnectResult =
             if self.args_transport == "quic" {
                 match transport_quic::QuicClientTransport::new()
                     .and_then(|q| q.connect(&self.args_connect))

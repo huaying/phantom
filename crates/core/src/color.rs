@@ -1,8 +1,8 @@
-/// BGRA ↔ YUV color space conversions with SIMD acceleration.
-///
-/// All conversions use BT.601 full-range coefficients.
-/// SIMD paths (AVX2, SSE4.1) are auto-detected at runtime on x86_64.
-/// Fallback scalar path works on all platforms.
+//! BGRA ↔ YUV color space conversions with SIMD acceleration.
+//!
+//! All conversions use BT.601 full-range coefficients.
+//! SIMD paths (AVX2, SSE4.1) are auto-detected at runtime on x86_64.
+//! Fallback scalar path works on all platforms.
 
 // ── BGRA → YUV420p ─────────────────────────────────────────────────────────
 
@@ -32,6 +32,7 @@ pub fn bgra_to_yuv420(bgra: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec
 }
 
 /// Scalar fallback for BGRA → YUV420p.
+#[allow(clippy::too_many_arguments)]
 fn bgra_to_yuv420_scalar(
     bgra: &[u8],
     width: usize,
@@ -135,6 +136,7 @@ pub fn yuv420_to_rgb32(
 }
 
 /// Scalar fallback for YUV420p → 0RGB.
+#[allow(clippy::too_many_arguments)]
 fn yuv420_to_rgb32_scalar(
     y: &[u8],
     u: &[u8],
@@ -357,6 +359,7 @@ mod avx2 {
     /// # Safety
     /// Requires AVX2 support.
     #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn yuv420_to_rgb32_avx2(
         y_data: &[u8],
         u_data: &[u8],

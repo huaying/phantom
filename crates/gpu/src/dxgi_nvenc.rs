@@ -257,7 +257,7 @@ impl DxgiNvencPipeline {
         let mut preset_config = NvEncPresetConfig::zeroed();
         preset_config.set_version();
         preset_config.set_config_version();
-        let f = self.api.get_encode_preset_config_ex().unwrap();
+        let f = self.api.get_encode_preset_config_ex().context("NVENC API: get_encode_preset_config_ex not loaded")?;
         let status = unsafe {
             f(self.encoder, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
               NV_ENC_TUNING_INFO_LOW_LATENCY, preset_config.as_mut_ptr())
@@ -287,14 +287,14 @@ impl DxgiNvencPipeline {
         init_params.set_encode_config(config.as_mut_ptr());
         init_params.set_tuning_info(NV_ENC_TUNING_INFO_LOW_LATENCY);
 
-        let f = self.api.initialize_encoder().unwrap();
+        let f = self.api.initialize_encoder().context("NVENC API: initialize_encoder not loaded")?;
         let status = unsafe { f(self.encoder, init_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS { bail!("init encoder failed on reset"); }
 
         // Recreate output buffer
         let mut buf_params = NvEncCreateBitstreamBuffer::zeroed();
         buf_params.set_version();
-        let f = self.api.create_bitstream_buffer().unwrap();
+        let f = self.api.create_bitstream_buffer().context("NVENC API: create_bitstream_buffer not loaded")?;
         let status = unsafe { f(self.encoder, buf_params.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS { bail!("create bitstream failed on reset"); }
         self.output_buf = buf_params.bitstream_buffer();
@@ -308,7 +308,7 @@ impl DxgiNvencPipeline {
         reg.set_resource_to_register(self.capture.texture_ptr());
         reg.set_buffer_format(NV_ENC_BUFFER_FORMAT_ARGB);
         reg.set_pitch(0);
-        let f = self.api.register_resource().unwrap();
+        let f = self.api.register_resource().context("NVENC API: register_resource not loaded")?;
         let status = unsafe { f(self.encoder, reg.as_mut_ptr()) };
         if status != NV_ENC_SUCCESS { bail!("register resource failed on reset"); }
         self.registered_resource = reg.registered_resource();

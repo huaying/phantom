@@ -385,7 +385,9 @@ unsafe extern "C" fn vt_decode_callback(
 
     CVPixelBufferUnlockBaseAddress(image_buffer, 1);
 
-    *shared.lock().unwrap() = Some(rgb32);
+    if let Ok(mut guard) = shared.lock() {
+        *guard = Some(rgb32);
+    }
 }
 
 impl FrameDecoder for VideoToolboxDecoder {
@@ -482,7 +484,9 @@ impl FrameDecoder for VideoToolboxDecoder {
             VTDecompressionSessionWaitForAsynchronousFrames(self.session);
 
             // Get decoded frame from shared buffer
-            let frame = self.decoded_frame.lock().unwrap().take();
+            let frame = self.decoded_frame.lock()
+                .map_err(|_| anyhow::anyhow!("decoded_frame mutex poisoned"))?
+                .take();
             match frame {
                 Some(f) => Ok(f),
                 None => bail!("VideoToolbox produced no output frame"),

@@ -51,21 +51,32 @@ pub fn start_playback(
             let mut pcm_i16 = vec![0i16; frame_samples * ch as usize];
 
             while let Ok(opus_data) = rx.recv() {
-                let out = audiopus::MutSignals::try_from(&mut pcm_i16[..]).unwrap();
+                let Ok(out) = audiopus::MutSignals::try_from(&mut pcm_i16[..]) else {
+                    warn!("failed to create MutSignals buffer");
+                    continue;
+                };
+                let packet = match audiopus::packet::Packet::try_from(opus_data.as_slice()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("invalid Opus packet: {e}");
+                        continue;
+                    }
+                };
                 match decoder.decode(
-                    Some(audiopus::packet::Packet::try_from(opus_data.as_slice()).unwrap()),
+                    Some(packet),
                     out,
                     false, // no FEC
                 ) {
                     Ok(decoded_samples) => {
                         let total = decoded_samples * ch as usize;
-                        let mut ring = ring_writer.lock().unwrap();
-                        for &s in &pcm_i16[..total] {
-                            ring.push_back(s as f32 / 32768.0);
-                        }
-                        // Trim if too far ahead (prevent unbounded growth)
-                        while ring.len() > ring_size * 2 {
-                            ring.pop_front();
+                        if let Ok(mut ring) = ring_writer.lock() {
+                            for &s in &pcm_i16[..total] {
+                                ring.push_back(s as f32 / 32768.0);
+                            }
+                            // Trim if too far ahead (prevent unbounded growth)
+                            while ring.len() > ring_size * 2 {
+                                ring.pop_front();
+                            }
                         }
                     }
                     Err(e) => {
@@ -92,9 +103,13 @@ pub fn start_playback(
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut ring = ring_reader.lock().unwrap();
-            for sample in data.iter_mut() {
-                *sample = ring.pop_front().unwrap_or(0.0);
+            if let Ok(mut ring) = ring_reader.lock() {
+                for sample in data.iter_mut() {
+                    *sample = ring.pop_front().unwrap_or(0.0);
+                }
+            } else {
+                // Mutex poisoned — output silence
+                data.fill(0.0);
             }
         },
         move |err| {
