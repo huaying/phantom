@@ -374,8 +374,21 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
     };
 
     match msg {
-        Message::Hello { width, height, .. } => {
-            console::log_1(&format!("Server: {width}x{height}").into());
+        Message::Hello { width, height, protocol_version, .. } => {
+            if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
+                console::error_1(&format!(
+                    "Server protocol version {protocol_version} is too old (minimum: {}). Please upgrade the server.",
+                    phantom_core::protocol::MIN_PROTOCOL_VERSION
+                ).into());
+                return;
+            }
+            if protocol_version > phantom_core::protocol::PROTOCOL_VERSION {
+                console::warn_1(&format!(
+                    "Server is newer (v{protocol_version}) than this client (v{}). Some features may not work.",
+                    phantom_core::protocol::PROTOCOL_VERSION
+                ).into());
+            }
+            console::log_1(&format!("Server: {width}x{height} (protocol v{protocol_version})").into());
             let mut s = state.borrow_mut();
             s.server_width = width;
             s.server_height = height;
