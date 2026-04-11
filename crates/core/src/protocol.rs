@@ -154,6 +154,27 @@ pub fn read_message(reader: &mut impl Read) -> Result<Message> {
     Ok(msg)
 }
 
+/// Read a message, returning `None` for unknown/undeserializable messages.
+///
+/// This is the forward-compatible variant: if a newer peer sends a message type
+/// we don't recognize, we skip it rather than disconnecting.
+pub fn read_message_lenient(reader: &mut impl Read) -> Result<Option<Message>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > MAX_MESSAGE_SIZE {
+        anyhow::bail!("message too large ({len} bytes, max {MAX_MESSAGE_SIZE})");
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    match bincode::deserialize(&payload) {
+        Ok(msg) => Ok(Some(msg)),
+        Err(_) => Ok(None), // Unknown message variant — skip gracefully
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +398,25 @@ mod tests {
             }
             _ => panic!("expected Stats"),
         }
+    }
+
+    #[test]
+    fn lenient_reader_skips_unknown() {
+        // Construct a framed payload with an invalid enum variant index.
+        // bincode uses u32 for enum variant, so variant 0xFFFFFFFF should not exist.
+        let bogus_variant: u32 = 0xFFFF_FFFF;
+        let bogus_payload = bincode::serialize(&bogus_variant).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(bogus_payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&bogus_payload);
+        // Append a valid Ping message after it
+        write_message(&mut buf, &Message::Ping).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        // First message: unknown → should return None (not error)
+        assert!(read_message_lenient(&mut cursor).unwrap().is_none());
+        // Second message: valid Ping
+        let msg = read_message_lenient(&mut cursor).unwrap();
+        assert!(matches!(msg, Some(Message::Ping)));
     }
 }
