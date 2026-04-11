@@ -454,6 +454,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             // Clipboard write requires document focus and secure context.
             // Silently ignore — don't let it crash the message handler.
         }
+        Message::Ping => {
+            let s = state.borrow();
+            send_message(&s, &Message::Pong);
+        }
         _ => {}
     }
 }
@@ -611,7 +615,11 @@ fn setup_input(canvas: &HtmlCanvasElement, document: &web_sys::Document, state: 
 
 fn send_input(state: &AppState, event: InputEvent) {
     let msg = Message::Input(event);
-    if let Ok(data) = bincode::serialize(&msg) {
+    send_message(state, &msg);
+}
+
+fn send_message(state: &AppState, msg: &Message) {
+    if let Ok(data) = bincode::serialize(msg) {
         // Prefer DataChannel, fallback to WebSocket
         if let Some(ref dc) = state.send_dc {
             if dc.ready_state() == web_sys::RtcDataChannelState::Open {

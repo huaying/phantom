@@ -425,6 +425,9 @@ impl ApplicationHandler for App {
                                 let _ = audio_tx.try_send(data);
                             }
                         }
+                        Message::Ping => {
+                            let _ = session.input_tx.send(Message::Pong);
+                        }
                         Message::FileOffer { transfer_id, name, size } => {
                             match session.file_xfer.on_file_offer(transfer_id, &name, size) {
                                 Ok(reply) => {

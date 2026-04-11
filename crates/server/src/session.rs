@@ -28,6 +28,7 @@ pub enum InboundEvent {
     Input(InputEvent),
     Clipboard(String),
     PasteText(String),
+    Pong,
     FileOffer { transfer_id: u64, name: String, size: u64 },
     FileAccept { transfer_id: u64 },
     FileCancel { transfer_id: u64, reason: String },
@@ -55,6 +56,9 @@ pub fn spawn_receive_thread(
                     }
                     Ok(Message::PasteText(text)) => {
                         let _ = tx.send(InboundEvent::PasteText(text));
+                    }
+                    Ok(Message::Pong) => {
+                        let _ = tx.send(InboundEvent::Pong);
                     }
                     Ok(Message::FileOffer { transfer_id, name, size }) => {
                         let _ = tx.send(InboundEvent::FileOffer { transfer_id, name, size });
@@ -177,6 +181,10 @@ pub struct SessionRunner {
     pub had_input: bool,
     pub frame_interval: Duration,
     pub last_keyframe_time: Instant,
+    /// Last time we sent a Ping (for RTT measurement).
+    pub ping_sent_at: Option<Instant>,
+    /// Smoothed round-trip time (exponential moving average).
+    pub rtt_us: Option<u64>,
     /// Set to true by the accept loop when a new client connects.
     /// The session loop checks this and exits cleanly.
     pub cancel: Arc<AtomicBool>,
@@ -235,6 +243,8 @@ impl SessionRunner {
             had_input: false,
             frame_interval,
             last_keyframe_time: Instant::now(),
+            ping_sent_at: None,
+            rtt_us: None,
             cancel,
             #[cfg(feature = "audio")]
             audio_rx,
@@ -306,6 +316,16 @@ impl SessionRunner {
                         self.had_input = true;
                     }
                     tracing::debug!("paste: {} chars", text.len());
+                }
+                Ok(InboundEvent::Pong) => {
+                    if let Some(sent_at) = self.ping_sent_at.take() {
+                        let rtt = sent_at.elapsed().as_micros() as u64;
+                        // Exponential moving average (α = 0.2)
+                        self.rtt_us = Some(match self.rtt_us {
+                            Some(prev) => (prev * 4 + rtt) / 5,
+                            None => rtt,
+                        });
+                    }
                 }
                 Ok(InboundEvent::FileOffer { transfer_id, name, size }) => {
                     match self.file_transfer.on_file_offer(transfer_id, &name, size) {
@@ -409,6 +429,7 @@ impl SessionRunner {
     pub fn keepalive_tick(&mut self) -> Result<()> {
         if self.keepalive_time.elapsed() >= Duration::from_secs(1) {
             self.keepalive_time = Instant::now();
+            self.ping_sent_at = Some(Instant::now());
             if self.sender.send_msg(&Message::Ping).is_err() {
                 anyhow::bail!("connection lost (keepalive failed)");
             }
@@ -420,9 +441,14 @@ impl SessionRunner {
     pub fn log_stats(&mut self, label: &str) {
         if self.stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = self.stats_time.elapsed().as_secs_f64();
+            let rtt_str = match self.rtt_us {
+                Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
+                None => "n/a".to_string(),
+            };
             tracing::info!(
                 fps = format_args!("{:.1}", self.stats_frames as f64 / elapsed),
                 bw = format_args!("{:.1} KB/s", self.stats_bytes as f64 / elapsed / 1024.0),
+                rtt = %rtt_str,
                 "{label}"
             );
             self.stats_time = Instant::now();
