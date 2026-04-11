@@ -571,6 +571,23 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             let s = state.borrow();
             send_message(&s, &Message::Pong);
         }
+        Message::Stats {
+            rtt_us,
+            fps,
+            bandwidth_bps,
+            encode_us,
+        } => {
+            console::log_1(
+                &format!(
+                    "Stats: RTT={:.1}ms FPS={:.1} BW={:.0}KB/s Encode={:.1}ms",
+                    rtt_us as f64 / 1000.0,
+                    fps,
+                    bandwidth_bps as f64 / 1024.0,
+                    encode_us as f64 / 1000.0
+                )
+                .into(),
+            );
+        }
         _ => {}
     }
 }

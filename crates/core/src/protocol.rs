@@ -104,6 +104,18 @@ pub enum Message {
         transfer_id: u64,
         sha256: [u8; 32],
     },
+
+    /// Server → Client: connection quality statistics (sent periodically).
+    Stats {
+        /// Server-measured round-trip time in microseconds (Ping→Pong EMA).
+        rtt_us: u64,
+        /// Server-side video frames per second.
+        fps: f32,
+        /// Server-side bandwidth in bytes per second.
+        bandwidth_bps: u64,
+        /// Server-side encode time per frame in microseconds (average).
+        encode_us: u64,
+    },
 }
 
 fn default_protocol_version_1() -> u32 {
@@ -337,6 +349,33 @@ mod tests {
         match read_message(&mut cursor).unwrap() {
             Message::ClipboardSync(text) => assert_eq!(text, "hello"),
             _ => panic!("expected ClipboardSync"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_stats() {
+        let msg = Message::Stats {
+            rtt_us: 15_000,
+            fps: 59.8,
+            bandwidth_bps: 5_000_000,
+            encode_us: 2_500,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::Stats {
+                rtt_us,
+                fps,
+                bandwidth_bps,
+                encode_us,
+            } => {
+                assert_eq!(rtt_us, 15_000);
+                assert!((fps - 59.8).abs() < 0.1);
+                assert_eq!(bandwidth_bps, 5_000_000);
+                assert_eq!(encode_us, 2_500);
+            }
+            _ => panic!("expected Stats"),
         }
     }
 }

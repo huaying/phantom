@@ -465,6 +465,20 @@ impl ApplicationHandler for App {
                         Message::Ping => {
                             let _ = session.input_tx.send(Message::Pong);
                         }
+                        Message::Stats {
+                            rtt_us,
+                            fps,
+                            bandwidth_bps,
+                            encode_us,
+                        } => {
+                            tracing::debug!(
+                                rtt_ms = format_args!("{:.1}", rtt_us as f64 / 1000.0),
+                                fps = format_args!("{:.1}", fps),
+                                bw = format_args!("{:.0} KB/s", bandwidth_bps as f64 / 1024.0),
+                                encode_ms = format_args!("{:.1}", encode_us as f64 / 1000.0),
+                                "server stats"
+                            );
+                        }
                         Message::FileOffer {
                             transfer_id,
                             name,

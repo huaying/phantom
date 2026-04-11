@@ -230,6 +230,8 @@ pub struct SessionRunner {
     pub ping_sent_at: Option<Instant>,
     /// Smoothed round-trip time (exponential moving average).
     pub rtt_us: Option<u64>,
+    /// Accumulated encode time for stats period.
+    pub stats_encode_us: u64,
     /// Set to true by the accept loop when a new client connects.
     /// The session loop checks this and exits cleanly.
     pub cancel: Arc<AtomicBool>,
@@ -290,6 +292,7 @@ impl SessionRunner {
             last_keyframe_time: Instant::now(),
             ping_sent_at: None,
             rtt_us: None,
+            stats_encode_us: 0,
             cancel,
             #[cfg(feature = "audio")]
             audio_rx,
@@ -494,23 +497,46 @@ impl SessionRunner {
         Ok(())
     }
 
-    /// Log stats every 5s. Returns the label to use (caller can override).
+    /// Record the time spent encoding a frame.
+    pub fn record_encode_time(&mut self, dur: Duration) {
+        self.stats_encode_us += dur.as_micros() as u64;
+    }
+
+    /// Log stats every 5s and send Stats message to client.
     pub fn log_stats(&mut self, label: &str) {
         if self.stats_time.elapsed() >= Duration::from_secs(5) {
             let elapsed = self.stats_time.elapsed().as_secs_f64();
+            let fps = self.stats_frames as f64 / elapsed;
+            let bw_bps = (self.stats_bytes as f64 / elapsed) as u64;
+            let avg_encode_us = if self.stats_frames > 0 {
+                self.stats_encode_us / self.stats_frames
+            } else {
+                0
+            };
             let rtt_str = match self.rtt_us {
                 Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
                 None => "n/a".to_string(),
             };
             tracing::info!(
-                fps = format_args!("{:.1}", self.stats_frames as f64 / elapsed),
-                bw = format_args!("{:.1} KB/s", self.stats_bytes as f64 / elapsed / 1024.0),
+                fps = format_args!("{:.1}", fps),
+                bw = format_args!("{:.1} KB/s", bw_bps as f64 / 1024.0),
                 rtt = %rtt_str,
+                encode_ms = format_args!("{:.1}", avg_encode_us as f64 / 1000.0),
                 "{label}"
             );
+
+            // Send Stats to client for overlay display
+            let _ = self.sender.send_msg(&Message::Stats {
+                rtt_us: self.rtt_us.unwrap_or(0),
+                fps: fps as f32,
+                bandwidth_bps: bw_bps,
+                encode_us: avg_encode_us,
+            });
+
             self.stats_time = Instant::now();
             self.stats_frames = 0;
             self.stats_bytes = 0;
+            self.stats_encode_us = 0;
         }
     }
 
@@ -671,7 +697,9 @@ pub fn run_session_cpu(
                 if runner.needs_keyframe() || !sent_first_frame_encoded {
                     video_encoder.force_keyframe();
                 }
+                let enc_start = Instant::now();
                 let encoded = video_encoder.encode_frame(&frame)?;
+                runner.record_encode_time(enc_start.elapsed());
                 if encoded.is_keyframe && !sent_first_frame_encoded {
                     tracing::info!(size = encoded.data.len(), "first keyframe sent");
                 }
@@ -740,7 +768,9 @@ pub fn run_session_gpu(
             Ok(Some(f)) => {
                 no_frame_count = 0;
                 let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
+                let enc_start = Instant::now();
                 let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
+                runner.record_encode_time(enc_start.elapsed());
                 runner.send_video_frame(encoded, None)?;
             }
             Ok(None) => {
@@ -798,8 +828,10 @@ pub fn run_session_dxgi(
         }
 
         // Capture + encode (zero-copy, all GPU)
+        let enc_start = Instant::now();
         match pipeline.capture_and_encode()? {
             Some(encoded) => {
+                runner.record_encode_time(enc_start.elapsed());
                 runner.send_video_frame(encoded, None)?;
             }
             None => {
