@@ -25,5 +25,7 @@ jobs:
           wasm-pack build crates/web --target web --no-typescript
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+      - name: Doc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - name: Test
         run: cargo test --workspace
