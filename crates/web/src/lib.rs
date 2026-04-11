@@ -107,6 +107,17 @@ struct AppState {
     /// For sending input — either DataChannel or WebSocket
     send_dc: Option<web_sys::RtcDataChannel>,
     send_ws: Option<WebSocket>,
+    /// Latest stats from server (for overlay display).
+    last_stats: Option<StatsSnapshot>,
+}
+
+/// Snapshot of the most recent Stats message from the server.
+#[derive(Clone)]
+struct StatsSnapshot {
+    rtt_ms: f64,
+    fps: f32,
+    bandwidth_kbps: f64,
+    encode_ms: f64,
 }
 
 thread_local! {
@@ -152,6 +163,7 @@ pub fn main() {
         last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
+        last_stats: None,
     }));
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -577,16 +589,14 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             bandwidth_bps,
             encode_us,
         } => {
-            console::log_1(
-                &format!(
-                    "Stats: RTT={:.1}ms FPS={:.1} BW={:.0}KB/s Encode={:.1}ms",
-                    rtt_us as f64 / 1000.0,
-                    fps,
-                    bandwidth_bps as f64 / 1024.0,
-                    encode_us as f64 / 1000.0
-                )
-                .into(),
-            );
+            let snapshot = StatsSnapshot {
+                rtt_ms: rtt_us as f64 / 1000.0,
+                fps,
+                bandwidth_kbps: bandwidth_bps as f64 / 1024.0,
+                encode_ms: encode_us as f64 / 1000.0,
+            };
+            update_stats_overlay(&snapshot);
+            state.borrow_mut().last_stats = Some(snapshot);
         }
         _ => {}
     }
@@ -784,6 +794,53 @@ fn setup_input(
             .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
             .unwrap();
         cb.forget();
+    }
+}
+
+/// Create or get the floating stats overlay element.
+fn get_or_create_stats_overlay() -> Option<web_sys::HtmlElement> {
+    let document = web_sys::window()?.document()?;
+    if let Some(el) = document.get_element_by_id("phantom-stats") {
+        return el.dyn_into::<web_sys::HtmlElement>().ok();
+    }
+    let div = document.create_element("div").ok()?;
+    div.set_id("phantom-stats");
+    let style = [
+        "position:fixed",
+        "top:8px",
+        "right:8px",
+        "background:rgba(0,0,0,0.7)",
+        "color:#0f0",
+        "font-family:monospace",
+        "font-size:12px",
+        "padding:6px 10px",
+        "border-radius:4px",
+        "z-index:9999",
+        "pointer-events:none",
+        "line-height:1.4",
+        "white-space:pre",
+    ]
+    .join(";");
+    let _ = div.set_attribute("style", &style);
+    let body = document.body()?;
+    let _ = body.append_child(&div);
+    div.dyn_into::<web_sys::HtmlElement>().ok()
+}
+
+/// Update the floating stats overlay with the latest snapshot.
+fn update_stats_overlay(stats: &StatsSnapshot) {
+    if let Some(el) = get_or_create_stats_overlay() {
+        let color = if stats.rtt_ms < 20.0 {
+            "#0f0" // green — excellent
+        } else if stats.rtt_ms < 50.0 {
+            "#ff0" // yellow — ok
+        } else {
+            "#f00" // red — poor
+        };
+        el.set_inner_html(&format!(
+            "<span style='color:{color}'>●</span> {:.0} FPS | {:.1}ms RTT | {:.0} KB/s | enc {:.1}ms",
+            stats.fps, stats.rtt_ms, stats.bandwidth_kbps, stats.encode_ms
+        ));
     }
 }
 
