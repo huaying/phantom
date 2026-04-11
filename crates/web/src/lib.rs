@@ -761,6 +761,28 @@ fn setup_input(
             if code == "MetaLeft" || code == "MetaRight" {
                 return;
             }
+            // F11: toggle browser fullscreen
+            if pressed && code == "F11" {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    let is_fullscreen = doc.fullscreen_element().is_some();
+                    if is_fullscreen {
+                        doc.exit_fullscreen();
+                    } else if let Some(el) = doc.document_element() {
+                        let _ = el.request_fullscreen();
+                    }
+                }
+                return; // Don't forward F11 to remote
+            }
+            // Ctrl+Shift+S: toggle stats overlay visibility
+            if pressed && code == "KeyS" && e.ctrl_key() && e.shift_key() {
+                if let Some(el) = get_or_create_stats_overlay() {
+                    let current = el.style().get_property_value("display").unwrap_or_default();
+                    let _ = el
+                        .style()
+                        .set_property("display", if current == "none" { "" } else { "none" });
+                }
+                return; // Don't forward to remote
+            }
             // Paste
             if pressed && code == "KeyV" && (e.ctrl_key() || e.meta_key()) {
                 if let Some(w) = web_sys::window() {
