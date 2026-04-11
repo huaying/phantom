@@ -1,3 +1,10 @@
+//! Phantom remote desktop client (native, using winit + wgpu).
+//!
+//! Connects to a Phantom server via TCP or QUIC, decodes H.264 video,
+//! renders to a window, and forwards keyboard/mouse input back to the
+//! server. Supports encrypted connections, audio playback, clipboard
+//! sync, and bidirectional file transfer.
+
 #[cfg(feature = "audio")]
 mod audio_playback;
 mod decode_h264;

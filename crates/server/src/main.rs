@@ -1,3 +1,10 @@
+//! Phantom remote desktop server.
+//!
+//! Captures the screen (via scrap, NVFBC, PipeWire, or DXGI), encodes it
+//! (OpenH264 or NVENC), and streams to connected clients over TCP, QUIC,
+//! WebSocket, or WebRTC. Supports encrypted connections, audio capture,
+//! bidirectional file transfer, and clipboard synchronization.
+
 #[cfg(feature = "audio")]
 mod audio_capture;
 #[cfg(feature = "wayland")]

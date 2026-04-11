@@ -1,3 +1,10 @@
+//! Phantom remote desktop client for the browser (WebAssembly).
+//!
+//! Runs in a web page, connecting to the server via WebSocket or WebRTC
+//! DataChannel. Decodes H.264 video using the browser's WebCodecs API
+//! and renders to an HTML5 canvas. Sends keyboard/mouse input back to
+//! the server and supports clipboard paste.
+
 use phantom_core::encode::{TileEncoding, VideoCodec};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 use phantom_core::protocol::Message;
