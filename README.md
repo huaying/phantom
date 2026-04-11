@@ -11,7 +11,7 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 - **Multi-monitor** — `--display N` to select monitor, `--list-displays` to enumerate
 - **Hardware auto-detect** — `--encoder auto` probes GPU and picks best encoder/capture
 - **Multi-transport** — `--transport tcp,web` serves TCP and HTTPS/WebSocket simultaneously
-- **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264 decode
+- **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264 decode + Opus audio
 - **Native client** — winit + softbuffer with local cursor rendering
 - **QUIC/UDP transport** — for native client, no head-of-line blocking
 - **Encrypted by default** — ChaCha20-Poly1305 (TCP) or TLS (QUIC) or DTLS (WebRTC)

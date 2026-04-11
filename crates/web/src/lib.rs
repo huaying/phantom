@@ -35,6 +35,35 @@ extern "C" {
     type JsEncodedVideoChunk;
     #[wasm_bindgen(constructor, js_class = "EncodedVideoChunk")]
     fn new(init: &JsValue) -> JsEncodedVideoChunk;
+
+    // -- WebCodecs AudioDecoder bindings --
+    #[wasm_bindgen(js_name = AudioDecoder)]
+    type JsAudioDecoder;
+    #[wasm_bindgen(constructor, js_class = "AudioDecoder")]
+    fn new(init: &JsValue) -> JsAudioDecoder;
+    #[wasm_bindgen(method, js_class = "AudioDecoder")]
+    fn configure(this: &JsAudioDecoder, config: &JsValue);
+    #[wasm_bindgen(method, js_class = "AudioDecoder")]
+    fn decode(this: &JsAudioDecoder, chunk: &JsValue);
+
+    #[wasm_bindgen(js_name = EncodedAudioChunk)]
+    type JsEncodedAudioChunk;
+    #[wasm_bindgen(constructor, js_class = "EncodedAudioChunk")]
+    fn new(init: &JsValue) -> JsEncodedAudioChunk;
+
+    // AudioData from WebCodecs output callback
+    #[wasm_bindgen(js_name = AudioData)]
+    type JsAudioData;
+    #[wasm_bindgen(method, getter, js_class = "AudioData")]
+    fn numberOfChannels(this: &JsAudioData) -> u32;
+    #[wasm_bindgen(method, getter, js_class = "AudioData")]
+    fn numberOfFrames(this: &JsAudioData) -> u32;
+    #[wasm_bindgen(method, getter, js_class = "AudioData")]
+    fn sampleRate(this: &JsAudioData) -> f32;
+    #[wasm_bindgen(method, js_class = "AudioData")]
+    fn copyTo(this: &JsAudioData, dest: &JsValue, options: &JsValue);
+    #[wasm_bindgen(method, js_class = "AudioData")]
+    fn close(this: &JsAudioData);
 }
 
 /// Reassembles chunked DataChannel messages.
@@ -109,6 +138,12 @@ struct AppState {
     send_ws: Option<WebSocket>,
     /// Latest stats from server (for overlay display).
     last_stats: Option<StatsSnapshot>,
+    /// WebCodecs audio decoder (if server sends audio).
+    audio_decoder: Option<JsAudioDecoder>,
+    /// Web Audio API context for playback.
+    audio_ctx: Option<web_sys::AudioContext>,
+    /// Timestamp counter for audio chunks (in microseconds).
+    audio_timestamp_us: i64,
 }
 
 /// Snapshot of the most recent Stats message from the server.
@@ -164,6 +199,9 @@ pub fn main() {
         send_dc: None,
         send_ws: None,
         last_stats: None,
+        audio_decoder: None,
+        audio_ctx: None,
+        audio_timestamp_us: 0,
     }));
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -444,6 +482,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             width,
             height,
             protocol_version,
+            audio,
             ..
         } => {
             if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
@@ -469,6 +508,9 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             s.canvas.set_height(height);
             drop(s);
             setup_decoder(state, width, height);
+            if audio {
+                setup_audio(state);
+            }
         }
         Message::VideoFrame { sequence, frame } => {
             if frame.codec != VideoCodec::H264 || frame.data.is_empty() {
@@ -579,6 +621,30 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             // Clipboard write requires document focus and secure context.
             // Silently ignore — don't let it crash the message handler.
         }
+        Message::AudioFrame { data, .. } => {
+            let mut s = state.borrow_mut();
+            if s.audio_decoder.is_none() {
+                return;
+            }
+            // Resume AudioContext if suspended (browsers require user gesture)
+            if let Some(ref ctx) = s.audio_ctx {
+                if ctx.state() == web_sys::AudioContextState::Suspended {
+                    let _ = ctx.resume();
+                }
+            }
+
+            let timestamp = s.audio_timestamp_us;
+            s.audio_timestamp_us += 20_000; // 20ms per Opus frame
+
+            // Create EncodedAudioChunk from the Opus data
+            let js_data = js_sys::Uint8Array::from(data.as_slice());
+            let init = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&init, &"type".into(), &"key".into());
+            let _ = js_sys::Reflect::set(&init, &"timestamp".into(), &(timestamp as f64).into());
+            let _ = js_sys::Reflect::set(&init, &"data".into(), &js_data.buffer());
+            let chunk = JsEncodedAudioChunk::new(&init);
+            s.audio_decoder.as_ref().unwrap().decode(&chunk);
+        }
         Message::Ping => {
             let s = state.borrow();
             send_message(&s, &Message::Pong);
@@ -671,6 +737,95 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
     console::log_1(&"H.264 decoder ready".into());
     output_cb.forget();
     error_cb.forget();
+}
+
+// -- Audio --
+
+/// Initialize WebCodecs AudioDecoder + Web Audio API for Opus playback.
+fn setup_audio(state: &Rc<RefCell<AppState>>) {
+    // Create AudioContext (may need user gesture to resume on some browsers)
+    let audio_ctx = match web_sys::AudioContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            console::warn_1(&format!("AudioContext creation failed: {e:?}").into());
+            return;
+        }
+    };
+
+    // AudioDecoder output callback: decoded AudioData → AudioBuffer → play
+    let ctx_clone = audio_ctx.clone();
+    let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |output: JsValue| {
+        let audio_data: JsAudioData = output.unchecked_into();
+        let channels = audio_data.numberOfChannels();
+        let frames = audio_data.numberOfFrames();
+        let sample_rate = audio_data.sampleRate();
+
+        if frames == 0 || channels == 0 {
+            audio_data.close();
+            return;
+        }
+
+        // Copy decoded PCM (f32 planar) into an AudioBuffer
+        let buffer = match ctx_clone.create_buffer(channels, frames, sample_rate) {
+            Ok(b) => b,
+            Err(_) => {
+                audio_data.close();
+                return;
+            }
+        };
+
+        // Copy each channel
+        for ch in 0..channels {
+            let channel_data = js_sys::Float32Array::new_with_length(frames);
+            let opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts, &"planeIndex".into(), &ch.into());
+            let _ = js_sys::Reflect::set(&opts, &"format".into(), &"f32-planar".into());
+            audio_data.copyTo(&channel_data, &opts);
+
+            if let Ok(mut buf_data) = buffer.get_channel_data(ch) {
+                let src: Vec<f32> = channel_data.to_vec();
+                let len = buf_data.len().min(src.len());
+                buf_data[..len].copy_from_slice(&src[..len]);
+                let _ = buffer.copy_to_channel(&buf_data, ch as i32);
+            }
+        }
+        audio_data.close();
+
+        // Play the buffer immediately via a BufferSourceNode
+        if let Ok(source) = ctx_clone.create_buffer_source() {
+            source.set_buffer(Some(&buffer));
+            let dest = ctx_clone.destination();
+            let _ = source.connect_with_audio_node(&dest);
+            let _ = source.start();
+        }
+    });
+
+    let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
+        console::warn_1(&format!("AudioDecoder error: {e:?}").into());
+    });
+
+    let init = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&init, &"output".into(), output_cb.as_ref());
+    let _ = js_sys::Reflect::set(&init, &"error".into(), error_cb.as_ref());
+    let audio_decoder = JsAudioDecoder::new(&init);
+
+    // Configure for Opus 48kHz stereo
+    let config = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&config, &"codec".into(), &"opus".into());
+    let _ = js_sys::Reflect::set(&config, &"sampleRate".into(), &48000.into());
+    let _ = js_sys::Reflect::set(&config, &"numberOfChannels".into(), &2.into());
+    audio_decoder.configure(&config);
+
+    {
+        let mut s = state.borrow_mut();
+        s.audio_decoder = Some(audio_decoder);
+        s.audio_ctx = Some(audio_ctx);
+    }
+
+    output_cb.forget();
+    error_cb.forget();
+
+    console::log_1(&"Audio playback initialized (Opus 48kHz stereo)".into());
 }
 
 // -- Input --

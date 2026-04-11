@@ -37,4 +37,9 @@ features = [
     "RtcPeerConnectionIceEvent", "RtcIceCandidate", "RtcIceCandidateInit",
     # Fetch API (for POST /rtc)
     "Headers", "Request", "RequestInit", "Response",
+    # Web Audio API
+    "AudioContext", "AudioContextState", "AudioContextOptions",
+    "AudioBuffer", "AudioBufferSourceNode",
+    "AudioDestinationNode", "AudioNode",
+    "BaseAudioContext",
 ]
