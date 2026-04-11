@@ -21,6 +21,7 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 - **Auto-reconnect** — exponential backoff (native client)
 - **HTTP keep-alive + connection pool** — reuses TLS connections, bounded thread pool (16 max)
 - **SIMD color conversion** — AVX2-accelerated BGRA↔YUV (2.8–3.4x faster than scalar)
+- **Connection quality stats** — RTT, FPS, bandwidth, encode time reported to client every 5s
 - **Wayland capture** — PipeWire + XDG Desktop Portal (compile-tested)
 - **WAN tested** — verified under simulated latency (0–300ms RTT), jitter, and session replacement
 - **Windows + Linux** — DXGI (Windows) / X11 (Linux) capture, auto-start support
@@ -189,7 +190,7 @@ cargo build --release --features webrtc
 # Build WASM web client (pre-built pkg checked into repo)
 wasm-pack build crates/web --target web --no-typescript
 
-# Run tests (91 tests: unit, integration, E2E, WAN simulation)
+# Run tests (94 tests: unit, integration, E2E, WAN simulation)
 cargo test --features audio
 ```
 
