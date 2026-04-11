@@ -777,3 +777,83 @@ fn hide_remote_cursor() {
         tracing::debug!("remote cursor hiding not implemented for this OS");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_state_initial_motion() {
+        let qs = QualityState::new(Duration::from_secs(2));
+        // Just created — should not send lossless yet (delay not elapsed)
+        assert!(!qs.should_send_lossless());
+    }
+
+    #[test]
+    fn quality_state_sends_lossless_after_idle() {
+        let mut qs = QualityState::new(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(qs.should_send_lossless());
+        qs.mark_lossless_sent();
+        assert!(!qs.should_send_lossless());
+    }
+
+    #[test]
+    fn quality_state_resets_on_motion() {
+        let mut qs = QualityState::new(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(qs.should_send_lossless());
+        qs.on_motion();
+        assert!(!qs.should_send_lossless());
+    }
+
+    #[test]
+    fn congestion_no_skip_initially() {
+        let mut ct = CongestionTracker::new(Duration::from_millis(33));
+        // First several frames should not be skipped
+        for _ in 0..10 {
+            assert!(!ct.should_skip_frame());
+        }
+    }
+
+    #[test]
+    fn congestion_skips_after_slow_frames() {
+        let mut ct = CongestionTracker::new(Duration::from_millis(33));
+        // Simulate 4 slow frames (>2x frame interval)
+        for _ in 0..4 {
+            ct.on_frame_sent(Duration::from_millis(80));
+        }
+        // After 4 slow frames, skip_ratio should be 2
+        assert_eq!(ct.skip_ratio, 2);
+        // Should skip every other frame
+        let skipped: usize = (0..10)
+            .filter(|_| ct.should_skip_frame())
+            .count();
+        assert!(skipped > 0, "should skip some frames under congestion");
+    }
+
+    #[test]
+    fn congestion_recovers_after_fast_frames() {
+        let mut ct = CongestionTracker::new(Duration::from_millis(33));
+        // First enter congestion
+        for _ in 0..4 {
+            ct.on_frame_sent(Duration::from_millis(80));
+        }
+        assert!(ct.skip_ratio > 1);
+        // Then recover
+        for _ in 0..10 {
+            ct.on_frame_sent(Duration::from_millis(5));
+        }
+        assert_eq!(ct.skip_ratio, 1);
+    }
+
+    #[test]
+    fn congestion_caps_at_4() {
+        let mut ct = CongestionTracker::new(Duration::from_millis(33));
+        // Spam many slow frames
+        for _ in 0..100 {
+            ct.on_frame_sent(Duration::from_millis(200));
+        }
+        assert_eq!(ct.skip_ratio, 4, "skip_ratio should cap at 4");
+    }
+}
