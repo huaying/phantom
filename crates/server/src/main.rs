@@ -52,8 +52,8 @@ struct Args {
     #[arg(long, default_value = "auto")]
     encoder: String,
 
-    /// Video codec: h264 (default), av1 (requires NVENC 8th gen+).
-    #[arg(long, default_value = "h264")]
+    /// Video codec: auto (default, uses AV1 if GPU supports it), h264, av1.
+    #[arg(long, default_value = "auto")]
     codec: String,
 
     /// Screen capture: auto (default, probes GPU/Wayland), scrap (CPU/X11), nvfbc (NVIDIA GPU), pipewire (Wayland).
@@ -206,6 +206,14 @@ fn main() -> Result<()> {
     }
 
     let video_codec = match args.codec.as_str() {
+        "auto" => {
+            let codec_name = gpu_probe.best_codec();
+            tracing::info!(codec = codec_name, "auto-detected video codec");
+            match codec_name {
+                "av1" => VideoCodec::Av1,
+                _ => VideoCodec::H264,
+            }
+        }
         "h264" | "H264" | "h.264" => VideoCodec::H264,
         "av1" | "AV1" => {
             if encoder_name != "nvenc" {
@@ -213,7 +221,7 @@ fn main() -> Result<()> {
             }
             VideoCodec::Av1
         }
-        other => anyhow::bail!("unknown codec: {other} (supported: h264, av1)"),
+        other => anyhow::bail!("unknown codec: {other} (supported: auto, h264, av1)"),
     };
 
     tracing::info!(encoder = %encoder_name, capture = %capture_name, codec = ?video_codec, display = args.display, "configuration resolved");

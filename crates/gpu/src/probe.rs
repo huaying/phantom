@@ -10,6 +10,8 @@ use tracing::{info, warn};
 pub struct GpuProbeResult {
     pub has_cuda: bool,
     pub has_nvenc: bool,
+    /// Whether NVENC supports AV1 encoding (Ada Lovelace / 8th gen+).
+    pub has_av1: bool,
     #[cfg(target_os = "linux")]
     pub has_nvfbc: bool,
     #[cfg(target_os = "windows")]
@@ -24,6 +26,16 @@ impl GpuProbeResult {
             "nvenc"
         } else {
             "openh264"
+        }
+    }
+
+    /// Best video codec based on GPU capabilities.
+    /// Prefers AV1 (better compression) when available, falls back to H.264.
+    pub fn best_codec(&self) -> &'static str {
+        if self.has_av1 {
+            "av1"
+        } else {
+            "h264"
         }
     }
 
@@ -57,6 +69,7 @@ pub fn probe() -> GpuProbeResult {
     let mut result = GpuProbeResult {
         has_cuda: false,
         has_nvenc: false,
+        has_av1: false,
         #[cfg(target_os = "linux")]
         has_nvfbc: false,
         #[cfg(target_os = "windows")]
@@ -81,6 +94,11 @@ pub fn probe() -> GpuProbeResult {
 
     // Try loading NVENC
     result.has_nvenc = probe_nvenc();
+
+    // Check AV1 support (Ada Lovelace / 8th gen NVENC and newer)
+    if result.has_nvenc {
+        result.has_av1 = probe_av1_support(result.gpu_name.as_deref());
+    }
 
     // Try loading capture backend
     #[cfg(target_os = "linux")]
@@ -149,6 +167,71 @@ fn probe_dxgi() -> bool {
             false
         }
     }
+}
+
+/// Check if the GPU supports AV1 encoding via NVENC.
+///
+/// Ada Lovelace (RTX 40xx, L40, L4) and newer GPUs have 8th gen NVENC
+/// which supports AV1. We detect by GPU name heuristic first, then
+/// try to actually initialize an AV1 encoder session as confirmation.
+fn probe_av1_support(gpu_name: Option<&str>) -> bool {
+    let name = match gpu_name {
+        Some(n) => n.to_uppercase(),
+        None => return false,
+    };
+
+    // Ada Lovelace (40xx series, L40, L4) and Blackwell (50xx, B200)
+    let likely_av1 = name.contains("RTX 40")
+        || name.contains("RTX 50")
+        || name.contains(" L40")
+        || name.contains(" L4 ")
+        || name.contains(" L4\0")
+        || name.ends_with(" L4")
+        || name.contains("B200")
+        || name.contains("B100")
+        || name.contains("H100") // Hopper has AV1 NVENC too
+        || name.contains("H200");
+
+    if !likely_av1 {
+        info!(gpu = gpu_name, "GPU does not appear to support AV1 NVENC");
+        return false;
+    }
+
+    // Confirm by trying to open an NVENC session with AV1 codec
+    match try_av1_encoder() {
+        true => {
+            info!("AV1 NVENC encoding confirmed available");
+            true
+        }
+        false => {
+            warn!(
+                gpu = gpu_name,
+                "GPU name suggests AV1 but encoder init failed"
+            );
+            false
+        }
+    }
+}
+
+/// Try to create a minimal NVENC AV1 encoder session.
+/// Returns true if successful, false otherwise.
+fn try_av1_encoder() -> bool {
+    use std::sync::Arc;
+    let cuda = match crate::cuda::CudaLib::load() {
+        Ok(c) => Arc::new(c),
+        Err(_) => return false,
+    };
+    // Try creating a tiny AV1 encoder (will fail fast if not supported)
+    crate::nvenc::NvencEncoder::new(
+        cuda,
+        0,
+        320,
+        240,
+        30,
+        1000,
+        phantom_core::encode::VideoCodec::Av1,
+    )
+    .is_ok()
 }
 
 /// Try to get the GPU device name via cuDeviceGetName.
