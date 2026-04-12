@@ -42,6 +42,12 @@ impl QuicServerTransport {
         })
     }
 
+    /// Get the local address this transport is bound to.
+    #[allow(dead_code)]
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint.local_addr().context("get local addr")
+    }
+
     /// Accept a connection, return (sender, receiver) on separate streams.
     pub fn accept(&self) -> Result<(QuicSender, QuicReceiver)> {
         let rt = self.rt.clone();
