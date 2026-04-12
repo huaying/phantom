@@ -2521,6 +2521,7 @@ dependencies = [
  "dav1d",
  "openh264",
  "phantom-core",
+ "phantom-gpu",
  "quinn",
  "rustls",
  "scrap",

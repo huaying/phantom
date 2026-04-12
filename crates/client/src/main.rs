@@ -63,6 +63,26 @@ struct Args {
     send_file: Option<String>,
 }
 
+/// Try to create an NVDEC hardware decoder. Returns None if unavailable.
+#[cfg(not(target_os = "macos"))]
+fn try_nvdec(
+    width: u32,
+    height: u32,
+    codec: phantom_core::encode::VideoCodec,
+) -> Option<Box<dyn phantom_core::encode::FrameDecoder>> {
+    let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load().ok()?);
+    match phantom_gpu::nvdec::NvdecDecoder::new(cuda, 0, width, height, codec) {
+        Ok(d) => {
+            tracing::info!("using NVDEC hardware decoder");
+            Some(Box::new(d))
+        }
+        Err(e) => {
+            tracing::debug!("NVDEC not available: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -304,28 +324,31 @@ impl App {
                 }
             }
             #[cfg(not(target_os = "macos"))]
-            match decode_h264::OpenH264Decoder::new(width, height) {
-                Ok(d) => Box::new(d),
-                Err(e) => {
-                    tracing::error!("decoder init failed: {e}");
-                    return;
+            {
+                // Try NVDEC first (GPU hardware decode — handles both H.264 and AV1)
+                if let Some(decoder) = try_nvdec(width, height, video_codec) {
+                    decoder
+                } else if video_codec == phantom_core::encode::VideoCodec::Av1 {
+                    // AV1 software fallback: dav1d
+                    match decode_av1::Dav1dDecoder::new(width, height) {
+                        Ok(d) => Box::new(d),
+                        Err(e) => {
+                            tracing::error!("AV1 decoder init failed: {e}");
+                            return;
+                        }
+                    }
+                } else {
+                    // H.264 software fallback: OpenH264
+                    match decode_h264::OpenH264Decoder::new(width, height) {
+                        Ok(d) => Box::new(d),
+                        Err(e) => {
+                            tracing::error!("decoder init failed: {e}");
+                            return;
+                        }
+                    }
                 }
             }
         };
-
-        // If server uses AV1, replace decoder with dav1d
-        let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> =
-            if video_codec == phantom_core::encode::VideoCodec::Av1 {
-                match decode_av1::Dav1dDecoder::new(width, height) {
-                    Ok(d) => Box::new(d),
-                    Err(e) => {
-                        tracing::error!("AV1 decoder init failed: {e}");
-                        return;
-                    }
-                }
-            } else {
-                h264_decoder
-            };
 
         let connected = Arc::new(AtomicBool::new(true));
         let server_kicked = Arc::new(AtomicBool::new(false));

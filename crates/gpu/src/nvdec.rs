@@ -1,9 +1,14 @@
 //! NVDEC hardware video decoder via CUVID API.
 //!
-//! Uses cuvidCreateVideoParser for bitstream parsing and cuvidCreateDecoder
-//! for hardware-accelerated decode. Output is NV12 in GPU memory, converted
-//! to RGB32 on the CPU for display.
+//! Architecture:
+//! 1. `cuvidCreateVideoParser` — parses H.264/AV1 bitstream, calls back for each picture
+//! 2. Parser callbacks invoke `cuvidDecodePicture` and `cuvidMapVideoFrame`
+//! 3. Decoded NV12 frames are copied from GPU → CPU and converted to RGB32
+//!
+//! The parser callback approach is required because CUVID handles all NAL/OBU
+//! parsing, reference frame management, and DPB internally.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -13,192 +18,335 @@ use crate::cuda::CudaLib;
 use crate::dl::DynLib;
 use crate::sys::*;
 
-// ── CUVID types ─────────────────────────────────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────────
 
-pub type CUvideodecoder = *mut c_void;
-pub type CUvideoparser = *mut c_void;
+const CUDA_VIDEO_CODEC_H264: i32 = 4;
+const CUDA_VIDEO_CODEC_AV1: i32 = 11;
+const CUDA_VIDEO_SURFACE_FORMAT_NV12: i32 = 0;
+const CUDA_VIDEO_CHROMA_FORMAT_420: i32 = 1;
+const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
+const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 4;
+const CUVID_PKT_TIMESTAMP: u32 = 0x02;
 
-/// cudaVideoCodec enum values
-pub const CUDA_VIDEO_CODEC_H264: u32 = 4;
-pub const CUDA_VIDEO_CODEC_AV1: u32 = 11;
+type CUvideodecoder = *mut c_void;
+type CUvideoparser = *mut c_void;
 
-/// cudaVideoSurfaceFormat
-pub const CUDA_VIDEO_SURFACE_FORMAT_NV12: u32 = 0;
+// ── CUVID struct layouts (64-bit Linux) ─────────────────────────────────────
+//
+// These match the NVIDIA Video Codec SDK 12.x headers.
+// We use opaque byte arrays with accessor methods to avoid layout mismatches.
 
-/// cudaVideoChromaFormat
-pub const CUDA_VIDEO_CHROMA_FORMAT_420: u32 = 1;
-
-/// cudaVideoDeinterlaceMode
-pub const CUDA_VIDEO_DEINTERLACE_WEAVE: u32 = 0;
-
-/// cudaVideoCreateFlags
-pub const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 4;
-
-// ── CUVIDDECODECREATEINFO (size: 304 bytes on 64-bit) ───────────────────────
-// Offsets verified against Video Codec SDK 12.1 header.
-
+/// CUVIDDECODECREATEINFO — passed to cuvidCreateDecoder.
+/// Size: 304 bytes on x86_64 Linux.
 #[repr(C)]
-#[derive(Clone)]
-pub struct CuvidDecodeCreateInfo {
-    pub coded_width: u64,            // 0
-    pub coded_height: u64,           // 8
-    pub num_decode_surfaces: u64,    // 16
-    pub codec_type: u32,             // 24
-    pub chroma_format: u32,          // 28
-    pub output_format: u32,          // 32
-    pub deinterlace_mode: u32,       // 36
-    pub bitrate: u64,                // 40
-    pub display_area_left: u32,      // 48
-    pub display_area_top: u32,       // 52
-    pub display_area_right: u32,     // 56
-    pub display_area_bottom: u32,    // 60
-    pub target_width: u64,           // 64
-    pub target_height: u64,          // 72
-    pub num_output_surfaces: u64,    // 80
-    pub video_lock: *mut c_void,     // 88
-    pub create_flags: u32,           // 96
-    pub reserved_padding: [u8; 204], // 100..304
+struct DecodeCreateInfo {
+    data: [u8; 304],
 }
 
-impl CuvidDecodeCreateInfo {
-    pub fn zeroed() -> Self {
-        unsafe { std::mem::zeroed() }
+impl DecodeCreateInfo {
+    fn zeroed() -> Self {
+        Self { data: [0u8; 304] }
+    }
+    fn write_u32(&mut self, offset: usize, val: u32) {
+        self.data[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
+    }
+    fn write_u64(&mut self, offset: usize, val: u64) {
+        self.data[offset..offset + 8].copy_from_slice(&val.to_ne_bytes());
+    }
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.data.as_mut_ptr() as *mut c_void
+    }
+
+    // Field setters matching the C struct layout:
+    // unsigned long ulWidth (8 bytes on LP64)
+    fn set_coded_width(&mut self, v: u32) {
+        self.write_u64(0, v as u64);
+    }
+    fn set_coded_height(&mut self, v: u32) {
+        self.write_u64(8, v as u64);
+    }
+    fn set_num_decode_surfaces(&mut self, v: u32) {
+        self.write_u64(16, v as u64);
+    }
+    fn set_codec_type(&mut self, v: i32) {
+        self.write_u32(24, v as u32);
+    }
+    fn set_chroma_format(&mut self, v: i32) {
+        self.write_u32(28, v as u32);
+    }
+    fn set_output_format(&mut self, v: i32) {
+        self.write_u32(32, v as u32);
+    }
+    fn set_deinterlace_mode(&mut self, v: i32) {
+        self.write_u32(36, v as u32);
+    }
+    // ulTargetWidth/Height at offset 64, 72
+    fn set_target_width(&mut self, v: u32) {
+        self.write_u64(64, v as u64);
+    }
+    fn set_target_height(&mut self, v: u32) {
+        self.write_u64(72, v as u64);
+    }
+    // ulNumOutputSurfaces at offset 80
+    fn set_num_output_surfaces(&mut self, v: u32) {
+        self.write_u64(80, v as u64);
+    }
+    // ulCreationFlags at offset 96
+    fn set_create_flags(&mut self, v: u32) {
+        self.write_u32(96, v);
+    }
+    // display_area: left(48), top(52), right(56), bottom(60) — all u32 (short in C but padded)
+    fn set_display_area(&mut self, right: u32, bottom: u32) {
+        self.write_u32(48, 0); // left
+        self.write_u32(52, 0); // top
+        self.write_u32(56, right);
+        self.write_u32(60, bottom);
     }
 }
 
-// ── CUVIDPICPARAMS (simplified — we use the parser which fills this) ────────
-
-/// Opaque picture params — the parser fills these for us.
+/// CUVIDPARSERPARAMS — passed to cuvidCreateVideoParser.
+/// Size: ~200 bytes. We use 256 to be safe.
 #[repr(C)]
-pub struct CuvidPicParams {
-    pub data: [u8; 1024], // oversized to be safe
+struct ParserParams {
+    data: [u8; 256],
 }
 
-impl CuvidPicParams {
-    pub fn zeroed() -> Self {
-        Self { data: [0u8; 1024] }
+impl ParserParams {
+    fn zeroed() -> Self {
+        Self { data: [0u8; 256] }
+    }
+    fn write_u32(&mut self, offset: usize, val: u32) {
+        self.data[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
+    }
+    fn write_ptr(&mut self, offset: usize, ptr: *mut c_void) {
+        let bytes = (ptr as u64).to_ne_bytes();
+        self.data[offset..offset + 8].copy_from_slice(&bytes);
+    }
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.data.as_mut_ptr() as *mut c_void
+    }
+
+    // Layout:
+    // 0: CodecType (i32)
+    // 4: ulMaxNumDecodeSurfaces (u32)
+    // 8: ulClockRate (u32)
+    // 12: ulErrorThreshold (u32)
+    // 16: ulMaxDisplayDelay (u32)
+    // 20: reserved (u32)
+    // 24: reserved[4] (16 bytes)
+    // 40: pUserData (ptr, 8 bytes)
+    // 48: pfnSequenceCallback (fn ptr, 8 bytes)
+    // 56: pfnDecodePicture (fn ptr, 8 bytes)
+    // 64: pfnDisplayPicture (fn ptr, 8 bytes)
+    fn set_codec_type(&mut self, v: i32) {
+        self.write_u32(0, v as u32);
+    }
+    fn set_max_num_decode_surfaces(&mut self, v: u32) {
+        self.write_u32(4, v);
+    }
+    fn set_max_display_delay(&mut self, v: u32) {
+        self.write_u32(16, v);
+    }
+    fn set_user_data(&mut self, ptr: *mut c_void) {
+        self.write_ptr(40, ptr);
+    }
+    fn set_sequence_callback(&mut self, f: usize) {
+        self.write_ptr(48, f as *mut c_void);
+    }
+    fn set_decode_callback(&mut self, f: usize) {
+        self.write_ptr(56, f as *mut c_void);
+    }
+    fn set_display_callback(&mut self, f: usize) {
+        self.write_ptr(64, f as *mut c_void);
     }
 }
 
-// ── CUVIDPARSERPARAMS ───────────────────────────────────────────────────────
-
+/// CUVIDSOURCEDATAPACKET — feed compressed data to parser.
 #[repr(C)]
-pub struct CuvidParserParams {
-    pub codec_type: u32,
-    pub max_num_decode_surfaces: u32,
-    pub clock_rate: u32,
-    pub error_threshold: u32,
-    pub max_display_delay: u32,
-    pub reserved_flags: u32,
-    pub reserved1: [u32; 4],
-    pub user_data: *mut c_void,
-    pub pfn_sequence_callback: Option<extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    pub pfn_decode_picture: Option<extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    pub pfn_display_picture: Option<extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    pub reserved2: [*mut c_void; 7],
+struct SourceDataPacket {
+    flags: u32,
+    payload_size: u32,
+    payload: *const u8,
+    timestamp: i64,
 }
 
-impl CuvidParserParams {
-    pub fn zeroed() -> Self {
-        unsafe { std::mem::zeroed() }
+/// CUVIDPROCPARAMS — for cuvidMapVideoFrame.
+#[repr(C)]
+struct ProcParams {
+    data: [u8; 256],
+}
+impl ProcParams {
+    fn zeroed() -> Self {
+        Self { data: [0u8; 256] }
+    }
+    fn set_progressive_frame(&mut self, v: i32) {
+        self.data[0..4].copy_from_slice(&v.to_ne_bytes());
+    }
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.data.as_mut_ptr() as *mut c_void
     }
 }
 
-// ── CUVIDPARSERDISPINFO ─────────────────────────────────────────────────────
-
+/// CUVIDPARSERDISP INFO — from display callback, offset 0: picture_index(i32)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct CuvidParserDispInfo {
-    pub picture_index: i32,
-    pub progressive_frame: i32,
-    pub top_field_first: i32,
-    pub repeat_first_field: i32,
-    pub timestamp: i64,
-}
-
-// ── CUVIDSOURCEDATAPACKET ───────────────────────────────────────────────────
-
-#[repr(C)]
-pub struct CuvidSourceDataPacket {
-    pub flags: u32,
-    pub payload_size: u32,
-    pub payload: *const u8,
-    pub timestamp: i64,
-}
-
-pub const CUVID_PKT_ENDOFSTREAM: u32 = 0x01;
-pub const CUVID_PKT_TIMESTAMP: u32 = 0x02;
-
-// ── CUVIDPROCPARAMS ─────────────────────────────────────────────────────────
-
-#[repr(C)]
-pub struct CuvidProcParams {
-    pub progressive_frame: i32,
-    pub second_field: i32,
-    pub top_field_first: i32,
-    pub unpaired_field: i32,
-    pub reserved_flags: u32,
-    pub reserved_zero: u32,
-    pub raw_input_dptr: u64,
-    pub raw_input_pitch: u32,
-    pub raw_input_format: u32,
-    pub raw_output_dptr: u64,
-    pub raw_output_pitch: u32,
-    pub reserved1: [u32; 48],
-}
-
-impl CuvidProcParams {
-    pub fn zeroed() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
+struct DispInfo {
+    picture_index: i32,
+    progressive_frame: i32,
+    top_field_first: i32,
+    repeat_first_field: i32,
+    timestamp: i64,
 }
 
 // ── Function pointer types ──────────────────────────────────────────────────
 
-type FnCuvidCreateDecoder =
-    unsafe extern "C" fn(*mut CUvideodecoder, *mut CuvidDecodeCreateInfo) -> CUresult;
-type FnCuvidDestroyDecoder = unsafe extern "C" fn(CUvideodecoder) -> CUresult;
-type FnCuvidDecodePicture = unsafe extern "C" fn(CUvideodecoder, *mut c_void) -> CUresult;
-type FnCuvidMapVideoFrame =
-    unsafe extern "C" fn(CUvideodecoder, i32, *mut u64, *mut u32, *mut CuvidProcParams) -> CUresult;
-type FnCuvidUnmapVideoFrame = unsafe extern "C" fn(CUvideodecoder, u64) -> CUresult;
-type FnCuvidCreateVideoParser =
-    unsafe extern "C" fn(*mut CUvideoparser, *mut CuvidParserParams) -> CUresult;
-type FnCuvidDestroyVideoParser = unsafe extern "C" fn(CUvideoparser) -> CUresult;
-type FnCuvidParseVideoData =
-    unsafe extern "C" fn(CUvideoparser, *mut CuvidSourceDataPacket) -> CUresult;
+type FnCreateDecoder = unsafe extern "C" fn(*mut CUvideodecoder, *mut c_void) -> i32;
+type FnDestroyDecoder = unsafe extern "C" fn(CUvideodecoder) -> i32;
+type FnDecodePicture = unsafe extern "C" fn(CUvideodecoder, *const c_void) -> i32;
+type FnMapVideoFrame =
+    unsafe extern "C" fn(CUvideodecoder, i32, *mut u64, *mut u32, *mut c_void) -> i32;
+type FnUnmapVideoFrame = unsafe extern "C" fn(CUvideodecoder, u64) -> i32;
+type FnCreateParser = unsafe extern "C" fn(*mut CUvideoparser, *mut c_void) -> i32;
+type FnDestroyParser = unsafe extern "C" fn(CUvideoparser) -> i32;
+type FnParseVideoData = unsafe extern "C" fn(CUvideoparser, *const SourceDataPacket) -> i32;
+
+// ── Shared state for parser callbacks ───────────────────────────────────────
+
+struct CallbackState {
+    decoder: CUvideodecoder,
+    cuda: Arc<CudaLib>,
+    #[allow(dead_code)]
+    ctx: CUcontext,
+    width: u32,
+    height: u32,
+    fn_decode_picture: FnDecodePicture,
+    fn_map_video_frame: FnMapVideoFrame,
+    fn_unmap_video_frame: FnUnmapVideoFrame,
+    /// Decoded RGB32 frames ready for consumption.
+    output_queue: VecDeque<Vec<u32>>,
+}
+
+// ── Parser callbacks (extern "C") ───────────────────────────────────────────
+//
+// These are called by cuvidParseVideoData. `user_data` points to CallbackState.
+
+/// Sequence callback — called when parser detects stream parameters.
+/// Return the number of decode surfaces to allocate.
+extern "C" fn on_sequence(user_data: *mut c_void, _format: *mut c_void) -> i32 {
+    let _ = user_data;
+    // Return number of decode surfaces (must match what we created the decoder with)
+    8
+}
+
+/// Decode callback — called for each picture to decode.
+extern "C" fn on_decode(user_data: *mut c_void, pic_params: *mut c_void) -> i32 {
+    let state = unsafe { &*(user_data as *const CallbackState) };
+    let status = unsafe { (state.fn_decode_picture)(state.decoder, pic_params) };
+    if status != 0 {
+        tracing::warn!("cuvidDecodePicture failed: {status}");
+        return 0;
+    }
+    1
+}
+
+/// Display callback — called when a decoded picture is ready for display.
+/// We map the frame, convert NV12→RGB, and push to the output queue.
+extern "C" fn on_display(user_data: *mut c_void, disp_info: *mut c_void) -> i32 {
+    if disp_info.is_null() {
+        return 1; // End of stream signal
+    }
+    let state = unsafe { &mut *(user_data as *mut CallbackState) };
+    let info = unsafe { &*(disp_info as *const DispInfo) };
+
+    // Map the decoded frame
+    let mut dev_ptr: u64 = 0;
+    let mut pitch: u32 = 0;
+    let mut proc_params = ProcParams::zeroed();
+    proc_params.set_progressive_frame(info.progressive_frame);
+
+    let status = unsafe {
+        (state.fn_map_video_frame)(
+            state.decoder,
+            info.picture_index,
+            &mut dev_ptr,
+            &mut pitch,
+            proc_params.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        tracing::warn!("cuvidMapVideoFrame failed: {status}");
+        return 0;
+    }
+
+    let w = state.width as usize;
+    let h = state.height as usize;
+
+    // Copy NV12 from GPU to CPU
+    let nv12_size = pitch as usize * h * 3 / 2;
+    let mut nv12 = vec![0u8; nv12_size];
+
+    // Use cuMemcpyDtoH to copy from device
+    if let Ok(()) = state.cuda.memcpy_dtoh(&mut nv12, dev_ptr) {
+        // Convert NV12 → RGB32
+        let rgb = nv12_to_rgb32(&nv12, w, h, pitch as usize);
+        state.output_queue.push_back(rgb);
+    } else {
+        tracing::warn!("cuMemcpyDtoH failed for decoded frame");
+    }
+
+    // Unmap
+    unsafe { (state.fn_unmap_video_frame)(state.decoder, dev_ptr) };
+
+    1
+}
+
+/// Convert NV12 (Y plane + interleaved UV plane) to 0RGB32.
+fn nv12_to_rgb32(nv12: &[u8], w: usize, h: usize, pitch: usize) -> Vec<u32> {
+    let mut rgb = vec![0u32; w * h];
+    let y_plane = &nv12[..pitch * h];
+    let uv_plane = &nv12[pitch * h..];
+
+    for row in 0..h {
+        for col in 0..w {
+            let y = y_plane[row * pitch + col] as f32;
+            let uv_row = row / 2;
+            let uv_col = (col / 2) * 2;
+            let u = uv_plane[uv_row * pitch + uv_col] as f32 - 128.0;
+            let v = uv_plane[uv_row * pitch + uv_col + 1] as f32 - 128.0;
+
+            let r = (y + 1.402 * v).clamp(0.0, 255.0) as u32;
+            let g = (y - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u32;
+            let b = (y + 1.772 * u).clamp(0.0, 255.0) as u32;
+
+            rgb[row * w + col] = (r << 16) | (g << 8) | b;
+        }
+    }
+    rgb
+}
 
 // ── NvdecDecoder ────────────────────────────────────────────────────────────
 
 /// NVDEC hardware decoder using CUVID API.
+///
+/// Feed compressed bitstream via `decode()`, get decoded RGB32 frames back.
 pub struct NvdecDecoder {
     cuda: Arc<CudaLib>,
     ctx: CUcontext,
     _lib: DynLib,
-    decoder: CUvideodecoder,
     parser: CUvideoparser,
+    /// Leaked Box — the parser callbacks hold a raw pointer to this.
+    /// Freed in Drop.
+    callback_state: *mut CallbackState,
+    fn_parse_video_data: FnParseVideoData,
+    fn_destroy_decoder: FnDestroyDecoder,
+    fn_destroy_parser: FnDestroyParser,
+    #[allow(dead_code)]
     width: u32,
+    #[allow(dead_code)]
     height: u32,
-    /// Latest decoded NV12 frame (GPU device pointer + pitch).
-    decoded_frame: std::sync::Mutex<Option<DecodedNv12>>,
-    // Function pointers
-    fn_decode_picture: FnCuvidDecodePicture,
-    fn_map_video_frame: FnCuvidMapVideoFrame,
-    fn_unmap_video_frame: FnCuvidUnmapVideoFrame,
-    fn_parse_video_data: FnCuvidParseVideoData,
-    fn_destroy_decoder: FnCuvidDestroyDecoder,
-    fn_destroy_parser: FnCuvidDestroyVideoParser,
-}
-
-struct DecodedNv12 {
-    dev_ptr: u64,
-    pitch: u32,
 }
 
 impl NvdecDecoder {
-    /// Create a new NVDEC decoder.
-    ///
-    /// `codec` must be `VideoCodec::H264` or `VideoCodec::Av1`.
     pub fn new(
         cuda: Arc<CudaLib>,
         device_ordinal: i32,
@@ -212,71 +360,77 @@ impl NvdecDecoder {
         let lib = DynLib::open(&["libnvcuvid.so.1", "libnvcuvid.so"])
             .context("failed to load libnvcuvid")?;
 
-        let fn_create_decoder: FnCuvidCreateDecoder =
-            unsafe { std::mem::transmute(lib.sym("cuvidCreateDecoder")?) };
-        let fn_destroy_decoder: FnCuvidDestroyDecoder =
-            unsafe { std::mem::transmute(lib.sym("cuvidDestroyDecoder")?) };
-        let fn_decode_picture: FnCuvidDecodePicture =
-            unsafe { std::mem::transmute(lib.sym("cuvidDecodePicture")?) };
-        let fn_map_video_frame: FnCuvidMapVideoFrame =
-            unsafe { std::mem::transmute(lib.sym("cuvidMapVideoFrame64")?) };
-        let fn_unmap_video_frame: FnCuvidUnmapVideoFrame =
-            unsafe { std::mem::transmute(lib.sym("cuvidUnmapVideoFrame64")?) };
-        let fn_create_parser: FnCuvidCreateVideoParser =
-            unsafe { std::mem::transmute(lib.sym("cuvidCreateVideoParser")?) };
-        let fn_destroy_parser: FnCuvidDestroyVideoParser =
-            unsafe { std::mem::transmute(lib.sym("cuvidDestroyVideoParser")?) };
-        let fn_parse_video_data: FnCuvidParseVideoData =
-            unsafe { std::mem::transmute(lib.sym("cuvidParseVideoData")?) };
+        let fn_create_decoder: FnCreateDecoder = unsafe { lib.sym("cuvidCreateDecoder")? };
+        let fn_destroy_decoder: FnDestroyDecoder = unsafe { lib.sym("cuvidDestroyDecoder")? };
+        let fn_decode_picture: FnDecodePicture = unsafe { lib.sym("cuvidDecodePicture")? };
+        let fn_map_video_frame: FnMapVideoFrame = unsafe { lib.sym("cuvidMapVideoFrame64")? };
+        let fn_unmap_video_frame: FnUnmapVideoFrame = unsafe { lib.sym("cuvidUnmapVideoFrame64")? };
+        let fn_create_parser: FnCreateParser = unsafe { lib.sym("cuvidCreateVideoParser")? };
+        let fn_destroy_parser: FnDestroyParser = unsafe { lib.sym("cuvidDestroyVideoParser")? };
+        let fn_parse_video_data: FnParseVideoData = unsafe { lib.sym("cuvidParseVideoData")? };
 
         let cuvid_codec = match codec {
             phantom_core::encode::VideoCodec::Av1 => CUDA_VIDEO_CODEC_AV1,
             _ => CUDA_VIDEO_CODEC_H264,
         };
 
+        unsafe { cuda.ctx_push(ctx)? };
+
         // Create decoder
-        cuda.ctx_push(ctx)?;
-        let mut create_info = CuvidDecodeCreateInfo::zeroed();
-        create_info.coded_width = width as u64;
-        create_info.coded_height = height as u64;
-        create_info.num_decode_surfaces = 8;
-        create_info.codec_type = cuvid_codec;
-        create_info.chroma_format = CUDA_VIDEO_CHROMA_FORMAT_420;
-        create_info.output_format = CUDA_VIDEO_SURFACE_FORMAT_NV12;
-        create_info.deinterlace_mode = CUDA_VIDEO_DEINTERLACE_WEAVE;
-        create_info.target_width = width as u64;
-        create_info.target_height = height as u64;
-        create_info.num_output_surfaces = 2;
-        create_info.create_flags = CUDA_VIDEO_CREATE_PREFER_CUVID;
-        create_info.display_area_right = width as u32;
-        create_info.display_area_bottom = height as u32;
+        let mut create_info = DecodeCreateInfo::zeroed();
+        create_info.set_coded_width(width);
+        create_info.set_coded_height(height);
+        create_info.set_num_decode_surfaces(8);
+        create_info.set_codec_type(cuvid_codec);
+        create_info.set_chroma_format(CUDA_VIDEO_CHROMA_FORMAT_420);
+        create_info.set_output_format(CUDA_VIDEO_SURFACE_FORMAT_NV12);
+        create_info.set_deinterlace_mode(CUDA_VIDEO_DEINTERLACE_WEAVE);
+        create_info.set_target_width(width);
+        create_info.set_target_height(height);
+        create_info.set_num_output_surfaces(2);
+        create_info.set_create_flags(CUDA_VIDEO_CREATE_PREFER_CUVID);
+        create_info.set_display_area(width, height);
 
         let mut decoder: CUvideodecoder = std::ptr::null_mut();
-        let status = unsafe { fn_create_decoder(&mut decoder, &mut create_info) };
+        let status = unsafe { fn_create_decoder(&mut decoder, create_info.as_mut_ptr()) };
         if status != 0 {
             cuda.ctx_pop()?;
             bail!("cuvidCreateDecoder failed: {status}");
         }
 
-        // Create parser with callbacks
-        let decoded_frame = std::sync::Arc::new(std::sync::Mutex::new(None::<DecodedNv12>));
+        // Create callback state (leaked — freed in Drop)
+        let callback_state = Box::into_raw(Box::new(CallbackState {
+            decoder,
+            cuda: Arc::clone(&cuda),
+            ctx,
+            width,
+            height,
+            fn_decode_picture,
+            fn_map_video_frame,
+            fn_unmap_video_frame,
+            output_queue: VecDeque::new(),
+        }));
 
-        let mut parser_params = CuvidParserParams::zeroed();
-        parser_params.codec_type = cuvid_codec;
-        parser_params.max_num_decode_surfaces = 8;
-        parser_params.max_display_delay = 0; // Low latency
-
-        // For the parser callbacks, we need a way to pass the decoder handle.
-        // We'll use a simpler approach: skip the parser and decode directly.
-        // Actually, for H.264/AV1 streaming, we need the parser to handle NAL/OBU parsing.
-        // Let's use the parser approach.
-
-        // TODO: implement parser callbacks (sequence, decode, display)
-        // For now, this is a placeholder — the full implementation needs
-        // static callback functions that reference the decoder instance.
+        // Create parser
+        let mut parser_params = ParserParams::zeroed();
+        parser_params.set_codec_type(cuvid_codec);
+        parser_params.set_max_num_decode_surfaces(8);
+        parser_params.set_max_display_delay(0); // Low latency: display immediately
+        parser_params.set_user_data(callback_state as *mut c_void);
+        parser_params.set_sequence_callback(on_sequence as extern "C" fn(_, _) -> _ as usize);
+        parser_params.set_decode_callback(on_decode as extern "C" fn(_, _) -> _ as usize);
+        parser_params.set_display_callback(on_display as extern "C" fn(_, _) -> _ as usize);
 
         let mut parser: CUvideoparser = std::ptr::null_mut();
-        // Parser creation deferred — we'll implement the callback approach
+        let status = unsafe { fn_create_parser(&mut parser, parser_params.as_mut_ptr()) };
+        if status != 0 {
+            unsafe {
+                fn_destroy_decoder(decoder);
+                let _ = Box::from_raw(callback_state);
+            }
+            cuda.ctx_pop()?;
+            bail!("cuvidCreateVideoParser failed: {status}");
+        }
 
         cuda.ctx_pop()?;
 
@@ -295,33 +449,66 @@ impl NvdecDecoder {
             cuda,
             ctx,
             _lib: lib,
-            decoder,
             parser,
-            width,
-            height,
-            decoded_frame: std::sync::Mutex::new(None),
-            fn_decode_picture,
-            fn_map_video_frame,
-            fn_unmap_video_frame,
+            callback_state,
             fn_parse_video_data,
             fn_destroy_decoder,
             fn_destroy_parser,
+            width,
+            height,
         })
+    }
+
+    /// Feed compressed bitstream and get decoded RGB32 frame(s).
+    ///
+    /// Returns empty Vec if no frame is ready yet (decoder buffering).
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u32>> {
+        unsafe { self.cuda.ctx_push(self.ctx)? };
+
+        let mut packet = SourceDataPacket {
+            flags: CUVID_PKT_TIMESTAMP,
+            payload_size: data.len() as u32,
+            payload: data.as_ptr(),
+            timestamp: 0,
+        };
+
+        let status = unsafe { (self.fn_parse_video_data)(self.parser, &mut packet) };
+        if status != 0 {
+            self.cuda.ctx_pop()?;
+            bail!("cuvidParseVideoData failed: {status}");
+        }
+
+        // Check if the display callback produced a frame
+        let state = unsafe { &mut *self.callback_state };
+        let frame = state.output_queue.pop_front().unwrap_or_default();
+
+        self.cuda.ctx_pop()?;
+        Ok(frame)
+    }
+}
+
+impl phantom_core::encode::FrameDecoder for NvdecDecoder {
+    fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>> {
+        self.decode(data)
     }
 }
 
 impl Drop for NvdecDecoder {
     fn drop(&mut self) {
-        let _ = self.cuda.ctx_push(self.ctx);
+        let _ = unsafe { self.cuda.ctx_push(self.ctx) };
         if !self.parser.is_null() {
             unsafe { (self.fn_destroy_parser)(self.parser) };
         }
-        if !self.decoder.is_null() {
-            unsafe { (self.fn_destroy_decoder)(self.decoder) };
+        let state = unsafe { &*self.callback_state };
+        if !state.decoder.is_null() {
+            unsafe { (self.fn_destroy_decoder)(state.decoder) };
+        }
+        // Reclaim the leaked callback state
+        unsafe {
+            let _ = Box::from_raw(self.callback_state);
         }
         let _ = self.cuda.ctx_pop();
     }
 }
 
-// Safety: decoder is tied to CUDA context which is thread-safe when properly synchronized
 unsafe impl Send for NvdecDecoder {}

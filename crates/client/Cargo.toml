@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 phantom-core = { path = "../core" }
+phantom-gpu = { path = "../gpu" }
 anyhow = "1"
 bincode = "1"
 tracing = "0.1"
