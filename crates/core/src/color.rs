@@ -183,6 +183,58 @@ fn yuv420_to_rgb32_scalar(
     }
 }
 
+// ── NV12 → 0RGB u32 ────────────────────────────────────────────────────────
+
+/// NV12 → 0RGB u32 buffer (for display after hardware decode).
+///
+/// NV12 layout: Y plane (pitch × height) followed by interleaved UV plane
+/// (pitch × height/2). `pitch` may be larger than `width` (stride padding).
+/// Output: `width × height` pixels as 0RGB packed u32.
+pub fn nv12_to_rgb32(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u32> {
+    let mut buffer = vec![0u32; width * height];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                avx2::nv12_to_rgb32_avx2(nv12, width, height, pitch, &mut buffer);
+            }
+            return buffer;
+        }
+    }
+
+    nv12_to_rgb32_scalar(nv12, width, height, pitch, &mut buffer);
+    buffer
+}
+
+/// Scalar fallback for NV12 → 0RGB.
+fn nv12_to_rgb32_scalar(
+    nv12: &[u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+    buffer: &mut [u32],
+) {
+    let y_plane = &nv12[..pitch * height];
+    let uv_plane = &nv12[pitch * height..];
+
+    for row in 0..height {
+        for col in 0..width {
+            let y_val = y_plane[row * pitch + col] as i32 - 16;
+            let uv_row = row / 2;
+            let uv_col = (col / 2) * 2;
+            let u_val = uv_plane[uv_row * pitch + uv_col] as i32 - 128;
+            let v_val = uv_plane[uv_row * pitch + uv_col + 1] as i32 - 128;
+
+            let r = ((298 * y_val + 409 * v_val + 128) >> 8).clamp(0, 255) as u32;
+            let g = ((298 * y_val - 100 * u_val - 208 * v_val + 128) >> 8).clamp(0, 255) as u32;
+            let b = ((298 * y_val + 516 * u_val + 128) >> 8).clamp(0, 255) as u32;
+
+            buffer[row * width + col] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 // ── AVX2 SIMD implementation ────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -500,6 +552,131 @@ mod avx2 {
             }
         }
     }
+
+    /// NV12 → 0RGB u32 with AVX2 acceleration.
+    ///
+    /// NV12: Y plane (pitch × height) + interleaved UV plane (pitch × height/2).
+    /// Processes 8 pixels per iteration.
+    ///
+    /// # Safety
+    /// Requires AVX2 support.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn nv12_to_rgb32_avx2(
+        nv12: &[u8],
+        width: usize,
+        height: usize,
+        pitch: usize,
+        buffer: &mut [u32],
+    ) {
+        let y_plane = &nv12[..pitch * height];
+        let uv_plane = &nv12[pitch * height..];
+
+        let c298 = _mm256_set1_epi32(298);
+        let c409 = _mm256_set1_epi32(409);
+        let c100 = _mm256_set1_epi32(100);
+        let c208 = _mm256_set1_epi32(208);
+        let c516 = _mm256_set1_epi32(516);
+        let c128 = _mm256_set1_epi32(128);
+        let zero = _mm256_setzero_si256();
+        let max255 = _mm256_set1_epi32(255);
+
+        for row in 0..height {
+            let y_row = &y_plane[row * pitch..];
+            let uv_row = &uv_plane[(row / 2) * pitch..];
+            let out_row = &mut buffer[row * width..];
+
+            let mut col = 0;
+            while col + 8 <= width {
+                // Load 8 Y values, zero-extend to 32-bit
+                let y_raw = _mm_loadl_epi64(y_row[col..].as_ptr() as *const __m128i);
+                let y16 = _mm_unpacklo_epi8(y_raw, _mm_setzero_si128());
+                let y32 = _mm256_cvtepu16_epi32(y16);
+                let y_val = _mm256_sub_epi32(y32, _mm256_set1_epi32(16));
+
+                // Load 4 UV pairs (interleaved U0,V0,U1,V1,...), duplicate for 2 pixels each
+                let mut u_arr = [0i32; 8];
+                let mut v_arr = [0i32; 8];
+                for i in 0..4 {
+                    let uv_idx = (col / 2 + i) * 2;
+                    let ui = uv_row[uv_idx] as i32 - 128;
+                    let vi = uv_row[uv_idx + 1] as i32 - 128;
+                    u_arr[i * 2] = ui;
+                    u_arr[i * 2 + 1] = ui;
+                    v_arr[i * 2] = vi;
+                    v_arr[i * 2 + 1] = vi;
+                }
+                let u_val = _mm256_loadu_si256(u_arr.as_ptr() as *const __m256i);
+                let v_val = _mm256_loadu_si256(v_arr.as_ptr() as *const __m256i);
+
+                // R = ((298*y + 409*v + 128) >> 8)
+                let r32 = _mm256_srai_epi32(
+                    _mm256_add_epi32(
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(c298, y_val),
+                            _mm256_mullo_epi32(c409, v_val),
+                        ),
+                        c128,
+                    ),
+                    8,
+                );
+                // G = ((298*y - 100*u - 208*v + 128) >> 8)
+                let g32 = _mm256_srai_epi32(
+                    _mm256_add_epi32(
+                        _mm256_sub_epi32(
+                            _mm256_sub_epi32(
+                                _mm256_mullo_epi32(c298, y_val),
+                                _mm256_mullo_epi32(c100, u_val),
+                            ),
+                            _mm256_mullo_epi32(c208, v_val),
+                        ),
+                        c128,
+                    ),
+                    8,
+                );
+                // B = ((298*y + 516*u + 128) >> 8)
+                let b32 = _mm256_srai_epi32(
+                    _mm256_add_epi32(
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(c298, y_val),
+                            _mm256_mullo_epi32(c516, u_val),
+                        ),
+                        c128,
+                    ),
+                    8,
+                );
+
+                // Clamp to [0, 255]
+                let r_clamped = _mm256_min_epi32(_mm256_max_epi32(r32, zero), max255);
+                let g_clamped = _mm256_min_epi32(_mm256_max_epi32(g32, zero), max255);
+                let b_clamped = _mm256_min_epi32(_mm256_max_epi32(b32, zero), max255);
+
+                // Pack: 0RGB = (R << 16) | (G << 8) | B
+                let rgb = _mm256_or_si256(
+                    _mm256_or_si256(
+                        _mm256_slli_epi32(r_clamped, 16),
+                        _mm256_slli_epi32(g_clamped, 8),
+                    ),
+                    b_clamped,
+                );
+
+                _mm256_storeu_si256(out_row[col..].as_mut_ptr() as *mut __m256i, rgb);
+                col += 8;
+            }
+
+            // Scalar tail
+            while col < width {
+                let yv = y_row[col] as i32 - 16;
+                let uv_idx = (col / 2) * 2;
+                let uv = uv_row[uv_idx] as i32 - 128;
+                let vv = uv_row[uv_idx + 1] as i32 - 128;
+                let r = ((298 * yv + 409 * vv + 128) >> 8).clamp(0, 255) as u32;
+                let g = ((298 * yv - 100 * uv - 208 * vv + 128) >> 8).clamp(0, 255) as u32;
+                let b = ((298 * yv + 516 * uv + 128) >> 8).clamp(0, 255) as u32;
+                out_row[col] = (r << 16) | (g << 8) | b;
+                col += 1;
+            }
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -624,6 +801,68 @@ mod tests {
         let rgb_simd = yuv420_to_rgb32(&y_data, &u_data, &v_data, w, h, w, w / 2);
 
         assert_eq!(rgb_scalar, rgb_simd, "RGB32 buffers differ");
+    }
+
+    #[test]
+    fn simd_matches_scalar_nv12_to_rgb() {
+        let w = 1920;
+        let h = 1080;
+        let pitch = w; // no padding
+                       // Create plausible NV12 data
+        let mut nv12 = vec![0u8; pitch * h * 3 / 2];
+        // Y plane
+        for i in 0..pitch * h {
+            nv12[i] = (16 + (i % 220)) as u8;
+        }
+        // UV plane (interleaved)
+        let uv_start = pitch * h;
+        for i in 0..pitch * h / 2 {
+            nv12[uv_start + i] = (64 + (i % 128)) as u8;
+        }
+
+        // Scalar reference
+        let mut rgb_scalar = vec![0u32; w * h];
+        nv12_to_rgb32_scalar(&nv12, w, h, pitch, &mut rgb_scalar);
+
+        // SIMD (via public API)
+        let rgb_simd = nv12_to_rgb32(&nv12, w, h, pitch);
+
+        assert_eq!(rgb_scalar, rgb_simd, "NV12→RGB32 buffers differ");
+    }
+
+    #[test]
+    fn nv12_to_rgb32_with_pitch() {
+        // Test with pitch > width (common from hardware decoders)
+        let w = 100;
+        let h = 64;
+        let pitch = 128; // padded stride
+        let mut nv12 = vec![128u8; pitch * h * 3 / 2];
+        // Fill Y with known value
+        for row in 0..h {
+            for col in 0..w {
+                nv12[row * pitch + col] = 180;
+            }
+        }
+        // Fill UV with 128 (neutral)
+        let uv_start = pitch * h;
+        for row in 0..h / 2 {
+            for col in 0..w {
+                nv12[uv_start + row * pitch + col] = 128;
+            }
+        }
+
+        let rgb = nv12_to_rgb32(&nv12, w, h, pitch);
+        assert_eq!(rgb.len(), w * h);
+        // With Y=180, U=V=128, should be roughly grey
+        for &px in &rgb {
+            let r = (px >> 16) & 0xFF;
+            let g = (px >> 8) & 0xFF;
+            let b = px & 0xFF;
+            // BT.601: neutral chroma → grey, Y=180 → ~189
+            assert!(r > 150 && r < 220, "r={r}");
+            assert!(g > 150 && g < 220, "g={g}");
+            assert!(b > 150 && b < 220, "b={b}");
+        }
     }
 
     #[test]

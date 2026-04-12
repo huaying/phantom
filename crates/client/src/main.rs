@@ -140,7 +140,7 @@ enum AppState {
 
 struct Session {
     display: display_winit::WinitDisplay,
-    h264_decoder: Box<dyn phantom_core::encode::FrameDecoder>,
+    decoder: Box<dyn phantom_core::encode::FrameDecoder>,
     /// The video codec the server uses.
     #[allow(dead_code)]
     server_codec: phantom_core::encode::VideoCodec,
@@ -298,7 +298,7 @@ impl App {
         };
 
         let _decoder_name = &self.args_decoder;
-        let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
+        let decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
             #[cfg(target_os = "macos")]
             if _decoder_name == "auto" || _decoder_name == "videotoolbox" {
                 match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
@@ -417,7 +417,7 @@ impl App {
 
         self.state = AppState::Connected(Session {
             display,
-            h264_decoder,
+            decoder,
             server_codec: video_codec,
             tile_decoder: decode_zstd::ZstdDecoder::new(),
             frame_rx,
@@ -488,7 +488,7 @@ impl ApplicationHandler for App {
                     match msg {
                         Message::VideoFrame { frame, .. } => {
                             let decode_start = std::time::Instant::now();
-                            match session.h264_decoder.decode_frame(&frame.data) {
+                            match session.decoder.decode_frame(&frame.data) {
                                 Ok(rgb32) => {
                                     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
                                     session.stats_decode_ms += decode_ms;

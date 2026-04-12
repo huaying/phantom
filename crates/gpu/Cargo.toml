@@ -3,6 +3,9 @@ name = "phantom-gpu"
 version = "0.2.0"
 edition = "2021"
 
+[features]
+nvdec = []
+
 [dependencies]
 phantom-core = { path = "../core" }
 anyhow = "1"

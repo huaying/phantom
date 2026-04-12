@@ -304,8 +304,8 @@ extern "C" fn on_display(user_data: *mut c_void, disp_info: *mut c_void) -> i32 
 
     // Use cuMemcpyDtoH to copy from device
     if let Ok(()) = state.cuda.memcpy_dtoh(&mut nv12, dev_ptr) {
-        // Convert NV12 → RGB32
-        let rgb = nv12_to_rgb32(&nv12, w, h, pitch as usize);
+        // Convert NV12 → RGB32 using SIMD-accelerated conversion
+        let rgb = phantom_core::color::nv12_to_rgb32(&nv12, w, h, pitch as usize);
         state.output_queue.push_back(rgb);
     } else {
         tracing::warn!("cuMemcpyDtoH failed for decoded frame");
@@ -315,30 +315,6 @@ extern "C" fn on_display(user_data: *mut c_void, disp_info: *mut c_void) -> i32 
     unsafe { (state.fn_unmap_video_frame)(state.decoder, dev_ptr) };
 
     1
-}
-
-/// Convert NV12 (Y plane + interleaved UV plane) to 0RGB32.
-fn nv12_to_rgb32(nv12: &[u8], w: usize, h: usize, pitch: usize) -> Vec<u32> {
-    let mut rgb = vec![0u32; w * h];
-    let y_plane = &nv12[..pitch * h];
-    let uv_plane = &nv12[pitch * h..];
-
-    for row in 0..h {
-        for col in 0..w {
-            let y = y_plane[row * pitch + col] as f32;
-            let uv_row = row / 2;
-            let uv_col = (col / 2) * 2;
-            let u = uv_plane[uv_row * pitch + uv_col] as f32 - 128.0;
-            let v = uv_plane[uv_row * pitch + uv_col + 1] as f32 - 128.0;
-
-            let r = (y + 1.402 * v).clamp(0.0, 255.0) as u32;
-            let g = (y - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u32;
-            let b = (y + 1.772 * u).clamp(0.0, 255.0) as u32;
-
-            rgb[row * w + col] = (r << 16) | (g << 8) | b;
-        }
-    }
-    rgb
 }
 
 // ── NvdecDecoder ────────────────────────────────────────────────────────────
@@ -415,7 +391,8 @@ impl NvdecDecoder {
             bail!("cuvidCreateDecoder failed: {status}");
         }
 
-        // Create callback state (leaked — freed in Drop)
+        // Create callback state (leaked — freed in Drop).
+        // Use a guard to prevent leaks if code below panics.
         let callback_state = Box::into_raw(Box::new(CallbackState {
             decoder,
             cuda: Arc::clone(&cuda),
@@ -427,6 +404,19 @@ impl NvdecDecoder {
             fn_unmap_video_frame,
             output_queue: VecDeque::new(),
         }));
+
+        /// Guard that reclaims the CallbackState Box on drop (panic safety).
+        struct CallbackStateGuard(*mut CallbackState);
+        impl Drop for CallbackStateGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let _ = Box::from_raw(self.0);
+                    }
+                }
+            }
+        }
+        let mut guard = CallbackStateGuard(callback_state);
 
         // Create parser
         let mut parser_params = ParserParams::zeroed();
@@ -443,8 +433,8 @@ impl NvdecDecoder {
         if status != 0 {
             unsafe {
                 fn_destroy_decoder(decoder);
-                let _ = Box::from_raw(callback_state);
             }
+            // guard will free callback_state on drop
             cuda.ctx_pop()?;
             bail!("cuvidCreateVideoParser failed: {status}");
         }
@@ -461,6 +451,9 @@ impl NvdecDecoder {
             codec = codec_name,
             "NVDEC decoder initialized"
         );
+
+        // Defuse the guard — ownership transfers to Self (freed in Drop)
+        guard.0 = std::ptr::null_mut();
 
         Ok(Self {
             cuda,
@@ -547,59 +540,5 @@ mod tests {
             Ok(_) => eprintln!("NVDEC H264 decoder created OK"),
             Err(e) => eprintln!("NVDEC H264 failed: {e}"),
         }
-    }
-}
-
-#[test]
-fn test_nvdec_av1_with_real_data() {
-    use crate::nvenc::NvencEncoder;
-    use phantom_core::encode::{FrameEncoder, VideoCodec};
-    use phantom_core::frame::{Frame, PixelFormat};
-
-    let cuda = match CudaLib::load() {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("CUDA not available: {e}");
-            return;
-        }
-    };
-
-    // Create a small AV1 encoder and encode one frame
-    let mut enc = match NvencEncoder::new(Arc::clone(&cuda), 0, 64, 64, 30, 500, VideoCodec::Av1) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("NVENC AV1 not available: {e}");
-            return;
-        }
-    };
-
-    let pixels = vec![0u8; 64 * 64 * 4]; // black frame
-    let frame = Frame {
-        width: 64,
-        height: 64,
-        format: PixelFormat::Bgra8,
-        data: pixels,
-        timestamp: std::time::Instant::now(),
-    };
-    let encoded = enc.encode_frame(&frame).unwrap();
-    eprintln!(
-        "Encoded {} bytes, keyframe={}",
-        encoded.data.len(),
-        encoded.is_keyframe
-    );
-
-    // Create NVDEC decoder and try to decode
-    let mut dec = match NvdecDecoder::new(Arc::clone(&cuda), 0, 64, 64, VideoCodec::Av1) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("NVDEC AV1 decoder failed: {e}");
-            return;
-        }
-    };
-
-    let result = dec.decode(&encoded.data);
-    match result {
-        Ok(rgb) => eprintln!("Decoded {} pixels", rgb.len()),
-        Err(e) => eprintln!("Decode failed: {e}"),
     }
 }

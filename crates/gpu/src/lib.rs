@@ -11,6 +11,7 @@ pub mod cuda;
 pub mod dxgi;
 #[cfg(target_os = "windows")]
 pub mod dxgi_nvenc;
+#[cfg(feature = "nvdec")]
 pub mod nvdec;
 pub mod nvenc;
 #[cfg(target_os = "linux")]

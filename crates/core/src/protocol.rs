@@ -4,7 +4,7 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Minimum protocol version we can interoperate with.
 /// Versions below this are rejected at handshake.

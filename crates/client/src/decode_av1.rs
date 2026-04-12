@@ -47,37 +47,22 @@ impl FrameDecoder for Dav1dDecoder {
         let w = picture.width() as usize;
         let h = picture.height() as usize;
 
-        // Convert YUV to 0RGB
-        let mut rgb = vec![0u32; w * h];
-
         match picture.pixel_layout() {
             dav1d::PixelLayout::I420 => {
                 let y_stride = picture.stride(dav1d::PlanarImageComponent::Y) as usize;
                 let u_stride = picture.stride(dav1d::PlanarImageComponent::U) as usize;
-                let v_stride = picture.stride(dav1d::PlanarImageComponent::V) as usize;
                 let y_plane = picture.plane(dav1d::PlanarImageComponent::Y);
                 let u_plane = picture.plane(dav1d::PlanarImageComponent::U);
                 let v_plane = picture.plane(dav1d::PlanarImageComponent::V);
 
-                for row in 0..h {
-                    for col in 0..w {
-                        let y = y_plane[row * y_stride + col] as f32;
-                        let u = u_plane[(row / 2) * u_stride + col / 2] as f32 - 128.0;
-                        let v = v_plane[(row / 2) * v_stride + col / 2] as f32 - 128.0;
-
-                        let r = (y + 1.402 * v).clamp(0.0, 255.0) as u32;
-                        let g = (y - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u32;
-                        let b = (y + 1.772 * u).clamp(0.0, 255.0) as u32;
-
-                        rgb[row * w + col] = (r << 16) | (g << 8) | b;
-                    }
-                }
+                // Use SIMD-accelerated conversion from phantom_core::color
+                Ok(phantom_core::color::yuv420_to_rgb32(
+                    &y_plane, &u_plane, &v_plane, w, h, y_stride, u_stride,
+                ))
             }
             _ => {
                 anyhow::bail!("unsupported pixel layout: {:?}", picture.pixel_layout());
             }
         }
-
-        Ok(rgb)
     }
 }

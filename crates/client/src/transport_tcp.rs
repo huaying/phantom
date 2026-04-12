@@ -88,7 +88,12 @@ impl Connection for TcpConnection {
         protocol::write_message(&mut self.stream, msg)
     }
     fn recv_msg(&mut self) -> Result<Message> {
-        protocol::read_message(&mut self.stream)
+        loop {
+            if let Some(msg) = protocol::read_message_lenient(&mut self.stream)? {
+                return Ok(msg);
+            }
+            // Unknown message variant — skip and read next
+        }
     }
 }
 
@@ -108,7 +113,11 @@ pub struct PlainReceiver {
 
 impl MessageReceiver for PlainReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
-        protocol::read_message(&mut self.stream)
+        loop {
+            if let Some(msg) = protocol::read_message_lenient(&mut self.stream)? {
+                return Ok(msg);
+            }
+        }
     }
 }
 
@@ -129,7 +138,12 @@ pub struct EncReceiver {
 
 impl MessageReceiver for EncReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
-        let payload = self.reader.read_decrypted()?;
-        bincode::deserialize(&payload).context("deserialize")
+        loop {
+            let payload = self.reader.read_decrypted()?;
+            match bincode::deserialize(&payload) {
+                Ok(msg) => return Ok(msg),
+                Err(_) => continue, // Unknown message variant — skip
+            }
+        }
     }
 }
