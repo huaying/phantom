@@ -579,8 +579,11 @@ fn main() -> Result<()> {
                 },
             )
         };
-        _active_session_token = result.session_token.clone();
-        tracing::info!("session ended: {}", result.error);
+        #[cfg(target_os = "linux")]
+        {
+            _active_session_token = result.session_token.clone();
+            tracing::info!("session ended: {}", result.error);
+        }
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
             session::run_session_dxgi(
