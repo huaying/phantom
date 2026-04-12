@@ -4,15 +4,16 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 
 ## Features
 
-- **H.264 streaming** with periodic keyframes and lossless refinement after 2s idle
-- **GPU acceleration** — NVENC encoding + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
-- **Audio forwarding** — PulseAudio → Opus 48kHz stereo → client playback
+- **H.264 / AV1 streaming** with periodic keyframes and lossless refinement after 2s idle
+- **GPU acceleration** — NVENC encoding (H.264 + AV1) + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
+- **Audio forwarding** — PulseAudio → Opus 48kHz stereo → client playback (native + web)
+- **Adaptive bitrate** — RTT-based, automatic quality adjustment with hysteresis
 - **File transfer** — bidirectional, chunked streaming with SHA-256 integrity verification
 - **Multi-monitor** — `--display N` to select monitor, `--list-displays` to enumerate
 - **Hardware auto-detect** — `--encoder auto` probes GPU and picks best encoder/capture
 - **Multi-transport** — `--transport tcp,web` serves TCP and HTTPS/WebSocket simultaneously
-- **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264 decode + Opus audio
-- **Native client** — winit + softbuffer with local cursor rendering
+- **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264/AV1 decode + Opus audio
+- **Native client** — winit + softbuffer with local cursor rendering, OpenH264/dav1d/NVDEC decode
 - **QUIC/UDP transport** — for native client, no head-of-line blocking
 - **Encrypted by default** — ChaCha20-Poly1305 (TCP) or TLS (QUIC) or DTLS (WebRTC)
 - **Clipboard sync** — bidirectional, with Ctrl+V paste injection
@@ -20,8 +21,9 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 - **Graceful shutdown** — Ctrl+C / SIGTERM clean exit
 - **Auto-reconnect** — exponential backoff (native client)
 - **HTTP keep-alive + connection pool** — reuses TLS connections, bounded thread pool (16 max)
-- **SIMD color conversion** — AVX2-accelerated BGRA↔YUV (2.8–3.4x faster than scalar)
-- **Connection quality stats** — RTT, FPS, bandwidth, encode time reported to client every 5s
+- **SIMD color conversion** — AVX2-accelerated BGRA↔YUV + NV12↔RGB (2.8–3.4x faster than scalar)
+- **Connection quality stats** — RTT, FPS, bandwidth, encode time reported to client every 5s (web overlay)
+- **NVDEC hardware decode** — client-side NVIDIA GPU decode (H.264 + AV1)
 - **Wayland capture** — PipeWire + XDG Desktop Portal (compile-tested)
 - **WAN tested** — verified under simulated latency (0–300ms RTT), jitter, and session replacement
 - **Windows + Linux** — DXGI (Windows) / X11 (Linux) capture, auto-start support
@@ -118,10 +120,11 @@ docker run --rm -p 9900:9900 -e PHANTOM_HOST=127.0.0.1 phantom server-web
 ```
 Native Client                        Server                         Web Client (Browser)
 ┌──────────────┐   QUIC/TCP   ┌──────────────────┐    WSS        ┌──────────────┐
-│ OpenH264     │◄════════════╗│ Screen Capture    │╗══(TCP/TLS)═►│ WASM client  │
-│ winit render │             ║│ H.264 Encode      │║             │ WebCodecs    │
-│ Local cursor │             ║│ (OpenH264/NVENC)  │║             │ Canvas       │
-│ OS key repeat│             ║│                    │║             │ Input capture│
+│ OpenH264/    │◄════════════╗│ Screen Capture    │╗══(TCP/TLS)═►│ WASM client  │
+│ dav1d/NVDEC  │             ║│ H.264/AV1 Encode  │║             │ WebCodecs    │
+│ winit render │             ║│ (OpenH264/NVENC)  │║             │ Canvas       │
+│ Local cursor │             ║│ Adaptive Bitrate  │║             │ Opus Audio   │
+│ Audio (cpal) │             ║│ Audio Capture     │║             │ Stats HUD    │
 │              │═════════════╝│ enigo inject      │╝═════════════│              │
 │ Input capture│──────────────│                    │──────────────│ Keyboard/    │
 │              │              │                    │              │ Mouse events │
@@ -137,6 +140,7 @@ Native Client                        Server                         Web Client (
 --bitrate <kbps>             H.264 bitrate (default: 5000)
 --quality-delay-ms <ms>      Lossless update delay (default: 2000)
 --encoder <auto|openh264|nvenc>  Video encoder (default: auto)
+--codec <auto|h264|av1>          Video codec (default: auto, AV1 if GPU supports it)
 --capture <auto|scrap|nvfbc|pipewire>  Screen capture (default: auto)
 --display <n>                Display index to capture (default: 0)
 --list-displays              List available displays and exit
@@ -151,7 +155,7 @@ Native Client                        Server                         Web Client (
 ```
 --connect <addr>             Server address (default: 127.0.0.1:9900)
 --transport <tcp|quic>       Transport protocol (default: tcp)
---decoder <auto|openh264|videotoolbox>  Video decoder (default: auto)
+--decoder <auto|openh264|videotoolbox>  Video decoder (default: auto — tries NVDEC, then dav1d/OpenH264)
 --send-file <path>           Send a file to the server after connecting
 --key <hex>                  Encryption key (from server output)
 --no-encrypt                 Disable encryption
@@ -172,6 +176,7 @@ Native Client                        Server                         Web Client (
 |-----------|---------------|-----------|---------|
 | BGRA→NV12 (encode) | 5.1ms | 1.8ms | **2.8x** |
 | YUV→RGB32 (decode) | 8.5ms | 2.5ms | **3.4x** |
+| NV12→RGB32 (NVDEC decode) | ~15ms | ~4ms | **~3.5x** |
 
 Runtime-detected: AVX2 on x86_64, automatic scalar fallback on other architectures.
 
@@ -190,7 +195,7 @@ cargo build --release --features webrtc
 # Build WASM web client (pre-built pkg checked into repo)
 wasm-pack build crates/web --target web --no-typescript
 
-# Run tests (95 tests: unit, integration, E2E, WAN simulation)
+# Run tests (104 tests: unit, integration, E2E, WAN simulation)
 cargo test
 ```
 
@@ -203,7 +208,7 @@ phantom/
 │   ├── server/    Capture, encode, input inject, file transfer, TCP/QUIC/WSS transports
 │   ├── client/    Decode, winit display, input capture, file transfer, reconnect
 │   ├── web/       WASM client (WebCodecs, Canvas, WebSocket/WebRTC)
-│   ├── gpu/       NVENC, NVFBC (Linux), DXGI capture (Windows), CUDA, hardware probe
+│   ├── gpu/       NVENC, NVDEC (feature-gated), NVFBC (Linux), DXGI capture (Windows), CUDA, hardware probe
 │   └── bench/     Encoder benchmark (OpenH264 vs NVENC)
 ├── Dockerfile     XFCE desktop test environment
 ├── CLAUDE.md      Developer guide
@@ -222,8 +227,8 @@ See [CLAUDE.md](CLAUDE.md) for the full roadmap. Key next steps:
 - ~~Session replacement~~ ✅ Seamless client takeover
 - ~~Graceful shutdown~~ ✅ Clean Ctrl+C / SIGTERM handling
 - ~~Wayland capture~~ ✅ PipeWire + XDG Desktop Portal (compile-tested)
-- **Hardware decode** — NVDEC (Linux), VideoToolbox (macOS) client-side
-- **AV1 encoder** — better compression ratio at same bitrate
+- ~~Hardware decode~~ ✅ NVDEC (Linux), VideoToolbox (macOS), dav1d (AV1 software) client-side
+- ~~AV1 encoder~~ ✅ NVENC hardware AV1 encode (Ada Lovelace+), dav1d/NVDEC decode
 - **QUIC unreliable datagrams** — lower latency for WAN
 - **VAAPI/AMF GPU encoding** — AMD/Intel GPU encode support
 - **NAT traversal** — STUN/TURN for firewall bypass

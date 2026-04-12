@@ -4,7 +4,7 @@
 
 Phantom is a high-performance, open-source remote desktop built in Rust. Target: Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text), single binary deployment, browser + native access.
 
-~17,000 lines Rust (across 7 crates), 76 tests, MIT license. Runs on Linux + Windows.
+~18,000 lines Rust (across 6 crates), 104 tests, MIT license. Runs on Linux + Windows.
 
 ## Build Commands
 
@@ -13,8 +13,8 @@ cargo build --release                                    # native (WSS web trans
 cargo build --release --features webrtc                  # native + WebRTC DataChannel support
 wasm-pack build crates/web --target web --no-typescript  # WASM (must run BEFORE server build!)
 cargo build --release -p phantom-server                  # server embeds WASM via include_bytes!
-cargo test                                               # 76 tests (unit + integration + WAN simulation)
-cargo clippy --release                                   # must be zero warnings
+cargo test                                               # 104 tests (unit + integration + WAN simulation)
+cargo clippy --workspace -- -D warnings                  # must be zero warnings
 
 # GPU benchmarks (requires NVIDIA GPU + DISPLAY=:0)
 DISPLAY=:0 cargo run --release -p phantom-bench          # encoder comparison: openh264 vs nvenc
@@ -233,7 +233,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (34)
+## Implemented Features (43)
 
 | # | Feature |
 |---|---------|
@@ -271,6 +271,15 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 32 | **HTTP keep-alive + connection pool** (reuses TLS connections, bounded 16-thread pool, 30s idle timeout) |
 | 33 | **AVX2 SIMD color conversion** (BGRA→NV12 2.8x, YUV→RGB32 3.4x faster, runtime-detected, scalar fallback) |
 | 34 | **WAN simulation tests** (8 E2E tests: 0–300ms RTT, jitter, encrypted, keepalive, session replacement) |
+| 35 | **AV1 encoder** (NVENC hardware AV1, Ada Lovelace+, `--codec av1`) |
+| 36 | **AV1 decoder** (dav1d software + NVDEC hardware, WebCodecs for web) |
+| 37 | **NVDEC hardware decode** (client-side H.264 + AV1, runtime dlopen, feature-gated) |
+| 38 | **Adaptive bitrate** (RTT-based: >100ms → decrease ×0.7, stable 10s → increase ×1.2, NVENC reconfigure API) |
+| 39 | **Connection quality stats** (Stats message every 5s: RTT, FPS, bandwidth, encode_us) |
+| 40 | **Web stats overlay** (floating HUD, green/yellow/red RTT, F11 fullscreen, Ctrl+Shift+S toggle) |
+| 41 | **RTT measurement** (Ping/Pong, server EMA α=0.2) |
+| 42 | **Web audio** (Opus decode via WebCodecs AudioDecoder, auto-resume on gesture) |
+| 43 | **Forward-compatible protocol** (read_message_lenient, skips unknown message variants) |
 
 ---
 
@@ -292,14 +301,18 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~**Audio forwarding**~~ | ✅ done | PulseAudio → Opus 48kHz stereo, `--features audio` (PR #6) |
 | ~~**WAN testing**~~ | ✅ done | Simulated latency/jitter E2E tests (0–300ms RTT, 8 tests) |
 | ~~**HTTP keep-alive + pool**~~ | ✅ done | Reuses TLS connections, bounded 16-thread pool |
-| ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV, 2.8–3.4x speedup at 1080p |
+| ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV + NV12↔RGB, 2.8–3.4x speedup at 1080p |
+| ~~**AV1 encoder**~~ | ✅ done | NVENC AV1 (Ada Lovelace+), `--codec av1`, 8.7ms at 1080p |
+| ~~**NVDEC hardware decode**~~ | ✅ done | Client H.264+AV1 GPU decode, feature-gated |
+| ~~**Adaptive bitrate**~~ | ✅ done | RTT-based, NVENC reconfigure API, hysteresis |
+| ~~**Stats + web overlay**~~ | ✅ done | RTT/FPS/bandwidth, floating HUD, Ping/Pong |
 
 ### Host Performance
 | Task | Impact |
 |------|--------|
 | VAAPI GPU encoding | AMD/Intel GPU encode |
 | x264 via FFmpeg | 2-3x better compression than OpenH264 |
-| AV1 encoding (NVENC/SVT-AV1) | 30% better than H.264 |
+| ~~AV1 encoding (NVENC/SVT-AV1)~~ | ✅ Done — NVENC AV1 hardware encode (Ada Lovelace+), 8.7ms/frame at 1080p |
 | DMA-BUF/KMS capture | Linux zero-copy |
 | ~~SIMD color conversion~~ | ✅ Done — AVX2 BGRA→NV12 2.8x, YUV→RGB 3.4x (runtime-detected, scalar fallback) |
 
@@ -308,7 +321,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 |------|--------|
 | QUIC Unreliable Datagram | video over datagram, no retransmit |
 | 0-RTT reconnect | instant reconnect on network switch |
-| Hardware decode (DXVA2/VideoToolbox/VA-API) | decode 10ms→1ms |
+| ~~Hardware decode (DXVA2/VideoToolbox/VA-API)~~ | ✅ Done — NVDEC (H.264+AV1), VideoToolbox (macOS), dav1d (AV1 software) |
 | GPU direct render (wgpu) | zero-copy display |
 
 ### Features
@@ -317,7 +330,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~Make WS default, WebRTC optional~~ | ✅ done — WS default, `--features webrtc` + `?rtc` for WebRTC |
 | ~~Wayland capture (PipeWire)~~ | ✅ done — `--features wayland` or `--capture pipewire`, auto-detected on Wayland sessions via XDG Portal + PipeWire |
 | ~~Multi-monitor~~ | ✅ done — `--display N` to select display, `--list-displays` to enumerate |
-| File transfer | drag-and-drop |
+| ~~File transfer~~ | ✅ done — bidirectional, chunked, SHA-256 verified |
 | NAT traversal (STUN/TURN) | firewall bypass |
 
 ### Enterprise
@@ -364,13 +377,17 @@ crates/core/src/
   frame.rs        Frame struct, PixelFormat
   input.rs        InputEvent, KeyCode, MouseButton
   clipboard.rs    ClipboardTracker (echo-loop prevention)
-  color.rs        BGRA↔YUV420/NV12 conversion (BT.601, AVX2 SIMD + scalar fallback)
+  color.rs        BGRA↔YUV420/NV12 + NV12→RGB conversion (BT.601, AVX2 SIMD + scalar fallback)
   crypto.rs       ChaCha20-Poly1305 EncryptedWriter/Reader (feature-gated)
 
 crates/server/src/
-  main.rs              CLI args, transport selection, session loop, H.264 encoding, keepalive,
-                       periodic keyframe, auto-start (--install/--uninstall)
+  main.rs              CLI args, transport selection, codec/encoder/capture auto-detection
+  session.rs           SessionRunner: capture→encode→send loop, adaptive bitrate, RTT tracking, audio, file transfer, stats
+  audio_capture.rs     PulseAudio monitor → Opus 48kHz stereo (feature-gated)
   capture_scrap.rs     ScrapCapture (impl FrameCapture, cross-platform, DXGI on Windows)
+  capture_pipewire.rs  PipeWire + XDG Desktop Portal (Wayland, feature-gated)
+  file_transfer.rs     Server-side file transfer handler
+  encode_h264.rs       OpenH264Encoder (impl FrameEncoder, CPU baseline)
   encode_h264.rs       OpenH264Encoder (impl FrameEncoder, CPU baseline)
   encode_zstd.rs       ZstdEncoder (impl Encoder, lossless tiles — UNUSED, kept for future)
   input_injector.rs    enigo: mouse/keyboard injection + type_text for paste, modifier release
@@ -386,7 +403,10 @@ crates/client/src/
   display_winit.rs     softbuffer rendering, coordinate mapping, cursor overlay
   input_capture.rs     winit KeyCode → phantom KeyCode mapping
   decode_h264.rs       OpenH264Decoder (impl FrameDecoder, CPU fallback)
+  decode_av1.rs        Dav1dDecoder (AV1 software decode via dav1d, uses color.rs SIMD)
   decode_videotoolbox.rs  VideoToolbox hardware decoder (macOS, Annex B→AVCC)
+  audio_playback.rs    Opus decode → cpal ring buffer → audio output (feature-gated)
+  file_transfer.rs     Client-side file transfer handler
   decode_zstd.rs       ZstdDecoder (impl Decoder)
   transport_tcp.rs     TCP client: Plain/Encrypted, split
   transport_quic.rs    QUIC client: quinn, skip cert verification
@@ -398,12 +418,14 @@ crates/web/src/
                        mouse/keyboard/scroll/paste input capture, h264_has_idr() NAL parser
 
 crates/gpu/src/
-  lib.rs               Module exports (cuda, nvenc, nvfbc[linux], dxgi[win], dxgi_nvenc[win])
+  lib.rs               Module exports (cuda, nvenc, nvdec[feature-gated], nvfbc[linux], dxgi[win], dxgi_nvenc[win])
   dl.rs                Runtime dlopen/dlsym abstraction (no build-time NVIDIA dep)
   sys.rs               C FFI types: CUDA, NVENC (SDK 12.1), NVFBC (v1.8/1.9 compat)
   cuda.rs              CUDA driver API: context, memory, memcpy, primary context
-  nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 GPU encode via NVENC (uses phantom_core::color for BGRA→NV12)
+  nvenc.rs             NvencEncoder (impl FrameEncoder): H.264 + AV1 GPU encode via NVENC (uses phantom_core::color for BGRA→NV12)
+  nvdec.rs             NvdecDecoder: NVDEC hardware decode H.264 + AV1 via CUVID API (feature-gated "nvdec")
   nvfbc.rs             NvfbcCapture (impl FrameCapture): GPU screen capture via NVFBC
+  probe.rs             GPU capability probe: NVENC codecs, AV1 support detection
   dxgi.rs              DxgiCapture: DXGI Desktop Duplication → ID3D11Texture2D (Windows)
   dxgi_nvenc.rs        DxgiNvencPipeline: DXGI capture + NVENC encode zero-copy (Windows)
 

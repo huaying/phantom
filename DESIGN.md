@@ -11,19 +11,26 @@ A high-performance, open-source remote desktop built in Rust. Target: Parsec-cla
 ### Encoding Pipeline
 
 ```
-Screen Capture → H.264 Encode → Send to Client → WebCodecs/OpenH264 Decode → Display
+Screen Capture → H.264/AV1 Encode → Send to Client → Decode (WebCodecs/OpenH264/dav1d/NVDEC) → Display
 ```
 
-All screen changes are encoded as full H.264 frames. After 2 seconds of inactivity, a lossless zstd update is sent for pixel-perfect text.
+All screen changes are encoded as full H.264 or AV1 frames. After 2 seconds of inactivity, a lossless zstd update is sent for pixel-perfect text. Adaptive bitrate adjusts quality based on RTT.
 
 **Capture backends:**
 - `scrap` — CPU-based, cross-platform (DXGI on Windows, X11 on Linux)
 - `dxgi` — GPU-resident D3D11 texture, Windows zero-copy (→ NVENC)
 - `nvfbc` — NVIDIA FrameBuffer Capture, Linux zero-copy (→ NVENC)
+- `pipewire` — PipeWire + XDG Desktop Portal (Wayland, compile-tested)
 
 **Encoder backends:**
 - `openh264` — CPU H.264, Baseline profile, works everywhere
-- `nvenc` — NVIDIA GPU H.264, runtime dlopen, no build-time CUDA dep
+- `nvenc` — NVIDIA GPU H.264 + AV1, runtime dlopen, no build-time CUDA dep
+
+**Decoder backends (client):**
+- `openh264` — CPU H.264 decode, fallback
+- `dav1d` — CPU AV1 decode, SIMD-accelerated color conversion
+- `nvdec` — NVIDIA GPU H.264 + AV1 decode, runtime dlopen, feature-gated
+- `videotoolbox` — macOS native hardware decode
 
 ### Transport Layer
 
@@ -78,7 +85,8 @@ Both paths: zero CPU readback, zero CPU color conversion, zero GPU upload.
 5. **Runtime dlopen for GPU** — compiles on any machine, GPU optional
 6. **Self-signed HTTPS** — enables WebCodecs on non-localhost (rcgen)
 7. **Periodic keyframes (2s)** — recovers from decode errors, supports reconnect
-8. **Encoder recreation per session** — NVENC only outputs SPS/PPS on fresh encoder
+8. **Protocol versioning** — `PROTOCOL_VERSION` in Hello, `read_message_lenient` for forward compat
+9. **Feature-gated GPU decode** — `phantom-gpu/nvdec` feature, client enables, server does not
 
 ## Roadmap
 
