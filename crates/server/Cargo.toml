@@ -14,6 +14,7 @@ wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + 
 phantom-core = { path = "../core" }
 anyhow = "1"
 bincode = "1"
+bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 scrap = "0.5"
