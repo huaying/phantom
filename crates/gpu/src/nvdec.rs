@@ -168,12 +168,14 @@ impl ParserParams {
 }
 
 /// CUVIDSOURCEDATAPACKET — feed compressed data to parser.
+/// Note: flags and payload_size are `unsigned int` (not `unsigned long`)
+/// in the actual NVIDIA SDK, despite other structs using unsigned long.
 #[repr(C)]
 struct SourceDataPacket {
-    flags: u32,
-    payload_size: u32,
-    payload: *const u8,
-    timestamp: i64,
+    flags: u32,         // offset 0 (unsigned int)
+    payload_size: u32,  // offset 4 (unsigned int)
+    payload: *const u8, // offset 8
+    timestamp: i64,     // offset 16
 }
 
 /// CUVIDPROCPARAMS — for cuvidMapVideoFrame.
@@ -240,13 +242,22 @@ struct CallbackState {
 /// Return the number of decode surfaces to allocate.
 extern "C" fn on_sequence(user_data: *mut c_void, _format: *mut c_void) -> i32 {
     let _ = user_data;
-    // Return number of decode surfaces (must match what we created the decoder with)
+    tracing::info!("NVDEC on_sequence callback fired");
     8
 }
 
 /// Decode callback — called for each picture to decode.
 extern "C" fn on_decode(user_data: *mut c_void, pic_params: *mut c_void) -> i32 {
+    tracing::info!("NVDEC on_decode callback fired");
+    if user_data.is_null() {
+        tracing::error!("on_decode: user_data is null!");
+        return 0;
+    }
     let state = unsafe { &*(user_data as *const CallbackState) };
+    if state.decoder.is_null() {
+        tracing::error!("on_decode: decoder is null!");
+        return 0;
+    }
     let status = unsafe { (state.fn_decode_picture)(state.decoder, pic_params) };
     if status != 0 {
         tracing::warn!("cuvidDecodePicture failed: {status}");
@@ -256,8 +267,8 @@ extern "C" fn on_decode(user_data: *mut c_void, pic_params: *mut c_void) -> i32 
 }
 
 /// Display callback — called when a decoded picture is ready for display.
-/// We map the frame, convert NV12→RGB, and push to the output queue.
 extern "C" fn on_display(user_data: *mut c_void, disp_info: *mut c_void) -> i32 {
+    tracing::info!("NVDEC on_display callback fired");
     if disp_info.is_null() {
         return 1; // End of stream signal
     }
@@ -471,14 +482,14 @@ impl NvdecDecoder {
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u32>> {
         unsafe { self.cuda.ctx_push(self.ctx)? };
 
-        let mut packet = SourceDataPacket {
+        let packet = SourceDataPacket {
             flags: CUVID_PKT_TIMESTAMP,
             payload_size: data.len() as u32,
             payload: data.as_ptr(),
             timestamp: 0,
         };
 
-        let status = unsafe { (self.fn_parse_video_data)(self.parser, &mut packet) };
+        let status = unsafe { (self.fn_parse_video_data)(self.parser, &packet) };
         if status != 0 {
             self.cuda.ctx_pop()?;
             bail!("cuvidParseVideoData failed: {status}");
@@ -536,5 +547,59 @@ mod tests {
             Ok(_) => eprintln!("NVDEC H264 decoder created OK"),
             Err(e) => eprintln!("NVDEC H264 failed: {e}"),
         }
+    }
+}
+
+#[test]
+fn test_nvdec_av1_with_real_data() {
+    use crate::nvenc::NvencEncoder;
+    use phantom_core::encode::{FrameEncoder, VideoCodec};
+    use phantom_core::frame::{Frame, PixelFormat};
+
+    let cuda = match CudaLib::load() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("CUDA not available: {e}");
+            return;
+        }
+    };
+
+    // Create a small AV1 encoder and encode one frame
+    let mut enc = match NvencEncoder::new(Arc::clone(&cuda), 0, 64, 64, 30, 500, VideoCodec::Av1) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("NVENC AV1 not available: {e}");
+            return;
+        }
+    };
+
+    let pixels = vec![0u8; 64 * 64 * 4]; // black frame
+    let frame = Frame {
+        width: 64,
+        height: 64,
+        format: PixelFormat::Bgra8,
+        data: pixels,
+        timestamp: std::time::Instant::now(),
+    };
+    let encoded = enc.encode_frame(&frame).unwrap();
+    eprintln!(
+        "Encoded {} bytes, keyframe={}",
+        encoded.data.len(),
+        encoded.is_keyframe
+    );
+
+    // Create NVDEC decoder and try to decode
+    let mut dec = match NvdecDecoder::new(Arc::clone(&cuda), 0, 64, 64, VideoCodec::Av1) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("NVDEC AV1 decoder failed: {e}");
+            return;
+        }
+    };
+
+    let result = dec.decode(&encoded.data);
+    match result {
+        Ok(rgb) => eprintln!("Decoded {} pixels", rgb.len()),
+        Err(e) => eprintln!("Decode failed: {e}"),
     }
 }
