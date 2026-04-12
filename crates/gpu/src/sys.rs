@@ -116,11 +116,12 @@ pub const NV_ENC_CODEC_HEVC_GUID: GUID = GUID {
 };
 
 /// AV1 codec GUID (NVENC 8th gen+, Ada Lovelace and newer).
+/// {0A352289-0AA7-4759-862D-5D15CD16D254}
 pub const NV_ENC_CODEC_AV1_GUID: GUID = GUID {
-    data1: 0x0e737ba0,
-    data2: 0xda4b,
-    data3: 0x49d5,
-    data4: [0x96, 0x2d, 0xbf, 0xce, 0x5d, 0x8f, 0x6c, 0xfd],
+    data1: 0x0A352289,
+    data2: 0x0AA7,
+    data3: 0x4759,
+    data4: [0x86, 0x2D, 0x5D, 0x15, 0xCD, 0x16, 0xD2, 0x54],
 };
 
 pub const NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID: GUID = GUID {
@@ -152,11 +153,12 @@ pub const NV_ENC_H264_PROFILE_HIGH_GUID: GUID = GUID {
 };
 
 /// AV1 Main Profile GUID.
+/// {5f2a39f5-f14e-4f95-9a9e-b76d568fcf97}
 pub const NV_ENC_AV1_PROFILE_MAIN_GUID: GUID = GUID {
     data1: 0x5f2a39f5,
     data2: 0xf14e,
     data3: 0x4f95,
-    data4: [0x9a, 0x9e, 0xb7, 0x6d, 0x56, 0x8f, 0xcb, 0x97],
+    data4: [0x9a, 0x9e, 0xb7, 0x6d, 0x56, 0x8f, 0xcf, 0x97],
 };
 
 pub const NV_ENC_PRESET_P1_GUID: GUID = GUID {

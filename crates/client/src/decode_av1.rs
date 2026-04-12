@@ -31,7 +31,18 @@ impl FrameDecoder for Dav1dDecoder {
             .send_data(data.to_vec(), None, None, None)
             .context("dav1d send_data")?;
 
-        let picture = self.decoder.get_picture().context("dav1d get_picture")?;
+        // dav1d may return EAGAIN if the frame doesn't produce output yet
+        let picture = match self.decoder.get_picture() {
+            Ok(pic) => pic,
+            Err(dav1d::Error::Again) => {
+                // Decoder buffered the data but needs more to produce output.
+                // Return empty — caller will skip this frame.
+                return Ok(vec![]);
+            }
+            Err(e) => {
+                anyhow::bail!("dav1d decode error: {e}");
+            }
+        };
 
         let w = picture.width() as usize;
         let h = picture.height() as usize;
