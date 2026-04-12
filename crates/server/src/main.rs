@@ -84,6 +84,16 @@ struct Args {
     /// Send a file to the first client that connects.
     #[arg(long)]
     send_file: Option<String>,
+
+    /// STUN server for NAT discovery (e.g. stun.l.google.com:19302).
+    /// When set, the server discovers its public IP:port and prints a
+    /// connection code that clients can use to connect from the internet.
+    #[arg(long)]
+    stun: Option<String>,
+
+    /// Override public address (skip STUN discovery). Format: IP:port.
+    #[arg(long)]
+    public_addr: Option<String>,
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
@@ -447,6 +457,22 @@ fn main() -> Result<()> {
 
     // Resolve --send-file path once
     let send_file_path = args.send_file.as_ref().map(std::path::PathBuf::from);
+
+    // ── STUN NAT discovery ──────────────────────────────────────────────────
+    if let Some(ref stun_server) = args.stun {
+        match phantom_core::stun::discover_public_addr(stun_server) {
+            Ok(public_addr) => {
+                tracing::info!(%public_addr, "STUN discovery: public address");
+                print_connection_code(&public_addr.to_string());
+            }
+            Err(e) => {
+                tracing::warn!("STUN discovery failed: {e}");
+                tracing::warn!("Clients may not be able to connect from outside the LAN");
+            }
+        }
+    } else if let Some(ref public) = args.public_addr {
+        print_connection_code(public);
+    }
 
     // ── Main accept loop (with session replacement) ─────────────────────────
     //
@@ -902,4 +928,16 @@ fn uninstall_autostart() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_connection_code(addr: &str) {
+    let code = format!("phantom://{addr}");
+    let cmd = format!("phantom-client -c {addr}");
+    let w = code.len().max(cmd.len()) + 4;
+    let bar = "═".repeat(w + 2);
+    println!("\n╔{bar}╗");
+    println!("║  {code:<w$}  ║");
+    println!("║  {:<w$}  ║", "");
+    println!("║  {cmd:<w$}  ║");
+    println!("╚{bar}╝\n");
 }

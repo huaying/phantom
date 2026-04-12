@@ -30,5 +30,6 @@ pub mod file_transfer;
 pub mod frame;
 pub mod input;
 pub mod protocol;
+pub mod stun;
 pub mod tile;
 pub mod transport;

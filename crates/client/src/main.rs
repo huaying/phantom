@@ -202,15 +202,24 @@ impl App {
 
         tracing::info!(addr = %self.args_connect, "connecting...");
 
+        // Parse phantom:// connection code if provided
+        let connect_addr = if self.args_connect.starts_with("phantom://") {
+            self.args_connect
+                .strip_prefix("phantom://")
+                .unwrap_or(&self.args_connect)
+                .to_string()
+        } else {
+            self.args_connect.clone()
+        };
+
         let result: ConnectResult = if self.args_transport == "quic" {
-            match transport_quic::QuicClientTransport::new()
-                .and_then(|q| q.connect(&self.args_connect))
+            match transport_quic::QuicClientTransport::new().and_then(|q| q.connect(&connect_addr))
             {
                 Ok((s, r)) => Ok((Box::new(s), Box::new(r), None)),
                 Err(e) => Err(e),
             }
         } else {
-            match transport_tcp::TcpClientTransport::new(&self.args_connect).connect_tcp() {
+            match transport_tcp::TcpClientTransport::new(&connect_addr).connect_tcp() {
                 Ok(conn) => {
                     let shutdown_handle = conn.shutdown_handle().ok();
                     if let Some(ref key) = self.encryption_key {
