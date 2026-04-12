@@ -44,6 +44,7 @@ fn main() -> Result<()> {
             format: PixelFormat::Bgra8,
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
+            video_codec: VideoCodec::H264,
         },
     )?;
 

@@ -176,7 +176,18 @@ fn main() {
             // --- NVENC ---
             let nvenc = cuda
                 .as_ref()
-                .and_then(|c| NvencEncoder::new(Arc::clone(c), 0, w, h, 30, bitrate).ok())
+                .and_then(|c| {
+                    NvencEncoder::new(
+                        Arc::clone(c),
+                        0,
+                        w,
+                        h,
+                        30,
+                        bitrate,
+                        phantom_core::encode::VideoCodec::H264,
+                    )
+                    .ok()
+                })
                 .map(|mut enc| {
                     bench(ROUNDS, || {
                         enc.encode_frame(&frame)
@@ -269,6 +280,7 @@ fn main() {
                         fh,
                         30,
                         5000,
+                        phantom_core::encode::VideoCodec::H264,
                     )
                 } {
                     Ok(mut enc) => {

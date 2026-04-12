@@ -24,7 +24,7 @@ mod transport_ws;
 use anyhow::Result;
 use clap::Parser;
 use phantom_core::crypto;
-use phantom_core::encode::FrameEncoder;
+use phantom_core::encode::{FrameEncoder, VideoCodec};
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +51,10 @@ struct Args {
     /// Video encoder: auto (default, probes GPU), openh264 (CPU), nvenc (NVIDIA GPU).
     #[arg(long, default_value = "auto")]
     encoder: String,
+
+    /// Video codec: h264 (default), av1 (requires NVENC 8th gen+).
+    #[arg(long, default_value = "h264")]
+    codec: String,
 
     /// Screen capture: auto (default, probes GPU/Wayland), scrap (CPU/X11), nvfbc (NVIDIA GPU), pipewire (Wayland).
     #[arg(long, default_value = "auto")]
@@ -201,7 +205,18 @@ fn main() -> Result<()> {
         capture_name = "scrap".to_string();
     }
 
-    tracing::info!(encoder = %encoder_name, capture = %capture_name, display = args.display, "configuration resolved");
+    let video_codec = match args.codec.as_str() {
+        "h264" | "H264" | "h.264" => VideoCodec::H264,
+        "av1" | "AV1" => {
+            if encoder_name != "nvenc" {
+                anyhow::bail!("AV1 codec requires --encoder nvenc (OpenH264 only supports H.264)");
+            }
+            VideoCodec::Av1
+        }
+        other => anyhow::bail!("unknown codec: {other} (supported: h264, av1)"),
+    };
+
+    tracing::info!(encoder = %encoder_name, capture = %capture_name, codec = ?video_codec, display = args.display, "configuration resolved");
 
     // GPU zero-copy pipeline detection
     #[cfg(target_os = "linux")]
@@ -215,7 +230,7 @@ fn main() -> Result<()> {
     // Falls back gracefully if init fails (e.g. NVFBC not supported on virtual display)
     #[cfg(target_os = "linux")]
     let mut gpu = if use_gpu_pipeline {
-        match GpuPipeline::new(args.fps, args.bitrate) {
+        match GpuPipeline::new(args.fps, args.bitrate, video_codec) {
             Ok(g) => Some(g),
             Err(e) => {
                 tracing::warn!("GPU pipeline init failed, falling back to CPU: {e}");
@@ -289,6 +304,7 @@ fn main() -> Result<()> {
             height,
             args.fps as f32,
             args.bitrate,
+            video_codec,
         )?)
     } else {
         None
@@ -502,6 +518,7 @@ fn main() -> Result<()> {
                     quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
+                    video_codec,
                 },
             )
         } else {
@@ -516,6 +533,7 @@ fn main() -> Result<()> {
                     quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
+                    video_codec,
                 },
             )
         };
@@ -530,6 +548,7 @@ fn main() -> Result<()> {
                     quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
+                    video_codec,
                 },
             )
         } else {
@@ -544,6 +563,7 @@ fn main() -> Result<()> {
                     quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
+                    video_codec,
                 },
             )
         };
@@ -609,11 +629,12 @@ struct GpuPipeline {
     height: u32,
     fps: u32,
     bitrate: u32,
+    codec: VideoCodec,
 }
 
 #[cfg(target_os = "linux")]
 impl GpuPipeline {
-    fn new(fps: u32, bitrate_kbps: u32) -> Result<Self> {
+    fn new(fps: u32, bitrate_kbps: u32, codec: VideoCodec) -> Result<Self> {
         use phantom_core::capture::FrameCapture;
         let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
         let dev = cuda.device_get(0)?;
@@ -654,6 +675,7 @@ impl GpuPipeline {
                 height,
                 fps,
                 bitrate_kbps,
+                codec,
             )?
         };
 
@@ -666,6 +688,7 @@ impl GpuPipeline {
             height,
             fps,
             bitrate: bitrate_kbps,
+            codec,
         })
     }
 
@@ -680,6 +703,7 @@ impl GpuPipeline {
                 self.height,
                 self.fps,
                 self.bitrate,
+                self.codec,
             )?
         };
         tracing::info!("GPU pipeline reset for new session");
@@ -725,9 +749,13 @@ fn create_encoder(
     height: u32,
     fps: f32,
     bitrate_kbps: u32,
+    codec: VideoCodec,
 ) -> Result<Box<dyn FrameEncoder>> {
     match name {
         "openh264" => {
+            if codec == VideoCodec::Av1 {
+                anyhow::bail!("OpenH264 does not support AV1. Use --encoder nvenc for AV1.");
+            }
             let enc = encode_h264::OpenH264Encoder::new(width, height, fps, bitrate_kbps)?;
             Ok(Box::new(enc))
         }
@@ -740,6 +768,7 @@ fn create_encoder(
                 height,
                 fps as u32,
                 bitrate_kbps,
+                codec,
             )?;
             Ok(Box::new(enc))
         }

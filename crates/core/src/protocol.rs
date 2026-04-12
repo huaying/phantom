@@ -31,6 +31,9 @@ pub enum Message {
         /// Whether the server will send AudioFrame messages.
         #[serde(default)]
         audio: bool,
+        /// Video codec used for VideoFrame messages (H.264 or AV1).
+        #[serde(default = "default_video_codec")]
+        video_codec: crate::encode::VideoCodec,
     },
 
     /// Server → Client: H.264/AV1 encoded full frame (lossy, during motion).
@@ -122,6 +125,10 @@ fn default_protocol_version_1() -> u32 {
     1
 }
 
+fn default_video_codec() -> crate::encode::VideoCodec {
+    crate::encode::VideoCodec::H264
+}
+
 // -- Wire framing: [u32 big-endian length][bincode payload] --
 
 use anyhow::{Context, Result};
@@ -190,6 +197,7 @@ mod tests {
             format: PixelFormat::Bgra8,
             protocol_version: PROTOCOL_VERSION,
             audio: true,
+            video_codec: VideoCodec::H264,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();

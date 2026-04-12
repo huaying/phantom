@@ -339,6 +339,7 @@ impl SessionRunner {
         height: u32,
         frame_interval: Duration,
         cancel: Arc<AtomicBool>,
+        video_codec: phantom_core::encode::VideoCodec,
     ) -> Result<Self> {
         let event_rx = spawn_receive_thread(receiver);
         let injector = InputInjector::new().ok();
@@ -392,6 +393,7 @@ impl SessionRunner {
             format: phantom_core::frame::PixelFormat::Bgra8,
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: has_audio,
+            video_codec,
         })?;
         tracing::info!(width, height, audio = has_audio, "session started");
 
@@ -713,6 +715,7 @@ pub struct SessionConfig<'a> {
     pub quality_delay: Duration,
     pub cancel: Arc<AtomicBool>,
     pub send_file: Option<&'a std::path::Path>,
+    pub video_codec: phantom_core::encode::VideoCodec,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -737,6 +740,7 @@ pub fn run_session_cpu(
         height,
         cfg.frame_interval,
         cfg.cancel,
+        cfg.video_codec,
     )?;
 
     // Send file if requested via --send-file
@@ -839,6 +843,7 @@ pub fn run_session_gpu(
         height,
         cfg.frame_interval,
         cfg.cancel,
+        cfg.video_codec,
     )?;
 
     if let Some(path) = cfg.send_file {
@@ -914,6 +919,7 @@ pub fn run_session_dxgi(
         height,
         cfg.frame_interval,
         cfg.cancel,
+        cfg.video_codec,
     )?;
 
     if let Some(path) = cfg.send_file {

@@ -85,6 +85,7 @@ fn main() {
                         fh,
                         30,
                         5000,
+                        phantom_core::encode::VideoCodec::H264,
                     )
                 } {
                     Ok(mut enc) => {

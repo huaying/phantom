@@ -30,8 +30,7 @@ pub struct NvencEncoder {
     nv12_buf: Vec<u8>,
     force_idr: bool,
     frame_idx: u64,
-    /// Saved SPS/PPS NAL units from the first keyframe.
-    /// Prepended to subsequent keyframes that don't include them.
+    /// Saved SPS/PPS NAL units from the first keyframe (H.264 only).
     sps_pps: Vec<u8>,
     owns_ctx: bool,
     _nvenc_lib: DynLib,
@@ -41,6 +40,8 @@ pub struct NvencEncoder {
     init_params: NvEncInitializeParams,
     /// Saved encode config for reconfiguration.
     encode_config: NvEncConfig,
+    /// Video codec (H.264 or AV1).
+    codec: VideoCodec,
 }
 
 // NVENC encoder handle is not thread-safe, but we only use it from one thread.
@@ -65,16 +66,18 @@ impl NvencEncoder {
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
+        codec: VideoCodec,
     ) -> Result<Self> {
         let dev = cuda.device_get(device_ordinal)?;
         let ctx = cuda.ctx_create(dev)?;
-        unsafe { Self::with_context(cuda, ctx, true, width, height, fps, bitrate_kbps) }
+        unsafe { Self::with_context(cuda, ctx, true, width, height, fps, bitrate_kbps, codec) }
     }
 
     /// Create encoder using an existing CUDA context (e.g., shared with NVFBC).
     ///
     /// # Safety
     /// `ctx` must be a valid CUDA context.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn with_context(
         cuda: Arc<CudaLib>,
         ctx: CUcontext,
@@ -83,6 +86,7 @@ impl NvencEncoder {
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
+        codec: VideoCodec,
     ) -> Result<Self> {
         // Load NVENC library
         #[cfg(unix)]
@@ -128,25 +132,35 @@ impl NvencEncoder {
         preset_config.set_version();
         preset_config.set_config_version();
 
+        // Determine codec and profile GUIDs
+        let (codec_guid, profile_guid) = match codec {
+            VideoCodec::Av1 => (NV_ENC_CODEC_AV1_GUID, NV_ENC_AV1_PROFILE_MAIN_GUID),
+            _ => (NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_BASELINE_GUID),
+        };
+
         let f = api
             .get_encode_preset_config_ex()
             .context("nvEncGetEncodePresetConfigEx is null")?;
         let status = unsafe {
             f(
                 encoder,
-                NV_ENC_CODEC_H264_GUID,
+                codec_guid,
                 NV_ENC_PRESET_P4_GUID,
                 NV_ENC_TUNING_INFO_LOW_LATENCY,
                 preset_config.as_mut_ptr(),
             )
         };
         if status != NV_ENC_SUCCESS {
-            bail!("nvEncGetEncodePresetConfigEx failed: {status}");
+            bail!(
+                "nvEncGetEncodePresetConfigEx failed: {} ({})",
+                nvenc_status_name(status),
+                status
+            );
         }
 
         // Extract and customize config
         let mut config = preset_config.copy_config();
-        config.set_profile_guid(&NV_ENC_H264_PROFILE_BASELINE_GUID);
+        config.set_profile_guid(&profile_guid);
         config.set_gop_length(u32::MAX); // infinite GOP (low latency)
         config.set_rc_mode(NV_ENC_PARAMS_RC_CBR);
         config.set_avg_bitrate(bitrate_kbps * 1000);
@@ -157,7 +171,7 @@ impl NvencEncoder {
         // Initialize encoder
         let mut init_params = NvEncInitializeParams::zeroed();
         init_params.set_version();
-        init_params.set_encode_guid(&NV_ENC_CODEC_H264_GUID);
+        init_params.set_encode_guid(&codec_guid);
         init_params.set_preset_guid(&NV_ENC_PRESET_P4_GUID);
         init_params.set_encode_width(width);
         init_params.set_encode_height(height);
@@ -196,12 +210,17 @@ impl NvencEncoder {
         let device_buf = cuda.mem_alloc(nv12_size)?;
         cuda.ctx_pop()?;
 
+        let codec_name = match codec {
+            VideoCodec::Av1 => "AV1",
+            _ => "H.264",
+        };
         tracing::info!(
             width,
             height,
             fps,
             bitrate_kbps,
-            "NVENC H.264 encoder initialized (GPU)"
+            codec = codec_name,
+            "NVENC encoder initialized (GPU)"
         );
 
         Ok(Self {
@@ -223,6 +242,7 @@ impl NvencEncoder {
             bitrate_kbps,
             init_params,
             encode_config: config,
+            codec,
         })
     }
 
@@ -429,9 +449,9 @@ impl NvencEncoder {
             unsafe { f(self.encoder, self.output_buf) };
         }
 
-        // NVENC only outputs SPS/PPS on the very first encode after init.
+        // H.264 only: NVENC only outputs SPS/PPS on the very first encode after init.
         // Save it, and prepend to any subsequent keyframe that lacks it.
-        if is_keyframe {
+        if is_keyframe && self.codec == VideoCodec::H264 {
             let has_sps = data
                 .windows(5)
                 .any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1f) == 7);
@@ -456,7 +476,7 @@ impl NvencEncoder {
         }
 
         Ok(EncodedFrame {
-            codec: VideoCodec::H264,
+            codec: self.codec,
             data,
             is_keyframe,
         })
@@ -608,7 +628,7 @@ mod tests {
             return;
         }
         let cuda = std::sync::Arc::new(cuda.unwrap());
-        let result = NvencEncoder::new(cuda, 0, 320, 240, 30, 1000);
+        let result = NvencEncoder::new(cuda, 0, 320, 240, 30, 1000, VideoCodec::H264);
         // Should succeed if GPU is available
         assert!(result.is_ok(), "NVENC init failed: {:?}", result.err());
     }

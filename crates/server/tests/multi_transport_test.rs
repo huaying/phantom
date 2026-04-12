@@ -132,6 +132,7 @@ fn hello_message_roundtrip() {
         format: PixelFormat::Bgra8,
         protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
         audio: false,
+        video_codec: phantom_core::encode::VideoCodec::H264,
     };
 
     let mut buf = Vec::new();

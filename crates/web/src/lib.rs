@@ -483,6 +483,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             height,
             protocol_version,
             audio,
+            video_codec,
             ..
         } => {
             if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
@@ -507,17 +508,25 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             s.canvas.set_width(width);
             s.canvas.set_height(height);
             drop(s);
-            setup_decoder(state, width, height);
+            setup_decoder(state, width, height, video_codec);
             if audio {
                 setup_audio(state);
             }
         }
         Message::VideoFrame { sequence, frame } => {
-            if frame.codec != VideoCodec::H264 || frame.data.is_empty() {
+            if frame.data.is_empty() {
                 return;
             }
             let mut s = state.borrow_mut();
-            let is_key = h264_has_idr(&frame.data);
+
+            let is_key = match frame.codec {
+                VideoCodec::H264 => h264_has_idr(&frame.data),
+                VideoCodec::Av1 => {
+                    // AV1: first byte OBU header, check if it's a key frame
+                    // For simplicity, mark first frame as key
+                    s.frame_count == 0
+                }
+            };
             // Log first few frames for debugging
             if s.frame_count < 5 {
                 let hex: String = frame
@@ -693,7 +702,7 @@ fn h264_has_idr(data: &[u8]) -> bool {
     false
 }
 
-fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
+fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: VideoCodec) {
     let s = state.clone();
     let decode_count = Rc::new(RefCell::new(0u64));
     let dc = decode_count.clone();
@@ -724,17 +733,22 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32) {
     let decoder = JsVideoDecoder::new(&init);
 
     let config = js_sys::Object::new();
-    // Baseline profile, Level 4.0 — supports 1080p@30fps.
-    // NVENC outputs Level 4.0 (0x28), OpenH264 outputs Level 3.1 (0x1f).
-    // Level 4.0 config decodes both (higher level is superset).
-    js_sys::Reflect::set(&config, &"codec".into(), &"avc1.42c028".into()).unwrap();
+    let codec_str = match codec {
+        VideoCodec::Av1 => "av01.0.08M.08", // AV1 Main Profile, Level 4.0, 8-bit
+        _ => "avc1.42c028",                 // H.264 Baseline, Level 4.0
+    };
+    js_sys::Reflect::set(&config, &"codec".into(), &codec_str.into()).unwrap();
     js_sys::Reflect::set(&config, &"codedWidth".into(), &(width).into()).unwrap();
     js_sys::Reflect::set(&config, &"codedHeight".into(), &(height).into()).unwrap();
     js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &true.into()).unwrap();
     decoder.configure(&config);
 
     state.borrow_mut().decoder = Some(decoder);
-    console::log_1(&"H.264 decoder ready".into());
+    let codec_name = match codec {
+        VideoCodec::Av1 => "AV1",
+        _ => "H.264",
+    };
+    console::log_1(&format!("{codec_name} decoder ready").into());
     output_cb.forget();
     error_cb.forget();
 }

@@ -7,6 +7,7 @@
 
 #[cfg(feature = "audio")]
 mod audio_playback;
+mod decode_av1;
 mod decode_h264;
 #[cfg(target_os = "macos")]
 mod decode_videotoolbox;
@@ -114,6 +115,9 @@ enum AppState {
 struct Session {
     display: display_winit::WinitDisplay,
     h264_decoder: Box<dyn phantom_core::encode::FrameDecoder>,
+    /// The video codec the server uses.
+    #[allow(dead_code)]
+    server_codec: phantom_core::encode::VideoCodec,
     tile_decoder: decode_zstd::ZstdDecoder,
     frame_rx: mpsc::Receiver<Message>,
     input_tx: mpsc::Sender<Message>,
@@ -210,12 +214,13 @@ impl App {
         };
 
         // Read Hello and check protocol version
-        let (width, height, server_audio) = match receiver.recv_msg() {
+        let (width, height, server_audio, video_codec) = match receiver.recv_msg() {
             Ok(Message::Hello {
                 width,
                 height,
                 audio,
                 protocol_version,
+                video_codec,
                 ..
             }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
                 if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
@@ -234,7 +239,7 @@ impl App {
                     );
                 }
                 tracing::info!(width, height, audio, protocol_version, "connected");
-                (width, height, audio)
+                (width, height, audio, video_codec)
             }
             Ok(_) => {
                 tracing::warn!("bad Hello");
@@ -308,6 +313,20 @@ impl App {
             }
         };
 
+        // If server uses AV1, replace decoder with dav1d
+        let h264_decoder: Box<dyn phantom_core::encode::FrameDecoder> =
+            if video_codec == phantom_core::encode::VideoCodec::Av1 {
+                match decode_av1::Dav1dDecoder::new(width, height) {
+                    Ok(d) => Box::new(d),
+                    Err(e) => {
+                        tracing::error!("AV1 decoder init failed: {e}");
+                        return;
+                    }
+                }
+            } else {
+                h264_decoder
+            };
+
         let connected = Arc::new(AtomicBool::new(true));
         let server_kicked = Arc::new(AtomicBool::new(false));
 
@@ -370,6 +389,7 @@ impl App {
         self.state = AppState::Connected(Session {
             display,
             h264_decoder,
+            server_codec: video_codec,
             tile_decoder: decode_zstd::ZstdDecoder::new(),
             frame_rx,
             input_tx,
