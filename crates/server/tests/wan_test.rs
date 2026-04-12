@@ -288,6 +288,7 @@ fn run_wan_e2e(profile: WanProfile, num_frames: u32, label: &str) -> (u32, Durat
                     protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                     audio: false,
                     video_codec: phantom_core::encode::VideoCodec::H264,
+                    session_token: vec![],
                 },
             )
             .unwrap();
@@ -501,6 +502,7 @@ fn wan_encrypted_high_latency() {
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
             video_codec: phantom_core::encode::VideoCodec::H264,
+            session_token: vec![],
         })
         .unwrap();
         writer.write_encrypted(&payload).unwrap();
@@ -584,6 +586,7 @@ fn wan_keepalive_survives_latency() {
                 protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                 audio: false,
                 video_codec: phantom_core::encode::VideoCodec::H264,
+                session_token: vec![],
             },
         )
         .unwrap();
@@ -663,6 +666,7 @@ fn wan_session_replacement_under_latency() {
                 protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                 audio: false,
                 video_codec: phantom_core::encode::VideoCodec::H264,
+                session_token: vec![],
             },
         )
         .unwrap();
@@ -707,6 +711,7 @@ fn wan_session_replacement_under_latency() {
                 protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                 audio: false,
                 video_codec: phantom_core::encode::VideoCodec::H264,
+                session_token: vec![],
             },
         )
         .unwrap();

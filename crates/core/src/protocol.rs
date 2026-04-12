@@ -4,7 +4,7 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Minimum protocol version we can interoperate with.
 /// Versions below this are rejected at handshake.
@@ -34,6 +34,9 @@ pub enum Message {
         /// Video codec used for VideoFrame messages (H.264 or AV1).
         #[serde(default = "default_video_codec")]
         video_codec: crate::encode::VideoCodec,
+        /// Opaque session token for reconnect. Client sends this back in Resume.
+        #[serde(default)]
+        session_token: Vec<u8>,
     },
 
     /// Server → Client: H.264/AV1 encoded full frame (lossy, during motion).
@@ -75,6 +78,18 @@ pub enum Message {
     Disconnect {
         reason: String,
     },
+
+    /// Client → Server: attempt to resume a previous session.
+    /// If the token matches the active session, server skips Hello and
+    /// sends a keyframe immediately. Otherwise server closes the connection.
+    Resume {
+        session_token: Vec<u8>,
+        /// Last sequence number the client successfully decoded.
+        last_sequence: u64,
+    },
+
+    /// Server → Client: resume accepted — session continues.
+    ResumeOk,
 
     // ── File transfer (v3) ──────────────────────────────────────────────
     /// Bidirectional: offer to send a file.
@@ -198,6 +213,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             audio: true,
             video_codec: VideoCodec::H264,
+            session_token: vec![1, 2, 3, 4],
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();

@@ -459,6 +459,8 @@ fn main() -> Result<()> {
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cancel = Arc::new(AtomicBool::new(false));
+    // Active session token for reconnect validation (future: pre-Hello resume)
+    let mut _active_session_token: Vec<u8> = Vec::new();
 
     {
         let conn_rx = Arc::clone(&conn_rx);
@@ -514,6 +516,10 @@ fn main() -> Result<()> {
         // Register with signal handler so Ctrl+C cancels active session
         *shutdown_cancel.lock().unwrap() = Some(Arc::clone(&cancel));
 
+        // No resume check at accept time — client sends Resume after receiving Hello
+        // if it wants to reconnect. The session's receive thread handles Resume.
+        let is_resume = false;
+
         #[cfg(target_os = "linux")]
         let result = if let Some(ref mut gpu) = gpu {
             session::run_session_gpu(
@@ -527,6 +533,7 @@ fn main() -> Result<()> {
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
+                    is_resume,
                 },
             )
         } else {
@@ -542,9 +549,12 @@ fn main() -> Result<()> {
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
+                    is_resume,
                 },
             )
         };
+        _active_session_token = result.session_token.clone();
+        tracing::info!("session ended: {}", result.error);
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
             session::run_session_dxgi(
@@ -557,6 +567,7 @@ fn main() -> Result<()> {
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
+                    is_resume,
                 },
             )
         } else {
@@ -572,6 +583,7 @@ fn main() -> Result<()> {
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
+                    is_resume,
                 },
             )
         };
@@ -587,27 +599,34 @@ fn main() -> Result<()> {
                 quality_delay,
                 cancel: session_cancel,
                 send_file: send_file_path.as_deref(),
+                video_codec,
+                is_resume,
             },
         );
 
-        if let Err(e) = result {
-            tracing::warn!("session ended: {e}");
-            differ.reset();
-            if let Some(ref mut enc) = video_encoder {
-                enc.force_keyframe();
+        // Update active session token from session result
+        #[cfg(not(target_os = "linux"))]
+        {
+            _active_session_token = result.session_token.clone();
+            tracing::info!("session ended: {}", result.error);
+        }
+
+        // Post-session cleanup
+        differ.reset();
+        if let Some(ref mut enc) = video_encoder {
+            enc.force_keyframe();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ref mut gpu) = gpu {
+            let _ = gpu.capture.release_context();
+            if let Err(e) = gpu.reset_for_new_session() {
+                tracing::error!("GPU pipeline reset failed: {e}");
             }
-            #[cfg(target_os = "linux")]
-            if let Some(ref mut gpu) = gpu {
-                let _ = gpu.capture.release_context();
-                if let Err(e) = gpu.reset_for_new_session() {
-                    tracing::error!("GPU pipeline reset failed: {e}");
-                }
-            }
-            #[cfg(target_os = "windows")]
-            if let Some(ref mut gw) = gpu_win {
-                if let Err(e) = gw.reset_for_new_session() {
-                    tracing::error!("DXGI pipeline reset failed: {e}");
-                }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(ref mut gw) = gpu_win {
+            if let Err(e) = gw.reset_for_new_session() {
+                tracing::error!("DXGI pipeline reset failed: {e}");
             }
         }
     }

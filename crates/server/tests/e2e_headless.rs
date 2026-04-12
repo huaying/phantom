@@ -47,6 +47,7 @@ fn headless_e2e_h264_over_tcp() {
                 protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                 audio: false,
                 video_codec: phantom_core::encode::VideoCodec::H264,
+                session_token: vec![],
             },
         )
         .unwrap();
@@ -186,6 +187,7 @@ fn headless_e2e_encrypted_tcp() {
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
             video_codec: phantom_core::encode::VideoCodec::H264,
+            session_token: vec![],
         })
         .unwrap();
         writer.write_encrypted(&payload).unwrap();

@@ -125,6 +125,7 @@ fn main() -> Result<()> {
         last_connect_attempt: Instant::now() - Duration::from_secs(10),
         send_file: args.send_file,
         send_file_initiated: false,
+        last_session_token: Vec::new(),
     };
 
     event_loop
@@ -163,6 +164,8 @@ struct Session {
     stats_decode_ms: f64,
     /// Send Opus packets to audio playback thread (None if no audio).
     audio_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// Session token for reconnect.
+    session_token: Vec<u8>,
     /// File transfer handler.
     file_xfer: file_transfer::ClientFileTransfer,
 }
@@ -186,6 +189,8 @@ struct App {
     last_connect_attempt: Instant,
     send_file: Option<String>,
     send_file_initiated: bool,
+    /// Saved session token from previous connection for reconnect.
+    last_session_token: Vec<u8>,
 }
 
 impl App {
@@ -240,42 +245,59 @@ impl App {
         };
 
         // Read Hello and check protocol version
-        let (width, height, server_audio, video_codec) = match receiver.recv_msg() {
-            Ok(Message::Hello {
-                width,
-                height,
-                audio,
-                protocol_version,
-                video_codec,
-                ..
-            }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
-                if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
-                    tracing::error!(
-                        server_version = protocol_version,
-                        min = phantom_core::protocol::MIN_PROTOCOL_VERSION,
-                        "server protocol too old, please upgrade the server"
-                    );
+        let (width, height, server_audio, video_codec, new_session_token) =
+            match receiver.recv_msg() {
+                Ok(Message::Hello {
+                    width,
+                    height,
+                    audio,
+                    protocol_version,
+                    video_codec,
+                    session_token,
+                    ..
+                }) if width > 0 && width <= 8192 && height > 0 && height <= 8192 => {
+                    if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
+                        tracing::error!(
+                            server_version = protocol_version,
+                            min = phantom_core::protocol::MIN_PROTOCOL_VERSION,
+                            "server protocol too old, please upgrade the server"
+                        );
+                        return;
+                    }
+                    if protocol_version > phantom_core::protocol::PROTOCOL_VERSION {
+                        tracing::warn!(
+                            server_version = protocol_version,
+                            client_version = phantom_core::protocol::PROTOCOL_VERSION,
+                            "server is newer, some features may not work"
+                        );
+                    }
+                    tracing::info!(width, height, audio, protocol_version, "connected");
+                    (width, height, audio, video_codec, session_token)
+                }
+                Ok(_) => {
+                    tracing::warn!("bad Hello");
                     return;
                 }
-                if protocol_version > phantom_core::protocol::PROTOCOL_VERSION {
-                    tracing::warn!(
-                        server_version = protocol_version,
-                        client_version = phantom_core::protocol::PROTOCOL_VERSION,
-                        "server is newer, some features may not work"
-                    );
+                Err(e) => {
+                    tracing::warn!("handshake failed: {e}");
+                    return;
                 }
-                tracing::info!(width, height, audio, protocol_version, "connected");
-                (width, height, audio, video_codec)
+            };
+
+        // If we have a previous session token, send Resume to tell the server
+        // we're the same client. Server will force a keyframe.
+        if !self.last_session_token.is_empty() {
+            if let Err(e) = sender.send_msg(&Message::Resume {
+                session_token: self.last_session_token.clone(),
+                last_sequence: 0, // TODO: track last decoded sequence
+            }) {
+                tracing::warn!("failed to send Resume: {e}");
+            } else {
+                tracing::info!("sent Resume to server");
             }
-            Ok(_) => {
-                tracing::warn!("bad Hello");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("handshake failed: {e}");
-                return;
-            }
-        };
+            // Clear the token (used once)
+            self.last_session_token.clear();
+        }
 
         // Create window
         let win_size = display_winit::fit_window_size(width, height);
@@ -436,6 +458,7 @@ impl App {
             stats_decode_ms: 0.0,
             audio_tx,
             file_xfer: file_transfer::ClientFileTransfer::new(),
+            session_token: new_session_token,
         });
     }
 }
@@ -459,6 +482,8 @@ impl ApplicationHandler for App {
                         return;
                     }
                     tracing::info!("disconnected, will reconnect...");
+                    // Save session token for reconnect
+                    self.last_session_token = session.session_token.clone();
                     self.state = AppState::Disconnected;
                     return;
                 }

@@ -50,6 +50,11 @@ pub enum InboundEvent {
         transfer_id: u64,
         sha256: [u8; 32],
     },
+    /// Client wants to resume a previous session — force keyframe.
+    Resume {
+        session_token: Vec<u8>,
+        last_sequence: u64,
+    },
     Disconnected,
 }
 
@@ -116,6 +121,15 @@ pub fn spawn_receive_thread(
                     let _ = tx.send(InboundEvent::FileDone {
                         transfer_id,
                         sha256,
+                    });
+                }
+                Ok(Message::Resume {
+                    session_token,
+                    last_sequence,
+                }) => {
+                    let _ = tx.send(InboundEvent::Resume {
+                        session_token,
+                        last_sequence,
                     });
                 }
                 Ok(_) => {}
@@ -327,11 +341,14 @@ pub struct SessionRunner {
     pub _audio_capture: Option<crate::audio_capture::AudioCapture>,
     /// File transfer handler.
     pub file_transfer: crate::file_transfer::ServerFileTransfer,
+    /// Session token for reconnect validation.
+    pub session_token: Vec<u8>,
 }
 
 impl SessionRunner {
     /// Create a new session runner, spawn the receive thread, send Hello, and
     /// hide the remote cursor. Optionally starts audio capture.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sender: Box<dyn MessageSender>,
         receiver: Box<dyn MessageReceiver>,
@@ -340,6 +357,7 @@ impl SessionRunner {
         frame_interval: Duration,
         cancel: Arc<AtomicBool>,
         video_codec: phantom_core::encode::VideoCodec,
+        is_resume: bool,
     ) -> Result<Self> {
         let event_rx = spawn_receive_thread(receiver);
         let injector = InputInjector::new().ok();
@@ -385,17 +403,38 @@ impl SessionRunner {
             #[cfg(feature = "audio")]
             _audio_capture: audio_capture,
             file_transfer: crate::file_transfer::ServerFileTransfer::new(),
+            session_token: Vec::new(),
         };
 
-        runner.sender.send_msg(&Message::Hello {
-            width,
-            height,
-            format: phantom_core::frame::PixelFormat::Bgra8,
-            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
-            audio: has_audio,
-            video_codec,
-        })?;
-        tracing::info!(width, height, audio = has_audio, "session started");
+        // Generate session token for reconnect
+        let session_token: Vec<u8> = {
+            use ring::rand::SecureRandom;
+            let rng = ring::rand::SystemRandom::new();
+            let mut token = vec![0u8; 32];
+            rng.fill(&mut token).expect("RNG failed");
+            token
+        };
+
+        if is_resume {
+            // Resume: send ResumeOk instead of Hello, same session token
+            runner.sender.send_msg(&Message::ResumeOk)?;
+            tracing::info!(width, height, "session resumed");
+            // Force keyframe on first frame (reset last_keyframe_time to epoch)
+            runner.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+        } else {
+            runner.sender.send_msg(&Message::Hello {
+                width,
+                height,
+                format: phantom_core::frame::PixelFormat::Bgra8,
+                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+                audio: has_audio,
+                video_codec,
+                session_token: session_token.clone(),
+            })?;
+            tracing::info!(width, height, audio = has_audio, "session started");
+        }
+
+        runner.session_token = session_token;
 
         hide_remote_cursor();
 
@@ -502,6 +541,22 @@ impl SessionRunner {
                 }) => {
                     if let Err(e) = self.file_transfer.on_file_done(transfer_id, &sha256) {
                         tracing::error!(transfer_id, "file done error: {e}");
+                    }
+                }
+                Ok(InboundEvent::Resume {
+                    session_token,
+                    last_sequence,
+                }) => {
+                    if session_token == self.session_token {
+                        tracing::info!(last_sequence, "client resume accepted, forcing keyframe");
+                        // Send ResumeOk so client knows it can reuse its decoder
+                        let _ = self.sender.send_msg(&Message::ResumeOk);
+                        // Force keyframe by resetting the timer
+                        self.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+                        // Reset sequence to sync with client
+                        self.sequence = last_sequence;
+                    } else {
+                        tracing::warn!("client sent Resume with invalid token");
                     }
                 }
                 Ok(InboundEvent::Disconnected) => {
@@ -708,6 +763,13 @@ impl SessionRunner {
 // ── Session configuration ───────────────────────────────────────────────────
 
 /// Configuration for starting a session, avoids long parameter lists.
+/// Result of a session run — carries the session token for reconnect.
+pub struct SessionResult {
+    pub session_token: Vec<u8>,
+    /// The error that ended the session (disconnect, cancel, IO error).
+    pub error: anyhow::Error,
+}
+
 pub struct SessionConfig<'a> {
     pub sender: Box<dyn MessageSender>,
     pub receiver: Box<dyn MessageReceiver>,
@@ -716,6 +778,8 @@ pub struct SessionConfig<'a> {
     pub cancel: Arc<AtomicBool>,
     pub send_file: Option<&'a std::path::Path>,
     pub video_codec: phantom_core::encode::VideoCodec,
+    /// If true, this is a resumed session — skip Hello, send keyframe immediately.
+    pub is_resume: bool,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -727,8 +791,26 @@ pub fn run_session_cpu(
     video_encoder: &mut dyn FrameEncoder,
     differ: &mut TileDiffer,
     cfg: SessionConfig<'_>,
-) -> Result<()> {
-    video_encoder.force_keyframe();
+) -> SessionResult {
+    let result = run_session_cpu_inner(capture, video_encoder, differ, cfg);
+    match result {
+        Ok(token) => SessionResult {
+            session_token: token,
+            error: anyhow::anyhow!("session ended cleanly"),
+        },
+        Err(e) => SessionResult {
+            session_token: vec![],
+            error: e,
+        },
+    }
+}
+
+fn run_session_cpu_inner(
+    capture: &mut dyn phantom_core::capture::FrameCapture,
+    video_encoder: &mut dyn FrameEncoder,
+    differ: &mut TileDiffer,
+    cfg: SessionConfig<'_>,
+) -> Result<Vec<u8>> {
     differ.reset();
     let _ = capture.reset();
 
@@ -741,6 +823,7 @@ pub fn run_session_cpu(
         cfg.frame_interval,
         cfg.cancel,
         cfg.video_codec,
+        cfg.is_resume,
     )?;
 
     // Send file if requested via --send-file
@@ -831,7 +914,26 @@ pub fn run_session_gpu(
     capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
     encoder: &mut phantom_gpu::nvenc::NvencEncoder,
     cfg: SessionConfig<'_>,
-) -> Result<()> {
+) -> SessionResult {
+    let result = run_session_gpu_inner(capture, encoder, cfg);
+    match result {
+        Ok(token) => SessionResult {
+            session_token: token,
+            error: anyhow::anyhow!("session ended cleanly"),
+        },
+        Err(e) => SessionResult {
+            session_token: vec![],
+            error: e,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_session_gpu_inner(
+    capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
+    encoder: &mut phantom_gpu::nvenc::NvencEncoder,
+    cfg: SessionConfig<'_>,
+) -> Result<Vec<u8>> {
     use phantom_core::encode::FrameEncoder;
 
     encoder.force_keyframe();
@@ -844,6 +946,7 @@ pub fn run_session_gpu(
         cfg.frame_interval,
         cfg.cancel,
         cfg.video_codec,
+        cfg.is_resume,
     )?;
 
     if let Some(path) = cfg.send_file {
@@ -909,7 +1012,25 @@ pub fn run_session_gpu(
 pub fn run_session_dxgi(
     pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
     cfg: SessionConfig<'_>,
-) -> Result<()> {
+) -> SessionResult {
+    let result = run_session_dxgi_inner(pipeline, cfg);
+    match result {
+        Ok(token) => SessionResult {
+            session_token: token,
+            error: anyhow::anyhow!("session ended cleanly"),
+        },
+        Err(e) => SessionResult {
+            session_token: vec![],
+            error: e,
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_session_dxgi_inner(
+    pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
+    cfg: SessionConfig<'_>,
+) -> Result<Vec<u8>> {
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
     let mut runner = SessionRunner::new(
@@ -920,6 +1041,7 @@ pub fn run_session_dxgi(
         cfg.frame_interval,
         cfg.cancel,
         cfg.video_codec,
+        cfg.is_resume,
     )?;
 
     if let Some(path) = cfg.send_file {

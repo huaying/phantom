@@ -31,6 +31,7 @@ fn tcp_hello_roundtrip() {
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
             video_codec: phantom_core::encode::VideoCodec::H264,
+            session_token: vec![],
         };
         protocol::write_message(&mut stream, &hello).unwrap();
         let reply = protocol::read_message(&mut stream).unwrap();
@@ -119,6 +120,7 @@ fn tcp_bidirectional_input_and_video() {
                 protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                 audio: false,
                 video_codec: phantom_core::encode::VideoCodec::H264,
+                session_token: vec![],
             },
         )
         .unwrap();
@@ -296,6 +298,7 @@ mod crypto_tests {
                     protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                     audio: false,
                     video_codec: phantom_core::encode::VideoCodec::H264,
+                    session_token: vec![],
                 },
             );
 
@@ -343,6 +346,7 @@ mod crypto_tests {
                     protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
                     audio: false,
                     video_codec: phantom_core::encode::VideoCodec::H264,
+                    session_token: vec![],
                 },
             );
         });

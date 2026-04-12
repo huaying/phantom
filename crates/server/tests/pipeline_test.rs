@@ -260,6 +260,7 @@ fn protocol_message_roundtrip() {
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
             video_codec: phantom_core::encode::VideoCodec::H264,
+            session_token: vec![],
         },
         Message::Ping,
         Message::Pong,

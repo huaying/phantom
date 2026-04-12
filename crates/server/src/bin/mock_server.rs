@@ -45,6 +45,7 @@ fn main() -> Result<()> {
             protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
             audio: false,
             video_codec: VideoCodec::H264,
+            session_token: vec![],
         },
     )?;
 
