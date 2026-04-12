@@ -41,5 +41,10 @@ features = [
     "AudioContext", "AudioContextState", "AudioContextOptions",
     "AudioBuffer", "AudioBufferSourceNode",
     "AudioDestinationNode", "AudioNode",
+    "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
     "BaseAudioContext",
+    # Blob / URL for AudioWorklet inline module
+    "Blob", "BlobPropertyBag", "Url",
+    # MessagePort for worklet communication
+    "MessagePort",
 ]
