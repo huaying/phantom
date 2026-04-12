@@ -37,15 +37,15 @@ type CUvideoparser = *mut c_void;
 // We use opaque byte arrays with accessor methods to avoid layout mismatches.
 
 /// CUVIDDECODECREATEINFO — passed to cuvidCreateDecoder.
-/// Size: 304 bytes on x86_64 Linux.
+/// Size: 176 bytes on x86_64 Linux (verified with gcc offsetof).
 #[repr(C)]
 struct DecodeCreateInfo {
-    data: [u8; 304],
+    data: [u8; 176],
 }
 
 impl DecodeCreateInfo {
     fn zeroed() -> Self {
-        Self { data: [0u8; 304] }
+        Self { data: [0u8; 176] }
     }
     fn write_u32(&mut self, offset: usize, val: u32) {
         self.data[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
@@ -53,59 +53,69 @@ impl DecodeCreateInfo {
     fn write_u64(&mut self, offset: usize, val: u64) {
         self.data[offset..offset + 8].copy_from_slice(&val.to_ne_bytes());
     }
+    fn write_i16(&mut self, offset: usize, val: i16) {
+        self.data[offset..offset + 2].copy_from_slice(&val.to_ne_bytes());
+    }
     fn as_mut_ptr(&mut self) -> *mut c_void {
         self.data.as_mut_ptr() as *mut c_void
     }
 
-    // Field setters matching the C struct layout:
-    // unsigned long ulWidth (8 bytes on LP64)
+    // Offsets verified via gcc on x86_64 Linux:
+    // 0: ulWidth (unsigned long = 8)
     fn set_coded_width(&mut self, v: u32) {
         self.write_u64(0, v as u64);
     }
+    // 8: ulHeight
     fn set_coded_height(&mut self, v: u32) {
         self.write_u64(8, v as u64);
     }
+    // 16: ulNumDecodeSurfaces
     fn set_num_decode_surfaces(&mut self, v: u32) {
         self.write_u64(16, v as u64);
     }
+    // 24: CodecType (enum/int = 4)
     fn set_codec_type(&mut self, v: i32) {
         self.write_u32(24, v as u32);
     }
+    // 28: ChromaFormat (enum/int = 4)
     fn set_chroma_format(&mut self, v: i32) {
         self.write_u32(28, v as u32);
     }
-    fn set_output_format(&mut self, v: i32) {
-        self.write_u32(32, v as u32);
-    }
-    fn set_deinterlace_mode(&mut self, v: i32) {
-        self.write_u32(36, v as u32);
-    }
-    // ulTargetWidth/Height at offset 64, 72
-    fn set_target_width(&mut self, v: u32) {
-        self.write_u64(64, v as u64);
-    }
-    fn set_target_height(&mut self, v: u32) {
-        self.write_u64(72, v as u64);
-    }
-    // ulNumOutputSurfaces at offset 80
-    fn set_num_output_surfaces(&mut self, v: u32) {
-        self.write_u64(80, v as u64);
-    }
-    // ulCreationFlags at offset 96
-    fn set_create_flags(&mut self, v: u32) {
-        self.write_u32(96, v);
-    }
-    // display_area: left(48), top(52), right(56), bottom(60) — all u32 (short in C but padded)
+    // 80: display_area { short left(2), top(2), right(2), bottom(2) }
     fn set_display_area(&mut self, right: u32, bottom: u32) {
-        self.write_u32(48, 0); // left
-        self.write_u32(52, 0); // top
-        self.write_u32(56, right);
-        self.write_u32(60, bottom);
+        self.write_i16(80, 0); // left
+        self.write_i16(82, 0); // top
+        self.write_i16(84, right as i16);
+        self.write_i16(86, bottom as i16);
+    }
+    // 88: OutputFormat (enum/int = 4)
+    fn set_output_format(&mut self, v: i32) {
+        self.write_u32(88, v as u32);
+    }
+    // 92: DeinterlaceMode (enum/int = 4)
+    fn set_deinterlace_mode(&mut self, v: i32) {
+        self.write_u32(92, v as u32);
+    }
+    // 96: ulTargetWidth
+    fn set_target_width(&mut self, v: u32) {
+        self.write_u64(96, v as u64);
+    }
+    // 104: ulTargetHeight
+    fn set_target_height(&mut self, v: u32) {
+        self.write_u64(104, v as u64);
+    }
+    // 112: ulNumOutputSurfaces
+    fn set_num_output_surfaces(&mut self, v: u32) {
+        self.write_u64(112, v as u64);
+    }
+    // 32: ulCreationFlags (unsigned long = 8)
+    fn set_create_flags(&mut self, v: u32) {
+        self.write_u64(32, v as u64);
     }
 }
 
 /// CUVIDPARSERPARAMS — passed to cuvidCreateVideoParser.
-/// Size: ~200 bytes. We use 256 to be safe.
+/// Size: 80+ bytes (verified with gcc offsetof).
 #[repr(C)]
 struct ParserParams {
     data: [u8; 256],
@@ -126,38 +136,34 @@ impl ParserParams {
         self.data.as_mut_ptr() as *mut c_void
     }
 
-    // Layout:
-    // 0: CodecType (i32)
-    // 4: ulMaxNumDecodeSurfaces (u32)
-    // 8: ulClockRate (u32)
-    // 12: ulErrorThreshold (u32)
-    // 16: ulMaxDisplayDelay (u32)
-    // 20: reserved (u32)
-    // 24: reserved[4] (16 bytes)
-    // 40: pUserData (ptr, 8 bytes)
-    // 48: pfnSequenceCallback (fn ptr, 8 bytes)
-    // 56: pfnDecodePicture (fn ptr, 8 bytes)
-    // 64: pfnDisplayPicture (fn ptr, 8 bytes)
+    // Offsets verified via gcc on x86_64 Linux:
+    // 0: CodecType (int)
     fn set_codec_type(&mut self, v: i32) {
         self.write_u32(0, v as u32);
     }
+    // 4: ulMaxNumDecodeSurfaces (unsigned int)
     fn set_max_num_decode_surfaces(&mut self, v: u32) {
         self.write_u32(4, v);
     }
+    // 16: ulMaxDisplayDelay (unsigned int)
     fn set_max_display_delay(&mut self, v: u32) {
         self.write_u32(16, v);
     }
+    // 48: pUserData (void*)
     fn set_user_data(&mut self, ptr: *mut c_void) {
-        self.write_ptr(40, ptr);
+        self.write_ptr(48, ptr);
     }
+    // 56: pfnSequenceCallback
     fn set_sequence_callback(&mut self, f: usize) {
-        self.write_ptr(48, f as *mut c_void);
-    }
-    fn set_decode_callback(&mut self, f: usize) {
         self.write_ptr(56, f as *mut c_void);
     }
-    fn set_display_callback(&mut self, f: usize) {
+    // 64: pfnDecodePicture
+    fn set_decode_callback(&mut self, f: usize) {
         self.write_ptr(64, f as *mut c_void);
+    }
+    // 72: pfnDisplayPicture
+    fn set_display_callback(&mut self, f: usize) {
+        self.write_ptr(72, f as *mut c_void);
     }
 }
 
@@ -512,3 +518,23 @@ impl Drop for NvdecDecoder {
 }
 
 unsafe impl Send for NvdecDecoder {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nvdec_create() {
+        let cuda = match CudaLib::load() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("CUDA not available: {e}");
+                return;
+            }
+        };
+        match NvdecDecoder::new(cuda, 0, 320, 240, phantom_core::encode::VideoCodec::H264) {
+            Ok(_) => eprintln!("NVDEC H264 decoder created OK"),
+            Err(e) => eprintln!("NVDEC H264 failed: {e}"),
+        }
+    }
+}

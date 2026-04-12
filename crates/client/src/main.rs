@@ -70,14 +70,20 @@ fn try_nvdec(
     height: u32,
     codec: phantom_core::encode::VideoCodec,
 ) -> Option<Box<dyn phantom_core::encode::FrameDecoder>> {
-    let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load().ok()?);
+    let cuda = match phantom_gpu::cuda::CudaLib::load() {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            tracing::info!("NVDEC: CUDA not available: {e}");
+            return None;
+        }
+    };
     match phantom_gpu::nvdec::NvdecDecoder::new(cuda, 0, width, height, codec) {
         Ok(d) => {
             tracing::info!("using NVDEC hardware decoder");
             Some(Box::new(d))
         }
         Err(e) => {
-            tracing::debug!("NVDEC not available: {e}");
+            tracing::info!("NVDEC decoder init failed: {e}");
             None
         }
     }
