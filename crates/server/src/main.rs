@@ -372,6 +372,9 @@ fn main() -> Result<()> {
 
     let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
     let (conn_tx, conn_rx) = mpsc::channel::<ConnectionPair>();
+    // Audio WS receiver, shared across sessions. Set by "web" transport.
+    type AudioWsRxShared = Arc<std::sync::Mutex<Option<mpsc::Receiver<transport_ws::WsSender>>>>;
+    let mut audio_ws_rx_shared: Option<AudioWsRxShared> = None;
 
     let base_port: u16 = args
         .listen
@@ -437,9 +440,13 @@ fn main() -> Result<()> {
                 } else {
                     base_port
                 };
-                let ws_transport =
+                let mut ws_transport =
                     transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2)?;
                 tracing::info!("open https://localhost:{web_port} in browser");
+                // Share audio WS receiver with the session loop
+                audio_ws_rx_shared = Some(Arc::new(std::sync::Mutex::new(
+                    ws_transport.take_audio_ws_rx(),
+                )));
                 let tx = conn_tx.clone();
                 std::thread::Builder::new()
                     .name("web-accept".into())
@@ -610,6 +617,7 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
+                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
         } else {
@@ -627,6 +635,7 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
+                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
         };
@@ -649,6 +658,7 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
+                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
         } else {
@@ -666,6 +676,7 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
+                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
         };
@@ -684,6 +695,7 @@ fn main() -> Result<()> {
                 video_codec,
                 is_resume,
                 input_forwarder: None,
+                audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
             },
         );
 

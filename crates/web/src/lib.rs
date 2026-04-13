@@ -635,17 +635,16 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if s.audio_decoder.is_none() {
                 return;
             }
-            // Resume AudioContext if suspended (browsers require user gesture)
+            // Don't decode while AudioContext is suspended — frames would pile up
             if let Some(ref ctx) = s.audio_ctx {
                 if ctx.state() == web_sys::AudioContextState::Suspended {
-                    let _ = ctx.resume();
+                    return; // drop frame, will get fresh data after resume
                 }
             }
 
             let timestamp = s.audio_timestamp_us;
             s.audio_timestamp_us += 20_000; // 20ms per Opus frame
 
-            // Create EncodedAudioChunk from the Opus data
             let js_data = js_sys::Uint8Array::from(data.as_slice());
             let init = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&init, &"type".into(), &"key".into());
@@ -757,14 +756,43 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
 
 /// Initialize WebCodecs AudioDecoder + Web Audio API for Opus playback.
 fn setup_audio(state: &Rc<RefCell<AppState>>) {
-    // Create AudioContext (may need user gesture to resume on some browsers)
-    let audio_ctx = match web_sys::AudioContext::new() {
+    // Open dedicated audio WebSocket (independent from video WS)
+    let window = web_sys::window().unwrap();
+    let location = window.location();
+    let host = location.host().unwrap_or_default();
+    let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+    let audio_url = format!("{protocol}://{host}/ws/audio");
+
+    let s = state.clone();
+    match WebSocket::new(&audio_url) {
+        Ok(ws) => {
+            ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+            let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
+                }
+            });
+            ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+            cb.forget();
+            console::log_1(&format!("audio WebSocket connected to {audio_url}").into());
+        }
+        Err(e) => {
+            console::warn_1(&format!("audio WebSocket failed ({e:?}), using main WS fallback").into());
+        }
+    }
+
+    // Create AudioContext at 48kHz (must match Opus output to avoid resampling stutter)
+    let ctx_opts = web_sys::AudioContextOptions::new();
+    ctx_opts.set_sample_rate(48000.0);
+    ctx_opts.set_latency_hint(&wasm_bindgen::JsValue::from_str("interactive"));
+    let audio_ctx = match web_sys::AudioContext::new_with_context_options(&ctx_opts) {
         Ok(ctx) => ctx,
         Err(e) => {
             console::warn_1(&format!("AudioContext creation failed: {e:?}").into());
             return;
         }
     };
+    console::log_1(&format!("AudioContext: sampleRate={}", audio_ctx.sample_rate()).into());
 
     // Create a ring buffer for decoded PCM samples.
     // The AudioWorklet reads from this buffer at a steady rate (128 samples per
@@ -776,28 +804,27 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
     // Fallback: if SharedArrayBuffer is unavailable (cross-origin isolation not
     // set), we fall back to the old BufferSourceNode approach.
 
-    // Ring buffer size: 48000 * 2ch * 200ms = 19200 f32 samples per channel
-    let ring_size: u32 = 48000 / 5; // 200ms worth of samples (9600 per channel)
-    let channels: u32 = 2;
+    let _ring_size: u32 = 48000 * 3 / 10;
+    let _channels: u32 = 2;
 
-    // Try SharedArrayBuffer for zero-copy worklet communication
+    // Try SharedArrayBuffer for zero-copy AudioWorklet (pull-based, lowest latency).
+    // Falls back to BufferSourceNode jitter buffer if SAB unavailable.
     let sab_available = js_sys::Reflect::get(&js_sys::global(), &"SharedArrayBuffer".into())
         .map(|v| v.is_function())
         .unwrap_or(false);
 
     if sab_available {
-        setup_audio_worklet(state, &audio_ctx, ring_size, channels);
+        setup_audio_sab_worklet(state, &audio_ctx);
     } else {
-        console::warn_1(
-            &"SharedArrayBuffer unavailable — falling back to BufferSourceNode audio".into(),
-        );
+        console::warn_1(&"SharedArrayBuffer unavailable — using BufferSourceNode fallback".into());
         setup_audio_buffersource(state, &audio_ctx);
     }
 }
 
-/// AudioWorklet-based audio playback with ring buffer (preferred).
-/// Provides smooth, gap-free audio by decoupling decode timing from playback.
-fn setup_audio_worklet(
+/// Pull-based audio via AudioWorklet + SharedArrayBuffer (zero-copy, lowest latency).
+// Old MessagePort-based AudioWorklet (replaced by SAB approach below).
+#[allow(dead_code)]
+fn _setup_audio_worklet(
     state: &Rc<RefCell<AppState>>,
     audio_ctx: &web_sys::AudioContext,
     ring_size: u32,
@@ -808,7 +835,7 @@ fn setup_audio_worklet(
 class PhantomAudioProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    this.ringSize = options.processorOptions.ringSize || 9600;
+    this.ringSize = options.processorOptions.ringSize || 14400;
     this.channels = options.processorOptions.channels || 2;
     this.ring = [];
     for (let i = 0; i < this.channels; i++) {
@@ -817,9 +844,22 @@ class PhantomAudioProcessor extends AudioWorkletProcessor {
     this.writePos = 0;
     this.readPos = 0;
     this.buffered = 0;
+    this.started = false;
+
+    // Adaptive jitter buffer: starts at 40ms, grows on underflow, shrinks when stable
+    this.minPrefill = Math.floor(48000 * 0.02);  // 20ms floor
+    this.maxPrefill = Math.floor(48000 * 0.2);   // 200ms ceiling
+    this.prefill = Math.floor(48000 * 0.04);      // start at 40ms
+    this.stepUp = Math.floor(48000 * 0.02);       // grow by 20ms per underflow
+    this.stepDown = Math.floor(48000 * 0.01);     // shrink by 10ms
+    this.underflowCount = 0;
+    this.stableCount = 0;
+    // Shrink after ~5 seconds of stability (5s / 2.67ms per process call ≈ 1875)
+    this.stableThreshold = 1875;
 
     this.port.onmessage = (e) => {
       const { channelData } = e.data;
+      if (!channelData || !channelData[0]) return;
       const frames = channelData[0].length;
       for (let ch = 0; ch < Math.min(this.channels, channelData.length); ch++) {
         const src = channelData[ch];
@@ -828,7 +868,8 @@ class PhantomAudioProcessor extends AudioWorkletProcessor {
         }
       }
       this.writePos = (this.writePos + frames) % this.ringSize;
-      this.buffered = Math.min(this.buffered + frames, this.ringSize);
+      this.buffered += frames;
+      if (this.buffered > this.ringSize) this.buffered = this.ringSize;
     };
   }
 
@@ -836,11 +877,39 @@ class PhantomAudioProcessor extends AudioWorkletProcessor {
     const output = outputs[0];
     const frames = output[0].length;
 
-    if (this.buffered < frames) {
-      for (let ch = 0; ch < output.length; ch++) {
-        output[ch].fill(0);
+    // Wait until prefill threshold reached
+    if (!this.started) {
+      if (this.buffered < this.prefill) {
+        for (let ch = 0; ch < output.length; ch++) output[ch].fill(0);
+        return true;
       }
+      this.started = true;
+      this.stableCount = 0;
+    }
+
+    // Underflow: grow buffer, reset to re-prefill
+    if (this.buffered < frames) {
+      this.underflowCount++;
+      this.prefill = Math.min(this.prefill + this.stepUp, this.maxPrefill);
+      this.started = false;
+      for (let ch = 0; ch < output.length; ch++) output[ch].fill(0);
       return true;
+    }
+
+    // Stable playback: count towards shrink
+    this.stableCount++;
+    if (this.stableCount >= this.stableThreshold && this.prefill > this.minPrefill) {
+      this.prefill = Math.max(this.prefill - this.stepDown, this.minPrefill);
+      this.stableCount = 0;
+    }
+
+    // Overflow protection: if buffer is way too full (>80%), skip ahead
+    // to prevent latency from growing unbounded
+    const maxBuffered = Math.floor(this.ringSize * 0.8);
+    if (this.buffered > maxBuffered) {
+      const skip = this.buffered - this.prefill;
+      this.readPos = (this.readPos + skip) % this.ringSize;
+      this.buffered -= skip;
     }
 
     for (let ch = 0; ch < output.length; ch++) {
@@ -903,7 +972,7 @@ registerProcessor('phantom-audio', PhantomAudioProcessor);
         let port = node.port().unwrap();
 
         // Set up AudioDecoder with output → worklet port
-        setup_audio_decoder_worklet(&state_clone, &ctx_clone, port);
+        _setup_audio_decoder_worklet(&state_clone, &ctx_clone, port);
     });
 
     let on_error = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
@@ -915,8 +984,8 @@ registerProcessor('phantom-audio', PhantomAudioProcessor);
     on_error.forget();
 }
 
-/// Set up AudioDecoder that sends decoded PCM to the AudioWorklet via MessagePort.
-fn setup_audio_decoder_worklet(
+#[allow(dead_code)]
+fn _setup_audio_decoder_worklet(
     state: &Rc<RefCell<AppState>>,
     audio_ctx: &web_sys::AudioContext,
     port: web_sys::MessagePort,
@@ -976,55 +1045,336 @@ fn setup_audio_decoder_worklet(
     error_cb.forget();
 }
 
-/// Fallback audio playback using BufferSourceNode (when SharedArrayBuffer unavailable).
-/// Creates a new BufferSourceNode per decoded Opus frame (~50 nodes/sec).
+/// Pull-based audio via AudioWorklet + SharedArrayBuffer (zero-copy, lowest latency).
+/// Main thread writes decoded PCM directly to shared memory. AudioWorklet reads it.
+/// No MessagePort, no structured clone, no GC pressure.
+fn setup_audio_sab_worklet(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::AudioContext) {
+    // Ring buffer: 500ms stereo float32 = 48000 * 0.5 * 2 * 4 = 192000 bytes
+    let ring_samples: u32 = 48000 / 2; // 24000 samples per channel (500ms)
+    let channels: u32 = 2;
+
+    // SharedArrayBuffer for control: [writePos, readPos, buffered] as Uint32
+    let ctrl_sab = js_sys::SharedArrayBuffer::new(3 * 4); // 3 x u32
+    let ctrl_main = js_sys::Uint32Array::new(&ctrl_sab);
+
+    // SharedArrayBuffer for audio: interleaved stereo float32
+    let audio_sab = js_sys::SharedArrayBuffer::new(ring_samples * channels * 4);
+    let audio_main = js_sys::Float32Array::new(&audio_sab);
+
+    // AudioWorklet processor code
+    let worklet_code = r#"
+class PhantomSABProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const { ctrlBuffer, audioBuffer, ringSize, channels } = options.processorOptions;
+    this.ctrl = new Uint32Array(ctrlBuffer);   // [writePos, readPos, buffered]
+    this.audio = new Float32Array(audioBuffer); // interleaved stereo
+    this.ringSize = ringSize;
+    this.channels = channels;
+    // Pre-buffer 60ms before starting
+    this.prefill = Math.floor(48000 * 0.06);
+    this.started = false;
+  }
+
+  process(inputs, outputs, parameters) {
+    const output = outputs[0];
+    const frames = output[0].length; // 128
+    const buffered = Atomics.load(this.ctrl, 2);
+
+    if (!this.started) {
+      if (buffered < this.prefill) {
+        for (let ch = 0; ch < output.length; ch++) output[ch].fill(0);
+        return true;
+      }
+      this.started = true;
+    }
+
+    if (buffered < frames) {
+      // Underflow — silence, re-prefill
+      for (let ch = 0; ch < output.length; ch++) output[ch].fill(0);
+      this.started = false;
+      return true;
+    }
+
+    let readPos = Atomics.load(this.ctrl, 1);
+    for (let i = 0; i < frames; i++) {
+      const idx = ((readPos + i) % this.ringSize) * this.channels;
+      for (let ch = 0; ch < Math.min(output.length, this.channels); ch++) {
+        output[ch][i] = this.audio[idx + ch];
+      }
+    }
+    const newReadPos = (readPos + frames) % this.ringSize;
+    Atomics.store(this.ctrl, 1, newReadPos);
+    Atomics.sub(this.ctrl, 2, frames);
+    return true;
+  }
+}
+registerProcessor('phantom-sab-audio', PhantomSABProcessor);
+"#;
+
+    let blob_parts = js_sys::Array::new();
+    blob_parts.push(&worklet_code.into());
+    let blob_opts = web_sys::BlobPropertyBag::new();
+    blob_opts.set_type("application/javascript");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_opts).unwrap();
+    let url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
+
+    let ctx_clone = audio_ctx.clone();
+    let state_clone = state.clone();
+    let url_clone = url.clone();
+
+    // Store SAB refs for the AudioDecoder callback to write into
+    let ctrl_write = ctrl_main.clone();
+    let audio_write = audio_main.clone();
+    let ring_size = ring_samples;
+
+    let promise = audio_ctx.audio_worklet().unwrap().add_module(&url).unwrap();
+    let on_loaded = Closure::<dyn FnMut(JsValue)>::once(move |_: JsValue| {
+        let _ = web_sys::Url::revoke_object_url(&url_clone);
+
+        let opts = js_sys::Object::new();
+        let proc_opts = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&proc_opts, &"ctrlBuffer".into(), &ctrl_sab);
+        let _ = js_sys::Reflect::set(&proc_opts, &"audioBuffer".into(), &audio_sab);
+        let _ = js_sys::Reflect::set(&proc_opts, &"ringSize".into(), &ring_size.into());
+        let _ = js_sys::Reflect::set(&proc_opts, &"channels".into(), &channels.into());
+        let _ = js_sys::Reflect::set(&opts, &"processorOptions".into(), &proc_opts);
+        let _ = js_sys::Reflect::set(&opts, &"numberOfInputs".into(), &0.into());
+        let _ = js_sys::Reflect::set(&opts, &"numberOfOutputs".into(), &1.into());
+        let out_ch = js_sys::Array::new();
+        out_ch.push(&channels.into());
+        let _ = js_sys::Reflect::set(&opts, &"outputChannelCount".into(), &out_ch);
+
+        let node = web_sys::AudioWorkletNode::new_with_options(
+            &ctx_clone, "phantom-sab-audio", &opts.unchecked_into(),
+        ).unwrap();
+        let _ = node.connect_with_audio_node(&ctx_clone.destination());
+
+        // Set up AudioDecoder that writes directly to SharedArrayBuffer
+        setup_audio_decoder_sab(&state_clone, &ctx_clone, ctrl_write, audio_write, ring_size);
+
+        console::log_1(&"AudioWorklet pull-based playback initialized (SharedArrayBuffer)".into());
+    });
+
+    let on_error = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
+        console::warn_1(&format!("AudioWorklet load failed: {e:?}").into());
+    });
+
+    let _ = promise.then2(&on_loaded, &on_error);
+    on_loaded.forget();
+    on_error.forget();
+}
+
+/// AudioDecoder that writes decoded PCM directly into SharedArrayBuffer.
+fn setup_audio_decoder_sab(
+    state: &Rc<RefCell<AppState>>,
+    audio_ctx: &web_sys::AudioContext,
+    ctrl: js_sys::Uint32Array,
+    audio: js_sys::Float32Array,
+    ring_size: u32,
+) {
+    let channels: u32 = 2;
+
+    let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |output: JsValue| {
+        let audio_data: JsAudioData = output.unchecked_into();
+        let dec_channels = audio_data.numberOfChannels();
+        let frames = audio_data.numberOfFrames();
+
+        if frames == 0 || dec_channels == 0 {
+            audio_data.close();
+            return;
+        }
+
+        // Extract planar float32
+        let mut left = vec![0f32; frames as usize];
+        let opts = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&opts, &"planeIndex".into(), &0u32.into());
+        let _ = js_sys::Reflect::set(&opts, &"format".into(), &"f32-planar".into());
+        let arr = js_sys::Float32Array::new_with_length(frames);
+        audio_data.copyTo(&arr, &opts);
+        arr.copy_to(&mut left);
+
+        let mut right = if dec_channels >= 2 {
+            let mut r = vec![0f32; frames as usize];
+            let opts_r = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts_r, &"planeIndex".into(), &1u32.into());
+            let _ = js_sys::Reflect::set(&opts_r, &"format".into(), &"f32-planar".into());
+            let arr_r = js_sys::Float32Array::new_with_length(frames);
+            audio_data.copyTo(&arr_r, &opts_r);
+            arr_r.copy_to(&mut r);
+            r
+        } else {
+            left.clone()
+        };
+        audio_data.close();
+
+        // Write interleaved samples directly to SharedArrayBuffer
+        // Use Atomics for writePos synchronization
+        let write_pos = js_sys::Atomics::load(&ctrl, 0).unwrap_or(0) as u32;
+        let mut interleaved = vec![0f32; frames as usize * channels as usize];
+        for i in 0..frames as usize {
+            interleaved[i * 2] = left[i];
+            interleaved[i * 2 + 1] = right[i];
+        }
+
+        // Write to ring buffer with wrap-around
+        for i in 0..frames as usize {
+            let idx = ((write_pos as usize + i) % ring_size as usize) * channels as usize;
+            audio.set_index(idx as u32, interleaved[i * 2]);
+            audio.set_index(idx as u32 + 1, interleaved[i * 2 + 1]);
+        }
+
+        let new_write_pos = (write_pos + frames) % ring_size;
+        let _ = js_sys::Atomics::store(&ctrl, 0, new_write_pos as i32);
+        let _ = js_sys::Atomics::add(&ctrl, 2, frames as i32);
+
+        // Cap buffered to ring_size (overflow protection)
+        let buffered = js_sys::Atomics::load(&ctrl, 2).unwrap_or(0) as u32;
+        if buffered > ring_size {
+            let _ = js_sys::Atomics::store(&ctrl, 2, ring_size as i32);
+        }
+    });
+
+    let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
+        console::warn_1(&format!("AudioDecoder error: {e:?}").into());
+    });
+
+    let init = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&init, &"output".into(), output_cb.as_ref());
+    let _ = js_sys::Reflect::set(&init, &"error".into(), error_cb.as_ref());
+    let audio_decoder = JsAudioDecoder::new(&init);
+
+    let config = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&config, &"codec".into(), &"opus".into());
+    let _ = js_sys::Reflect::set(&config, &"sampleRate".into(), &48000.into());
+    let _ = js_sys::Reflect::set(&config, &"numberOfChannels".into(), &2.into());
+    audio_decoder.configure(&config);
+
+    {
+        let mut s = state.borrow_mut();
+        s.audio_decoder = Some(audio_decoder);
+        s.audio_ctx = Some(audio_ctx.clone());
+    }
+
+    output_cb.forget();
+    error_cb.forget();
+}
+
+/// Audio playback using a jitter buffer + periodic drain.
+/// Decoded PCM accumulates in a buffer. A 40ms timer drains it into
+/// BufferSourceNodes, smoothing out bursty AudioDecoder callbacks.
 fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::AudioContext) {
     let ctx_clone = audio_ctx.clone();
+    let ctx_drain = audio_ctx.clone();
+
+    // Jitter buffer: accumulates decoded PCM (interleaved stereo f32)
+    let pcm_buf: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::with_capacity(48000))); // ~500ms
+    let pcm_buf_write = pcm_buf.clone();
+    let pcm_buf_drain = pcm_buf.clone();
+    let next_time = Rc::new(RefCell::new(0.0f64));
+    let next_time_drain = next_time.clone();
+
+    // AudioDecoder output callback: just accumulates PCM, doesn't schedule
     let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |output: JsValue| {
         let audio_data: JsAudioData = output.unchecked_into();
         let channels = audio_data.numberOfChannels();
         let frames = audio_data.numberOfFrames();
-        let sample_rate = audio_data.sampleRate();
 
         if frames == 0 || channels == 0 {
             audio_data.close();
             return;
         }
 
-        // Copy decoded PCM (f32 planar) into an AudioBuffer
-        let buffer = match ctx_clone.create_buffer(channels, frames, sample_rate) {
-            Ok(b) => b,
-            Err(_) => {
-                audio_data.close();
-                return;
-            }
-        };
+        // Extract interleaved stereo f32
+        let mut left = vec![0f32; frames as usize];
+        let mut right = vec![0f32; frames as usize];
+        let opts_l = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&opts_l, &"planeIndex".into(), &0u32.into());
+        let _ = js_sys::Reflect::set(&opts_l, &"format".into(), &"f32-planar".into());
+        let left_arr = js_sys::Float32Array::new_with_length(frames);
+        audio_data.copyTo(&left_arr, &opts_l);
+        left_arr.copy_to(&mut left);
 
-        // Copy each channel
-        for ch in 0..channels {
-            let channel_data = js_sys::Float32Array::new_with_length(frames);
-            let opts = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&opts, &"planeIndex".into(), &ch.into());
-            let _ = js_sys::Reflect::set(&opts, &"format".into(), &"f32-planar".into());
-            audio_data.copyTo(&channel_data, &opts);
-
-            if let Ok(mut buf_data) = buffer.get_channel_data(ch) {
-                let src: Vec<f32> = channel_data.to_vec();
-                let len = buf_data.len().min(src.len());
-                buf_data[..len].copy_from_slice(&src[..len]);
-                let _ = buffer.copy_to_channel(&buf_data, ch as i32);
-            }
+        if channels >= 2 {
+            let opts_r = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts_r, &"planeIndex".into(), &1u32.into());
+            let _ = js_sys::Reflect::set(&opts_r, &"format".into(), &"f32-planar".into());
+            let right_arr = js_sys::Float32Array::new_with_length(frames);
+            audio_data.copyTo(&right_arr, &opts_r);
+            right_arr.copy_to(&mut right);
+        } else {
+            right = left.clone();
         }
         audio_data.close();
 
-        // Play the buffer immediately via a BufferSourceNode
-        if let Ok(source) = ctx_clone.create_buffer_source() {
-            source.set_buffer(Some(&buffer));
-            let dest = ctx_clone.destination();
-            let _ = source.connect_with_audio_node(&dest);
-            let _ = source.start();
+        // Append interleaved samples to jitter buffer
+        let mut buf = pcm_buf_write.borrow_mut();
+        for i in 0..frames as usize {
+            buf.push(left[i]);
+            buf.push(right[i]);
+        }
+        // Cap buffer at 500ms (48000 samples * 2 channels)
+        if buf.len() > 48000 * 2 {
+            let excess = buf.len() - 48000 * 2;
+            buf.drain(..excess);
         }
     });
+
+    // Periodic drain: every 40ms, take accumulated PCM and schedule playback
+    let drain_cb = Closure::<dyn FnMut()>::new(move || {
+        let mut buf = pcm_buf_drain.borrow_mut();
+        if buf.is_empty() { return; }
+
+        let current_time = ctx_drain.current_time();
+        let mut scheduled = next_time_drain.borrow_mut();
+
+        // Reset if behind or way ahead
+        if *scheduled < current_time {
+            *scheduled = current_time + 0.08; // 80ms buffer to absorb jitter
+        }
+        if *scheduled > current_time + 0.4 {
+            *scheduled = current_time + 0.08;
+            buf.clear(); // drop stale audio
+            return;
+        }
+
+        // Drain all accumulated samples into one AudioBuffer
+        let total_samples = buf.len() / 2; // stereo interleaved
+        if total_samples == 0 { return; }
+
+        let buffer = match ctx_drain.create_buffer(2, total_samples as u32, 48000.0) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        if let Ok(mut left_data) = buffer.get_channel_data(0) {
+            for i in 0..total_samples {
+                left_data[i] = buf[i * 2];
+            }
+            let _ = buffer.copy_to_channel(&left_data, 0);
+        }
+        if let Ok(mut right_data) = buffer.get_channel_data(1) {
+            for i in 0..total_samples {
+                right_data[i] = buf[i * 2 + 1];
+            }
+            let _ = buffer.copy_to_channel(&right_data, 1);
+        }
+        buf.clear();
+
+        if let Ok(source) = ctx_drain.create_buffer_source() {
+            source.set_buffer(Some(&buffer));
+            let _ = source.connect_with_audio_node(&ctx_drain.destination());
+            let _ = source.start_with_when(*scheduled);
+            *scheduled += total_samples as f64 / 48000.0;
+        }
+    });
+
+    // Start 20ms drain timer (matches Opus frame duration for smooth playback)
+    let window = web_sys::window().unwrap();
+    let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+        drain_cb.as_ref().unchecked_ref(), 20,
+    );
+    drain_cb.forget();
 
     let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
         console::warn_1(&format!("AudioDecoder error: {e:?}").into());
@@ -1061,6 +1411,22 @@ fn setup_input(
     document: &web_sys::Document,
     state: &Rc<RefCell<AppState>>,
 ) {
+    // Resume AudioContext on first user interaction (browser autoplay policy)
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+            let st = s.borrow();
+            if let Some(ref ctx) = st.audio_ctx {
+                if ctx.state() == web_sys::AudioContextState::Suspended {
+                    let _ = ctx.resume();
+                    console::log_1(&"AudioContext resumed after user gesture".into());
+                }
+            }
+        });
+        let _ = document.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
+        let _ = document.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
@@ -1116,16 +1482,48 @@ fn setup_input(
     }
     {
         let s = state.clone();
+        // Batch scroll events: send first immediately, then batch per rAF.
+        let scroll_accum = Rc::new(RefCell::new((0.0f32, 0.0f32)));
+        let scroll_pending = Rc::new(RefCell::new(false));
+        let scroll_accum2 = scroll_accum.clone();
+        let scroll_pending2 = scroll_pending.clone();
+        let s2 = s.clone();
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
-            let st = s.borrow();
-            send_input(
-                &st,
-                InputEvent::MouseScroll {
-                    dx: e.delta_x() as f32 / 120.0,
-                    dy: e.delta_y() as f32 / 120.0,
-                },
-            );
+            // Negate: browser deltaY positive = "scroll down" (content up),
+            // but server (enigo) expects positive = "scroll up" (content down).
+            let dx = -(e.delta_x() as f32 / 120.0);
+            let dy = -(e.delta_y() as f32 / 120.0);
+
+            if !*scroll_pending.borrow() {
+                // First scroll: send immediately (no delay)
+                {
+                    let st = s.borrow();
+                    send_input(&st, InputEvent::MouseScroll { dx, dy });
+                }
+                *scroll_pending.borrow_mut() = true;
+                let sa = scroll_accum2.clone();
+                let sp = scroll_pending2.clone();
+                let ss = s2.clone();
+                let flush = Closure::<dyn FnMut(f64)>::once(move |_: f64| {
+                    let mut acc = sa.borrow_mut();
+                    if acc.0 != 0.0 || acc.1 != 0.0 {
+                        let st = ss.borrow();
+                        send_input(&st, InputEvent::MouseScroll { dx: acc.0, dy: acc.1 });
+                        acc.0 = 0.0;
+                        acc.1 = 0.0;
+                    }
+                    *sp.borrow_mut() = false;
+                });
+                let window = web_sys::window().unwrap();
+                let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
+                flush.forget();
+            } else {
+                // Subsequent scrolls: accumulate for next rAF
+                let mut acc = scroll_accum.borrow_mut();
+                acc.0 += dx;
+                acc.1 += dy;
+            }
         });
         canvas
             .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())

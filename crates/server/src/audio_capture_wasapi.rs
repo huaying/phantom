@@ -13,17 +13,14 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use windows::core::HSTRING;
-use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+// CreateEventW and WaitForSingleObject removed — loopback mode uses polling, not events
 
 /// Handle to a running audio capture thread. Drop to stop capture.
 pub struct AudioCapture {
@@ -131,11 +128,8 @@ fn wasapi_capture_loop(
             )
             .context("IAudioClient::Initialize")?;
 
-        // Create an event for the audio client to signal when data is ready
-        let event = CreateEventW(None, false, false, &HSTRING::default()).context("CreateEvent")?;
-        audio_client
-            .SetEventHandle(event)
-            .context("SetEventHandle")?;
+        // Note: SetEventHandle is NOT supported in AUDCLNT_STREAMFLAGS_LOOPBACK mode.
+        // Use polling with GetNextPacketSize instead.
 
         // Get the capture client interface
         let capture_client: IAudioCaptureClient = audio_client
@@ -170,10 +164,12 @@ fn wasapi_capture_loop(
                 break;
             }
 
-            // Wait for audio data (up to 50ms timeout)
-            let wait_result = WaitForSingleObject(event, 50);
-            if wait_result != WAIT_OBJECT_0 {
-                continue; // timeout, check stop flag and retry
+            // Poll for available audio packets (10ms sleep between polls)
+            let packet_size = capture_client.GetNextPacketSize()
+                .unwrap_or(0);
+            if packet_size == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
 
             // Read all available packets
@@ -355,11 +351,12 @@ fn resample(pcm: &[i16], channels: usize, from_rate: u32, to_rate: u32) -> Vec<i
         let frac = src_pos - src_idx as f64;
 
         for ch in 0..channels {
-            let s0 = pcm.get(src_idx * channels + ch).copied().unwrap_or(0) as f64;
+            let s0_raw = pcm.get(src_idx * channels + ch).copied().unwrap_or(0);
+            let s0 = s0_raw as f64;
             let s1 = pcm
                 .get((src_idx + 1) * channels + ch)
                 .copied()
-                .unwrap_or(s0) as f64;
+                .unwrap_or(s0_raw) as f64;
             let interpolated = s0 + (s1 - s0) * frac;
             out.push(interpolated as i16);
         }

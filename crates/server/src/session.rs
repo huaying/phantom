@@ -320,6 +320,10 @@ impl AdaptiveBitrate {
 
 pub struct SessionRunner {
     pub sender: Box<dyn MessageSender>,
+    /// Separate audio sender (independent WebSocket). Falls back to main sender.
+    pub audio_sender: Option<Box<dyn MessageSender>>,
+    /// Receiver for audio WS connections (set from main.rs).
+    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
     pub event_rx: mpsc::Receiver<InboundEvent>,
     pub injector: Option<InputInjector>,
     pub clipboard: ClipboardTracker,
@@ -392,6 +396,8 @@ impl SessionRunner {
 
         let mut runner = Self {
             sender,
+            audio_sender: None,
+            audio_ws_rx: None,
             event_rx,
             injector,
             clipboard,
@@ -477,6 +483,15 @@ impl SessionRunner {
     /// Drain all pending inbound events (input, clipboard, paste).
     /// Returns `Err` if the client disconnected.
     pub fn pump_events(&mut self) -> Result<()> {
+        // Check for audio WS upgrade
+        if self.audio_sender.is_none() {
+            if let Some(ref rx) = self.audio_ws_rx {
+                if let Ok(sender) = rx.try_recv() {
+                    self.set_audio_sender(Box::new(sender));
+                }
+            }
+        }
+
         loop {
             match self.event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
@@ -715,10 +730,11 @@ impl SessionRunner {
         }
     }
 
-    /// Sleep until the frame interval, pumping input events between sleeps.
+    /// Sleep until the frame interval, pumping input and audio between sleeps.
     pub fn frame_pace(&mut self, loop_start: Instant) -> Result<()> {
         while loop_start.elapsed() < self.frame_interval {
             self.pump_events()?;
+            self.drain_audio()?; // keep audio flowing during frame pacing
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -736,6 +752,12 @@ impl SessionRunner {
         v
     }
 
+    /// Set a dedicated audio sender (separate WebSocket).
+    pub fn set_audio_sender(&mut self, sender: Box<dyn MessageSender>) {
+        tracing::info!("audio channel upgraded to dedicated WebSocket");
+        self.audio_sender = Some(sender);
+    }
+
     /// Send any pending audio frames to the client.
     /// Returns the number of audio frames sent.
     pub fn drain_audio(&mut self) -> Result<u32> {
@@ -744,12 +766,23 @@ impl SessionRunner {
             let mut count = 0u32;
             if let Some(ref rx) = self.audio_rx {
                 while let Ok(chunk) = rx.try_recv() {
-                    self.sender.send_msg(&Message::AudioFrame {
+                    let msg = Message::AudioFrame {
                         codec: AudioCodec::Opus,
                         sample_rate: chunk.sample_rate,
                         channels: chunk.channels,
                         data: chunk.data,
-                    })?;
+                    };
+                    // Use dedicated audio sender if available (independent WebSocket),
+                    // fall back to main sender (shared with video).
+                    if let Some(ref mut audio_tx) = self.audio_sender {
+                        if audio_tx.send_msg(&msg).is_err() {
+                            // Audio WS disconnected — fall back to main
+                            self.audio_sender = None;
+                            self.sender.send_msg(&msg)?;
+                        }
+                    } else {
+                        self.sender.send_msg(&msg)?;
+                    }
                     count += 1;
                 }
             }
@@ -799,6 +832,8 @@ pub struct SessionConfig<'a> {
     pub is_resume: bool,
     /// Optional input forwarder for service mode (IPC to agent).
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
+    /// Receiver for audio-only WebSocket connections (independent from video).
+    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -845,6 +880,7 @@ fn run_session_cpu_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Send file if requested via --send-file
     if let Some(path) = cfg.send_file {
@@ -873,6 +909,9 @@ fn run_session_cpu_inner(
 
         runner.pump_events()?;
         runner.poll_clipboard()?;
+
+        // Drain audio FIRST — tiny packets (~100 bytes), must not be blocked by video
+        runner.drain_audio()?;
 
         // Capture
         let frame = match capture.capture()? {
@@ -919,7 +958,6 @@ fn run_session_cpu_inner(
             last_frame = Some(frame);
         }
 
-        runner.drain_audio()?;
         runner.drain_file_transfers()?;
         runner.adapt_bitrate(&mut abr, &congestion, video_encoder);
         runner.log_stats("stats");
@@ -969,6 +1007,7 @@ fn run_session_gpu_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
@@ -987,6 +1026,7 @@ fn run_session_gpu_inner(
 
         runner.pump_events()?;
         runner.poll_clipboard()?;
+        runner.drain_audio()?; // audio first, before capture/encode
 
         // After input, give the screen a moment to update then grab.
         if runner.had_input {
@@ -1019,7 +1059,6 @@ fn run_session_gpu_inner(
             }
         }
 
-        runner.drain_audio()?;
         runner.drain_file_transfers()?;
         runner.adapt_bitrate(&mut abr, &congestion, encoder);
         runner.log_stats("GPU stats");
@@ -1065,6 +1104,7 @@ fn run_session_dxgi_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
@@ -1078,6 +1118,7 @@ fn run_session_dxgi_inner(
 
         runner.pump_events()?;
         runner.poll_clipboard()?;
+        runner.drain_audio()?; // audio first, before capture/encode
 
         // Periodic keyframe
         if runner.needs_keyframe() {
@@ -1097,7 +1138,6 @@ fn run_session_dxgi_inner(
             }
         }
 
-        runner.drain_audio()?;
         runner.drain_file_transfers()?;
         runner.log_stats("stats (DXGI→NVENC)");
         runner.keepalive_tick()?;
