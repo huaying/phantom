@@ -22,6 +22,14 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// ── Input forwarding (for service mode IPC) ─────────────────────────────────
+
+/// Trait for forwarding input events to a remote agent instead of local injection.
+/// Used by Windows Service mode to send input over IPC to the agent process.
+pub trait InputForwarder: Send {
+    fn forward_input(&self, event: &InputEvent) -> Result<()>;
+}
+
 // ── Inbound events from the network receive thread ──────────────────────────
 
 pub enum InboundEvent {
@@ -343,6 +351,9 @@ pub struct SessionRunner {
     pub file_transfer: crate::file_transfer::ServerFileTransfer,
     /// Session token for reconnect validation.
     pub session_token: Vec<u8>,
+    /// Optional input forwarder (e.g. IPC to agent in service mode).
+    /// When set, input events are forwarded instead of locally injected.
+    pub input_forwarder: Option<Box<dyn InputForwarder>>,
 }
 
 impl SessionRunner {
@@ -404,6 +415,7 @@ impl SessionRunner {
             _audio_capture: audio_capture,
             file_transfer: crate::file_transfer::ServerFileTransfer::new(),
             session_token: Vec::new(),
+            input_forwarder: None,
         };
 
         // Generate session token for reconnect
@@ -468,7 +480,11 @@ impl SessionRunner {
         loop {
             match self.event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
-                    if let Some(ref mut inj) = self.injector {
+                    // If we have an input forwarder (e.g. IPC to agent), use it.
+                    // Otherwise inject locally (console mode).
+                    if let Some(ref fwd) = self.input_forwarder {
+                        let _ = fwd.forward_input(&event);
+                    } else if let Some(ref mut inj) = self.injector {
                         let _ = inj.inject(&event);
                     }
                     self.had_input = true;
@@ -485,6 +501,7 @@ impl SessionRunner {
                         let _ = ab.set_text(&text);
                     }
                     self.clipboard.on_remote_update(&text);
+                    // TODO: forward paste to agent via IPC in service mode
                     if let Some(ref mut inj) = self.injector {
                         let _ = inj.type_text(&text);
                         self.had_input = true;
@@ -780,6 +797,8 @@ pub struct SessionConfig<'a> {
     pub video_codec: phantom_core::encode::VideoCodec,
     /// If true, this is a resumed session — skip Hello, send keyframe immediately.
     pub is_resume: bool,
+    /// Optional input forwarder for service mode (IPC to agent).
+    pub input_forwarder: Option<Box<dyn InputForwarder>>,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -825,6 +844,7 @@ fn run_session_cpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
 
     // Send file if requested via --send-file
     if let Some(path) = cfg.send_file {
@@ -948,6 +968,7 @@ fn run_session_gpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
 
     if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
@@ -1043,6 +1064,7 @@ fn run_session_dxgi_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
 
     if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {

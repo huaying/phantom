@@ -609,6 +609,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                 },
             )
         } else {
@@ -625,6 +626,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                 },
             )
         };
@@ -646,6 +648,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                 },
             )
         } else {
@@ -662,6 +665,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                 },
             )
         };
@@ -679,6 +683,7 @@ fn main() -> Result<()> {
                 send_file: send_file_path.as_deref(),
                 video_codec,
                 is_resume,
+                input_forwarder: None,
             },
         );
 

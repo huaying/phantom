@@ -335,6 +335,12 @@ mod platform {
             Ok(())
         }
 
+        /// Get a cloneable input sender for use as an InputForwarder.
+        /// Returns None if IPC I/O threads haven't been started.
+        pub fn input_sender(&self) -> Option<mpsc::Sender<InputEvent>> {
+            self.input_tx.clone()
+        }
+
         /// Send shutdown command to agent.
         pub fn send_shutdown(&self) -> Result<()> {
             if self.connected {
@@ -512,6 +518,9 @@ mod platform {
         }
         pub fn send_input(&self, _event: InputEvent) -> Result<()> {
             Ok(())
+        }
+        pub fn input_sender(&self) -> Option<std::sync::mpsc::Sender<InputEvent>> {
+            None
         }
         pub fn send_shutdown(&self) -> Result<()> {
             Ok(())

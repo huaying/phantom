@@ -326,12 +326,11 @@ fn create_service_session(
             )?);
             let mut differ = phantom_core::tile::TileDiffer::new();
 
-            // TODO: forward input events to agent via IPC.
-            // For now the session's input handling calls InputInjector locally,
-            // but in service mode (Session 0) that won't reach the user's desktop.
-            // This requires intercepting InputEvents in the session's receive loop
-            // and forwarding them through session_mgr.ipc.send_input().
-            // For MVP: input works when agent is in the same session.
+            // Create input forwarder to send input events to agent via IPC
+            let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
+                ipc.input_sender().map(|tx| {
+                    Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
+                });
 
             let result = crate::session::run_session_cpu(
                 &mut capture,
@@ -346,6 +345,7 @@ fn create_service_session(
                     send_file: None,
                     video_codec: phantom_core::encode::VideoCodec::H264,
                     is_resume: false,
+                    input_forwarder,
                 },
             );
             differ.reset();
@@ -380,6 +380,7 @@ fn create_service_session_gdi(
             send_file: None,
             video_codec: phantom_core::encode::VideoCodec::H264,
             is_resume: false,
+            input_forwarder: None,
         },
     );
     differ.reset();
@@ -391,6 +392,21 @@ fn create_service_session_gdi(
 struct IpcFrameCapture<'a> {
     ipc: &'a crate::ipc_pipe::IpcServer,
     last_frame: Option<phantom_core::frame::Frame>,
+}
+
+/// An InputForwarder that sends input events to the agent via IPC.
+#[cfg(target_os = "windows")]
+struct IpcInputForwarder {
+    tx: std::sync::mpsc::Sender<phantom_core::input::InputEvent>,
+}
+
+#[cfg(target_os = "windows")]
+impl crate::session::InputForwarder for IpcInputForwarder {
+    fn forward_input(&self, event: &phantom_core::input::InputEvent) -> anyhow::Result<()> {
+        self.tx
+            .send(event.clone())
+            .map_err(|e| anyhow::anyhow!("IPC input forward failed: {e}"))
+    }
 }
 
 #[cfg(target_os = "windows")]
