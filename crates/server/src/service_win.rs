@@ -194,7 +194,11 @@ fn run_server_loop(
                 let pair = { conn_rx.lock().unwrap().recv() };
                 match pair {
                     Ok(conn) => {
+                        let had_existing = pending.lock().unwrap().is_some();
                         *pending.lock().unwrap() = Some(conn);
+                        if had_existing {
+                            tracing::info!("New client arrived, replacing queued connection");
+                        }
                         cancel.store(true, Ordering::Relaxed);
                     }
                     Err(_) => break,
@@ -401,8 +405,7 @@ impl SessionManager {
         }
     }
 
-    /// Check if the agent process is still alive. If it died, clear it
-    /// so we can relaunch on next session change.
+    /// Check if the agent process is still alive. If it died, attempt relaunch.
     fn check_agent_health(&mut self) {
         #[cfg(target_os = "windows")]
         {
@@ -410,6 +413,20 @@ impl SessionManager {
                 if let Some(exit_code) = agent.try_wait() {
                     tracing::warn!(pid = agent.pid, exit_code, "Agent exited unexpectedly");
                     self.agent = None;
+
+                    // Attempt relaunch if there's still an active user session
+                    if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
+                        tracing::info!(session_id = self.current_session_id, "Relaunching agent");
+                        match launch_agent_in_session(self.current_session_id) {
+                            Ok(proc) => {
+                                tracing::info!(pid = proc.pid, "Agent relaunched");
+                                self.agent = Some(proc);
+                            }
+                            Err(e) => {
+                                tracing::error!("Agent relaunch failed: {e}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -458,10 +475,28 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     };
 
     unsafe {
-        // Get the user's token for the target session
+        // Get the user's token for the target session.
+        // Retry a few times — WTSQueryUserToken can fail early in logon
+        // before the user profile is fully loaded.
         let mut user_token = HANDLE::default();
-        WTSQueryUserToken(session_id, &mut user_token)
-            .context("WTSQueryUserToken failed (need LocalSystem or SeTcbPrivilege)")?;
+        let mut last_err = None;
+        for attempt in 0..5u64 {
+            match WTSQueryUserToken(session_id, &mut user_token) {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 4 {
+                        std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e).context("WTSQueryUserToken failed after 5 attempts (need LocalSystem or SeTcbPrivilege)");
+        }
 
         // Duplicate as primary token for CreateProcessAsUser
         let mut dup_token = HANDLE::default();
@@ -531,17 +566,21 @@ pub fn install_service() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("get current exe path")?;
     let exe_str = exe.to_string_lossy();
 
-    // sc.exe has a peculiar syntax: the value must be part of the same argument
-    // as the `key=` part, with a space after `=`. Each `key= value` is ONE arg.
-    // e.g. sc create Foo binPath= "C:\foo.exe" start= auto
+    // sc.exe syntax: each `key=` and its value are SEPARATE arguments.
+    // e.g. sc create Foo binPath= "C:\foo.exe --flag" start= auto
+    let bin_path = format!("\"{}\" --service", exe_str);
     let status = std::process::Command::new("sc")
         .args([
             "create",
             SERVICE_NAME,
-            &format!("binPath= \"{}\" --service", exe_str),
-            "start= auto",
-            "obj= LocalSystem",
-            &format!("DisplayName= {}", SERVICE_DISPLAY_NAME),
+            "binPath=",
+            &bin_path,
+            "start=",
+            "auto",
+            "obj=",
+            "LocalSystem",
+            "DisplayName=",
+            SERVICE_DISPLAY_NAME,
         ])
         .status()
         .context("sc create")?;
@@ -560,8 +599,10 @@ pub fn install_service() -> anyhow::Result<()> {
         .args([
             "failure",
             SERVICE_NAME,
-            "reset= 86400",
-            "actions= restart/5000/restart/10000/restart/30000",
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/5000/restart/10000/restart/30000",
         ])
         .status();
 

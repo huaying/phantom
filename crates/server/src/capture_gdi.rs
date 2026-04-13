@@ -19,8 +19,8 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetSystemMetrics, OpenInputDesktopW, SetThreadDesktop, SM_CXSCREEN,
-    SM_CYSCREEN,
+    CloseDesktop, GetDesktopWindow, GetSystemMetrics, OpenInputDesktopW, SetThreadDesktop,
+    SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// GDI-based screen capture. Works in Session 0 (service context).
@@ -71,9 +71,14 @@ impl GdiCapture {
             };
 
             if let Err(e) = SetThreadDesktop(hdesk) {
+                let _ = CloseDesktop(hdesk);
                 tracing::debug!("SetThreadDesktop failed: {e}");
                 return Ok(false);
             }
+
+            // SetThreadDesktop keeps its own reference to the desktop;
+            // we can (and must) close our handle to avoid leaking one per frame.
+            let _ = CloseDesktop(hdesk);
 
             Ok(true)
         }
