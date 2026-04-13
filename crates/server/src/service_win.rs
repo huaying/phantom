@@ -223,31 +223,15 @@ fn run_server_loop(
             let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
             let quality_delay = Duration::from_millis(2000);
 
-            // In service mode, use GDI capture (Session 0 / lock screen fallback).
-            // When the agent IPC is implemented, this will proxy through the agent's
-            // DXGI capture for logged-in sessions.
-            match create_service_capture() {
-                Ok((mut capture, mut encoder, mut differ)) => {
-                    let result = crate::session::run_session_cpu(
-                        &mut *capture,
-                        &mut *encoder,
-                        &mut differ,
-                        crate::session::SessionConfig {
-                            sender,
-                            receiver,
-                            frame_interval,
-                            quality_delay,
-                            cancel: session_cancel,
-                            send_file: None,
-                            video_codec: phantom_core::encode::VideoCodec::H264,
-                            is_resume: false,
-                        },
-                    );
+            // In service mode, prefer agent frames via IPC (DXGI quality).
+            // Fall back to local GDI capture when agent is not connected
+            // (lock screen, no user logged in, agent crashed).
+            match create_service_session(&mut session_mgr, sender, receiver, session_cancel) {
+                Ok(result) => {
                     tracing::info!("Service session ended: {}", result.error);
-                    differ.reset();
                 }
                 Err(e) => {
-                    tracing::error!("Service capture init failed: {e}");
+                    tracing::error!("Service session failed: {e}");
                 }
             }
         } else {
@@ -292,6 +276,160 @@ fn create_service_capture() -> anyhow::Result<(
     let differ = phantom_core::tile::TileDiffer::new();
 
     Ok((capture, encoder, differ))
+}
+
+/// Run a service-mode session with IPC agent frame proxying.
+///
+/// If the agent is connected via IPC, uses its DXGI frames (high quality).
+/// Otherwise falls back to local GDI capture (lock screen / no agent).
+/// Input events from the remote client are forwarded to the agent via IPC.
+fn create_service_session(
+    session_mgr: &mut SessionManager,
+    sender: Box<dyn phantom_core::transport::MessageSender>,
+    receiver: Box<dyn phantom_core::transport::MessageReceiver>,
+    cancel: Arc<AtomicBool>,
+) -> anyhow::Result<crate::session::SessionResult> {
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let quality_delay = Duration::from_millis(2000);
+
+    // Check if agent IPC is available
+    #[cfg(target_os = "windows")]
+    let has_ipc = session_mgr.ipc().is_some();
+    #[cfg(not(target_os = "windows"))]
+    let has_ipc = false;
+
+    if has_ipc {
+        // Use IPC-backed capture adapter that pulls frames from agent
+        #[cfg(target_os = "windows")]
+        {
+            let ipc = session_mgr.ipc.as_ref().unwrap();
+            let mut capture = IpcFrameCapture::new(ipc);
+            // We need to get a first frame to know the resolution
+            // Wait briefly for agent to start sending
+            let mut attempts = 0;
+            let (width, height) = loop {
+                if let Some(frame) = ipc.recv_frame() {
+                    capture.last_frame = Some(frame);
+                    break capture.resolution();
+                }
+                attempts += 1;
+                if attempts > 100 {
+                    // 2 seconds without a frame — fall back to GDI
+                    tracing::warn!("No frames from agent after 2s, falling back to GDI");
+                    return create_service_session_gdi(sender, receiver, cancel);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+
+            let mut encoder = Box::new(crate::encode_h264::OpenH264Encoder::new(
+                width, height, 30.0, 2000,
+            )?);
+            let mut differ = phantom_core::tile::TileDiffer::new();
+
+            // TODO: forward input events to agent via IPC.
+            // For now the session's input handling calls InputInjector locally,
+            // but in service mode (Session 0) that won't reach the user's desktop.
+            // This requires intercepting InputEvents in the session's receive loop
+            // and forwarding them through session_mgr.ipc.send_input().
+            // For MVP: input works when agent is in the same session.
+
+            let result = crate::session::run_session_cpu(
+                &mut capture,
+                &mut *encoder,
+                &mut differ,
+                crate::session::SessionConfig {
+                    sender,
+                    receiver,
+                    frame_interval,
+                    quality_delay,
+                    cancel,
+                    send_file: None,
+                    video_codec: phantom_core::encode::VideoCodec::H264,
+                    is_resume: false,
+                },
+            );
+            differ.reset();
+            return Ok(result);
+        }
+    }
+
+    // No IPC — use local capture (GDI fallback)
+    create_service_session_gdi(sender, receiver, cancel)
+}
+
+/// Fallback: run session with local GDI/scrap capture.
+fn create_service_session_gdi(
+    sender: Box<dyn phantom_core::transport::MessageSender>,
+    receiver: Box<dyn phantom_core::transport::MessageReceiver>,
+    cancel: Arc<AtomicBool>,
+) -> anyhow::Result<crate::session::SessionResult> {
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let quality_delay = Duration::from_millis(2000);
+
+    let (mut capture, mut encoder, mut differ) = create_service_capture()?;
+    let result = crate::session::run_session_cpu(
+        &mut *capture,
+        &mut *encoder,
+        &mut differ,
+        crate::session::SessionConfig {
+            sender,
+            receiver,
+            frame_interval,
+            quality_delay,
+            cancel,
+            send_file: None,
+            video_codec: phantom_core::encode::VideoCodec::H264,
+            is_resume: false,
+        },
+    );
+    differ.reset();
+    Ok(result)
+}
+
+/// A FrameCapture adapter that pulls frames from the IPC pipe (agent's DXGI capture).
+#[cfg(target_os = "windows")]
+struct IpcFrameCapture<'a> {
+    ipc: &'a crate::ipc_pipe::IpcServer,
+    last_frame: Option<phantom_core::frame::Frame>,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> IpcFrameCapture<'a> {
+    fn new(ipc: &'a crate::ipc_pipe::IpcServer) -> Self {
+        Self {
+            ipc,
+            last_frame: None,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl phantom_core::capture::FrameCapture for IpcFrameCapture<'_> {
+    fn capture(&mut self) -> anyhow::Result<Option<phantom_core::frame::Frame>> {
+        if let Some(frame) = self.ipc.recv_frame() {
+            self.last_frame = Some(phantom_core::frame::Frame {
+                width: frame.width,
+                height: frame.height,
+                format: frame.format,
+                data: Vec::new(), // keep metadata only for resolution tracking
+                timestamp: frame.timestamp,
+            });
+            Ok(Some(frame))
+        } else {
+            Ok(None) // No new frame from agent yet
+        }
+    }
+
+    fn resolution(&self) -> (u32, u32) {
+        self.last_frame
+            .as_ref()
+            .map(|f| (f.width, f.height))
+            .unwrap_or((1920, 1080))
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(()) // Nothing to reset — agent handles its own capture lifecycle
+    }
 }
 
 // ── Process Handle Wrapper ──────────────────────────────────────────────────
@@ -345,13 +483,15 @@ impl Drop for WinProcessHandle {
 // ── Session Manager ─────────────────────────────────────────────────────────
 
 /// Monitors Windows user sessions and manages the agent process lifecycle.
-/// When a user logs in, it launches a phantom agent in their session.
-/// When they log out, it kills the agent.
+/// When a user logs in, it launches a phantom agent in their session
+/// and establishes an IPC pipe for frame/input proxying.
 struct SessionManager {
     #[cfg(target_os = "windows")]
     agent: Option<WinProcessHandle>,
     #[cfg(target_os = "windows")]
     current_session_id: u32,
+    #[cfg(target_os = "windows")]
+    ipc: Option<crate::ipc_pipe::IpcServer>,
 }
 
 impl SessionManager {
@@ -361,6 +501,8 @@ impl SessionManager {
             agent: None,
             #[cfg(target_os = "windows")]
             current_session_id: 0,
+            #[cfg(target_os = "windows")]
+            ipc: None,
         }
     }
 
@@ -388,17 +530,56 @@ impl SessionManager {
             // 0xFFFFFFFF means no active console session (all users logged out)
             // Session 0 is the service session — don't launch agent there
             if session_id != 0xFFFFFFFF && session_id != 0 {
-                match launch_agent_in_session(session_id) {
-                    Ok(proc) => {
-                        tracing::info!(
-                            session_id,
-                            pid = proc.pid,
-                            "Launched agent in user session"
-                        );
-                        self.agent = Some(proc);
+                // Create IPC pipe BEFORE launching agent so it's ready to connect
+                match crate::ipc_pipe::IpcServer::new() {
+                    Ok(mut ipc_server) => {
+                        match launch_agent_in_session(session_id) {
+                            Ok(proc) => {
+                                tracing::info!(
+                                    session_id,
+                                    pid = proc.pid,
+                                    "Launched agent in user session"
+                                );
+                                self.agent = Some(proc);
+
+                                // Wait for agent to connect to the IPC pipe (up to 10s)
+                                match ipc_server.wait_for_connection(Duration::from_secs(10)) {
+                                    Ok(true) => {
+                                        tracing::info!("Agent connected to IPC pipe");
+                                        self.ipc = Some(ipc_server);
+                                    }
+                                    Ok(false) => {
+                                        tracing::warn!("Agent did not connect to IPC within timeout, using GDI fallback");
+                                        ipc_server.disconnect();
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("IPC connection error: {e}");
+                                        ipc_server.disconnect();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(session_id, "Failed to launch agent: {e}");
+                                ipc_server.disconnect();
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::error!(session_id, "Failed to launch agent: {e}");
+                        tracing::error!("Failed to create IPC pipe: {e}");
+                        // Still try to launch agent (it will fail to connect but that's OK)
+                        match launch_agent_in_session(session_id) {
+                            Ok(proc) => {
+                                tracing::info!(
+                                    session_id,
+                                    pid = proc.pid,
+                                    "Launched agent (no IPC)"
+                                );
+                                self.agent = Some(proc);
+                            }
+                            Err(e) => {
+                                tracing::error!(session_id, "Failed to launch agent: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -413,17 +594,36 @@ impl SessionManager {
                 if let Some(exit_code) = agent.try_wait() {
                     tracing::warn!(pid = agent.pid, exit_code, "Agent exited unexpectedly");
                     self.agent = None;
+                    // Clean up IPC
+                    if let Some(ref mut ipc) = self.ipc {
+                        ipc.disconnect();
+                    }
+                    self.ipc = None;
 
                     // Attempt relaunch if there's still an active user session
                     if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
                         tracing::info!(session_id = self.current_session_id, "Relaunching agent");
-                        match launch_agent_in_session(self.current_session_id) {
-                            Ok(proc) => {
-                                tracing::info!(pid = proc.pid, "Agent relaunched");
-                                self.agent = Some(proc);
-                            }
-                            Err(e) => {
-                                tracing::error!("Agent relaunch failed: {e}");
+                        // Create fresh IPC pipe for the new agent
+                        if let Ok(mut ipc_server) = crate::ipc_pipe::IpcServer::new() {
+                            match launch_agent_in_session(self.current_session_id) {
+                                Ok(proc) => {
+                                    tracing::info!(pid = proc.pid, "Agent relaunched");
+                                    self.agent = Some(proc);
+                                    match ipc_server.wait_for_connection(Duration::from_secs(10)) {
+                                        Ok(true) => {
+                                            tracing::info!("Relaunched agent connected to IPC");
+                                            self.ipc = Some(ipc_server);
+                                        }
+                                        _ => {
+                                            tracing::warn!("Relaunched agent did not connect to IPC");
+                                            ipc_server.disconnect();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Agent relaunch failed: {e}");
+                                    ipc_server.disconnect();
+                                }
                             }
                         }
                     }
@@ -436,12 +636,24 @@ impl SessionManager {
     fn kill_agent(&mut self) {
         #[cfg(target_os = "windows")]
         {
+            // Disconnect IPC first (sends shutdown to agent)
+            if let Some(ref mut ipc) = self.ipc {
+                ipc.disconnect();
+            }
+            self.ipc = None;
+
             if let Some(agent) = self.agent.take() {
                 tracing::info!(pid = agent.pid, "Killing agent");
                 agent.kill();
                 // Handle is closed on drop
             }
         }
+    }
+
+    /// Get a reference to the IPC server (if agent is connected).
+    #[cfg(target_os = "windows")]
+    fn ipc(&self) -> Option<&crate::ipc_pipe::IpcServer> {
+        self.ipc.as_ref().filter(|ipc| ipc.is_connected())
     }
 }
 

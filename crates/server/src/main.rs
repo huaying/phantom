@@ -19,6 +19,7 @@ mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
 mod input_injector;
+mod ipc_pipe;
 #[cfg(target_os = "windows")]
 mod service_win;
 mod session;
@@ -142,10 +143,7 @@ fn main() -> Result<()> {
 
         if args.agent_mode {
             tracing::info!("Running as agent (user session capture + input)");
-            // TODO: Agent mode — connect back to service via IPC,
-            // provide DXGI capture + input injection from user session.
-            // For now, just run as a normal server on the agent port.
-            // The --listen flag already defaults to what the service passes.
+            return run_agent_mode();
         }
     }
 
@@ -951,6 +949,104 @@ fn uninstall_autostart() -> Result<()> {
         println!("Auto-start not supported on this OS.");
     }
 
+    Ok(())
+}
+
+// ── Agent mode (Windows only) ───────────────────────────────────────────────
+
+/// Run as an agent process in the user's session.
+/// Captures the screen via DXGI/scrap, sends frames to the service via IPC,
+/// and receives input events to inject into the desktop.
+#[cfg(target_os = "windows")]
+fn run_agent_mode() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    tracing::info!("Agent: connecting to service IPC pipe...");
+    let ipc = ipc_pipe::IpcClient::connect()?;
+    tracing::info!("Agent: IPC connected");
+
+    // Set up capture (try scrap/DXGI first — we're in the user's session so it should work)
+    let mut capture: Box<dyn phantom_core::capture::FrameCapture> =
+        match capture_scrap::ScrapCapture::new() {
+            Ok(cap) => {
+                tracing::info!("Agent: using scrap (DXGI) capture");
+                Box::new(cap)
+            }
+            Err(e) => {
+                tracing::error!("Agent: scrap capture failed: {e}");
+                anyhow::bail!("No capture method available in agent mode: {e}");
+            }
+        };
+
+    // Set up input injection
+    let mut injector = match input_injector::InputInjector::new() {
+        Ok(inj) => {
+            tracing::info!("Agent: input injection ready");
+            Some(inj)
+        }
+        Err(e) => {
+            tracing::warn!("Agent: input injection unavailable: {e}");
+            None
+        }
+    };
+
+    // Graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        ctrlc::set_handler(move || {
+            shutdown.store(true, Ordering::SeqCst);
+        })
+        .ok(); // May fail if handler already set
+    }
+
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let mut last_frame_time = Instant::now();
+
+    tracing::info!("Agent: entering capture loop");
+    while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
+        // Capture frame at target FPS
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_frame_time);
+        if elapsed < frame_interval {
+            std::thread::sleep(frame_interval - elapsed);
+        }
+
+        match capture.capture() {
+            Ok(Some(frame)) => {
+                last_frame_time = Instant::now();
+                if let Err(e) = ipc.send_frame(&frame) {
+                    tracing::warn!("Agent: failed to send frame: {e}");
+                    break;
+                }
+            }
+            Ok(None) => {
+                // No new frame available, brief sleep
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => {
+                tracing::warn!("Agent: capture error: {e}");
+                // Try to reset capture
+                if let Err(re) = capture.reset() {
+                    tracing::error!("Agent: capture reset failed: {re}");
+                    break;
+                }
+            }
+        }
+
+        // Process input events from service
+        for event in ipc.recv_inputs() {
+            if let Some(ref mut inj) = injector {
+                if let Err(e) = inj.inject(&event) {
+                    tracing::trace!("Agent: input inject error: {e}");
+                }
+            }
+        }
+    }
+
+    tracing::info!("Agent: shutting down");
     Ok(())
 }
 
