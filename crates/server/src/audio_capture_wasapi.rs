@@ -360,11 +360,12 @@ fn resample(pcm: &[i16], channels: usize, from_rate: u32, to_rate: u32) -> Vec<i
         let frac = src_pos - src_idx as f64;
 
         for ch in 0..channels {
-            let s0 = pcm.get(src_idx * channels + ch).copied().unwrap_or(0) as f64;
+            let s0_raw = pcm.get(src_idx * channels + ch).copied().unwrap_or(0);
+            let s0 = s0_raw as f64;
             let s1 = pcm
                 .get((src_idx + 1) * channels + ch)
                 .copied()
-                .unwrap_or(s0) as f64;
+                .unwrap_or(s0_raw) as f64;
             let interpolated = s0 + (s1 - s0) * frac;
             out.push(interpolated as i16);
         }
