@@ -108,47 +108,17 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long)]
     agent_mode: bool,
+
+    /// Run as Windows Service (invoked by SCM — do not use manually).
+    /// Use `--install` to register the service instead.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    service: bool,
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
-    // ── Windows Service detection ───────────────────────────────────────────
-    // If launched by the Service Control Manager (no console window),
-    // enter service mode before parsing CLI args (SCM passes its own args).
-    #[cfg(target_os = "windows")]
-    {
-        if service_win::is_running_as_service() {
-            // Initialize logging to file since there's no console
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("phantom=info".parse().unwrap()),
-                )
-                .with_writer(|| {
-                    // Log to %PROGRAMDATA%\Phantom\phantom-server.log
-                    let log_dir = std::path::PathBuf::from(
-                        std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into()),
-                    )
-                    .join("Phantom");
-                    let _ = std::fs::create_dir_all(&log_dir);
-                    let log_path = log_dir.join("phantom-server.log");
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log_path)
-                        .unwrap_or_else(|_| {
-                            // Fallback to NUL if we can't write the log
-                            std::fs::File::create("NUL").unwrap()
-                        })
-                })
-                .init();
-            tracing::info!("Starting as Windows Service");
-            return service_win::run_as_service()
-                .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
-        }
-    }
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -157,6 +127,27 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ── Windows Service mode ────────────────────────────────────────────────
+    // When installed, the service binary is registered with `--service` flag.
+    // SCM launches us → we enter the service dispatcher → never returns until
+    // service stops. This is a clean, explicit detection (no heuristics).
+    #[cfg(target_os = "windows")]
+    {
+        if args.service {
+            tracing::info!("Entering Windows Service dispatcher mode");
+            return service_win::run_as_service()
+                .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
+        }
+
+        if args.agent_mode {
+            tracing::info!("Running as agent (user session capture + input)");
+            // TODO: Agent mode — connect back to service via IPC,
+            // provide DXGI capture + input injection from user session.
+            // For now, just run as a normal server on the agent port.
+            // The --listen flag already defaults to what the service passes.
+        }
+    }
 
     // ── Graceful shutdown signal (Ctrl+C / SIGTERM) ─────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));

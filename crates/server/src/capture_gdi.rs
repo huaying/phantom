@@ -7,20 +7,20 @@
 //! Performance: ~15-30 FPS at 1080p (slower than DXGI's ~60 FPS zero-copy),
 //! but sufficient for lock screen / login screen viewing.
 //!
-//! Can capture the Winlogon desktop (Secure Desktop) when running as LocalSystem.
+//! To capture the Winlogon Secure Desktop (lock screen), we use
+//! OpenInputDesktop + SetThreadDesktop to switch to whichever desktop is active.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use phantom_core::capture::FrameCapture;
 use phantom_core::frame::{Frame, PixelFormat};
 use std::time::Instant;
-use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
-    SRCCOPY,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    GetDesktopWindow, GetSystemMetrics, OpenInputDesktopW, SetThreadDesktop, SM_CXSCREEN,
+    SM_CYSCREEN,
 };
 
 /// GDI-based screen capture. Works in Session 0 (service context).
@@ -31,13 +31,12 @@ pub struct GdiCapture {
 
 impl GdiCapture {
     pub fn new() -> Result<Self> {
-        let width;
-        let height;
-
-        unsafe {
-            width = GetSystemMetrics(SM_CXSCREEN) as u32;
-            height = GetSystemMetrics(SM_CYSCREEN) as u32;
-        }
+        let (width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN) as u32,
+                GetSystemMetrics(SM_CYSCREEN) as u32,
+            )
+        };
 
         if width == 0 || height == 0 {
             anyhow::bail!(
@@ -48,10 +47,45 @@ impl GdiCapture {
         tracing::info!(width, height, "GdiCapture initialized (Session 0 fallback)");
         Ok(Self { width, height })
     }
+
+    /// Switch the current thread to whichever desktop is receiving input.
+    /// This is essential for Session 0: without it, we'd capture the
+    /// empty Session 0 desktop instead of the Winlogon lock screen.
+    ///
+    /// Returns Ok(true) if we switched, Ok(false) if we couldn't open
+    /// the input desktop (non-fatal — we'll capture whatever we can).
+    fn switch_to_input_desktop(&self) -> Result<bool> {
+        unsafe {
+            // DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP are needed
+            // for SetThreadDesktop; GENERIC_READ covers these.
+            let hdesk = match OpenInputDesktopW(
+                windows::Win32::UI::WindowsAndMessaging::DESKTOP_CONTROL_FLAGS(0),
+                false,
+                windows::Win32::Foundation::GENERIC_READ.0,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::debug!("OpenInputDesktop failed (expected in some states): {e}");
+                    return Ok(false);
+                }
+            };
+
+            if let Err(e) = SetThreadDesktop(hdesk) {
+                tracing::debug!("SetThreadDesktop failed: {e}");
+                return Ok(false);
+            }
+
+            Ok(true)
+        }
+    }
 }
 
 impl FrameCapture for GdiCapture {
     fn capture(&mut self) -> Result<Option<Frame>> {
+        // Try to switch to the active input desktop (Winlogon / user desktop).
+        // If this fails, we'll still capture whatever desktop we're on.
+        let _ = self.switch_to_input_desktop();
+
         unsafe {
             let hwnd = GetDesktopWindow();
             let hdc_screen = GetDC(hwnd);

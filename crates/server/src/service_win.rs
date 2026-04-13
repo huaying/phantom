@@ -26,7 +26,7 @@ const SERVICE_DESCRIPTION: &str =
     "Phantom remote desktop server — provides remote access including pre-login lock screen.";
 
 /// Entry point when invoked by the Windows Service Control Manager.
-/// Call this from main() when service mode is detected.
+/// Call this from main() when `--service` flag is passed.
 pub fn run_as_service() -> Result<(), windows_service::Error> {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
@@ -37,8 +37,7 @@ define_windows_service!(ffi_service_main, phantom_service_main);
 
 fn phantom_service_main(arguments: Vec<OsString>) {
     if let Err(e) = run_service(arguments) {
-        // Log to Windows Event Log or stderr (service has no console)
-        eprintln!("Service failed: {e}");
+        tracing::error!("Service failed: {e}");
     }
 }
 
@@ -46,7 +45,12 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
-    // Register the service control handler
+    // Register the service control handler.
+    // Accept SESSION_CHANGE events so SCM notifies us of logon/logoff
+    // instead of polling WTSGetActiveConsoleSessionId.
+    let session_changed = Arc::new(AtomicBool::new(false));
+    let session_changed_clone = Arc::clone(&session_changed);
+
     let status_handle = service_control_handler::register(
         SERVICE_NAME,
         move |control_event| -> ServiceControlHandlerResult {
@@ -56,6 +60,11 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                ServiceControl::SessionChange(_) => {
+                    // A user logged in/out — wake the session manager
+                    session_changed_clone.store(true, Ordering::Relaxed);
+                    ServiceControlHandlerResult::NoError
+                }
                 _ => ServiceControlHandlerResult::NotImplemented,
             }
         },
@@ -65,7 +74,9 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        controls_accepted: ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::SESSION_CHANGE,
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
@@ -73,15 +84,10 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     })?;
 
     // Run the actual server logic.
-    // This re-uses the same server code but with service-appropriate defaults:
-    // - Listens on 0.0.0.0:9900
-    // - No encryption by default (service can't prompt for key)
-    //   Users should configure via registry/config file in production
-    // - Monitors for user session changes to launch/kill the agent process
-    let result = run_server_loop(Arc::clone(&shutdown));
+    let result = run_server_loop(Arc::clone(&shutdown), session_changed);
 
     if let Err(ref e) = result {
-        eprintln!("Server loop error: {e}");
+        tracing::error!("Server loop error: {e}");
     }
 
     // Report "Stopped" to SCM
@@ -100,7 +106,10 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
 
 /// Main server loop when running as a service.
 /// Uses the same transport/session infrastructure as console mode.
-fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_server_loop(
+    shutdown: Arc<AtomicBool>,
+    session_changed: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     use crate::transport_tcp;
     use crate::transport_ws;
     use phantom_core::transport::{MessageReceiver, MessageSender};
@@ -133,12 +142,12 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("TCP split failed: {e}");
+                            tracing::warn!("TCP split failed: {e}");
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("TCP accept error: {e}");
+                    tracing::warn!("TCP accept error: {e}");
                 }
             }
         })?;
@@ -157,7 +166,7 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("WebSocket accept error: {e}");
+                    tracing::warn!("WebSocket accept error: {e}");
                 }
             }
         })?;
@@ -165,9 +174,10 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
 
     // Session manager: monitors user sessions and launches agents
     let mut session_mgr = SessionManager::new();
+    // Do an initial poll to detect any already-logged-in user
+    session_mgr.update();
 
     // Main loop: accept connections and run sessions
-    // In service mode, we use GDI capture as fallback when no user session agent is available
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -193,8 +203,12 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     }
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Check if we need to launch/kill agent for user session changes
-        session_mgr.poll();
+        // Check for session changes (driven by SCM SESSION_CHANGE events)
+        if session_changed.swap(false, Ordering::Relaxed) {
+            session_mgr.update();
+        }
+        // Also check if agent died unexpectedly
+        session_mgr.check_agent_health();
 
         // Check for pending connection
         let conn = pending.lock().unwrap().take();
@@ -202,14 +216,12 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
             cancel.store(false, Ordering::Relaxed);
             let session_cancel = Arc::clone(&cancel);
 
-            // Try to use the agent's DXGI capture if a user session agent is running.
-            // Otherwise, fall back to GDI capture (lock screen).
-            // For now, use CPU capture as the service-mode fallback.
             let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
             let quality_delay = Duration::from_millis(2000);
 
-            // In service mode, attempt GDI capture (Session 0 / lock screen).
-            // This will be replaced by agent IPC in Phase 2.
+            // In service mode, use GDI capture (Session 0 / lock screen fallback).
+            // When the agent IPC is implemented, this will proxy through the agent's
+            // DXGI capture for logged-in sessions.
             match create_service_capture() {
                 Ok((mut capture, mut encoder, mut differ)) => {
                     let result = crate::session::run_session_cpu(
@@ -227,18 +239,20 @@ fn run_server_loop(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
                             is_resume: false,
                         },
                     );
-                    eprintln!("Service session ended: {}", result.error);
+                    tracing::info!("Service session ended: {}", result.error);
                     differ.reset();
                 }
                 Err(e) => {
-                    eprintln!("Service capture init failed: {e}");
-                    // Drop connection, client will retry
+                    tracing::error!("Service capture init failed: {e}");
                 }
             }
         } else {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    // Shutdown: kill agent if running
+    session_mgr.kill_agent();
 
     Ok(())
 }
@@ -276,69 +290,139 @@ fn create_service_capture() -> anyhow::Result<(
     Ok((capture, encoder, differ))
 }
 
+// ── Process Handle Wrapper ──────────────────────────────────────────────────
+
+/// Wrapper around a raw Win32 process handle from CreateProcessAsUser.
+/// Provides kill/wait/try_wait similar to std::process::Child but works
+/// with processes created via CreateProcessAsUser (which can't produce
+/// a std::process::Child).
+#[cfg(target_os = "windows")]
+struct WinProcessHandle {
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl WinProcessHandle {
+    /// Terminate the process.
+    fn kill(&self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(self.handle, 1);
+        }
+    }
+
+    /// Check if the process has exited. Returns Some(exit_code) if exited.
+    fn try_wait(&self) -> Option<u32> {
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetExitCodeProcess, WaitForSingleObject, WAIT_TIMEOUT,
+            };
+            // Non-blocking check
+            let wait_result = WaitForSingleObject(self.handle, 0);
+            if wait_result == WAIT_TIMEOUT {
+                return None; // Still running
+            }
+            let mut exit_code: u32 = 0;
+            let _ = GetExitCodeProcess(self.handle, &mut exit_code);
+            Some(exit_code)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WinProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
 // ── Session Manager ─────────────────────────────────────────────────────────
 
 /// Monitors Windows user sessions and manages the agent process lifecycle.
 /// When a user logs in, it launches a phantom agent in their session.
 /// When they log out, it kills the agent.
 struct SessionManager {
-    agent_process: Option<std::process::Child>,
-    last_session_id: u32,
+    #[cfg(target_os = "windows")]
+    agent: Option<WinProcessHandle>,
+    #[cfg(target_os = "windows")]
+    current_session_id: u32,
 }
 
 impl SessionManager {
     fn new() -> Self {
         Self {
-            agent_process: None,
-            last_session_id: 0,
+            #[cfg(target_os = "windows")]
+            agent: None,
+            #[cfg(target_os = "windows")]
+            current_session_id: 0,
         }
     }
 
-    /// Check for user session changes and launch/kill agent as needed.
-    fn poll(&mut self) {
+    /// React to a session change event. Check current active session and
+    /// launch/kill agent as needed.
+    fn update(&mut self) {
         #[cfg(target_os = "windows")]
         {
             let session_id = get_active_console_session_id();
 
-            if session_id != self.last_session_id {
-                self.last_session_id = session_id;
+            if session_id == self.current_session_id {
+                return; // No change
+            }
 
-                // Kill existing agent if any
-                if let Some(ref mut child) = self.agent_process {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    self.agent_process = None;
-                    eprintln!("Killed agent for old session");
-                }
+            tracing::info!(
+                old = self.current_session_id,
+                new = session_id,
+                "Active console session changed"
+            );
+            self.current_session_id = session_id;
 
-                // 0xFFFFFFFF means no active console session
-                if session_id != 0xFFFFFFFF && session_id != 0 {
-                    // A user has an interactive session — launch agent
-                    match launch_agent_in_session(session_id) {
-                        Ok(child) => {
-                            eprintln!("Launched agent in session {session_id}");
-                            self.agent_process = Some(child);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to launch agent in session {session_id}: {e}");
-                        }
+            // Kill existing agent
+            self.kill_agent();
+
+            // 0xFFFFFFFF means no active console session (all users logged out)
+            // Session 0 is the service session — don't launch agent there
+            if session_id != 0xFFFFFFFF && session_id != 0 {
+                match launch_agent_in_session(session_id) {
+                    Ok(proc) => {
+                        tracing::info!(
+                            session_id,
+                            pid = proc.pid,
+                            "Launched agent in user session"
+                        );
+                        self.agent = Some(proc);
+                    }
+                    Err(e) => {
+                        tracing::error!(session_id, "Failed to launch agent: {e}");
                     }
                 }
             }
+        }
+    }
 
-            // Check if agent is still alive
-            if let Some(ref mut child) = self.agent_process {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        eprintln!("Agent exited with {status}");
-                        self.agent_process = None;
-                    }
-                    Ok(None) => {} // Still running
-                    Err(e) => {
-                        eprintln!("Error checking agent: {e}");
-                        self.agent_process = None;
-                    }
+    /// Check if the agent process is still alive. If it died, clear it
+    /// so we can relaunch on next session change.
+    fn check_agent_health(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref agent) = self.agent {
+                if let Some(exit_code) = agent.try_wait() {
+                    tracing::warn!(pid = agent.pid, exit_code, "Agent exited unexpectedly");
+                    self.agent = None;
                 }
+            }
+        }
+    }
+
+    /// Kill the current agent process if one is running.
+    fn kill_agent(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(agent) = self.agent.take() {
+                tracing::info!(pid = agent.pid, "Killing agent");
+                agent.kill();
+                // Handle is closed on drop
             }
         }
     }
@@ -349,7 +433,6 @@ impl SessionManager {
 /// Get the session ID of the active console session.
 #[cfg(target_os = "windows")]
 fn get_active_console_session_id() -> u32 {
-    // WTSGetActiveConsoleSessionId is in kernel32, always available
     extern "system" {
         fn WTSGetActiveConsoleSessionId() -> u32;
     }
@@ -357,17 +440,17 @@ fn get_active_console_session_id() -> u32 {
 }
 
 /// Launch the phantom agent process in a specific user session.
-/// Uses WTSQueryUserToken + CreateProcessAsUser to inject into the user's desktop.
+/// Uses WTSQueryUserToken + DuplicateTokenEx + CreateProcessAsUser to inject
+/// into the user's interactive desktop (winsta0\default).
+///
+/// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
-fn launch_agent_in_session(session_id: u32) -> anyhow::Result<std::process::Child> {
+fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> {
     use anyhow::Context;
-    use std::ffi::c_void;
     use std::mem;
-    use std::ptr;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, SECURITY_ATTRIBUTES,
-        TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
     };
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::{
@@ -380,41 +463,40 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<std::process::Chil
         WTSQueryUserToken(session_id, &mut user_token)
             .context("WTSQueryUserToken failed (need LocalSystem or SeTcbPrivilege)")?;
 
-        // Duplicate token as primary token for CreateProcessAsUser
+        // Duplicate as primary token for CreateProcessAsUser
         let mut dup_token = HANDLE::default();
-        DuplicateTokenEx(
+        let dup_result = DuplicateTokenEx(
             user_token,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenPrimary,
             &mut dup_token,
-        )
-        .context("DuplicateTokenEx failed")?;
+        );
         let _ = CloseHandle(user_token);
+        dup_result.context("DuplicateTokenEx failed")?;
 
-        // Get the path to our own executable
+        // Build command line
         let exe_path = std::env::current_exe().context("get current exe")?;
         let cmd_line = format!(
             "\"{}\" --agent-mode --listen 127.0.0.1:9910 --no-encrypt",
             exe_path.display()
         );
-
-        // Convert to wide string
-        let cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+        // CreateProcessAsUserW needs a mutable wide string
+        let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut si: STARTUPINFOW = mem::zeroed();
         si.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        // Run on the interactive desktop
-        let desktop = "winsta0\\default\0".encode_utf16().collect::<Vec<u16>>();
-        si.lpDesktop = windows::core::PWSTR(desktop.as_ptr() as *mut u16);
+        // Target the interactive window station + desktop
+        let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+        si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
 
         let mut pi: PROCESS_INFORMATION = mem::zeroed();
 
         let result = CreateProcessAsUserW(
             dup_token,
             None,
-            windows::core::PWSTR(cmd_wide.as_ptr() as *mut u16),
+            windows::core::PWSTR(cmd_wide.as_mut_ptr()),
             None,
             None,
             false,
@@ -424,54 +506,41 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<std::process::Chil
             &si,
             &mut pi,
         );
-
         let _ = CloseHandle(dup_token);
-
         result.context("CreateProcessAsUserW failed")?;
 
-        // We don't need the thread handle
+        // Close thread handle (we only need the process handle)
         let _ = CloseHandle(pi.hThread);
 
-        // Wrap the process handle in a Child-like struct for lifecycle management
-        // Since we can't easily create a std::process::Child from a raw handle,
-        // we use a simple wrapper. For now, spawn via Command as fallback.
-        let _ = CloseHandle(pi.hProcess);
-
-        // Fallback: use runas / session injection via command
-        // The CreateProcessAsUser above is the correct approach, but returning
-        // a std::process::Child from it requires more plumbing. For now, we track
-        // the PID manually.
-        //
-        // TODO: Implement proper process handle wrapper
-        // For the initial implementation, we spawn via a helper approach:
-        let child = std::process::Command::new(exe_path)
-            .args(["--agent-mode", "--listen", "127.0.0.1:9910", "--no-encrypt"])
-            .spawn()
-            .context("spawn agent process")?;
-
-        Ok(child)
+        Ok(WinProcessHandle {
+            handle: pi.hProcess,
+            pid: pi.dwProcessId,
+        })
     }
 }
 
 // ── Service installation helpers ────────────────────────────────────────────
 
 /// Install Phantom as a Windows Service (replaces schtasks approach).
+///
+/// Uses `sc.exe` to create a service that runs as LocalSystem at boot.
+/// The `--service` flag in binPath tells the server to enter SCM dispatcher mode.
 pub fn install_service() -> anyhow::Result<()> {
     use anyhow::Context;
 
     let exe = std::env::current_exe().context("get current exe path")?;
     let exe_str = exe.to_string_lossy();
 
-    // Create the service
+    // sc.exe has a peculiar syntax: the value must be part of the same argument
+    // as the `key=` part, with a space after `=`. Each `key= value` is ONE arg.
+    // e.g. sc create Foo binPath= "C:\foo.exe" start= auto
     let status = std::process::Command::new("sc")
         .args([
             "create",
             SERVICE_NAME,
-            &format!("binPath= \"{}\"", exe_str),
-            "start=",
-            "auto",
-            "obj=",
-            "LocalSystem",
+            &format!("binPath= \"{}\" --service", exe_str),
+            "start= auto",
+            "obj= LocalSystem",
             &format!("DisplayName= {}", SERVICE_DISPLAY_NAME),
         ])
         .status()
@@ -486,15 +555,13 @@ pub fn install_service() -> anyhow::Result<()> {
         .args(["description", SERVICE_NAME, SERVICE_DESCRIPTION])
         .status();
 
-    // Configure service recovery: restart on failure
+    // Configure service recovery: restart on failure (5s, 10s, 30s)
     let _ = std::process::Command::new("sc")
         .args([
             "failure",
             SERVICE_NAME,
-            "reset=",
-            "86400",
-            "actions=",
-            "restart/5000/restart/10000/restart/30000",
+            "reset= 86400",
+            "actions= restart/5000/restart/10000/restart/30000",
         ])
         .status();
 
@@ -545,29 +612,10 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
     }
 
-    // Also clean up old schtasks entry if it exists
+    // Also clean up old schtasks entry if it exists (from pre-service installs)
     let _ = std::process::Command::new("schtasks")
         .args(["/Delete", "/TN", "PhantomServer", "/F"])
         .status();
 
     Ok(())
-}
-
-/// Detect if the process was started by the Service Control Manager.
-/// If stdin is not a console and no console is attached, we're likely a service.
-pub fn is_running_as_service() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // Heuristic: services don't have a console window.
-        // The definitive way is to attempt service dispatcher registration,
-        // but that blocks. Instead, check if we have a console.
-        extern "system" {
-            fn GetConsoleWindow() -> *mut std::ffi::c_void;
-        }
-        unsafe { GetConsoleWindow().is_null() }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
 }
