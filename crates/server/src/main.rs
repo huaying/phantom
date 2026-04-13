@@ -980,8 +980,24 @@ fn run_agent_mode() -> Result<()> {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    // Redirect agent tracing to file (spawned by service, no console)
+    let _ = std::fs::write(r"C:\Users\horde\phantom-agent.log", "Agent starting\n");
+    fn agent_log(msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(r"C:\Users\horde\phantom-agent.log") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
+        }
+    }
+
+    agent_log("Connecting to IPC pipe...");
     tracing::info!("Agent: connecting to service IPC pipe...");
-    let ipc = ipc_pipe::IpcClient::connect()?;
+    let ipc = match ipc_pipe::IpcClient::connect() {
+        Ok(c) => { agent_log("IPC connected!"); c }
+        Err(e) => { agent_log(&format!("IPC connect FAILED: {e}")); return Err(e); }
+    };
     tracing::info!("Agent: IPC connected");
 
     // Set up capture (try scrap/DXGI first — we're in the user's session so it should work)
@@ -1022,9 +1038,9 @@ fn run_agent_mode() -> Result<()> {
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_time = Instant::now();
 
-    tracing::info!("Agent: entering capture loop");
+    agent_log("Entering capture loop");
+    let mut frame_count = 0u64;
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
-        // Capture frame at target FPS
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_time);
         if elapsed < frame_interval {
@@ -1034,8 +1050,12 @@ fn run_agent_mode() -> Result<()> {
         match capture.capture() {
             Ok(Some(frame)) => {
                 last_frame_time = Instant::now();
+                frame_count += 1;
+                if frame_count <= 3 || frame_count % 100 == 0 {
+                    agent_log(&format!("Frame #{frame_count}: {}x{} {} bytes", frame.width, frame.height, frame.data.len()));
+                }
                 if let Err(e) = ipc.send_frame(&frame) {
-                    tracing::warn!("Agent: failed to send frame: {e}");
+                    agent_log(&format!("send_frame FAILED: {e}"));
                     break;
                 }
             }
