@@ -1,12 +1,17 @@
 //! Phantom remote desktop server.
 //!
-//! Captures the screen (via scrap, NVFBC, PipeWire, or DXGI), encodes it
+//! Captures the screen (via scrap, NVFBC, PipeWire, DXGI, or GDI), encodes it
 //! (OpenH264 or NVENC), and streams to connected clients over TCP, QUIC,
 //! WebSocket, or WebRTC. Supports encrypted connections, audio capture,
 //! bidirectional file transfer, and clipboard synchronization.
+//!
+//! On Windows, can run as a Windows Service (Session 0) for pre-login access.
+//! Use `--install` to register the service, `--uninstall` to remove it.
 
 #[cfg(feature = "audio")]
 mod audio_capture;
+#[cfg(target_os = "windows")]
+mod capture_gdi;
 #[cfg(feature = "wayland")]
 mod capture_pipewire;
 mod capture_scrap;
@@ -14,6 +19,8 @@ mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
 mod input_injector;
+#[cfg(target_os = "windows")]
+mod service_win;
 mod session;
 mod transport_quic;
 mod transport_tcp;
@@ -95,11 +102,53 @@ struct Args {
     /// Override public address (skip STUN discovery). Format: IP:port.
     #[arg(long)]
     public_addr: Option<String>,
+
+    /// Run as agent process (launched by service in user session).
+    /// Handles DXGI capture + input injection, connects back to service.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    agent_mode: bool,
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
+    // ── Windows Service detection ───────────────────────────────────────────
+    // If launched by the Service Control Manager (no console window),
+    // enter service mode before parsing CLI args (SCM passes its own args).
+    #[cfg(target_os = "windows")]
+    {
+        if service_win::is_running_as_service() {
+            // Initialize logging to file since there's no console
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("phantom=info".parse().unwrap()),
+                )
+                .with_writer(|| {
+                    // Log to %PROGRAMDATA%\Phantom\phantom-server.log
+                    let log_dir = std::path::PathBuf::from(
+                        std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into()),
+                    )
+                    .join("Phantom");
+                    let _ = std::fs::create_dir_all(&log_dir);
+                    let log_path = log_dir.join("phantom-server.log");
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log_path)
+                        .unwrap_or_else(|_| {
+                            // Fallback to NUL if we can't write the log
+                            std::fs::File::create("NUL").unwrap()
+                        })
+                })
+                .init();
+            tracing::info!("Starting as Windows Service");
+            return service_win::run_as_service()
+                .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -853,29 +902,7 @@ fn install_autostart() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("schtasks")
-            .args([
-                "/Create",
-                "/TN",
-                "PhantomServer",
-                "/TR",
-                &format!("\"{exe_str}\" --no-encrypt --transport web"),
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "HIGHEST",
-                "/IT",
-                "/F",
-            ])
-            .status()
-            .context("schtasks")?;
-        if status.success() {
-            println!("Installed: PhantomServer scheduled task (runs at logon)");
-            println!("  To start now: schtasks /Run /TN PhantomServer");
-            println!("  To remove:    phantom-server --uninstall");
-        } else {
-            anyhow::bail!("schtasks failed with {status}");
-        }
+        return service_win::install_service();
     }
 
     #[cfg(target_os = "linux")]
@@ -914,15 +941,7 @@ fn uninstall_autostart() -> Result<()> {
     use anyhow::Context;
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", "PhantomServer", "/F"])
-            .status()
-            .context("schtasks delete")?;
-        if status.success() {
-            println!("Removed: PhantomServer scheduled task");
-        } else {
-            anyhow::bail!("schtasks delete failed");
-        }
+        return service_win::uninstall_service();
     }
 
     #[cfg(target_os = "linux")]
