@@ -6,7 +6,7 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 
 - **H.264 / AV1 streaming** with periodic keyframes and lossless refinement after 2s idle
 - **GPU acceleration** — NVENC encoding (H.264 + AV1) + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
-- **Audio forwarding** — PulseAudio → Opus 48kHz stereo → client playback (native + web)
+- **Audio forwarding** — PulseAudio (Linux) / WASAPI (Windows) → Opus 48kHz stereo → client playback (native + web)
 - **Adaptive bitrate** — RTT-based, automatic quality adjustment with hysteresis
 - **File transfer** — bidirectional, chunked streaming with SHA-256 integrity verification
 - **Multi-monitor** — `--display N` to select monitor, `--list-displays` to enumerate
@@ -186,7 +186,10 @@ Runtime-detected: AVX2 on x86_64, automatic scalar fallback on other architectur
 # Prerequisites
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Build (WSS web transport, default)
+# Linux build dependencies
+sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm libpulse-dev libopus-dev
+
+# Build (includes audio by default)
 cargo build --release
 
 # Build with WebRTC support (adds str0m dependency)
@@ -219,7 +222,7 @@ phantom/
 
 See [CLAUDE.md](CLAUDE.md) for the full roadmap. Key next steps:
 
-- ~~Audio forwarding~~ ✅ PulseAudio → Opus → client playback
+- ~~Audio forwarding~~ ✅ PulseAudio (Linux) + WASAPI (Windows) → Opus → client playback
 - ~~Hardware probe~~ ✅ Auto-detect best encoder/capture at startup
 - ~~SIMD color conversion~~ ✅ AVX2-accelerated BGRA↔YUV (2.8–3.4x speedup)
 - ~~Multi-monitor~~ ✅ `--display N` and `--list-displays`

@@ -62,7 +62,7 @@ jobs:
       # Linux x86_64: install X11 dev libs + nasm (for OpenH264 assembly)
       - name: Install Linux dependencies (x86_64)
         if: contains(matrix.target, 'linux') && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm libpulse-dev libopus-dev
 
       # Linux aarch64: cross-compilation toolchain
       - name: Install Linux cross-compile dependencies (aarch64)
@@ -74,7 +74,8 @@ jobs:
           echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libxcb1-dev:arm64 libxcb-shm0-dev:arm64 libxcb-randr0-dev:arm64 libxdo-dev:arm64 nasm
+            libxcb1-dev:arm64 libxcb-shm0-dev:arm64 libxcb-randr0-dev:arm64 libxdo-dev:arm64 nasm \
+            libpulse-dev:arm64 libopus-dev:arm64
       - name: Set cross-compile env
         if: matrix.cross
         run: |
@@ -96,10 +97,10 @@ jobs:
         if: matrix.build_server && !contains(matrix.target, 'windows') && !matrix.cross
         run: cargo build --release --target ${{ matrix.target }} -p phantom-server
 
-      # Build server (Windows and cross-compile: without web client)
+      # Build server (Windows and cross-compile: without web client, with audio)
       - name: Build server (without web client)
         if: matrix.build_server && (contains(matrix.target, 'windows') || matrix.cross)
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio
 
       # Build client
       - name: Build client

@@ -298,7 +298,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~Web client auto-reconnect~~ | ✅ done | Exponential backoff 1s→5s cap, resets decoder state |
 | ~~**Multi-transport**~~ | ✅ done | `--transport tcp,web` runs TCP:9900 + HTTPS:9901 simultaneously (PR #3) |
 | ~~**Hardware probe**~~ | ✅ done | `--encoder auto` / `--capture auto` auto-detects GPU at startup (PR #3) |
-| ~~**Audio forwarding**~~ | ✅ done | PulseAudio → Opus 48kHz stereo, `--features audio` (PR #6) |
+| ~~**Audio forwarding**~~ | ✅ done | PulseAudio (Linux) + WASAPI (Windows) → Opus 48kHz stereo, default feature |
 | ~~**WAN testing**~~ | ✅ done | Simulated latency/jitter E2E tests (0–300ms RTT, 8 tests) |
 | ~~**HTTP keep-alive + pool**~~ | ✅ done | Reuses TLS connections, bounded 16-thread pool |
 | ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV + NV12↔RGB, 2.8–3.4x speedup at 1080p |
@@ -383,7 +383,9 @@ crates/core/src/
 crates/server/src/
   main.rs              CLI args, transport selection, codec/encoder/capture auto-detection
   session.rs           SessionRunner: capture→encode→send loop, adaptive bitrate, RTT tracking, audio, file transfer, stats
-  audio_capture.rs     PulseAudio monitor → Opus 48kHz stereo (feature-gated)
+  audio_capture.rs     Cross-platform audio dispatch (cfg-selects pulse/wasapi)
+  audio_capture_pulse.rs   PulseAudio monitor → Opus 48kHz stereo (Linux)
+  audio_capture_wasapi.rs  WASAPI loopback → Opus 48kHz stereo (Windows)
   capture_scrap.rs     ScrapCapture (impl FrameCapture, cross-platform, DXGI on Windows)
   capture_pipewire.rs  PipeWire + XDG Desktop Portal (Wayland, feature-gated)
   file_transfer.rs     Server-side file transfer handler

@@ -1,6 +1,6 @@
 FROM rust:1.94-bookworm AS builder
 
-# Install build deps for openh264 (needs nasm) and scrap (needs X11 dev libs)
+# Install build deps for openh264 (needs nasm), scrap (needs X11 dev libs), and audio (PulseAudio + Opus)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nasm \
     libx11-dev \
@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdo-dev \
     libxcb-randr0-dev \
     libxcb-shm0-dev \
+    libpulse-dev \
+    libopus-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdo3 \
     libxcb-randr0 \
     libxcb-shm0 \
+    libpulse0 \
+    pulseaudio \
     ca-certificates \
     xclip \
     unclutter \

@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [features]
-default = ["web-client"]
+default = ["web-client", "audio"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
 audio = ["audiopus", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
