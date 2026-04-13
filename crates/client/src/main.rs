@@ -155,6 +155,7 @@ struct Session {
     shutdown_handle: Option<transport_tcp::TcpShutdownHandle>,
     cursor_pos: Option<PhysicalPosition<f64>>,
     last_sent_mouse: (i32, i32),
+    scroll_accum: (f32, f32),
     modifiers: winit::event::Modifiers,
     clipboard: ClipboardTracker,
     arboard: Option<arboard::Clipboard>,
@@ -458,6 +459,7 @@ impl App {
             shutdown_handle,
             cursor_pos: None,
             last_sent_mouse: (-1, -1),
+            scroll_accum: (0.0, 0.0),
             modifiers: winit::event::Modifiers::default(),
             clipboard: ClipboardTracker::default(),
             arboard: arboard::Clipboard::new().ok(),
@@ -643,6 +645,15 @@ impl ApplicationHandler for App {
                     session.display.update_tiles(&decoded);
                 }
 
+                // Flush accumulated scroll (once per frame, like Parsec)
+                if session.scroll_accum.0 != 0.0 || session.scroll_accum.1 != 0.0 {
+                    let _ = session.input_tx.send(Message::Input(InputEvent::MouseScroll {
+                        dx: session.scroll_accum.0,
+                        dy: session.scroll_accum.1,
+                    }));
+                    session.scroll_accum = (0.0, 0.0);
+                }
+
                 // Present
                 let _ = session.display.present(session.cursor_pos);
 
@@ -737,8 +748,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Accumulate scroll deltas, send max once per frame interval
                 if let Some(input) = input_capture::scroll_event(delta) {
-                    let _ = session.input_tx.send(Message::Input(input));
+                    if let InputEvent::MouseScroll { dx, dy } = input {
+                        session.scroll_accum.0 += dx;
+                        session.scroll_accum.1 += dy;
+                    }
                 }
             }
             WindowEvent::Focused(false) => {

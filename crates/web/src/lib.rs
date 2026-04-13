@@ -1457,16 +1457,38 @@ fn setup_input(
     }
     {
         let s = state.clone();
+        // Batch scroll events per animation frame (like Parsec).
+        // Accumulate deltas, flush once per requestAnimationFrame.
+        let scroll_accum = Rc::new(RefCell::new((0.0f32, 0.0f32)));
+        let scroll_pending = Rc::new(RefCell::new(false));
+        let scroll_accum2 = scroll_accum.clone();
+        let scroll_pending2 = scroll_pending.clone();
+        let s2 = s.clone();
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
-            let st = s.borrow();
-            send_input(
-                &st,
-                InputEvent::MouseScroll {
-                    dx: e.delta_x() as f32 / 120.0,
-                    dy: e.delta_y() as f32 / 120.0,
-                },
-            );
+            let mut acc = scroll_accum.borrow_mut();
+            acc.0 += e.delta_x() as f32 / 120.0;
+            acc.1 += e.delta_y() as f32 / 120.0;
+
+            if !*scroll_pending.borrow() {
+                *scroll_pending.borrow_mut() = true;
+                let sa = scroll_accum2.clone();
+                let sp = scroll_pending2.clone();
+                let ss = s2.clone();
+                let flush = Closure::<dyn FnMut(f64)>::once(move |_: f64| {
+                    let mut acc = sa.borrow_mut();
+                    if acc.0 != 0.0 || acc.1 != 0.0 {
+                        let st = ss.borrow();
+                        send_input(&st, InputEvent::MouseScroll { dx: acc.0, dy: acc.1 });
+                        acc.0 = 0.0;
+                        acc.1 = 0.0;
+                    }
+                    *sp.borrow_mut() = false;
+                });
+                let window = web_sys::window().unwrap();
+                let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
+                flush.forget();
+            }
         });
         canvas
             .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
