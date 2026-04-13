@@ -399,9 +399,11 @@ fn main() -> Result<()> {
                 } else {
                     base_port
                 };
-                let ws_transport =
+                let mut ws_transport =
                     transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2)?;
                 tracing::info!("open https://localhost:{web_port} in browser");
+                // Extract audio WS receiver before moving transport into accept thread
+                let audio_ws_rx = ws_transport.take_audio_ws_rx();
                 let tx = conn_tx.clone();
                 std::thread::Builder::new()
                     .name("web-accept".into())
@@ -571,6 +573,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    audio_ws_rx: None,
                 },
             )
         } else {
@@ -587,6 +590,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    audio_ws_rx: None,
                 },
             )
         };
@@ -608,6 +612,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    audio_ws_rx: None,
                 },
             )
         } else {
@@ -624,6 +629,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    audio_ws_rx: None,
                 },
             )
         };
@@ -641,6 +647,7 @@ fn main() -> Result<()> {
                 send_file: send_file_path.as_deref(),
                 video_codec,
                 is_resume,
+                    audio_ws_rx: None,
             },
         );
 

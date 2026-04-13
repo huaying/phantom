@@ -756,6 +756,31 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
 
 /// Initialize WebCodecs AudioDecoder + Web Audio API for Opus playback.
 fn setup_audio(state: &Rc<RefCell<AppState>>) {
+    // Open dedicated audio WebSocket (independent from video WS)
+    let window = web_sys::window().unwrap();
+    let location = window.location();
+    let host = location.host().unwrap_or_default();
+    let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+    let audio_url = format!("{protocol}://{host}/ws/audio");
+
+    let s = state.clone();
+    match WebSocket::new(&audio_url) {
+        Ok(ws) => {
+            ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+            let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
+                }
+            });
+            ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+            cb.forget();
+            console::log_1(&format!("audio WebSocket connected to {audio_url}").into());
+        }
+        Err(e) => {
+            console::warn_1(&format!("audio WebSocket failed ({e:?}), using main WS fallback").into());
+        }
+    }
+
     // Create AudioContext at 48kHz (must match Opus output to avoid resampling stutter)
     let ctx_opts = web_sys::AudioContextOptions::new();
     ctx_opts.set_sample_rate(48000.0);

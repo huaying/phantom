@@ -139,6 +139,7 @@ pub struct WebServerTransport {
     #[cfg(feature = "webrtc")]
     rtc_notify: mpsc::Receiver<()>,
     ws_rx: mpsc::Receiver<WsConnection>,
+    audio_ws_rx: mpsc::Receiver<WsSender>,
 }
 
 #[allow(dead_code)]
@@ -151,6 +152,7 @@ impl WebServerTransport {
     pub fn start(http_port: u16, _ws_port: u16, _udp_port: u16) -> Result<Self> {
         // Channel for WS connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
+        let (audio_ws_tx, audio_ws_rx) = mpsc::channel::<WsSender>();
 
         // Shared connection counter for the thread pool
         let conn_count = Arc::new(AtomicUsize::new(0));
@@ -198,6 +200,7 @@ impl WebServerTransport {
                     let tls = tls_acceptor.clone();
                     let rtc_tx = rtc_tx.clone();
                     let ws_tx = ws_tx.clone();
+                    let audio_ws_tx = audio_ws_tx.clone();
                     let candidate_addr = candidate_addr;
                     std::thread::Builder::new()
                         .name("http-handler".into())
@@ -216,16 +219,16 @@ impl WebServerTransport {
                             for _req_num in 0..MAX_REQUESTS_PER_CONN {
                                 match handle_http_rw_rtc(&mut stream, &rtc_tx, candidate_addr) {
                                     Ok(HttpResult::WsUpgrade) => {
-                                        // WebSocket takes over — exit the keep-alive loop
                                         spawn_ws_connection(stream, ws_tx);
                                         return;
                                     }
-                                    Ok(HttpResult::Done) => {
-                                        // Request served, loop back for next request (keep-alive)
-                                        continue;
+                                    Ok(HttpResult::WsUpgradeAudio) => {
+                                        spawn_audio_ws_connection(stream, audio_ws_tx);
+                                        return;
                                     }
+                                    Ok(HttpResult::Done) => continue,
                                     Ok(HttpResult::Close) => break,
-                                    Err(_) => break, // read timeout, client closed, or error
+                                    Err(_) => break,
                                 }
                             }
                         })
@@ -258,6 +261,7 @@ impl WebServerTransport {
 
                     let tls = tls_acceptor.clone();
                     let ws_tx = ws_tx.clone();
+                    let audio_ws_tx = audio_ws_tx.clone();
                     std::thread::Builder::new()
                         .name("http-handler".into())
                         .spawn(move || {
@@ -274,6 +278,10 @@ impl WebServerTransport {
                                 match handle_http_rw(&mut stream) {
                                     Ok(HttpResult::WsUpgrade) => {
                                         spawn_ws_connection(stream, ws_tx);
+                                        return;
+                                    }
+                                    Ok(HttpResult::WsUpgradeAudio) => {
+                                        spawn_audio_ws_connection(stream, audio_ws_tx);
                                         return;
                                     }
                                     Ok(HttpResult::Done) => continue,
@@ -293,6 +301,7 @@ impl WebServerTransport {
             #[cfg(feature = "webrtc")]
             rtc_notify,
             ws_rx,
+            audio_ws_rx,
         })
     }
 
@@ -302,6 +311,14 @@ impl WebServerTransport {
         let ws = self.ws_rx.recv().context("WS channel closed")?;
         tracing::info!("WebSocket client accepted");
         Ok((Box::new(ws.data_sender), Box::new(ws.data_receiver)))
+    }
+
+    /// Take the audio WS receiver (to pass to session runner).
+    /// Can only be called once — subsequent calls return None.
+    pub fn take_audio_ws_rx(&mut self) -> Option<mpsc::Receiver<WsSender>> {
+        // Swap with a dummy channel
+        let (_, dummy) = mpsc::channel();
+        Some(std::mem::replace(&mut self.audio_ws_rx, dummy))
     }
 
     /// Accept: either WebRTC or WebSocket, whichever connects first.
@@ -335,8 +352,10 @@ enum HttpResult {
     Done,
     /// Client requested `Connection: close` or a non-keepalive response was sent.
     Close,
-    /// WebSocket upgrade — caller must hand off the connection.
+    /// WebSocket upgrade for main channel (video + control).
     WsUpgrade,
+    /// WebSocket upgrade for audio-only channel.
+    WsUpgradeAudio,
 }
 
 /// Check whether the client sent `Connection: close`.
@@ -363,10 +382,14 @@ fn handle_http_rw(stream: &mut (impl Read + Write)) -> Result<HttpResult> {
 
     let close = wants_close(&request);
 
-    // WebSocket upgrade
+    // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
-        return send_ws_upgrade(stream, &request);
+        send_ws_upgrade(stream, &request)?;
+        if path.contains("audio") {
+            return Ok(HttpResult::WsUpgradeAudio);
+        }
+        return Ok(HttpResult::WsUpgrade);
     }
 
     serve_static(stream, path, !close)?;
@@ -397,10 +420,14 @@ fn handle_http_rw_rtc(
 
     let close = wants_close(&request);
 
-    // WebSocket upgrade
+    // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
-        return send_ws_upgrade(stream, &request);
+        send_ws_upgrade(stream, &request)?;
+        if path.contains("audio") {
+            return Ok(HttpResult::WsUpgradeAudio);
+        }
+        return Ok(HttpResult::WsUpgrade);
     }
 
     let body_start = buf
@@ -508,6 +535,23 @@ fn spawn_ws_connection(
         data_sender: WsSender { tx: send_tx },
         data_receiver: WsReceiver { rx: recv_rx },
     });
+}
+
+/// Audio-only WebSocket — send only, no receive needed.
+fn spawn_audio_ws_connection(
+    stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
+    audio_ws_tx: mpsc::Sender<WsSender>,
+) {
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let ws =
+        tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
+    tracing::info!("audio WebSocket connected");
+    let (send_tx, send_rx) = mpsc::channel();
+    let (recv_tx, _recv_rx) = mpsc::channel();
+    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
+    let _ = audio_ws_tx.send(WsSender { tx: send_tx });
 }
 
 #[cfg(feature = "webrtc")]
