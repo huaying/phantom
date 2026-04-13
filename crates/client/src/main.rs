@@ -748,12 +748,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Accumulate scroll deltas, send max once per frame interval
                 if let Some(input) = input_capture::scroll_event(delta) {
-                    if let InputEvent::MouseScroll { dx, dy } = input {
-                        session.scroll_accum.0 += dx;
-                        session.scroll_accum.1 += dy;
-                    }
+                    // Send every scroll immediately — native TCP has enough bandwidth
+                    let _ = session.input_tx.send(Message::Input(input));
                 }
             }
             WindowEvent::Focused(false) => {

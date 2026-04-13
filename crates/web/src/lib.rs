@@ -1482,8 +1482,7 @@ fn setup_input(
     }
     {
         let s = state.clone();
-        // Batch scroll events per animation frame (like Parsec).
-        // Accumulate deltas, flush once per requestAnimationFrame.
+        // Batch scroll events: send first immediately, then batch per rAF.
         let scroll_accum = Rc::new(RefCell::new((0.0f32, 0.0f32)));
         let scroll_pending = Rc::new(RefCell::new(false));
         let scroll_accum2 = scroll_accum.clone();
@@ -1491,11 +1490,15 @@ fn setup_input(
         let s2 = s.clone();
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
-            let mut acc = scroll_accum.borrow_mut();
-            acc.0 += e.delta_x() as f32 / 120.0;
-            acc.1 += e.delta_y() as f32 / 120.0;
+            let dx = e.delta_x() as f32 / 120.0;
+            let dy = e.delta_y() as f32 / 120.0;
 
             if !*scroll_pending.borrow() {
+                // First scroll: send immediately (no delay)
+                {
+                    let st = s.borrow();
+                    send_input(&st, InputEvent::MouseScroll { dx, dy });
+                }
                 *scroll_pending.borrow_mut() = true;
                 let sa = scroll_accum2.clone();
                 let sp = scroll_pending2.clone();
@@ -1513,6 +1516,11 @@ fn setup_input(
                 let window = web_sys::window().unwrap();
                 let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
                 flush.forget();
+            } else {
+                // Subsequent scrolls: accumulate for next rAF
+                let mut acc = scroll_accum.borrow_mut();
+                acc.0 += dx;
+                acc.1 += dy;
             }
         });
         canvas
