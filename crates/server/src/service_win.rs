@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-    ServiceType,
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -270,10 +269,7 @@ fn create_service_capture() -> anyhow::Result<(
 
     let (width, height) = capture.resolution();
     let encoder = Box::new(crate::encode_h264::OpenH264Encoder::new(
-        width,
-        height,
-        30.0,
-        2000,
+        width, height, 30.0, 2000,
     )?);
     let differ = phantom_core::tile::TileDiffer::new();
 
@@ -370,8 +366,8 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<std::process::Chil
     use std::ptr;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, SECURITY_ATTRIBUTES, TOKEN_ALL_ACCESS,
-        TokenPrimary,
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, SECURITY_ATTRIBUTES,
+        TOKEN_ALL_ACCESS,
     };
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::{
@@ -410,9 +406,7 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<std::process::Chil
         let mut si: STARTUPINFOW = mem::zeroed();
         si.cb = mem::size_of::<STARTUPINFOW>() as u32;
         // Run on the interactive desktop
-        let desktop = "winsta0\\default\0"
-            .encode_utf16()
-            .collect::<Vec<u16>>();
+        let desktop = "winsta0\\default\0".encode_utf16().collect::<Vec<u16>>();
         si.lpDesktop = windows::core::PWSTR(desktop.as_ptr() as *mut u16);
 
         let mut pi: PROCESS_INFORMATION = mem::zeroed();
@@ -489,11 +483,7 @@ pub fn install_service() -> anyhow::Result<()> {
 
     // Set description
     let _ = std::process::Command::new("sc")
-        .args([
-            "description",
-            SERVICE_NAME,
-            SERVICE_DESCRIPTION,
-        ])
+        .args(["description", SERVICE_NAME, SERVICE_DESCRIPTION])
         .status();
 
     // Configure service recovery: restart on failure

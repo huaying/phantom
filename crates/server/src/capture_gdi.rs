@@ -15,9 +15,9 @@ use phantom_core::frame::{Frame, PixelFormat};
 use std::time::Instant;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-    GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBITMAP, HDC, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
