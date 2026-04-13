@@ -26,13 +26,25 @@ mod platform {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
-        OPEN_EXISTING,
+        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_ACCESS_DUPLEX,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+
+    /// Wrapper to allow HANDLE to be sent between threads.
+    /// HANDLE is a kernel object handle (pointer-sized integer) — safe to use from any thread.
+    #[derive(Clone, Copy)]
+    struct SendHandle(HANDLE);
+    unsafe impl Send for SendHandle {}
+
+    impl SendHandle {
+        fn get(self) -> HANDLE {
+            self.0
+        }
+    }
 
     const PIPE_NAME: &str = r"\\.\pipe\PhantomIPC";
     const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024; // 4MB buffer
@@ -158,7 +170,7 @@ mod platform {
         /// to block until an agent connects.
         pub fn new() -> Result<Self> {
             let handle = unsafe {
-                CreateNamedPipeW(
+                let h = CreateNamedPipeW(
                     &HSTRING::from(PIPE_NAME),
                     PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -167,8 +179,11 @@ mod platform {
                     PIPE_BUFFER_SIZE,
                     0,
                     None,
-                )
-                .context("CreateNamedPipe")?
+                );
+                if h.is_invalid() {
+                    anyhow::bail!("CreateNamedPipe failed: {}", windows::core::Error::from_win32());
+                }
+                h
             };
 
             Ok(Self {
@@ -187,13 +202,13 @@ mod platform {
         pub fn wait_for_connection(&mut self, timeout: Duration) -> Result<bool> {
             // ConnectNamedPipe blocks until a client connects.
             // We run it in a thread so we can enforce a timeout.
-            let handle = self.handle;
+            let handle = SendHandle(self.handle);
             let (done_tx, done_rx) = mpsc::channel();
 
             std::thread::Builder::new()
                 .name("ipc-connect-wait".into())
                 .spawn(move || {
-                    let result = unsafe { ConnectNamedPipe(handle, None) };
+                    let result = unsafe { ConnectNamedPipe(handle.get(), None) };
                     let _ = done_tx.send(result);
                 })?;
 
@@ -228,12 +243,13 @@ mod platform {
             self.input_tx = Some(input_tx);
 
             // Read thread: receives frames from agent
-            let handle = self.handle;
+            let handle = SendHandle(self.handle);
             let shutdown = Arc::clone(&self.shutdown);
             let read_thread =
                 std::thread::Builder::new()
                     .name("ipc-read".into())
                     .spawn(move || {
+                        let handle = handle.get();
                         while !shutdown.load(Ordering::Relaxed) {
                             match unsafe { recv_message(handle) } {
                                 Ok((MSG_FRAME, payload)) => {
@@ -268,12 +284,13 @@ mod platform {
                     })?;
 
             // Write thread: sends input events to agent
-            let handle = self.handle;
+            let handle = SendHandle(self.handle);
             let shutdown = Arc::clone(&self.shutdown);
             let write_thread =
                 std::thread::Builder::new()
                     .name("ipc-write".into())
                     .spawn(move || {
+                        let handle = handle.get();
                         while !shutdown.load(Ordering::Relaxed) {
                             match input_rx.recv_timeout(Duration::from_secs(5)) {
                                 Ok(event) => {
@@ -411,12 +428,13 @@ mod platform {
 
             // Read thread: receives input events and shutdown from service
             let (input_tx, input_rx) = mpsc::channel();
-            let read_handle = handle;
+            let read_handle = SendHandle(handle);
             let read_shutdown = Arc::clone(&shutdown);
 
             let read_thread = std::thread::Builder::new()
                 .name("ipc-agent-read".into())
                 .spawn(move || {
+                    let read_handle = read_handle.get();
                     while !read_shutdown.load(Ordering::Relaxed) {
                         match unsafe { recv_message(read_handle) } {
                             Ok((MSG_INPUT, payload)) => {

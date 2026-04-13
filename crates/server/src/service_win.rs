@@ -18,6 +18,7 @@ use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::define_windows_service;
 use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "PhantomServer";
@@ -302,6 +303,7 @@ fn create_service_session(
         // Use IPC-backed capture adapter that pulls frames from agent
         #[cfg(target_os = "windows")]
         {
+            use phantom_core::capture::FrameCapture as _;
             let ipc = session_mgr.ipc.as_ref().unwrap();
             let mut capture = IpcFrameCapture::new(ipc);
             // We need to get a first frame to know the resolution
@@ -346,6 +348,7 @@ fn create_service_session(
                     video_codec: phantom_core::encode::VideoCodec::H264,
                     is_resume: false,
                     input_forwarder,
+                    audio_ws_rx: None,
                 },
             );
             differ.reset();
@@ -381,6 +384,7 @@ fn create_service_session_gdi(
             video_codec: phantom_core::encode::VideoCodec::H264,
             is_resume: false,
             input_forwarder: None,
+            audio_ws_rx: None,
         },
     );
     differ.reset();

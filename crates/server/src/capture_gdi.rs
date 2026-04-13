@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
@@ -60,10 +60,10 @@ impl GdiCapture {
         unsafe {
             // DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP are needed
             // for SetThreadDesktop; GENERIC_READ covers these.
-            let hdesk = match OpenInputDesktopW(
+            let hdesk = match OpenInputDesktop(
                 DESKTOP_CONTROL_FLAGS(0),
                 false,
-                windows::Win32::Foundation::GENERIC_READ.0,
+                DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
             ) {
                 Ok(d) => d,
                 Err(e) => {
