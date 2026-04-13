@@ -331,7 +331,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~Wayland capture (PipeWire)~~ | ✅ done — `--features wayland` or `--capture pipewire`, auto-detected on Wayland sessions via XDG Portal + PipeWire |
 | ~~Multi-monitor~~ | ✅ done — `--display N` to select display, `--list-displays` to enumerate |
 | ~~File transfer~~ | ✅ done — bidirectional, chunked, SHA-256 verified |
-| NAT traversal (STUN/TURN) | firewall bypass |
+| ~~NAT discovery (STUN)~~ | ✅ done — `--stun auto` discovers public IP, prints connection code |
+| NAT relay (TURN) | symmetric NAT / firewall bypass without port forwarding |
 
 ### Enterprise
 | Task | Impact |

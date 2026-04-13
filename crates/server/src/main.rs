@@ -86,8 +86,9 @@ struct Args {
     send_file: Option<String>,
 
     /// STUN server for NAT discovery (e.g. stun.l.google.com:19302).
-    /// When set, the server discovers its public IP:port and prints a
-    /// connection code that clients can use to connect from the internet.
+    /// Use "auto" to use Google's public STUN server.
+    /// Discovers the server's public IP and prints a connection code.
+    /// Note: port forwarding must be set up for the listen port.
     #[arg(long)]
     stun: Option<String>,
 
@@ -459,11 +460,21 @@ fn main() -> Result<()> {
     let send_file_path = args.send_file.as_ref().map(std::path::PathBuf::from);
 
     // ── STUN NAT discovery ──────────────────────────────────────────────────
-    if let Some(ref stun_server) = args.stun {
+    // STUN discovers the server's public IP. The connection code uses
+    // public_ip:listen_port (assumes port forwarding is set up).
+    let stun_server = match args.stun.as_deref() {
+        Some("auto") => Some("stun.l.google.com:19302"),
+        Some(s) => Some(s),
+        None => None,
+    };
+    if let Some(stun_server) = stun_server {
         match phantom_core::stun::discover_public_addr(stun_server) {
             Ok(public_addr) => {
-                tracing::info!(%public_addr, "STUN discovery: public address");
-                print_connection_code(&public_addr.to_string());
+                let public_ip = public_addr.ip();
+                tracing::info!(%public_ip, stun_port = %public_addr.port(), "STUN discovery: public IP");
+                // Use public IP + server listen port (user must port-forward this port)
+                let connection_addr = format!("{public_ip}:{base_port}");
+                print_connection_code(&connection_addr);
             }
             Err(e) => {
                 tracing::warn!("STUN discovery failed: {e}");
@@ -936,11 +947,14 @@ fn uninstall_autostart() -> Result<()> {
 fn print_connection_code(addr: &str) {
     let code = format!("phantom://{addr}");
     let cmd = format!("phantom-client -c {addr}");
-    let w = code.len().max(cmd.len()) + 4;
+    let note = "Ensure port forwarding is configured on your router.";
+    let w = code.len().max(cmd.len()).max(note.len()) + 4;
     let bar = "═".repeat(w + 2);
     println!("\n╔{bar}╗");
     println!("║  {code:<w$}  ║");
     println!("║  {:<w$}  ║", "");
     println!("║  {cmd:<w$}  ║");
+    println!("║  {:<w$}  ║", "");
+    println!("║  {note:<w$}  ║");
     println!("╚{bar}╝\n");
 }

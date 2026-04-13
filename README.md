@@ -147,6 +147,8 @@ Native Client                        Server                         Web Client (
 --send-file <path>           Send a file to the first connected client
 --key <hex>                  Encryption key (auto-generated if omitted)
 --no-encrypt                 Disable encryption
+--stun <server|auto>         STUN NAT discovery (use "auto" for Google STUN)
+--public-addr <ip:port>      Override public address (skip STUN)
 --install / --uninstall      Auto-start (Windows: schtasks, Linux: systemd)
 ```
 
@@ -234,7 +236,8 @@ See [CLAUDE.md](CLAUDE.md) for the full roadmap. Key next steps:
 - ~~AV1 encoder~~ ✅ NVENC hardware AV1 encode (Ada Lovelace+), dav1d/NVDEC decode
 - **QUIC unreliable datagrams** — lower latency for WAN
 - **VAAPI/AMF GPU encoding** — AMD/Intel GPU encode support
-- **NAT traversal** — STUN/TURN for firewall bypass
+- ~~**NAT discovery (STUN)**~~ ✅ `--stun auto` discovers public IP, prints connection code
+- **NAT relay (TURN)** — for symmetric NAT / firewall bypass without port forwarding
 
 ## License
 
