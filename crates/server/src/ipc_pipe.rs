@@ -259,28 +259,26 @@ mod platform {
                     .name("ipc-read".into())
                     .spawn(move || {
                         let handle = handle.get();
+                        super::service_win::svc_log("IPC read thread started");
+                        let mut frame_count = 0u64;
                         while !shutdown.load(Ordering::Relaxed) {
+                            super::service_win::svc_log(&format!("IPC read thread: calling recv_message (frame_count={frame_count})"));
                             match unsafe { recv_message(handle) } {
                                 Ok((MSG_FRAME, payload)) => {
+                                    frame_count += 1;
+                                    super::service_win::svc_log(&format!("IPC: received frame #{frame_count} ({} bytes payload)", payload.len()));
                                     match decode_frame(&payload) {
                                         Ok(frame) => {
-                                            // Use try_send-like behavior: if receiver is behind,
-                                            // just drop the frame (latest-wins for video)
                                             let _ = frame_tx.send(frame);
                                         }
                                         Err(e) => {
-                                            tracing::warn!("IPC: bad frame: {e}");
+                                            super::service_win::svc_log(&format!("IPC: bad frame: {e}"));
                                         }
                                     }
                                 }
-                                Ok((MSG_HEARTBEAT, _)) => {
-                                    tracing::trace!("IPC: heartbeat from agent");
-                                }
+                                Ok((MSG_HEARTBEAT, _)) => {}
                                 Ok((msg_type, _)) => {
-                                    tracing::debug!(
-                                        "IPC: unexpected message type 0x{:02x}",
-                                        msg_type
-                                    );
+                                    super::service_win::svc_log(&format!("IPC: unexpected message type 0x{msg_type:02x}"));
                                 }
                                 Err(e) => {
                                     if !shutdown.load(Ordering::Relaxed) {

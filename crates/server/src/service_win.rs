@@ -25,7 +25,7 @@ const SERVICE_NAME: &str = "PhantomServer";
 
 /// Simple file logger for service mode debugging.
 #[cfg(target_os = "windows")]
-fn svc_log(msg: &str) {
+pub fn svc_log(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
         .open(r"C:\Users\horde\phantom-service.log") {
