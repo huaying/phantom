@@ -22,6 +22,18 @@ use windows_service::define_windows_service;
 use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "PhantomServer";
+
+/// Simple file logger for service mode debugging.
+#[cfg(target_os = "windows")]
+fn svc_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+        .open(r"C:\Users\horde\phantom-service.log") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
+    }
+}
 const SERVICE_DISPLAY_NAME: &str = "Phantom Remote Desktop Server";
 const SERVICE_DESCRIPTION: &str =
     "Phantom remote desktop server — provides remote access including pre-login lock screen.";
@@ -43,17 +55,7 @@ fn phantom_service_main(arguments: Vec<OsString>) {
 }
 
 fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
-    // Set up file-based logging for service mode (stderr goes nowhere under SCM)
-    let log_path = std::path::PathBuf::from(r"C:\Users\horde\phantom-service.log");
-    let log_file = std::fs::File::create(&log_path).ok();
-    if let Some(file) = log_file {
-        tracing_subscriber::fmt()
-            .with_env_filter("phantom=debug")
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .init();
-        tracing::info!("Service logging to {}", log_path.display());
-    }
+    svc_log("=== Service starting ===");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -186,9 +188,13 @@ fn run_server_loop(
     drop(conn_tx);
 
     // Session manager: monitors user sessions and launches agents
+    svc_log("Creating SessionManager");
     let mut session_mgr = SessionManager::new();
     // Do an initial poll to detect any already-logged-in user
+    svc_log("Initial session update");
     session_mgr.update();
+    svc_log(&format!("After update: has_agent={}, has_ipc={}",
+        session_mgr.agent.is_some(), session_mgr.ipc.is_some()));
 
     // Main loop: accept connections and run sessions
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
@@ -311,8 +317,8 @@ fn create_service_session(
     #[cfg(not(target_os = "windows"))]
     let has_ipc = false;
 
+    svc_log(&format!("create_service_session: has_ipc={has_ipc}"));
     if has_ipc {
-        // Use IPC-backed capture adapter that pulls frames from agent
         #[cfg(target_os = "windows")]
         {
             use phantom_core::capture::FrameCapture as _;
@@ -559,33 +565,28 @@ impl SessionManager {
             // Kill existing agent
             self.kill_agent();
 
-            // 0xFFFFFFFF means no active console session (all users logged out)
-            // Session 0 is the service session — don't launch agent there
             if session_id != 0xFFFFFFFF && session_id != 0 {
-                // Create IPC pipe BEFORE launching agent so it's ready to connect
+                svc_log(&format!("Creating IPC pipe for session {session_id}"));
                 match crate::ipc_pipe::IpcServer::new() {
                     Ok(mut ipc_server) => {
+                        svc_log("IPC pipe created, launching agent");
                         match launch_agent_in_session(session_id) {
                             Ok(proc) => {
-                                tracing::info!(
-                                    session_id,
-                                    pid = proc.pid,
-                                    "Launched agent in user session"
-                                );
+                                svc_log(&format!("Agent launched PID={}", proc.pid));
                                 self.agent = Some(proc);
 
                                 // Wait for agent to connect to the IPC pipe (up to 10s)
                                 match ipc_server.wait_for_connection(Duration::from_secs(10)) {
                                     Ok(true) => {
-                                        tracing::info!("Agent connected to IPC pipe");
+                                        svc_log("IPC: agent connected!");
                                         self.ipc = Some(ipc_server);
                                     }
                                     Ok(false) => {
-                                        tracing::warn!("Agent did not connect to IPC within timeout, using GDI fallback");
+                                        svc_log("IPC: agent did NOT connect within timeout → GDI fallback");
                                         ipc_server.disconnect();
                                     }
                                     Err(e) => {
-                                        tracing::error!("IPC connection error: {e}");
+                                        svc_log(&format!("IPC: connection error: {e}"));
                                         ipc_server.disconnect();
                                     }
                                 }
