@@ -43,6 +43,18 @@ fn phantom_service_main(arguments: Vec<OsString>) {
 }
 
 fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
+    // Set up file-based logging for service mode (stderr goes nowhere under SCM)
+    let log_path = std::path::PathBuf::from(r"C:\Users\horde\phantom-service.log");
+    let log_file = std::fs::File::create(&log_path).ok();
+    if let Some(file) = log_file {
+        tracing_subscriber::fmt()
+            .with_env_filter("phantom=debug")
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+        tracing::info!("Service logging to {}", log_path.display());
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
