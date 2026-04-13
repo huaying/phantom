@@ -13,8 +13,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use windows::core::HSTRING;
-use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -23,7 +21,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+// CreateEventW and WaitForSingleObject removed — loopback mode uses polling, not events
 
 /// Handle to a running audio capture thread. Drop to stop capture.
 pub struct AudioCapture {
@@ -132,12 +130,8 @@ fn wasapi_capture_loop(
             )
             .context("IAudioClient::Initialize")?;
 
-        // Create an event for the audio client to signal when data is ready
-        let event = CreateEventW(None, false, false, &HSTRING::default())
-            .context("CreateEvent")?;
-        audio_client
-            .SetEventHandle(event)
-            .context("SetEventHandle")?;
+        // Note: SetEventHandle is NOT supported in AUDCLNT_STREAMFLAGS_LOOPBACK mode.
+        // Use polling with GetNextPacketSize instead.
 
         // Get the capture client interface
         let capture_client: IAudioCaptureClient = audio_client
@@ -171,10 +165,12 @@ fn wasapi_capture_loop(
                 break;
             }
 
-            // Wait for audio data (up to 50ms timeout)
-            let wait_result = WaitForSingleObject(event, 50);
-            if wait_result != WAIT_OBJECT_0 {
-                continue; // timeout, check stop flag and retry
+            // Poll for available audio packets (10ms sleep between polls)
+            let packet_size = capture_client.GetNextPacketSize()
+                .unwrap_or(0);
+            if packet_size == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
 
             // Read all available packets
