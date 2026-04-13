@@ -7,4 +7,5 @@ members = [
     "crates/web",
     "crates/gpu",
     "crates/bench",
+    "crates/stream",
 ]
