@@ -200,8 +200,7 @@ mod platform {
         /// Block until an agent connects to the pipe, or timeout expires.
         /// After connection, spawns read/write threads.
         pub fn wait_for_connection(&mut self, timeout: Duration) -> Result<bool> {
-            // ConnectNamedPipe blocks until a client connects.
-            // We run it in a thread so we can enforce a timeout.
+            tracing::info!("IPC: waiting for agent connection (timeout {:?})", timeout);
             let handle = SendHandle(self.handle);
             let (done_tx, done_rx) = mpsc::channel();
 
@@ -411,17 +410,39 @@ mod platform {
     impl IpcClient {
         /// Connect to the service's named pipe.
         pub fn connect() -> Result<Self> {
-            let handle = unsafe {
-                CreateFileW(
-                    &HSTRING::from(PIPE_NAME),
-                    (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-                    FILE_SHARE_NONE,
-                    None,
-                    OPEN_EXISTING,
-                    windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-                    None,
-                )
-                .context("connect to IPC pipe")?
+            // Retry connecting to the pipe — service may not have created it yet.
+            let handle = {
+                let mut last_err = None;
+                let mut h = None;
+                for attempt in 0..50u32 {
+                    match unsafe {
+                        CreateFileW(
+                            &HSTRING::from(PIPE_NAME),
+                            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                            FILE_SHARE_NONE,
+                            None,
+                            OPEN_EXISTING,
+                            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                            None,
+                        )
+                    } {
+                        Ok(handle) => {
+                            tracing::info!("IPC: connected to pipe on attempt {}", attempt + 1);
+                            h = Some(handle);
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 49 {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                match h {
+                    Some(handle) => handle,
+                    None => return Err(last_err.unwrap()).context("connect to IPC pipe after 50 attempts"),
+                }
             };
 
             let shutdown = Arc::new(AtomicBool::new(false));
