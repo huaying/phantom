@@ -1490,8 +1490,10 @@ fn setup_input(
         let s2 = s.clone();
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
-            let dx = e.delta_x() as f32 / 120.0;
-            let dy = e.delta_y() as f32 / 120.0;
+            // Negate: browser deltaY positive = "scroll down" (content up),
+            // but server (enigo) expects positive = "scroll up" (content down).
+            let dx = -(e.delta_x() as f32 / 120.0);
+            let dy = -(e.delta_y() as f32 / 120.0);
 
             if !*scroll_pending.borrow() {
                 // First scroll: send immediately (no delay)
