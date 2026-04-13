@@ -980,6 +980,10 @@ fn setup_audio_decoder_worklet(
 /// Creates a new BufferSourceNode per decoded Opus frame (~50 nodes/sec).
 fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::AudioContext) {
     let ctx_clone = audio_ctx.clone();
+    // Track the next scheduled playback time so frames play back-to-back
+    let next_time = Rc::new(RefCell::new(0.0f64));
+    let next_time_clone = next_time.clone();
+
     let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |output: JsValue| {
         let audio_data: JsAudioData = output.unchecked_into();
         let channels = audio_data.numberOfChannels();
@@ -1017,12 +1021,19 @@ fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::
         }
         audio_data.close();
 
-        // Play the buffer immediately via a BufferSourceNode
+        // Schedule playback sequentially — each frame starts after the previous ends
+        let current_time = ctx_clone.current_time();
+        let mut scheduled = next_time_clone.borrow_mut();
+        if *scheduled < current_time {
+            *scheduled = current_time;
+        }
+
         if let Ok(source) = ctx_clone.create_buffer_source() {
             source.set_buffer(Some(&buffer));
             let dest = ctx_clone.destination();
             let _ = source.connect_with_audio_node(&dest);
-            let _ = source.start();
+            let _ = source.start_with_when(*scheduled);
+            *scheduled += frames as f64 / sample_rate as f64;
         }
     });
 
@@ -1061,6 +1072,22 @@ fn setup_input(
     document: &web_sys::Document,
     state: &Rc<RefCell<AppState>>,
 ) {
+    // Resume AudioContext on first user interaction (browser autoplay policy)
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+            let st = s.borrow();
+            if let Some(ref ctx) = st.audio_ctx {
+                if ctx.state() == web_sys::AudioContextState::Suspended {
+                    let _ = ctx.resume();
+                    console::log_1(&"AudioContext resumed after user gesture".into());
+                }
+            }
+        });
+        let _ = document.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
+        let _ = document.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {

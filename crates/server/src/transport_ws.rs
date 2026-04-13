@@ -483,7 +483,7 @@ fn serve_static(stream: &mut (impl Read + Write), path: &str, keep_alive: bool) 
     };
     let conn_header = if keep_alive { "keep-alive" } else { "close" };
     write!(stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: {conn_header}\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: {conn_header}\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)?;
