@@ -631,7 +631,9 @@ impl SessionManager {
                                             self.ipc = Some(ipc_server);
                                         }
                                         _ => {
-                                            tracing::warn!("Relaunched agent did not connect to IPC");
+                                            tracing::warn!(
+                                                "Relaunched agent did not connect to IPC"
+                                            );
                                             ipc_server.disconnect();
                                         }
                                     }
@@ -723,7 +725,9 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             }
         }
         if let Some(e) = last_err {
-            return Err(e).context("WTSQueryUserToken failed after 5 attempts (need LocalSystem or SeTcbPrivilege)");
+            return Err(e).context(
+                "WTSQueryUserToken failed after 5 attempts (need LocalSystem or SeTcbPrivilege)",
+            );
         }
 
         // Duplicate as primary token for CreateProcessAsUser

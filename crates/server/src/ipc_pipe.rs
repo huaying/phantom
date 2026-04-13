@@ -19,21 +19,20 @@ mod platform {
     use anyhow::{Context, Result};
     use phantom_core::frame::{Frame, PixelFormat};
     use phantom_core::input::InputEvent;
-    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
+        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+        OPEN_EXISTING,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_ACCESS_DUPLEX,
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
-    use windows::core::HSTRING;
 
     const PIPE_NAME: &str = r"\\.\pipe\PhantomIPC";
     const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024; // 4MB buffer
@@ -50,13 +49,8 @@ mod platform {
         let mut offset = 0;
         while offset < buf.len() {
             let mut written = 0u32;
-            WriteFile(
-                handle,
-                Some(&buf[offset..]),
-                Some(&mut written),
-                None,
-            )
-            .context("pipe write")?;
+            WriteFile(handle, Some(&buf[offset..]), Some(&mut written), None)
+                .context("pipe write")?;
             offset += written as usize;
         }
         Ok(())
@@ -68,13 +62,8 @@ mod platform {
         let mut offset = 0;
         while offset < len {
             let mut read = 0u32;
-            ReadFile(
-                handle,
-                Some(&mut buf[offset..]),
-                Some(&mut read),
-                None,
-            )
-            .context("pipe read")?;
+            ReadFile(handle, Some(&mut buf[offset..]), Some(&mut read), None)
+                .context("pipe read")?;
             if read == 0 {
                 anyhow::bail!("pipe disconnected (read 0 bytes)");
             }
@@ -110,8 +99,8 @@ mod platform {
 
     /// Encode a Frame into the wire format: [u32 width][u32 height][zstd(bgra_data)]
     fn encode_frame(frame: &Frame) -> Result<Vec<u8>> {
-        let compressed = zstd::encode_all(frame.data.as_slice(), ZSTD_LEVEL)
-            .context("zstd compress frame")?;
+        let compressed =
+            zstd::encode_all(frame.data.as_slice(), ZSTD_LEVEL).context("zstd compress frame")?;
         let mut payload = Vec::with_capacity(8 + compressed.len());
         payload.extend_from_slice(&frame.width.to_le_bytes());
         payload.extend_from_slice(&frame.height.to_le_bytes());
@@ -126,13 +115,15 @@ mod platform {
         }
         let width = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let height = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        let data = zstd::decode_all(&payload[8..])
-            .context("zstd decompress frame")?;
+        let data = zstd::decode_all(&payload[8..]).context("zstd decompress frame")?;
         let expected = (width * height * 4) as usize;
         if data.len() != expected {
             anyhow::bail!(
                 "frame size mismatch: got {} bytes, expected {} ({}x{}x4)",
-                data.len(), expected, width, height
+                data.len(),
+                expected,
+                width,
+                height
             );
         }
         Ok(Frame {
@@ -208,12 +199,11 @@ mod platform {
 
             match done_rx.recv_timeout(timeout) {
                 Ok(result) => {
-                    // ConnectNamedPipe returns error if client already connected
-                    // (ERROR_PIPE_CONNECTED) — that's OK
                     if let Err(ref e) = result {
-                        let code = unsafe { windows::Win32::Foundation::GetLastError() };
-                        // ERROR_PIPE_CONNECTED = 535
-                        if code.0 != 535 {
+                        // ERROR_PIPE_CONNECTED (0x80070217): client already connected
+                        // before we called ConnectNamedPipe — this is OK.
+                        const ERROR_PIPE_CONNECTED: i32 = 0x80070217u32 as i32;
+                        if e.code().0 != ERROR_PIPE_CONNECTED {
                             result.context("ConnectNamedPipe")?;
                         }
                     }
@@ -240,75 +230,84 @@ mod platform {
             // Read thread: receives frames from agent
             let handle = self.handle;
             let shutdown = Arc::clone(&self.shutdown);
-            let read_thread = std::thread::Builder::new()
-                .name("ipc-read".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Relaxed) {
-                        match unsafe { recv_message(handle) } {
-                            Ok((MSG_FRAME, payload)) => {
-                                match decode_frame(&payload) {
-                                    Ok(frame) => {
-                                        // Use try_send-like behavior: if receiver is behind,
-                                        // just drop the frame (latest-wins for video)
-                                        let _ = frame_tx.send(frame);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("IPC: bad frame: {e}");
+            let read_thread =
+                std::thread::Builder::new()
+                    .name("ipc-read".into())
+                    .spawn(move || {
+                        while !shutdown.load(Ordering::Relaxed) {
+                            match unsafe { recv_message(handle) } {
+                                Ok((MSG_FRAME, payload)) => {
+                                    match decode_frame(&payload) {
+                                        Ok(frame) => {
+                                            // Use try_send-like behavior: if receiver is behind,
+                                            // just drop the frame (latest-wins for video)
+                                            let _ = frame_tx.send(frame);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("IPC: bad frame: {e}");
+                                        }
                                     }
                                 }
-                            }
-                            Ok((MSG_HEARTBEAT, _)) => {
-                                tracing::trace!("IPC: heartbeat from agent");
-                            }
-                            Ok((msg_type, _)) => {
-                                tracing::debug!("IPC: unexpected message type 0x{:02x}", msg_type);
-                            }
-                            Err(e) => {
-                                if !shutdown.load(Ordering::Relaxed) {
-                                    tracing::warn!("IPC read error (agent disconnected?): {e}");
+                                Ok((MSG_HEARTBEAT, _)) => {
+                                    tracing::trace!("IPC: heartbeat from agent");
                                 }
-                                break;
+                                Ok((msg_type, _)) => {
+                                    tracing::debug!(
+                                        "IPC: unexpected message type 0x{:02x}",
+                                        msg_type
+                                    );
+                                }
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC read error (agent disconnected?): {e}");
+                                    }
+                                    break;
+                                }
                             }
                         }
-                    }
-                })?;
+                    })?;
 
             // Write thread: sends input events to agent
             let handle = self.handle;
             let shutdown = Arc::clone(&self.shutdown);
-            let write_thread = std::thread::Builder::new()
-                .name("ipc-write".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Relaxed) {
-                        match input_rx.recv_timeout(Duration::from_secs(5)) {
-                            Ok(event) => {
-                                let payload = match bincode::serialize(&event) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        tracing::warn!("IPC: serialize input: {e}");
-                                        continue;
+            let write_thread =
+                std::thread::Builder::new()
+                    .name("ipc-write".into())
+                    .spawn(move || {
+                        while !shutdown.load(Ordering::Relaxed) {
+                            match input_rx.recv_timeout(Duration::from_secs(5)) {
+                                Ok(event) => {
+                                    let payload = match bincode::serialize(&event) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            tracing::warn!("IPC: serialize input: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) =
+                                        unsafe { send_message(handle, MSG_INPUT, &payload) }
+                                    {
+                                        if !shutdown.load(Ordering::Relaxed) {
+                                            tracing::warn!("IPC write error: {e}");
+                                        }
+                                        break;
                                     }
-                                };
-                                if let Err(e) = unsafe { send_message(handle, MSG_INPUT, &payload) } {
-                                    if !shutdown.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC write error: {e}");
-                                    }
-                                    break;
                                 }
-                            }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                // Send heartbeat to detect broken pipe
-                                if let Err(e) = unsafe { send_message(handle, MSG_HEARTBEAT, &[]) } {
-                                    if !shutdown.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC heartbeat write error: {e}");
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    // Send heartbeat to detect broken pipe
+                                    if let Err(e) =
+                                        unsafe { send_message(handle, MSG_HEARTBEAT, &[]) }
+                                    {
+                                        if !shutdown.load(Ordering::Relaxed) {
+                                            tracing::warn!("IPC heartbeat write error: {e}");
+                                        }
+                                        break;
                                     }
-                                    break;
                                 }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                    }
-                })?;
+                    })?;
 
             self._read_thread = Some(read_thread);
             self._write_thread = Some(write_thread);
