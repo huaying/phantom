@@ -327,15 +327,19 @@ fn create_service_session(
             // We need to get a first frame to know the resolution
             // Wait briefly for agent to start sending
             let mut attempts = 0;
+            svc_log("Waiting for first frame from agent IPC...");
             let (width, height) = loop {
                 if let Some(frame) = ipc.recv_frame() {
+                    svc_log(&format!("Got frame from IPC: {}x{} {} bytes", frame.width, frame.height, frame.data.len()));
                     capture.last_frame = Some(frame);
                     break capture.resolution();
                 }
                 attempts += 1;
+                if attempts % 10 == 0 {
+                    svc_log(&format!("Still waiting for frame... attempt {attempts}/100"));
+                }
                 if attempts > 100 {
-                    // 2 seconds without a frame — fall back to GDI
-                    tracing::warn!("No frames from agent after 2s, falling back to GDI");
+                    svc_log("No frames from agent after 2s — falling back to GDI");
                     return create_service_session_gdi(sender, receiver, cancel);
                 }
                 std::thread::sleep(Duration::from_millis(20));
