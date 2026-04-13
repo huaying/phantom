@@ -201,41 +201,46 @@ mod platform {
         /// After connection, spawns read/write threads.
         pub fn wait_for_connection(&mut self, timeout: Duration) -> Result<bool> {
             tracing::info!("IPC: waiting for agent connection (timeout {:?})", timeout);
-            let handle = SendHandle(self.handle);
-            let (done_tx, done_rx) = mpsc::channel();
 
-            std::thread::Builder::new()
-                .name("ipc-connect-wait".into())
-                .spawn(move || {
-                    let result = unsafe { ConnectNamedPipe(handle.get(), None) };
-                    let _ = done_tx.send(result);
-                })?;
+            // Poll-based approach: periodically check if someone connected
+            // by trying to do a peek. ConnectNamedPipe + thread had race conditions.
+            let start = std::time::Instant::now();
 
-            match done_rx.recv_timeout(timeout) {
-                Ok(result) => {
-                    if let Err(ref e) = result {
-                        let code = e.code().0;
-                        tracing::info!("IPC: ConnectNamedPipe returned error code: 0x{:08X} ({})", code as u32, code);
-                        // ERROR_PIPE_CONNECTED: client already connected before ConnectNamedPipe
-                        // Win32 error 535 → HRESULT 0x80070217
-                        const ERROR_PIPE_CONNECTED_HRESULT: i32 = 0x80070217u32 as i32;
-                        // Also check raw Win32 error code in case HRESULT wrapping differs
-                        const ERROR_PIPE_CONNECTED_WIN32: i32 = 535;
-                        if code != ERROR_PIPE_CONNECTED_HRESULT && code != ERROR_PIPE_CONNECTED_WIN32 {
-                            result.context("ConnectNamedPipe")?;
-                        }
-                        tracing::info!("IPC: treating as successful connection (client connected first)");
-                    }
-                    self.connected = true;
-                    self.start_io_threads()?;
-                    tracing::info!("IPC: agent connected");
-                    Ok(true)
+            // First try ConnectNamedPipe synchronously with short timeouts
+            loop {
+                if start.elapsed() > timeout {
+                    tracing::warn!("IPC: connection timed out after {:?}", timeout);
+                    return Ok(false);
                 }
-                Err(_) => {
-                    tracing::debug!("IPC: connection timed out after {:?}", timeout);
-                    Ok(false)
+
+                let result = unsafe { ConnectNamedPipe(self.handle, None) };
+                match result {
+                    Ok(()) => {
+                        tracing::info!("IPC: ConnectNamedPipe succeeded");
+                        break;
+                    }
+                    Err(e) => {
+                        let code = e.code().0;
+                        // ERROR_PIPE_CONNECTED = 535 → HRESULT 0x80070217
+                        if code == 0x80070217u32 as i32 || code == 535 {
+                            tracing::info!("IPC: client already connected (ERROR_PIPE_CONNECTED)");
+                            break;
+                        }
+                        // ERROR_NO_DATA = 232 → pipe was closed by client
+                        if code == 0x800700E8u32 as i32 || code == 232 {
+                            tracing::warn!("IPC: pipe broken, client disconnected");
+                            return Ok(false);
+                        }
+                        tracing::warn!("IPC: ConnectNamedPipe error: 0x{:08X} ({})", code as u32, code);
+                        return Err(e).context("ConnectNamedPipe");
+                    }
                 }
             }
+
+            self.connected = true;
+            self.start_io_threads()?;
+            tracing::info!("IPC: agent connected, IO threads started");
+            Ok(true)
         }
 
         /// Start read (frame) and write (input) threads.
