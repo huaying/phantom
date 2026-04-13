@@ -473,11 +473,11 @@ impl WinProcessHandle {
     fn try_wait(&self) -> Option<u32> {
         unsafe {
             use windows::Win32::System::Threading::{
-                GetExitCodeProcess, WaitForSingleObject, WAIT_TIMEOUT,
+                GetExitCodeProcess, WaitForSingleObject,
             };
-            // Non-blocking check
+            // Non-blocking check (WAIT_TIMEOUT = 258)
             let wait_result = WaitForSingleObject(self.handle, 0);
-            if wait_result == WAIT_TIMEOUT {
+            if wait_result.0 == 258 {
                 return None; // Still running
             }
             let mut exit_code: u32 = 0;

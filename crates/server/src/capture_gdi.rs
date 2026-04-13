@@ -18,9 +18,11 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, OpenInputDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CloseDesktop, GetDesktopWindow, GetSystemMetrics, OpenInputDesktopW, SetThreadDesktop,
-    SM_CXSCREEN, SM_CYSCREEN,
+    GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// GDI-based screen capture. Works in Session 0 (service context).
@@ -59,7 +61,7 @@ impl GdiCapture {
             // DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP are needed
             // for SetThreadDesktop; GENERIC_READ covers these.
             let hdesk = match OpenInputDesktopW(
-                windows::Win32::UI::WindowsAndMessaging::DESKTOP_CONTROL_FLAGS(0),
+                DESKTOP_CONTROL_FLAGS(0),
                 false,
                 windows::Win32::Foundation::GENERIC_READ.0,
             ) {
