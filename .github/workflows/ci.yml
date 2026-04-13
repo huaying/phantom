@@ -7,6 +7,17 @@ on:
     branches: [main]
 
 jobs:
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (compile test)
+        run: cargo check --workspace
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
