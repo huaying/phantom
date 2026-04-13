@@ -19,4 +19,21 @@ mod platform;
 #[path = "audio_capture_wasapi.rs"]
 mod platform;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use platform::AudioCapture;
+
+/// Stub for unsupported platforms (macOS etc.)
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub struct AudioCapture;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+impl AudioCapture {
+    pub fn start() -> anyhow::Result<(Self, std::sync::mpsc::Receiver<AudioChunk>)> {
+        anyhow::bail!("audio capture not supported on this platform")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+impl Drop for AudioCapture {
+    fn drop(&mut self) {}
+}
