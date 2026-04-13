@@ -214,12 +214,17 @@ mod platform {
             match done_rx.recv_timeout(timeout) {
                 Ok(result) => {
                     if let Err(ref e) = result {
-                        // ERROR_PIPE_CONNECTED (0x80070217): client already connected
-                        // before we called ConnectNamedPipe — this is OK.
-                        const ERROR_PIPE_CONNECTED: i32 = 0x80070217u32 as i32;
-                        if e.code().0 != ERROR_PIPE_CONNECTED {
+                        let code = e.code().0;
+                        tracing::info!("IPC: ConnectNamedPipe returned error code: 0x{:08X} ({})", code as u32, code);
+                        // ERROR_PIPE_CONNECTED: client already connected before ConnectNamedPipe
+                        // Win32 error 535 → HRESULT 0x80070217
+                        const ERROR_PIPE_CONNECTED_HRESULT: i32 = 0x80070217u32 as i32;
+                        // Also check raw Win32 error code in case HRESULT wrapping differs
+                        const ERROR_PIPE_CONNECTED_WIN32: i32 = 535;
+                        if code != ERROR_PIPE_CONNECTED_HRESULT && code != ERROR_PIPE_CONNECTED_WIN32 {
                             result.context("ConnectNamedPipe")?;
                         }
+                        tracing::info!("IPC: treating as successful connection (client connected first)");
                     }
                     self.connected = true;
                     self.start_io_threads()?;
