@@ -2609,6 +2609,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite",
+ "windows 0.58.0",
  "zstd",
 ]
 
