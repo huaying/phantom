@@ -999,6 +999,10 @@ fn run_agent_mode() -> Result<()> {
         Err(e) => { agent_log(&format!("IPC connect FAILED: {e}")); return Err(e); }
     };
     tracing::info!("Agent: IPC connected");
+    // Wait for service to start its read thread after ConnectNamedPipe returns.
+    // Without this, the agent can fill the pipe buffer before the service reads.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    agent_log("Post-connect wait done, starting capture");
 
     // Set up capture (try scrap/DXGI first — we're in the user's session so it should work)
     let mut capture: Box<dyn phantom_core::capture::FrameCapture> =
