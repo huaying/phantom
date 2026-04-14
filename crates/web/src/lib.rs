@@ -701,14 +701,12 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             bandwidth_bps,
             encode_us,
         } => {
-            let snapshot = StatsSnapshot {
+            state.borrow_mut().last_stats = Some(StatsSnapshot {
                 rtt_ms: rtt_us as f64 / 1000.0,
                 fps,
                 bandwidth_kbps: bandwidth_bps as f64 / 1024.0,
                 encode_ms: encode_us as f64 / 1000.0,
-            };
-            update_stats_overlay(&snapshot);
-            state.borrow_mut().last_stats = Some(snapshot);
+            });
         }
         _ => {}
     }
@@ -1647,16 +1645,6 @@ fn setup_input(
                 }
                 return; // Don't forward F11 to remote
             }
-            // Ctrl+Shift+S: toggle stats overlay visibility
-            if pressed && code == "KeyS" && e.ctrl_key() && e.shift_key() {
-                if let Some(el) = get_or_create_stats_overlay() {
-                    let current = el.style().get_property_value("display").unwrap_or_default();
-                    let _ = el
-                        .style()
-                        .set_property("display", if current == "none" { "" } else { "none" });
-                }
-                return; // Don't forward to remote
-            }
             // Paste
             if pressed && code == "KeyV" && (e.ctrl_key() || e.meta_key()) {
                 if let Some(w) = web_sys::window() {
@@ -1728,54 +1716,6 @@ fn setup_input(
         let window = web_sys::window().unwrap();
         let _ = window.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref());
         cb.forget();
-    }
-}
-
-/// Create or get the floating stats overlay element.
-fn get_or_create_stats_overlay() -> Option<web_sys::HtmlElement> {
-    let document = web_sys::window()?.document()?;
-    if let Some(el) = document.get_element_by_id("phantom-stats") {
-        return el.dyn_into::<web_sys::HtmlElement>().ok();
-    }
-    let div = document.create_element("div").ok()?;
-    div.set_id("phantom-stats");
-    let style = [
-        "position:fixed",
-        "top:8px",
-        "right:8px",
-        "background:rgba(0,0,0,0.7)",
-        "color:#0f0",
-        "font-family:monospace",
-        "font-size:12px",
-        "padding:6px 10px",
-        "border-radius:4px",
-        "z-index:9999",
-        "pointer-events:none",
-        "line-height:1.4",
-        "white-space:pre",
-        "display:none",
-    ]
-    .join(";");
-    let _ = div.set_attribute("style", &style);
-    let body = document.body()?;
-    let _ = body.append_child(&div);
-    div.dyn_into::<web_sys::HtmlElement>().ok()
-}
-
-/// Update the floating stats overlay with the latest snapshot.
-fn update_stats_overlay(stats: &StatsSnapshot) {
-    if let Some(el) = get_or_create_stats_overlay() {
-        let color = if stats.rtt_ms < 20.0 {
-            "#0f0" // green — excellent
-        } else if stats.rtt_ms < 50.0 {
-            "#ff0" // yellow — ok
-        } else {
-            "#f00" // red — poor
-        };
-        el.set_inner_html(&format!(
-            "<span style='color:{color}'>●</span> {:.0} FPS | {:.1}ms RTT | {:.0} KB/s | enc {:.1}ms",
-            stats.fps, stats.rtt_ms, stats.bandwidth_kbps, stats.encode_ms
-        ));
     }
 }
 
