@@ -1,10 +1,10 @@
 //! Encoding pipeline: StreamSource → NVENC → encoded frames.
 
-use crate::source::{StreamFrame, StreamSource, GpuPixelFormat};
+use crate::source::{GpuPixelFormat, StreamFrame, StreamSource};
+use anyhow::{Context, Result};
 use phantom_core::encode::{EncodedFrame, FrameEncoder, VideoCodec};
-use phantom_gpu::nvenc::NvencEncoder;
 use phantom_gpu::cuda::CudaLib;
-use anyhow::{Result, Context};
+use phantom_gpu::nvenc::NvencEncoder;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,11 +73,13 @@ impl StreamPipeline {
             let encoder = NvencEncoder::new(
                 Arc::clone(&cuda),
                 0, // device ordinal
-                w, h,
+                w,
+                h,
                 self.config.fps,
                 self.config.bitrate_kbps,
                 self.config.codec,
-            ).context("failed to initialize NVENC encoder")?;
+            )
+            .context("failed to initialize NVENC encoder")?;
 
             self.cuda = Some(cuda);
             self.encoder = Some(encoder);

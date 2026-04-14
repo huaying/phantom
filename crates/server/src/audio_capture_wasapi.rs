@@ -165,8 +165,7 @@ fn wasapi_capture_loop(
             }
 
             // Poll for available audio packets (10ms sleep between polls)
-            let packet_size = capture_client.GetNextPacketSize()
-                .unwrap_or(0);
+            let packet_size = capture_client.GetNextPacketSize().unwrap_or(0);
             if packet_size == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;

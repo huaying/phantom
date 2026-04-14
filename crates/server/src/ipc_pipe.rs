@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Message types:
-//! - 0x01 EncodedFrame (agent → service): [u8 is_keyframe][u8 codec][u32 width][u32 height][data]
+//! - 0x01 EncodedFrame (agent → service): \[u8 is_keyframe\]\[u8 codec\]\[u32 width\]\[u32 height\]\[data\]
 //! - 0x02 InputEvent (service → agent): bincode-serialized InputEvent
 //! - 0x03 Heartbeat (bidirectional): empty payload
 //! - 0x04 Shutdown (service → agent): empty payload
@@ -32,19 +32,21 @@ mod platform {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
     #[derive(Clone, Copy)]
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
     impl SendHandle {
-        fn get(self) -> HANDLE { self.0 }
+        fn get(self) -> HANDLE {
+            self.0
+        }
     }
 
     const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
@@ -114,7 +116,7 @@ mod platform {
     }
 
     /// Encode an EncodedFrame into the wire format:
-    /// [u8 is_keyframe][u8 codec][u32 width][u32 height][data]
+    /// \[u8 is_keyframe\]\[u8 codec\]\[u32 width\]\[u32 height\]\[data\]
     /// codec: 0 = H264, 1 = AV1
     fn encode_ipc_frame(frame: &EncodedFrame, width: u32, height: u32) -> Vec<u8> {
         let mut payload = Vec::with_capacity(10 + frame.data.len());
@@ -168,7 +170,10 @@ mod platform {
                 None,
             );
             if h.is_invalid() {
-                anyhow::bail!("CreateNamedPipe({name}) failed: {}", windows::core::Error::from_win32());
+                anyhow::bail!(
+                    "CreateNamedPipe({name}) failed: {}",
+                    windows::core::Error::from_win32()
+                );
             }
             Ok(h)
         }
@@ -274,7 +279,10 @@ mod platform {
         }
 
         pub fn wait_for_connection(&mut self, timeout: Duration) -> Result<bool> {
-            tracing::info!("IPC: waiting for agent on both pipes (timeout {:?})", timeout);
+            tracing::info!(
+                "IPC: waiting for agent on both pipes (timeout {:?})",
+                timeout
+            );
             if !wait_connect(self.up_handle, "up", timeout)? {
                 return Ok(false);
             }
@@ -296,35 +304,36 @@ mod platform {
             // Read thread: reads encoded H.264 frames from upstream pipe
             let up = SendHandle(self.up_handle);
             let shutdown = Arc::clone(&self.shutdown);
-            let read_thread = std::thread::Builder::new()
-                .name("ipc-read".into())
-                .spawn(move || {
-                    let handle = up.get();
-                    while !shutdown.load(Ordering::Relaxed) {
-                        match unsafe { recv_message(handle) } {
-                            Ok((MSG_ENCODED_FRAME, payload)) => {
-                                match decode_ipc_frame(&payload) {
-                                    Ok((encoded, w, h)) => {
-                                        let _ = frame_tx.send(IpcEncodedFrame {
-                                            encoded,
-                                            width: w,
-                                            height: h,
-                                        });
+            let read_thread =
+                std::thread::Builder::new()
+                    .name("ipc-read".into())
+                    .spawn(move || {
+                        let handle = up.get();
+                        while !shutdown.load(Ordering::Relaxed) {
+                            match unsafe { recv_message(handle) } {
+                                Ok((MSG_ENCODED_FRAME, payload)) => {
+                                    match decode_ipc_frame(&payload) {
+                                        Ok((encoded, w, h)) => {
+                                            let _ = frame_tx.send(IpcEncodedFrame {
+                                                encoded,
+                                                width: w,
+                                                height: h,
+                                            });
+                                        }
+                                        Err(e) => tracing::warn!("IPC: bad encoded frame: {e}"),
                                     }
-                                    Err(e) => tracing::warn!("IPC: bad encoded frame: {e}"),
                                 }
-                            }
-                            Ok((MSG_HEARTBEAT, _)) => {}
-                            Ok((t, _)) => tracing::debug!("IPC up: unexpected 0x{t:02x}"),
-                            Err(e) => {
-                                if !shutdown.load(Ordering::Relaxed) {
-                                    tracing::warn!("IPC read error: {e}");
+                                Ok((MSG_HEARTBEAT, _)) => {}
+                                Ok((t, _)) => tracing::debug!("IPC up: unexpected 0x{t:02x}"),
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC read error: {e}");
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                         }
-                    }
-                })?;
+                    })?;
 
             // Write thread: sole owner of writes to the downstream pipe.
             // Checks AtomicBool flags for keyframe/shutdown requests to avoid
@@ -333,59 +342,69 @@ mod platform {
             let shutdown2 = Arc::clone(&self.shutdown);
             let kf_flag = Arc::clone(&self.keyframe_requested);
             let shutdown_flag = Arc::clone(&self.shutdown_requested);
-            let write_thread = std::thread::Builder::new()
-                .name("ipc-write".into())
-                .spawn(move || {
-                    let handle = down.get();
-                    let mut heartbeat_elapsed = Instant::now();
-                    while !shutdown2.load(Ordering::Relaxed) {
-                        // Check shutdown request flag (set by send_shutdown)
-                        if shutdown_flag.swap(false, Ordering::SeqCst) {
-                            let _ = unsafe { send_message(handle, MSG_SHUTDOWN, &[]) };
-                            break;
-                        }
-
-                        // Check keyframe request flag (set by request_keyframe)
-                        if kf_flag.swap(false, Ordering::SeqCst) {
-                            if let Err(e) = unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) } {
-                                if !shutdown2.load(Ordering::Relaxed) {
-                                    tracing::warn!("IPC keyframe write error: {e}");
-                                }
+            let write_thread =
+                std::thread::Builder::new()
+                    .name("ipc-write".into())
+                    .spawn(move || {
+                        let handle = down.get();
+                        let mut heartbeat_elapsed = Instant::now();
+                        while !shutdown2.load(Ordering::Relaxed) {
+                            // Check shutdown request flag (set by send_shutdown)
+                            if shutdown_flag.swap(false, Ordering::SeqCst) {
+                                let _ = unsafe { send_message(handle, MSG_SHUTDOWN, &[]) };
                                 break;
                             }
-                        }
 
-                        // Drain input events (200ms timeout for responsive flag checking)
-                        match input_rx.recv_timeout(Duration::from_millis(200)) {
-                            Ok(event) => {
-                                let payload = match bincode::serialize(&event) {
-                                    Ok(p) => p,
-                                    Err(e) => { tracing::warn!("IPC serialize: {e}"); continue; }
-                                };
-                                if let Err(e) = unsafe { send_message(handle, MSG_INPUT, &payload) } {
+                            // Check keyframe request flag (set by request_keyframe)
+                            if kf_flag.swap(false, Ordering::SeqCst) {
+                                if let Err(e) =
+                                    unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) }
+                                {
                                     if !shutdown2.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC write error: {e}");
+                                        tracing::warn!("IPC keyframe write error: {e}");
                                     }
                                     break;
                                 }
-                                heartbeat_elapsed = Instant::now();
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                // Send heartbeat every 5s of inactivity
-                                if heartbeat_elapsed.elapsed() >= Duration::from_secs(5) {
-                                    if let Err(e) = unsafe { send_message(handle, MSG_HEARTBEAT, &[]) } {
+
+                            // Drain input events (200ms timeout for responsive flag checking)
+                            match input_rx.recv_timeout(Duration::from_millis(200)) {
+                                Ok(event) => {
+                                    let payload = match bincode::serialize(&event) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            tracing::warn!("IPC serialize: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) =
+                                        unsafe { send_message(handle, MSG_INPUT, &payload) }
+                                    {
                                         if !shutdown2.load(Ordering::Relaxed) {
-                                            tracing::warn!("IPC heartbeat error: {e}");
+                                            tracing::warn!("IPC write error: {e}");
                                         }
                                         break;
                                     }
                                     heartbeat_elapsed = Instant::now();
                                 }
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    // Send heartbeat every 5s of inactivity
+                                    if heartbeat_elapsed.elapsed() >= Duration::from_secs(5) {
+                                        if let Err(e) =
+                                            unsafe { send_message(handle, MSG_HEARTBEAT, &[]) }
+                                        {
+                                            if !shutdown2.load(Ordering::Relaxed) {
+                                                tracing::warn!("IPC heartbeat error: {e}");
+                                            }
+                                            break;
+                                        }
+                                        heartbeat_elapsed = Instant::now();
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                    }
-                })?;
+                    })?;
 
             self._read_thread = Some(read_thread);
             self._write_thread = Some(write_thread);
@@ -519,7 +538,9 @@ mod platform {
                         match unsafe { recv_message(handle) } {
                             Ok((MSG_INPUT, payload)) => {
                                 match bincode::deserialize::<InputEvent>(&payload) {
-                                    Ok(event) => { let _ = input_tx.send(event); }
+                                    Ok(event) => {
+                                        let _ = input_tx.send(event);
+                                    }
                                     Err(e) => tracing::warn!("IPC: deserialize input: {e}"),
                                 }
                             }
@@ -556,7 +577,12 @@ mod platform {
         }
 
         /// Send an encoded H.264 frame to the service via upstream pipe.
-        pub fn send_encoded_frame(&self, frame: &EncodedFrame, width: u32, height: u32) -> Result<()> {
+        pub fn send_encoded_frame(
+            &self,
+            frame: &EncodedFrame,
+            width: u32,
+            height: u32,
+        ) -> Result<()> {
             let payload = encode_ipc_frame(frame, width, height);
             unsafe { send_message(self.up_handle, MSG_ENCODED_FRAME, &payload) }
         }

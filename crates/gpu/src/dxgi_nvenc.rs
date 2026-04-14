@@ -274,12 +274,14 @@ impl DxgiNvencPipeline {
         // SPS/PPS handling: NVENC only outputs SPS/PPS on first encode after init.
         // set_repeat_sps_pps is unreliable across drivers. Save and prepend manually.
         if is_keyframe {
-            let has_sps = data.windows(5)
+            let has_sps = data
+                .windows(5)
                 .any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1F) == 7);
             if has_sps && self.sps_pps.is_empty() {
-                if let Some(idr_pos) = data.windows(5).position(
-                    |w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1F) == 5
-                ) {
+                if let Some(idr_pos) = data
+                    .windows(5)
+                    .position(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1F) == 5)
+                {
                     self.sps_pps = data[..idr_pos].to_vec();
                     tracing::debug!(len = self.sps_pps.len(), "DxgiNvenc: saved SPS/PPS");
                 }

@@ -19,10 +19,10 @@
 //! server.run(); // blocks, streams frames to connected browsers
 //! ```
 
-mod source;
 mod pipeline;
 mod server;
+mod source;
 
-pub use source::{StreamSource, GpuFrame, GpuPixelFormat, CpuFrame, StreamFrame};
 pub use pipeline::StreamPipeline;
 pub use server::StreamServer;
+pub use source::{CpuFrame, GpuFrame, GpuPixelFormat, StreamFrame, StreamSource};

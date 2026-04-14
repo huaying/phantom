@@ -14,7 +14,11 @@ fn extract_query_param<'a>(raw_path: &'a str, key: &str) -> Option<&'a str> {
     raw_path.split('?').nth(1).and_then(|query| {
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            if k == key { Some(v) } else { None }
+            if k == key {
+                Some(v)
+            } else {
+                None
+            }
         })
     })
 }
@@ -92,14 +96,20 @@ fn check_ws_auth(
             }
             Err(e) => {
                 tracing::warn!("JWT auth failed: {e}");
-                let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized"
+                );
                 let _ = stream.flush();
                 anyhow::bail!("auth failed");
             }
         },
         None => {
             tracing::warn!("WebSocket missing ?token= param");
-            let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized"
+            );
             let _ = stream.flush();
             anyhow::bail!("auth required");
         }
@@ -248,7 +258,12 @@ pub struct WsConnection {
 }
 
 impl WebServerTransport {
-    pub fn start(http_port: u16, _ws_port: u16, _udp_port: u16, auth_secret: Option<Vec<u8>>) -> Result<Self> {
+    pub fn start(
+        http_port: u16,
+        _ws_port: u16,
+        _udp_port: u16,
+        auth_secret: Option<Vec<u8>>,
+    ) -> Result<Self> {
         let auth_secret = Arc::new(auth_secret);
         // Channel for WS connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
@@ -318,7 +333,12 @@ impl WebServerTransport {
 
                             // Keep-alive loop: serve multiple requests on the same TLS connection
                             for _req_num in 0..MAX_REQUESTS_PER_CONN {
-                                match handle_http_rw_rtc(&mut stream, &rtc_tx, candidate_addr, &auth) {
+                                match handle_http_rw_rtc(
+                                    &mut stream,
+                                    &rtc_tx,
+                                    candidate_addr,
+                                    &auth,
+                                ) {
                                     Ok(HttpResult::WsUpgrade) => {
                                         spawn_ws_connection(stream, ws_tx);
                                         return;
@@ -470,7 +490,10 @@ fn wants_close(request: &str) -> bool {
 
 /// HTTP handler WITHOUT WebRTC (no POST /rtc).
 #[cfg(not(feature = "webrtc"))]
-fn handle_http_rw(stream: &mut (impl Read + Write), auth_secret: &Option<Vec<u8>>) -> Result<HttpResult> {
+fn handle_http_rw(
+    stream: &mut (impl Read + Write),
+    auth_secret: &Option<Vec<u8>>,
+) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
     if n == 0 {

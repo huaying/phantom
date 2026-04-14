@@ -14,11 +14,11 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
-use windows_service::define_windows_service;
 use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "PhantomServer";
@@ -173,8 +173,12 @@ fn run_server_loop(
             }
         }
     });
-    let ws_transport =
-        transport_ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3, auth_secret)?;
+    let ws_transport = transport_ws::WebServerTransport::start(
+        base_port + 1,
+        base_port + 2,
+        base_port + 3,
+        auth_secret,
+    )?;
     let tx = conn_tx.clone();
     std::thread::Builder::new()
         .name("svc-web-accept".into())
@@ -336,8 +340,10 @@ fn create_service_session(
             let (width, height) = loop {
                 if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
                     tracing::info!(
-                        width = ef.width, height = ef.height,
-                        bytes = ef.encoded.data.len(), keyframe = ef.encoded.is_keyframe,
+                        width = ef.width,
+                        height = ef.height,
+                        bytes = ef.encoded.data.len(),
+                        keyframe = ef.encoded.is_keyframe,
                         "Got encoded frame from agent"
                     );
                     break (ef.width, ef.height);
@@ -454,9 +460,7 @@ impl WinProcessHandle {
     /// Check if the process has exited. Returns Some(exit_code) if exited.
     fn try_wait(&self) -> Option<u32> {
         unsafe {
-            use windows::Win32::System::Threading::{
-                GetExitCodeProcess, WaitForSingleObject,
-            };
+            use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
             // Non-blocking check (WAIT_TIMEOUT = 258)
             let wait_result = WaitForSingleObject(self.handle, 0);
             if wait_result.0 == 258 {
@@ -597,7 +601,9 @@ impl SessionManager {
                     if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
                         tracing::info!(session_id = self.current_session_id, "Relaunching agent");
                         // Create fresh IPC pipe for the new agent
-                        if let Ok(mut ipc_server) = crate::ipc_pipe::IpcServer::new(self.current_session_id) {
+                        if let Ok(mut ipc_server) =
+                            crate::ipc_pipe::IpcServer::new(self.current_session_id)
+                        {
                             match launch_agent_in_session(self.current_session_id) {
                                 Ok(proc) => {
                                     tracing::info!(pid = proc.pid, "Agent relaunched");
@@ -676,10 +682,10 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     use anyhow::Context;
     use std::mem;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::TOKEN_QUERY;
     use windows::Win32::Security::{
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
     };
-    use windows::Win32::Security::TOKEN_QUERY;
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
         PROCESS_INFORMATION, STARTUPINFOW,
@@ -690,8 +696,12 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         // Then set the session ID so the process launches in the user's session
         // but with SYSTEM privileges (can access Winlogon desktop).
         let mut service_token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS | TOKEN_QUERY, &mut service_token)
-            .context("OpenProcessToken failed")?;
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ALL_ACCESS | TOKEN_QUERY,
+            &mut service_token,
+        )
+        .context("OpenProcessToken failed")?;
         let mut dup_token = HANDLE::default();
         let dup_result = DuplicateTokenEx(
             service_token,

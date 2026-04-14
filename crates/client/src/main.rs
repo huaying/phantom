@@ -650,10 +650,12 @@ impl ApplicationHandler for App {
 
                 // Flush accumulated scroll (once per frame, like Parsec)
                 if session.scroll_accum.0 != 0.0 || session.scroll_accum.1 != 0.0 {
-                    let _ = session.input_tx.send(Message::Input(InputEvent::MouseScroll {
-                        dx: session.scroll_accum.0,
-                        dy: session.scroll_accum.1,
-                    }));
+                    let _ = session
+                        .input_tx
+                        .send(Message::Input(InputEvent::MouseScroll {
+                            dx: session.scroll_accum.0,
+                            dy: session.scroll_accum.1,
+                        }));
                     session.scroll_accum = (0.0, 0.0);
                 }
 
