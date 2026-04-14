@@ -335,9 +335,7 @@ impl App {
             attrs = attrs.with_decorations(false);
         }
 
-        let window = Rc::new(
-            event_loop.create_window(attrs).expect("create window"),
-        );
+        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
 
         let display = match display_winit::WinitDisplay::new(window.clone(), width, height) {
             Ok(d) => d,
@@ -829,6 +827,17 @@ impl ApplicationHandler for App {
                         key,
                         pressed: false,
                     }));
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                tracing::info!(path = %path.display(), "file dropped on window");
+                match session.file_xfer.initiate_send(&path) {
+                    Ok((_transfer_id, offer_msg)) => {
+                        let _ = session.input_tx.send(offer_msg);
+                    }
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), "failed to initiate file send: {e}");
+                    }
                 }
             }
             _ => {}

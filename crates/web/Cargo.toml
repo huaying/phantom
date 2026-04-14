@@ -47,4 +47,8 @@ features = [
     "Blob", "BlobPropertyBag", "Url",
     # MessagePort for worklet communication
     "MessagePort",
+    # Drag & drop file transfer
+    "DragEvent", "DataTransfer", "FileList", "File",
+    # Web Crypto API (SHA-256 for file transfer)
+    "Crypto", "SubtleCrypto",
 ]

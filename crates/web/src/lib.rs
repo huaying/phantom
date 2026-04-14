@@ -612,7 +612,9 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
                 if fc <= 3 {
-                    console::log_1(&format!("Submitting frame #{fc} to decoder (key={is_key})").into());
+                    console::log_1(
+                        &format!("Submitting frame #{fc} to decoder (key={is_key})").into(),
+                    );
                 }
                 decoder.decode(&chunk);
             }
@@ -664,9 +666,24 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             }
         }
-        Message::ClipboardSync(_text) => {
-            // Clipboard write requires document focus and secure context.
-            // Silently ignore — don't let it crash the message handler.
+        Message::ClipboardSync(text) => {
+            // Write remote clipboard to local clipboard via Async Clipboard API.
+            // Requires HTTPS (secure context) and document focus.
+            if let Some(w) = web_sys::window() {
+                if w.is_secure_context() {
+                    let cb = w.navigator().clipboard();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match wasm_bindgen_futures::JsFuture::from(cb.write_text(&text)).await {
+                            Ok(_) => {
+                                console::log_1(&"clipboard: synced from server".into());
+                            }
+                            Err(_e) => {
+                                // Permission denied or document not focused — silent fail
+                            }
+                        }
+                    });
+                }
+            }
         }
         Message::AudioFrame { data, .. } => {
             let mut s = state.borrow_mut();
@@ -737,7 +754,12 @@ fn h264_has_idr(data: &[u8]) -> bool {
     false
 }
 
-fn create_decoder_config(width: u32, height: u32, codec: VideoCodec, hw_accel: &str) -> js_sys::Object {
+fn create_decoder_config(
+    width: u32,
+    height: u32,
+    codec: VideoCodec,
+    hw_accel: &str,
+) -> js_sys::Object {
     let config = js_sys::Object::new();
     let codec_str = match codec {
         VideoCodec::Av1 => "av01.0.08M.08",
@@ -1671,7 +1693,9 @@ fn setup_input(
                 }
             }
             if let Some(kc) = js_code_to_keycode(&code) {
-                console::log_1(&format!("key: {code} pressed={pressed} repeat={}", e.repeat()).into());
+                console::log_1(
+                    &format!("key: {code} pressed={pressed} repeat={}", e.repeat()).into(),
+                );
                 send_input(&st, InputEvent::Key { key: kc, pressed });
             }
         });
@@ -1688,15 +1712,25 @@ fn setup_input(
             let st = s.borrow();
             // Release all common modifier and letter keys
             for kc in [
-                KeyCode::LeftShift, KeyCode::RightShift,
-                KeyCode::LeftCtrl, KeyCode::RightCtrl,
-                KeyCode::LeftAlt, KeyCode::RightAlt,
+                KeyCode::LeftShift,
+                KeyCode::RightShift,
+                KeyCode::LeftCtrl,
+                KeyCode::RightCtrl,
+                KeyCode::LeftAlt,
+                KeyCode::RightAlt,
             ] {
-                send_input(&st, InputEvent::Key { key: kc, pressed: false });
+                send_input(
+                    &st,
+                    InputEvent::Key {
+                        key: kc,
+                        pressed: false,
+                    },
+                );
             }
         });
         let window = web_sys::window().unwrap();
-        let _ = window.add_event_listener_with_callback("beforeunload", cb.as_ref().unchecked_ref());
+        let _ =
+            window.add_event_listener_with_callback("beforeunload", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
@@ -1706,15 +1740,142 @@ fn setup_input(
         let cb = Closure::<dyn FnMut()>::new(move || {
             let st = s.borrow();
             for kc in [
-                KeyCode::LeftShift, KeyCode::RightShift,
-                KeyCode::LeftCtrl, KeyCode::RightCtrl,
-                KeyCode::LeftAlt, KeyCode::RightAlt,
+                KeyCode::LeftShift,
+                KeyCode::RightShift,
+                KeyCode::LeftCtrl,
+                KeyCode::RightCtrl,
+                KeyCode::LeftAlt,
+                KeyCode::RightAlt,
             ] {
-                send_input(&st, InputEvent::Key { key: kc, pressed: false });
+                send_input(
+                    &st,
+                    InputEvent::Key {
+                        key: kc,
+                        pressed: false,
+                    },
+                );
             }
         });
         let window = web_sys::window().unwrap();
         let _ = window.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // ── Drag & drop file transfer ──────────────────────────────────────
+    // Prevent default on dragover (required to allow drop)
+    {
+        let cb = Closure::<dyn FnMut(web_sys::DragEvent)>::new(move |e: web_sys::DragEvent| {
+            e.prevent_default();
+            e.stop_propagation();
+        });
+        let _ = canvas.add_event_listener_with_callback("dragover", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // Handle file drop
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::DragEvent)>::new(move |e: web_sys::DragEvent| {
+            e.prevent_default();
+            e.stop_propagation();
+
+            let data_transfer = match e.data_transfer() {
+                Some(dt) => dt,
+                None => return,
+            };
+            let files = match data_transfer.files() {
+                Some(f) => f,
+                None => return,
+            };
+
+            for i in 0..files.length() {
+                let file = match files.get(i) {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                let name = file.name();
+                let size = file.size() as u64;
+                // Generate a transfer ID from random
+                let transfer_id = (js_sys::Math::random() * u32::MAX as f64) as u64;
+
+                let state_clone = s.clone();
+                let file_name = name.clone();
+
+                console::log_1(&format!("file drop: sending {} ({} bytes)", name, size).into());
+
+                // Send FileOffer
+                {
+                    let st = s.borrow();
+                    let offer = Message::FileOffer {
+                        transfer_id,
+                        name,
+                        size,
+                    };
+                    send_message(&st, &offer);
+                }
+
+                // Read file contents and send chunks asynchronously
+                wasm_bindgen_futures::spawn_local(async move {
+                    let array_buf =
+                        match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                            Ok(ab) => ab,
+                            Err(e) => {
+                                console::log_1(&format!("file read error: {:?}", e).into());
+                                return;
+                            }
+                        };
+                    let data = js_sys::Uint8Array::new(&array_buf).to_vec();
+
+                    // SHA-256 via Web Crypto API
+                    let sha256 = match web_crypto_sha256(&data).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            console::log_1(&format!("SHA-256 error: {:?}", e).into());
+                            return;
+                        }
+                    };
+
+                    // Send in 256KB chunks
+                    let chunk_size = 256 * 1024;
+                    let total = data.len();
+                    let mut offset = 0u64;
+                    while (offset as usize) < total {
+                        let end = ((offset as usize) + chunk_size).min(total);
+                        let chunk_data = data[offset as usize..end].to_vec();
+                        let msg = Message::FileChunk {
+                            transfer_id,
+                            offset,
+                            data: chunk_data,
+                        };
+                        {
+                            let st = state_clone.borrow();
+                            send_message(&st, &msg);
+                        }
+                        offset = end as u64;
+
+                        // Log progress every ~1MB
+                        if offset as usize == total || (offset % (1024 * 1024)) < chunk_size as u64
+                        {
+                            let pct = (offset as f64 / total as f64 * 100.0) as u32;
+                            console::log_1(&format!("sending {}: {}%", file_name, pct).into());
+                        }
+                    }
+
+                    // Send FileDone
+                    let msg = Message::FileDone {
+                        transfer_id,
+                        sha256,
+                    };
+                    {
+                        let st = state_clone.borrow();
+                        send_message(&st, &msg);
+                    }
+                    console::log_1(&format!("file sent: {} ({} bytes)", file_name, total).into());
+                });
+            }
+        });
+        let _ = canvas.add_event_listener_with_callback("drop", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 }
@@ -1850,4 +2011,21 @@ fn js_code_to_keycode(code: &str) -> Option<KeyCode> {
         "ScrollLock" => KeyCode::ScrollLock,
         _ => return None,
     })
+}
+
+/// Compute SHA-256 hash using Web Crypto API (SubtleCrypto).
+async fn web_crypto_sha256(data: &[u8]) -> Result<[u8; 32], JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let crypto = window
+        .crypto()
+        .map_err(|_| JsValue::from_str("no crypto"))?;
+    let subtle = crypto.subtle();
+
+    let buf = js_sys::Uint8Array::from(data);
+    let promise = subtle.digest_with_str_and_buffer_source("SHA-256", &buf)?;
+    let result = wasm_bindgen_futures::JsFuture::from(promise).await?;
+    let array = js_sys::Uint8Array::new(&result);
+    let mut hash = [0u8; 32];
+    array.copy_to(&mut hash);
+    Ok(hash)
 }
