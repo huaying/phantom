@@ -43,7 +43,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{WindowAttributes, WindowId};
+use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
 #[derive(Parser)]
 #[command(name = "phantom-client", about = "Phantom remote desktop client")]
@@ -320,7 +320,9 @@ impl App {
                 .create_window(
                     WindowAttributes::default()
                         .with_title("Phantom Remote Desktop")
-                        .with_inner_size(win_size),
+                        .with_inner_size(win_size)
+                        .with_decorations(false)
+                        .with_fullscreen(Some(Fullscreen::Borderless(None))),
                 )
                 .expect("create window"),
         );
@@ -736,6 +738,37 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                }
+
+                // F11: toggle fullscreen
+                if key_event.state == winit::event::ElementState::Pressed
+                    && !key_event.repeat
+                    && matches!(
+                        key_event.physical_key,
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F11)
+                    )
+                {
+                    let is_fs = session.display.window.fullscreen().is_some();
+                    session.display.window.set_fullscreen(if is_fs {
+                        None
+                    } else {
+                        Some(Fullscreen::Borderless(None))
+                    });
+                    session.display.window.set_decorations(is_fs); // show title bar in windowed
+                    return;
+                }
+
+                // Escape: exit fullscreen → windowed mode
+                if key_event.state == winit::event::ElementState::Pressed
+                    && matches!(
+                        key_event.physical_key,
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+                    )
+                    && session.display.window.fullscreen().is_some()
+                {
+                    session.display.window.set_fullscreen(None);
+                    session.display.window.set_decorations(true);
+                    return;
                 }
 
                 if let Some(input) =

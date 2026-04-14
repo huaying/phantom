@@ -9,7 +9,7 @@ use winit::window::Window;
 
 /// Display using winit + softbuffer.
 pub struct WinitDisplay {
-    window: Rc<Window>,
+    pub window: Rc<Window>,
     surface: Surface<Rc<Window>, Rc<Window>>,
     buffer: Vec<u32>,
     server_width: u32,
