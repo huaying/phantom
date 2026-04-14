@@ -302,64 +302,59 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ## Roadmap
 
-### Immediate
+### Next Up
 | Task | Impact | Notes |
 |------|--------|-------|
-| ~~NVENC GPU encoding~~ | ✅ done | encode 47ms→10ms (CPU path), 4ms (zero-copy) |
-| ~~NVFBC GPU capture~~ | ✅ done | zero-copy CUdeviceptr, ~0.4ms capture |
-| ~~Windows support~~ | ✅ done | DXGI capture, auto-start via schtasks |
-| ~~Web client WSS fallback~~ | ✅ done | `?ws` URL param, same HTTPS port |
-| ~~Fix WebRTC session disconnect detection~~ | ✅ done | ICE Disconnected → drop ActiveClient → session ends |
-| ~~DXGI→NVENC zero-copy~~ | ✅ done | 6fps→47fps on Windows L40 |
-| ~~Make WS default, WebRTC optional~~ | ✅ done | `--features webrtc` + `?rtc` |
-| ~~Web client auto-reconnect~~ | ✅ done | Exponential backoff 1s→5s cap, resets decoder state |
-| ~~**Multi-transport**~~ | ✅ done | `--transport tcp,web` runs TCP:9900 + HTTPS:9901 simultaneously (PR #3) |
-| ~~**Hardware probe**~~ | ✅ done | `--encoder auto` / `--capture auto` auto-detects GPU at startup (PR #3) |
-| ~~**Audio forwarding**~~ | ✅ done | PulseAudio (Linux) + WASAPI (Windows) → Opus 48kHz stereo, default feature |
-| ~~**WAN testing**~~ | ✅ done | Simulated latency/jitter E2E tests (0–300ms RTT, 8 tests) |
-| ~~**HTTP keep-alive + pool**~~ | ✅ done | Reuses TLS connections, bounded 16-thread pool |
-| ~~**SIMD color conversion**~~ | ✅ done | AVX2 BGRA↔YUV + NV12↔RGB, 2.8–3.4x speedup at 1080p |
-| ~~**AV1 encoder**~~ | ✅ done | NVENC AV1 (Ada Lovelace+), `--codec av1`, 8.7ms at 1080p |
-| ~~**NVDEC hardware decode**~~ | ✅ done | Client H.264+AV1 GPU decode, feature-gated |
-| ~~**Adaptive bitrate**~~ | ✅ done | RTT-based, NVENC reconfigure API, hysteresis |
-| ~~**Stats + web overlay**~~ | ✅ done | RTT/FPS/bandwidth, floating HUD, Ping/Pong |
+| Application-level auth | DCV-style web login form → `LogonUser` API | Avoids Winlogon secure desktop entirely. Cleaner than remote-controlling lock screen. Used by DCV, Parsec, RDP, TeamViewer |
+| NAT relay (TURN) | Symmetric NAT / firewall bypass | Only remaining networking gap for "works everywhere" |
+| VAAPI GPU encoding | AMD/Intel GPU encode on Linux | Broadens GPU support beyond NVIDIA |
+| DMA-BUF/KMS capture | Linux zero-copy capture | Eliminates CPU readback on Linux (like NVFBC but vendor-neutral) |
 
-### Host Performance
+### Future
 | Task | Impact |
 |------|--------|
-| VAAPI GPU encoding | AMD/Intel GPU encode |
 | x264 via FFmpeg | 2-3x better compression than OpenH264 |
-| ~~AV1 encoding (NVENC/SVT-AV1)~~ | ✅ Done — NVENC AV1 hardware encode (Ada Lovelace+), 8.7ms/frame at 1080p |
-| DMA-BUF/KMS capture | Linux zero-copy |
-| ~~SIMD color conversion~~ | ✅ Done — AVX2 BGRA→NV12 2.8x, YUV→RGB 3.4x (runtime-detected, scalar fallback) |
-
-### Native Client Performance
-| Task | Impact |
-|------|--------|
 | QUIC Unreliable Datagram | video over datagram, no retransmit |
 | 0-RTT reconnect | instant reconnect on network switch |
-| ~~Hardware decode (DXVA2/VideoToolbox/VA-API)~~ | ✅ Done — NVDEC (H.264+AV1), VideoToolbox (macOS), dav1d (AV1 software) |
 | GPU direct render (wgpu) | zero-copy display |
-
-### Features
-| Task | Impact |
-|------|--------|
-| ~~Make WS default, WebRTC optional~~ | ✅ done — WS default, `--features webrtc` + `?rtc` for WebRTC |
-| ~~Wayland capture (PipeWire)~~ | ✅ done — `--features wayland` or `--capture pipewire`, auto-detected on Wayland sessions via XDG Portal + PipeWire |
-| ~~Multi-monitor~~ | ✅ done — `--display N` to select display, `--list-displays` to enumerate |
-| ~~File transfer~~ | ✅ done — bidirectional, chunked, SHA-256 verified |
-| ~~NAT discovery (STUN)~~ | ✅ done — `--stun auto` discovers public IP, prints connection code |
-| NAT relay (TURN) | symmetric NAT / firewall bypass without port forwarding |
-| ~~Windows Service mode~~ | ✅ done — Session 0 service + agent, IPC pipe, DXGI→NVENC in agent, GDI lock screen fallback |
-| Application-level auth | DCV-style web login form → LogonUser API (avoids Winlogon secure desktop entirely) |
-
-### Enterprise
-| Task | Impact |
-|------|--------|
 | GPU sharing (OpenGL interposition) | cloud workstations |
 | DLP (watermark, clipboard control) | enterprise security |
 | Session recording | audit/training |
 | Protocol multiplexing | same port, auto-detect client type |
+
+### Completed
+<details>
+<summary>44 features shipped (click to expand)</summary>
+
+| Task | Status |
+|------|--------|
+| NVENC GPU encoding | ✅ encode 47ms→10ms (CPU path), 4ms (zero-copy) |
+| NVFBC GPU capture | ✅ zero-copy CUdeviceptr, ~0.4ms capture |
+| Windows support | ✅ DXGI capture, auto-start via schtasks |
+| Web client WSS fallback | ✅ `?ws` URL param, same HTTPS port |
+| WebRTC session disconnect | ✅ ICE Disconnected → drop ActiveClient |
+| DXGI→NVENC zero-copy | ✅ 6fps→47fps on Windows L40 |
+| WS default, WebRTC optional | ✅ `--features webrtc` + `?rtc` |
+| Web client auto-reconnect | ✅ Exponential backoff 1s→5s cap |
+| Multi-transport | ✅ `--transport tcp,web` TCP:9900 + HTTPS:9901 |
+| Hardware probe | ✅ `--encoder auto` / `--capture auto` |
+| Audio forwarding | ✅ PulseAudio + WASAPI → Opus 48kHz stereo |
+| WAN testing | ✅ 8 E2E tests: 0–300ms RTT, jitter |
+| HTTP keep-alive + pool | ✅ bounded 16-thread pool, 30s idle timeout |
+| SIMD color conversion | ✅ AVX2 BGRA↔YUV 2.8–3.4x speedup |
+| AV1 encoder | ✅ NVENC AV1 (Ada Lovelace+), 8.7ms/frame |
+| NVDEC hardware decode | ✅ Client H.264+AV1 GPU decode |
+| Adaptive bitrate | ✅ RTT-based, NVENC reconfigure API |
+| Stats + web overlay | ✅ RTT/FPS/bandwidth floating HUD |
+| Wayland capture (PipeWire) | ✅ XDG Portal + PipeWire, auto-detected |
+| Multi-monitor | ✅ `--display N`, `--list-displays` |
+| File transfer | ✅ bidirectional, chunked, SHA-256 |
+| NAT discovery (STUN) | ✅ `--stun auto`, connection code |
+| VideoToolbox decode | ✅ macOS hardware H.264 decode |
+| 4K support | ✅ bilinear downscale, aspect-ratio letterbox |
+| Windows Service mode | ✅ Session 0 + agent, IPC pipe, DXGI→NVENC, GDI lock screen fallback |
+
+</details>
 
 ---
 
