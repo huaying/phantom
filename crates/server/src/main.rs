@@ -116,6 +116,11 @@ struct Args {
     #[arg(long)]
     agent_mode: bool,
 
+    /// Windows session ID for IPC pipe isolation (passed by service to agent).
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    ipc_session: Option<u32>,
+
     /// Run as Windows Service (invoked by SCM — do not use manually).
     /// Use `--install` to register the service instead.
     #[cfg(target_os = "windows")]
@@ -126,32 +131,39 @@ struct Args {
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("phantom=info".parse().unwrap()),
-        )
-        .init();
-
     let args = Args::parse();
 
-    // ── Windows Service mode ────────────────────────────────────────────────
-    // When installed, the service binary is registered with `--service` flag.
-    // SCM launches us → we enter the service dispatcher → never returns until
-    // service stops. This is a clean, explicit detection (no heuristics).
+    // ── Windows: agent/service modes need early detection before tracing init ──
     #[cfg(target_os = "windows")]
     {
         if args.service {
+            // Service mode: tracing will be set up by the service itself.
+            // Initialize console tracing for the SCM dispatcher.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("phantom=info".parse().unwrap()),
+                )
+                .init();
             tracing::info!("Entering Windows Service dispatcher mode");
             return service_win::run_as_service()
                 .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
         }
 
         if args.agent_mode {
-            tracing::info!("Running as agent (user session capture + input)");
-            return run_agent_mode();
+            // Agent mode: no console, write tracing output to a log file
+            // in the system temp directory.
+            return run_agent_mode(args.ipc_session);
         }
     }
+
+    // ── Normal console mode: tracing to stdout ─────────────────────────────
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("phantom=info".parse().unwrap()),
+        )
+        .init();
 
     // ── Graceful shutdown signal (Ctrl+C / SIGTERM) ─────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -995,33 +1007,43 @@ fn uninstall_autostart() -> Result<()> {
 /// Captures the screen via DXGI/scrap, sends frames to the service via IPC,
 /// and receives input events to inject into the desktop.
 #[cfg(target_os = "windows")]
-fn run_agent_mode() -> Result<()> {
+fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    // Redirect agent tracing to file (spawned by service, no console)
-    let _ = std::fs::write(r"C:\Users\horde\phantom-agent.log", "Agent starting\n");
-    fn agent_log(msg: &str) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-            .open(r"C:\Users\horde\phantom-agent.log") {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
-        }
+    // Agent has no console (spawned by the service). Set up tracing to write
+    // to a log file in the system temp directory instead of stdout.
+    let log_file = std::env::temp_dir().join("phantom-agent.log");
+    if let Ok(file) = std::fs::File::create(&log_file) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("phantom=info".parse().unwrap()),
+            )
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    } else {
+        // Fallback: if we can't create the log file, init with default (stdout).
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("phantom=info".parse().unwrap()),
+            )
+            .init();
     }
 
-    agent_log("Connecting to IPC pipe...");
-    let ipc = match ipc_pipe::IpcClient::connect() {
-        Ok(c) => { agent_log("IPC connected!"); c }
-        Err(e) => { agent_log(&format!("IPC connect FAILED: {e}")); return Err(e); }
+    tracing::info!("Connecting to IPC pipe...");
+    let ipc = match ipc_pipe::IpcClient::connect(ipc_session) {
+        Ok(c) => { tracing::info!("IPC connected"); c }
+        Err(e) => { tracing::error!("IPC connect FAILED: {e}"); return Err(e); }
     };
 
     // Set up input injection
     let mut injector = match input_injector::InputInjector::new() {
         Ok(inj) => Some(inj),
-        Err(e) => { agent_log(&format!("Input injection unavailable: {e}")); None }
+        Err(e) => { tracing::warn!("Input injection unavailable: {e}"); None }
     };
 
     // Graceful shutdown
@@ -1049,38 +1071,6 @@ fn run_agent_loop(
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
-    use windows::Win32::System::StationsAndDesktops::{
-        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
-    };
-
-    fn agent_log(msg: &str) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-            .open(r"C:\Users\horde\phantom-agent.log") {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-            let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
-        }
-    }
-
-    /// Switch thread to whichever desktop is receiving input (user or Winlogon).
-    /// Called before every capture attempt, like RustDesk/Sunshine.
-    /// Uses GENERIC_ALL for full desktop access (required for DXGI).
-    fn switch_to_input_desktop() -> bool {
-        unsafe {
-            let hdesk = match OpenInputDesktop(
-                windows::Win32::System::StationsAndDesktops::DESKTOP_CONTROL_FLAGS(0),
-                false,
-                DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_ALL.0),
-            ) {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            let ok = SetThreadDesktop(hdesk).is_ok();
-            let _ = CloseDesktop(hdesk);
-            ok
-        }
-    }
 
     use phantom_core::capture::FrameCapture;
     use phantom_core::encode::FrameEncoder;
@@ -1099,11 +1089,11 @@ fn run_agent_loop(
     let mut height = 1080u32;
     let mut using_gdi = false;
 
-    agent_log("Starting agent loop");
+    tracing::info!("Starting agent loop");
 
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
         let loop_start = Instant::now();
-        switch_to_input_desktop();
+        capture_gdi::switch_to_input_desktop();
 
         // Try to init/reinit DXGI pipeline (preferred, GPU zero-copy)
         if gpu_pipeline.is_none() && last_init_attempt.elapsed() > Duration::from_secs(1) {
@@ -1114,9 +1104,9 @@ fn run_agent_loop(
                     height = gpu.height;
                     gpu.force_keyframe();
                     if using_gdi {
-                        agent_log(&format!("Switched back to DXGI→NVENC: {width}x{height}"));
+                        tracing::info!(width, height, "Switched back to DXGI→NVENC");
                     } else {
-                        agent_log(&format!("DXGI→NVENC ready: {width}x{height}"));
+                        tracing::info!(width, height, "DXGI→NVENC ready");
                     }
                     gpu_pipeline = Some(gpu);
                     gdi_capture = None;
@@ -1134,17 +1124,17 @@ fn run_agent_loop(
                                 match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
                                     Ok(mut e) => {
                                         e.force_keyframe();
-                                        agent_log(&format!("GDI+OpenH264 fallback: {w}x{h}"));
+                                        tracing::info!(width = w, height = h, "GDI+OpenH264 fallback");
                                         cpu_encoder = Some(Box::new(e));
                                         gdi_capture = Some(gdi);
                                         using_gdi = true;
                                     }
-                                    Err(e) => agent_log(&format!("OpenH264 init failed: {e}")),
+                                    Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
                                 }
                             }
                             Err(e) => {
                                 if frame_count == 0 {
-                                    agent_log(&format!("GDI also failed: {e} (will retry)"));
+                                    tracing::warn!("GDI also failed: {e} (will retry)");
                                 }
                             }
                         }
@@ -1171,20 +1161,21 @@ fn run_agent_loop(
                 Ok(Some(encoded)) => {
                     frame_count += 1;
                     if frame_count <= 3 || frame_count % 300 == 0 {
-                        agent_log(&format!(
-                            "Frame #{frame_count}: {width}x{height} h264={} kf={} [GPU]",
-                            encoded.data.len(), encoded.is_keyframe
-                        ));
+                        tracing::info!(
+                            frame = frame_count, width, height,
+                            bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
+                            "GPU frame"
+                        );
                     }
                     if encoded.is_keyframe { last_keyframe = Instant::now(); }
                     if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
-                        agent_log(&format!("send FAILED: {e}"));
+                        tracing::error!("IPC send failed: {e}");
                         break;
                     }
                 }
                 Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
                 Err(e) => {
-                    agent_log(&format!("DXGI error: {e} — falling back to GDI"));
+                    tracing::warn!("DXGI error: {e}, falling back to GDI");
                     gpu_pipeline = None;
                     // Will try DXGI again in 1s, GDI immediately
                 }
@@ -1198,23 +1189,24 @@ fn run_agent_loop(
                         Ok(encoded) => {
                             frame_count += 1;
                             if frame_count <= 3 || frame_count % 300 == 0 {
-                                agent_log(&format!(
-                                    "Frame #{frame_count}: {width}x{height} h264={} kf={} [GDI]",
-                                    encoded.data.len(), encoded.is_keyframe
-                                ));
+                                tracing::info!(
+                                    frame = frame_count, width, height,
+                                    bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
+                                    "GDI frame"
+                                );
                             }
                             if encoded.is_keyframe { last_keyframe = Instant::now(); }
                             if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
-                                agent_log(&format!("send FAILED: {e}"));
+                                tracing::error!("IPC send failed: {e}");
                                 break;
                             }
                         }
-                        Err(e) => agent_log(&format!("GDI encode error: {e}")),
+                        Err(e) => tracing::warn!("GDI encode error: {e}"),
                     }
                 }
                 Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
                 Err(e) => {
-                    agent_log(&format!("GDI capture error: {e}"));
+                    tracing::warn!("GDI capture error: {e}");
                     gdi_capture = None;
                     cpu_encoder = None;
                 }
@@ -1226,7 +1218,7 @@ fn run_agent_loop(
 
         // Forward input events
         for event in ipc.recv_inputs() {
-            switch_to_input_desktop();
+            capture_gdi::switch_to_input_desktop();
             if let Some(ref mut inj) = injector {
                 let _ = inj.inject(&event);
             }
@@ -1238,7 +1230,7 @@ fn run_agent_loop(
         }
     }
 
-    agent_log("Agent shutting down");
+    tracing::info!("Agent shutting down");
     Ok(())
 }
 

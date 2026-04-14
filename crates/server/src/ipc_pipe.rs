@@ -2,8 +2,11 @@
 //!
 //! Uses TWO separate unidirectional pipes to avoid Windows synchronous I/O
 //! deadlock (only one I/O operation can be pending per handle at a time):
-//! - `\\.\pipe\PhantomIPC_up`   — agent → service (encoded H.264 frames, heartbeat)
-//! - `\\.\pipe\PhantomIPC_down` — service → agent (input, heartbeat, shutdown, keyframe-request)
+//! - `\\.\pipe\PhantomIPC_up_{session_id}`   — agent → service (encoded frames, heartbeat)
+//! - `\\.\pipe\PhantomIPC_down_{session_id}` — service → agent (input, heartbeat, shutdown, keyframe-request)
+//!
+//! Pipe names include the Windows session ID for isolation between multiple
+//! concurrent user sessions.
 //!
 //! Protocol (little-endian, binary):
 //! ```text
@@ -11,7 +14,7 @@
 //! ```
 //!
 //! Message types:
-//! - 0x01 EncodedFrame (agent → service): [u8 is_keyframe][u32 width][u32 height][H.264 data]
+//! - 0x01 EncodedFrame (agent → service): [u8 is_keyframe][u8 codec][u32 width][u32 height][data]
 //! - 0x02 InputEvent (service → agent): bincode-serialized InputEvent
 //! - 0x03 Heartbeat (bidirectional): empty payload
 //! - 0x04 Shutdown (service → agent): empty payload
@@ -44,11 +47,15 @@ mod platform {
         fn get(self) -> HANDLE { self.0 }
     }
 
-    /// Upstream pipe: agent writes encoded frames → service reads
-    const PIPE_UP: &str = r"\\.\pipe\PhantomIPC_up";
-    /// Downstream pipe: service writes input/control → agent reads
-    const PIPE_DOWN: &str = r"\\.\pipe\PhantomIPC_down";
     const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
+
+    /// Build session-isolated pipe names.
+    fn pipe_names(session_id: u32) -> (String, String) {
+        (
+            format!(r"\\.\pipe\PhantomIPC_up_{session_id}"),
+            format!(r"\\.\pipe\PhantomIPC_down_{session_id}"),
+        )
+    }
     const MSG_ENCODED_FRAME: u8 = 0x01;
     const MSG_INPUT: u8 = 0x02;
     const MSG_HEARTBEAT: u8 = 0x03;
@@ -107,10 +114,15 @@ mod platform {
     }
 
     /// Encode an EncodedFrame into the wire format:
-    /// [u8 is_keyframe][u32 width][u32 height][H.264/AV1 data]
+    /// [u8 is_keyframe][u8 codec][u32 width][u32 height][data]
+    /// codec: 0 = H264, 1 = AV1
     fn encode_ipc_frame(frame: &EncodedFrame, width: u32, height: u32) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(9 + frame.data.len());
+        let mut payload = Vec::with_capacity(10 + frame.data.len());
         payload.push(if frame.is_keyframe { 1 } else { 0 });
+        payload.push(match frame.codec {
+            VideoCodec::H264 => 0,
+            VideoCodec::Av1 => 1,
+        });
         payload.extend_from_slice(&width.to_le_bytes());
         payload.extend_from_slice(&height.to_le_bytes());
         payload.extend_from_slice(&frame.data);
@@ -119,16 +131,21 @@ mod platform {
 
     /// Decode an EncodedFrame from the wire format.
     fn decode_ipc_frame(payload: &[u8]) -> Result<(EncodedFrame, u32, u32)> {
-        if payload.len() < 9 {
+        if payload.len() < 10 {
             anyhow::bail!("encoded frame payload too short: {} bytes", payload.len());
         }
         let is_keyframe = payload[0] != 0;
-        let width = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-        let height = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
-        let data = payload[9..].to_vec();
+        let codec = match payload[1] {
+            0 => VideoCodec::H264,
+            1 => VideoCodec::Av1,
+            other => anyhow::bail!("unknown IPC codec byte: {other}"),
+        };
+        let width = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        let height = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
+        let data = payload[10..].to_vec();
         Ok((
             EncodedFrame {
-                codec: VideoCodec::H264,
+                codec,
                 data,
                 is_keyframe,
             },
@@ -226,15 +243,21 @@ mod platform {
         frame_rx: Option<mpsc::Receiver<IpcEncodedFrame>>,
         input_tx: Option<mpsc::Sender<InputEvent>>,
         shutdown: Arc<AtomicBool>,
+        /// Flag set by request_keyframe(), cleared by the write thread after sending.
+        keyframe_requested: Arc<AtomicBool>,
+        /// Flag set by send_shutdown(), cleared by the write thread after sending.
+        shutdown_requested: Arc<AtomicBool>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
+        _write_thread: Option<std::thread::JoinHandle<()>>,
     }
 
     unsafe impl Send for IpcServer {}
 
     impl IpcServer {
-        pub fn new() -> Result<Self> {
-            let up_handle = create_pipe(PIPE_UP)?;
-            let down_handle = create_pipe(PIPE_DOWN)?;
+        pub fn new(session_id: u32) -> Result<Self> {
+            let (pipe_up, pipe_down) = pipe_names(session_id);
+            let up_handle = create_pipe(&pipe_up)?;
+            let down_handle = create_pipe(&pipe_down)?;
 
             Ok(Self {
                 up_handle,
@@ -243,7 +266,10 @@ mod platform {
                 frame_rx: None,
                 input_tx: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
+                keyframe_requested: Arc::new(AtomicBool::new(false)),
+                shutdown_requested: Arc::new(AtomicBool::new(false)),
                 _read_thread: None,
+                _write_thread: None,
             })
         }
 
@@ -300,15 +326,37 @@ mod platform {
                     }
                 })?;
 
-            // Write thread: writes input to downstream pipe
+            // Write thread: sole owner of writes to the downstream pipe.
+            // Checks AtomicBool flags for keyframe/shutdown requests to avoid
+            // concurrent WriteFile calls from multiple threads.
             let down = SendHandle(self.down_handle);
             let shutdown2 = Arc::clone(&self.shutdown);
-            let _write_thread = std::thread::Builder::new()
+            let kf_flag = Arc::clone(&self.keyframe_requested);
+            let shutdown_flag = Arc::clone(&self.shutdown_requested);
+            let write_thread = std::thread::Builder::new()
                 .name("ipc-write".into())
                 .spawn(move || {
                     let handle = down.get();
+                    let mut heartbeat_elapsed = Instant::now();
                     while !shutdown2.load(Ordering::Relaxed) {
-                        match input_rx.recv_timeout(Duration::from_secs(5)) {
+                        // Check shutdown request flag (set by send_shutdown)
+                        if shutdown_flag.swap(false, Ordering::SeqCst) {
+                            let _ = unsafe { send_message(handle, MSG_SHUTDOWN, &[]) };
+                            break;
+                        }
+
+                        // Check keyframe request flag (set by request_keyframe)
+                        if kf_flag.swap(false, Ordering::SeqCst) {
+                            if let Err(e) = unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) } {
+                                if !shutdown2.load(Ordering::Relaxed) {
+                                    tracing::warn!("IPC keyframe write error: {e}");
+                                }
+                                break;
+                            }
+                        }
+
+                        // Drain input events (200ms timeout for responsive flag checking)
+                        match input_rx.recv_timeout(Duration::from_millis(200)) {
                             Ok(event) => {
                                 let payload = match bincode::serialize(&event) {
                                     Ok(p) => p,
@@ -320,13 +368,18 @@ mod platform {
                                     }
                                     break;
                                 }
+                                heartbeat_elapsed = Instant::now();
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if let Err(e) = unsafe { send_message(handle, MSG_HEARTBEAT, &[]) } {
-                                    if !shutdown2.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC heartbeat error: {e}");
+                                // Send heartbeat every 5s of inactivity
+                                if heartbeat_elapsed.elapsed() >= Duration::from_secs(5) {
+                                    if let Err(e) = unsafe { send_message(handle, MSG_HEARTBEAT, &[]) } {
+                                        if !shutdown2.load(Ordering::Relaxed) {
+                                            tracing::warn!("IPC heartbeat error: {e}");
+                                        }
+                                        break;
                                     }
-                                    break;
+                                    heartbeat_elapsed = Instant::now();
                                 }
                             }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -335,6 +388,7 @@ mod platform {
                 })?;
 
             self._read_thread = Some(read_thread);
+            self._write_thread = Some(write_thread);
             Ok(())
         }
 
@@ -363,20 +417,21 @@ mod platform {
         }
 
         /// Request the agent to send a keyframe.
+        /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn request_keyframe(&self) -> Result<()> {
             if self.connected {
-                unsafe { send_message(self.down_handle, MSG_FORCE_KEYFRAME, &[]) }
-            } else {
-                Ok(())
+                self.keyframe_requested.store(true, Ordering::SeqCst);
             }
+            Ok(())
         }
 
+        /// Request orderly shutdown of the agent.
+        /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn send_shutdown(&self) -> Result<()> {
             if self.connected {
-                unsafe { send_message(self.down_handle, MSG_SHUTDOWN, &[]) }
-            } else {
-                Ok(())
+                self.shutdown_requested.store(true, Ordering::SeqCst);
             }
+            Ok(())
         }
 
         pub fn is_connected(&self) -> bool {
@@ -422,9 +477,31 @@ mod platform {
     unsafe impl Send for IpcClient {}
 
     impl IpcClient {
-        pub fn connect() -> Result<Self> {
-            let up_handle = open_pipe(PIPE_UP, 50)?;
-            let down_handle = open_pipe(PIPE_DOWN, 50)?;
+        /// Connect to the service's IPC pipes.
+        /// If `session_id` is provided, uses it directly. Otherwise, auto-detects
+        /// from the current process's session ID via ProcessIdToSessionId.
+        pub fn connect(session_id: Option<u32>) -> Result<Self> {
+            let sid = match session_id {
+                Some(id) => id,
+                None => {
+                    // Auto-detect session ID from current process
+                    let mut sid: u32 = 0;
+                    let pid = std::process::id();
+                    unsafe {
+                        extern "system" {
+                            fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
+                        }
+                        if ProcessIdToSessionId(pid, &mut sid) == 0 {
+                            anyhow::bail!("ProcessIdToSessionId failed for PID {pid}");
+                        }
+                    }
+                    tracing::info!(session_id = sid, "Auto-detected IPC session ID");
+                    sid
+                }
+            };
+            let (pipe_up, pipe_down) = pipe_names(sid);
+            let up_handle = open_pipe(&pipe_up, 50)?;
+            let down_handle = open_pipe(&pipe_down, 50)?;
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let keyframe_requested = Arc::new(AtomicBool::new(false));
@@ -533,7 +610,7 @@ mod platform {
 
     pub struct IpcServer;
     impl IpcServer {
-        pub fn new() -> Result<Self> {
+        pub fn new(_session_id: u32) -> Result<Self> {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
         pub fn wait_for_connection(&mut self, _timeout: Duration) -> Result<bool> {
@@ -562,7 +639,7 @@ mod platform {
 
     pub struct IpcClient;
     impl IpcClient {
-        pub fn connect() -> Result<Self> {
+        pub fn connect(_session_id: Option<u32>) -> Result<Self> {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
         pub fn send_encoded_frame(&self, _frame: &EncodedFrame, _w: u32, _h: u32) -> Result<()> {

@@ -22,18 +22,6 @@ use windows_service::define_windows_service;
 use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "PhantomServer";
-
-/// Simple file logger for service mode debugging.
-#[cfg(target_os = "windows")]
-pub fn svc_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-        .open(r"C:\Users\horde\phantom-service.log") {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
-    }
-}
 const SERVICE_DISPLAY_NAME: &str = "Phantom Remote Desktop Server";
 const SERVICE_DESCRIPTION: &str =
     "Phantom remote desktop server — provides remote access including pre-login lock screen.";
@@ -55,7 +43,7 @@ fn phantom_service_main(arguments: Vec<OsString>) {
 }
 
 fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
-    svc_log("=== Service starting ===");
+    tracing::info!("=== Service starting ===");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -176,11 +164,11 @@ fn run_server_loop(
             .collect();
         match bytes {
             Ok(b) => {
-                svc_log(&format!("JWT authentication ENABLED ({} byte secret)", b.len()));
+                tracing::info!("JWT authentication ENABLED ({} byte secret)", b.len());
                 Some(b)
             }
             Err(_) => {
-                svc_log("WARNING: PHANTOM_AUTH_SECRET invalid hex, auth disabled");
+                tracing::warn!("PHANTOM_AUTH_SECRET invalid hex, auth disabled");
                 None
             }
         }
@@ -205,13 +193,16 @@ fn run_server_loop(
     drop(conn_tx);
 
     // Session manager: monitors user sessions and launches agents
-    svc_log("Creating SessionManager");
+    tracing::info!("Creating SessionManager");
     let mut session_mgr = SessionManager::new();
     // Do an initial poll to detect any already-logged-in user
-    svc_log("Initial session update");
+    tracing::info!("Initial session update");
     session_mgr.update();
-    svc_log(&format!("After update: has_agent={}, has_ipc={}",
-        session_mgr.agent.is_some(), session_mgr.ipc.is_some()));
+    tracing::info!(
+        has_agent = session_mgr.agent.is_some(),
+        has_ipc = session_mgr.ipc.is_some(),
+        "After initial session update"
+    );
 
     // Main loop: accept connections and run sessions
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
@@ -333,7 +324,7 @@ fn create_service_session(
     #[cfg(not(target_os = "windows"))]
     let has_ipc = false;
 
-    svc_log(&format!("create_service_session: has_ipc={has_ipc}"));
+    tracing::info!(has_ipc, "create_service_session");
     if has_ipc {
         #[cfg(target_os = "windows")]
         {
@@ -341,19 +332,22 @@ fn create_service_session(
 
             // Wait for first encoded frame from agent to get resolution
             let mut attempts = 0;
-            svc_log("Waiting for first encoded frame from agent...");
+            tracing::info!("Waiting for first encoded frame from agent...");
             let (width, height) = loop {
                 if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
-                    svc_log(&format!("Got encoded frame: {}x{} {} bytes kf={}",
-                        ef.width, ef.height, ef.encoded.data.len(), ef.encoded.is_keyframe));
+                    tracing::info!(
+                        width = ef.width, height = ef.height,
+                        bytes = ef.encoded.data.len(), keyframe = ef.encoded.is_keyframe,
+                        "Got encoded frame from agent"
+                    );
                     break (ef.width, ef.height);
                 }
                 attempts += 1;
                 if attempts % 10 == 0 {
-                    svc_log(&format!("Still waiting... attempt {attempts}/100"));
+                    tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
                 }
                 if attempts > 100 {
-                    svc_log("No encoded frames after 2s — falling back to GDI");
+                    tracing::warn!("No encoded frames after 2s — falling back to GDI");
                     return create_service_session_gdi(sender, receiver, cancel);
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -532,27 +526,27 @@ impl SessionManager {
             self.kill_agent();
 
             if session_id != 0xFFFFFFFF && session_id != 0 {
-                svc_log(&format!("Creating IPC pipe for session {session_id}"));
-                match crate::ipc_pipe::IpcServer::new() {
+                tracing::info!(session_id, "Creating IPC pipe");
+                match crate::ipc_pipe::IpcServer::new(session_id) {
                     Ok(mut ipc_server) => {
-                        svc_log("IPC pipe created, launching agent");
+                        tracing::info!(session_id, "IPC pipe created, launching agent");
                         match launch_agent_in_session(session_id) {
                             Ok(proc) => {
-                                svc_log(&format!("Agent launched PID={}", proc.pid));
+                                tracing::info!(pid = proc.pid, "Agent launched");
                                 self.agent = Some(proc);
 
                                 // Wait for agent to connect to the IPC pipe (up to 10s)
                                 match ipc_server.wait_for_connection(Duration::from_secs(10)) {
                                     Ok(true) => {
-                                        svc_log("IPC: agent connected!");
+                                        tracing::info!("IPC: agent connected");
                                         self.ipc = Some(ipc_server);
                                     }
                                     Ok(false) => {
-                                        svc_log("IPC: agent did NOT connect within timeout → GDI fallback");
+                                        tracing::warn!("IPC: agent did not connect within timeout, GDI fallback");
                                         ipc_server.disconnect();
                                     }
                                     Err(e) => {
-                                        svc_log(&format!("IPC: connection error: {e}"));
+                                        tracing::warn!("IPC: connection error: {e}");
                                         ipc_server.disconnect();
                                     }
                                 }
@@ -603,7 +597,7 @@ impl SessionManager {
                     if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
                         tracing::info!(session_id = self.current_session_id, "Relaunching agent");
                         // Create fresh IPC pipe for the new agent
-                        if let Ok(mut ipc_server) = crate::ipc_pipe::IpcServer::new() {
+                        if let Ok(mut ipc_server) = crate::ipc_pipe::IpcServer::new(self.current_session_id) {
                             match launch_agent_in_session(self.current_session_id) {
                                 Ok(proc) => {
                                     tracing::info!(pid = proc.pid, "Agent relaunched");
@@ -726,8 +720,9 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         // Build command line
         let exe_path = std::env::current_exe().context("get current exe")?;
         let cmd_line = format!(
-            "\"{}\" --agent-mode --listen 127.0.0.1:9910 --no-encrypt",
-            exe_path.display()
+            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
+            exe_path.display(),
+            session_id,
         );
         let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 

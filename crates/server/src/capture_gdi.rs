@@ -25,6 +25,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
 };
 
+/// Switch the current thread to whichever desktop is receiving input.
+/// Used by both GdiCapture and the agent loop to follow desktop switches
+/// (e.g., lock screen / user desktop transitions).
+///
+/// Returns true if the switch succeeded, false otherwise.
+pub fn switch_to_input_desktop() -> bool {
+    unsafe {
+        let hdesk = match OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
+        ) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let ok = SetThreadDesktop(hdesk).is_ok();
+        let _ = CloseDesktop(hdesk);
+        ok
+    }
+}
+
 /// GDI-based screen capture. Works in Session 0 (service context).
 pub struct GdiCapture {
     width: u32,
@@ -51,39 +72,9 @@ impl GdiCapture {
     }
 
     /// Switch the current thread to whichever desktop is receiving input.
-    /// This is essential for Session 0: without it, we'd capture the
-    /// empty Session 0 desktop instead of the Winlogon lock screen.
-    ///
-    /// Returns Ok(true) if we switched, Ok(false) if we couldn't open
-    /// the input desktop (non-fatal — we'll capture whatever we can).
-    fn switch_to_input_desktop(&self) -> Result<bool> {
-        unsafe {
-            // DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP are needed
-            // for SetThreadDesktop; GENERIC_READ covers these.
-            let hdesk = match OpenInputDesktop(
-                DESKTOP_CONTROL_FLAGS(0),
-                false,
-                DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::debug!("OpenInputDesktop failed (expected in some states): {e}");
-                    return Ok(false);
-                }
-            };
-
-            if let Err(e) = SetThreadDesktop(hdesk) {
-                let _ = CloseDesktop(hdesk);
-                tracing::debug!("SetThreadDesktop failed: {e}");
-                return Ok(false);
-            }
-
-            // SetThreadDesktop keeps its own reference to the desktop;
-            // we can (and must) close our handle to avoid leaking one per frame.
-            let _ = CloseDesktop(hdesk);
-
-            Ok(true)
-        }
+    /// Delegates to the module-level [`switch_to_input_desktop()`] function.
+    fn switch_to_active_desktop(&self) -> bool {
+        switch_to_input_desktop()
     }
 }
 
@@ -91,7 +82,7 @@ impl FrameCapture for GdiCapture {
     fn capture(&mut self) -> Result<Option<Frame>> {
         // Try to switch to the active input desktop (Winlogon / user desktop).
         // If this fails, we'll still capture whatever desktop we're on.
-        let _ = self.switch_to_input_desktop();
+        let _ = self.switch_to_active_desktop();
 
         unsafe {
             let hwnd = GetDesktopWindow();
