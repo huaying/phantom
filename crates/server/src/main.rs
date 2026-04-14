@@ -1269,10 +1269,18 @@ fn run_agent_loop(
         }
 
         // Forward input events
-        for event in ipc.recv_inputs() {
+        let inputs = ipc.recv_inputs();
+        if !inputs.is_empty() {
+            tracing::info!(count = inputs.len(), "agent received input events");
+        }
+        for event in inputs {
             capture_gdi::switch_to_input_desktop();
             if let Some(ref mut inj) = injector {
-                let _ = inj.inject(&event);
+                if let Err(e) = inj.inject(&event) {
+                    tracing::warn!("input inject failed: {e}");
+                }
+            } else {
+                tracing::warn!("no injector available");
             }
         }
 

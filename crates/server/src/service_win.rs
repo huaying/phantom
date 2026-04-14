@@ -670,103 +670,116 @@ fn get_active_console_session_id() -> u32 {
 }
 
 /// Launch the phantom agent process in a specific user session.
-/// Launch agent in the target session using SYSTEM token (like Sunshine).
+/// Launch agent in the target session via schtasks (interactive task).
 ///
-/// Uses the service's own SYSTEM token with the session ID set to the target session.
-/// This gives the agent SYSTEM privileges, allowing access to both user desktop
-/// and Winlogon desktop (lock screen) — required for desktop switching on lock/unlock.
+/// CreateProcessAsUser from a service creates processes with wrong UIPI
+/// integrity level — SendInput gets "Access denied". Using schtasks /IT
+/// launches the agent in the user's full interactive context, matching
+/// the security level of processes started by the user's shell (explorer).
+/// This is the same context as console mode, where input works correctly.
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
 fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> {
     use anyhow::Context;
-    use std::mem;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::TOKEN_QUERY;
-    use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
-    };
-    use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
-        PROCESS_INFORMATION, STARTUPINFOW,
-    };
 
-    unsafe {
-        // Get the service's own SYSTEM token (we run as LocalSystem).
-        // Then set the session ID so the process launches in the user's session
-        // but with SYSTEM privileges (can access Winlogon desktop).
-        let mut service_token = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ALL_ACCESS | TOKEN_QUERY,
-            &mut service_token,
-        )
-        .context("OpenProcessToken failed")?;
-        let mut dup_token = HANDLE::default();
-        let dup_result = DuplicateTokenEx(
-            service_token,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut dup_token,
-        );
-        let _ = CloseHandle(service_token);
-        dup_result.context("DuplicateTokenEx (SYSTEM token) failed")?;
+    let exe_path = std::env::current_exe().context("get current exe")?;
+    let task_name = format!("PhantomAgent_{session_id}");
+    let cmd = format!(
+        "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
+        exe_path.display(),
+        session_id,
+    );
 
-        // Set the session ID on the duplicated token
-        let sid = session_id;
-        let result = windows::Win32::Security::SetTokenInformation(
-            dup_token,
-            windows::Win32::Security::TokenSessionId,
-            &sid as *const u32 as *const std::ffi::c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-        if result.is_err() {
-            let _ = CloseHandle(dup_token);
-            anyhow::bail!("SetTokenInformation(TokenSessionId={session_id}) failed");
-        }
+    // Delete any stale task from previous run
+    let _ = std::process::Command::new("schtasks")
+        .args(["/Delete", "/TN", &task_name, "/F"])
+        .output();
 
-        // Build command line
-        let exe_path = std::env::current_exe().context("get current exe")?;
-        let cmd_line = format!(
-            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
-            exe_path.display(),
-            session_id,
-        );
-        let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+    // Create a one-time interactive task
+    let create = std::process::Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN", &task_name,
+            "/TR", &cmd,
+            "/SC", "ONCE",
+            "/ST", "00:00",
+            "/RL", "HIGHEST",
+            "/IT",      // Interactive Token — runs in user's desktop context
+            "/F",
+        ])
+        .output()
+        .context("schtasks /Create")?;
 
-        let mut si: STARTUPINFOW = mem::zeroed();
-        si.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        // Target the interactive window station + desktop
-        let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
-        si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
-
-        let mut pi: PROCESS_INFORMATION = mem::zeroed();
-
-        let result = CreateProcessAsUserW(
-            dup_token,
-            None,
-            windows::core::PWSTR(cmd_wide.as_mut_ptr()),
-            None,
-            None,
-            false,
-            CREATE_UNICODE_ENVIRONMENT,
-            None,
-            None,
-            &si,
-            &mut pi,
-        );
-        let _ = CloseHandle(dup_token);
-        result.context("CreateProcessAsUserW failed")?;
-
-        let _ = CloseHandle(pi.hThread);
-
-        Ok(WinProcessHandle {
-            handle: pi.hProcess,
-            pid: pi.dwProcessId,
-        })
+    if !create.status.success() {
+        let stderr = String::from_utf8_lossy(&create.stderr);
+        anyhow::bail!("schtasks /Create failed: {stderr}");
     }
+
+    // Run it immediately
+    let run = std::process::Command::new("schtasks")
+        .args(["/Run", "/TN", &task_name])
+        .output()
+        .context("schtasks /Run")?;
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        anyhow::bail!("schtasks /Run failed: {stderr}");
+    }
+
+    // Wait briefly for the process to start, then find its PID
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Find the agent process by command line
+    let pid = find_agent_pid(session_id);
+    match pid {
+        Some(pid) => {
+            tracing::info!(pid, session_id, "Agent launched via schtasks");
+            // Open handle for lifecycle management
+            unsafe {
+                let handle = windows::Win32::System::Threading::OpenProcess(
+                    windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
+                    false,
+                    pid,
+                )
+                .context("OpenProcess for agent")?;
+                Ok(WinProcessHandle { handle, pid })
+            }
+        }
+        None => {
+            anyhow::bail!("Agent process not found after schtasks launch");
+        }
+    }
+}
+
+/// Find the agent process PID in the target session.
+#[cfg(target_os = "windows")]
+fn find_agent_pid(session_id: u32) -> Option<u32> {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq phantom-server.exe", "/FO", "CSV", "/V"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines().skip(1) {
+        // CSV format: "Image Name","PID","Session Name","Session#",...
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() >= 4 {
+            let pid: u32 = fields[1].trim_matches('"').parse().ok()?;
+            let sess: u32 = fields[3].trim_matches('"').parse().unwrap_or(0);
+            if sess == session_id && pid != std::process::id() {
+                // Check if this is the agent (not the service)
+                if let Some(cmd) = fields.last() {
+                    if cmd.contains("agent-mode") {
+                        return Some(pid);
+                    }
+                }
+                // If no command line info, check if it's in the user session
+                // and not the current process
+                return Some(pid);
+            }
+        }
+    }
+    None
 }
 
 // ── Service installation helpers ────────────────────────────────────────────
