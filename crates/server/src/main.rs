@@ -104,6 +104,12 @@ struct Args {
     #[arg(long)]
     public_addr: Option<String>,
 
+    /// HMAC-SHA256 shared secret (hex-encoded) for JWT token authentication.
+    /// When set, WebSocket clients must provide a valid JWT via ?token= query param.
+    /// The JWT is signed by an external platform (e.g. CloudStack, Horde).
+    #[arg(long)]
+    auth_secret: Option<String>,
+
     /// Run as agent process (launched by service in user session).
     /// Handles DXGI capture + input injection, connects back to service.
     #[cfg(target_os = "windows")]
@@ -389,6 +395,20 @@ fn main() -> Result<()> {
         .unwrap_or("0.0.0.0")
         .to_string();
 
+    // Parse JWT auth secret (hex → bytes)
+    let auth_secret: Option<Vec<u8>> = match &args.auth_secret {
+        Some(hex) => {
+            let bytes: Result<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(Into::into))
+                .collect();
+            let bytes = bytes.map_err(|_| anyhow::anyhow!("invalid --auth-secret: expected hex string"))?;
+            tracing::info!("JWT authentication ENABLED for WebSocket connections");
+            Some(bytes)
+        }
+        None => None,
+    };
+
     for transport in &transports {
         match *transport {
             "tcp" => {
@@ -441,7 +461,7 @@ fn main() -> Result<()> {
                     base_port
                 };
                 let mut ws_transport =
-                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2)?;
+                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2, auth_secret.clone())?;
                 tracing::info!("open https://localhost:{web_port} in browser");
                 // Share audio WS receiver with the session loop
                 audio_ws_rx_shared = Some(Arc::new(std::sync::Mutex::new(

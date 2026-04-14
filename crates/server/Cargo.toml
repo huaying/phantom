@@ -13,6 +13,7 @@ wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + 
 [dependencies]
 phantom-core = { path = "../core" }
 anyhow = "1"
+base64 = "0.22"
 bincode = "1"
 bytes = "1"
 tracing = "0.1"

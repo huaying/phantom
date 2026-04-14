@@ -2585,6 +2585,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "audiopus",
+ "base64",
  "bincode",
  "bytes",
  "clap",

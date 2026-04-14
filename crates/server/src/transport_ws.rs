@@ -7,6 +7,105 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use tungstenite::WebSocket;
 
+// ── JWT token authentication ────────────────────────────────────────────────
+
+/// Extract a query parameter value from a raw HTTP path (e.g. "/ws?token=abc").
+fn extract_query_param<'a>(raw_path: &'a str, key: &str) -> Option<&'a str> {
+    raw_path.split('?').nth(1).and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == key { Some(v) } else { None }
+        })
+    })
+}
+
+/// Verify a JWT token signed with HMAC-SHA256.
+/// Returns (sub, vm_id) claims on success.
+fn verify_jwt(token: &str, secret: &[u8]) -> Result<(String, String)> {
+    use base64::Engine;
+    let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("invalid JWT: expected 3 parts");
+    }
+    let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
+
+    // Verify HMAC-SHA256 signature
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let signature = url_safe.decode(sig_b64).context("decode JWT signature")?;
+    ring::hmac::verify(&key, signing_input.as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("invalid JWT signature"))?;
+
+    // Parse header — verify alg
+    let header: serde_json::Value =
+        serde_json::from_slice(&url_safe.decode(header_b64).context("decode JWT header")?)?;
+    if header["alg"].as_str() != Some("HS256") {
+        anyhow::bail!("unsupported JWT algorithm: {}", header["alg"]);
+    }
+
+    // Parse claims
+    let claims: serde_json::Value =
+        serde_json::from_slice(&url_safe.decode(payload_b64).context("decode JWT payload")?)?;
+
+    // Check expiration
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if let Some(exp) = claims["exp"].as_u64() {
+        if now > exp {
+            anyhow::bail!("JWT expired");
+        }
+    } else {
+        anyhow::bail!("JWT missing exp claim");
+    }
+    // Check not-before (optional)
+    if let Some(nbf) = claims["nbf"].as_u64() {
+        if now < nbf {
+            anyhow::bail!("JWT not yet valid");
+        }
+    }
+
+    let sub = claims["sub"].as_str().unwrap_or("unknown").to_string();
+    let vm_id = claims["vm_id"].as_str().unwrap_or("").to_string();
+    Ok((sub, vm_id))
+}
+
+/// Check JWT auth on a WebSocket upgrade request. Returns Ok(()) if auth passes
+/// or if no auth is configured. Returns Err with HTTP 401 already sent on failure.
+fn check_ws_auth(
+    stream: &mut (impl Read + Write),
+    raw_path: &str,
+    auth_secret: &Option<Vec<u8>>,
+) -> Result<()> {
+    let secret = match auth_secret {
+        Some(s) => s,
+        None => return Ok(()), // No auth configured
+    };
+    match extract_query_param(raw_path, "token") {
+        Some(token) => match verify_jwt(token, secret) {
+            Ok((user, vm_id)) => {
+                tracing::info!(user, vm_id, "authenticated WebSocket");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("JWT auth failed: {e}");
+                let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized");
+                let _ = stream.flush();
+                anyhow::bail!("auth failed");
+            }
+        },
+        None => {
+            tracing::warn!("WebSocket missing ?token= param");
+            let _ = write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized");
+            let _ = stream.flush();
+            anyhow::bail!("auth required");
+        }
+    }
+}
+
 #[cfg(feature = "webrtc")]
 use std::sync::Mutex;
 #[cfg(feature = "webrtc")]
@@ -149,7 +248,8 @@ pub struct WsConnection {
 }
 
 impl WebServerTransport {
-    pub fn start(http_port: u16, _ws_port: u16, _udp_port: u16) -> Result<Self> {
+    pub fn start(http_port: u16, _ws_port: u16, _udp_port: u16, auth_secret: Option<Vec<u8>>) -> Result<Self> {
+        let auth_secret = Arc::new(auth_secret);
         // Channel for WS connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
         let (audio_ws_tx, audio_ws_rx) = mpsc::channel::<WsSender>();
@@ -202,6 +302,7 @@ impl WebServerTransport {
                     let ws_tx = ws_tx.clone();
                     let audio_ws_tx = audio_ws_tx.clone();
                     let candidate_addr = candidate_addr;
+                    let auth = auth_secret.clone();
                     std::thread::Builder::new()
                         .name("http-handler".into())
                         .spawn(move || {
@@ -217,7 +318,7 @@ impl WebServerTransport {
 
                             // Keep-alive loop: serve multiple requests on the same TLS connection
                             for _req_num in 0..MAX_REQUESTS_PER_CONN {
-                                match handle_http_rw_rtc(&mut stream, &rtc_tx, candidate_addr) {
+                                match handle_http_rw_rtc(&mut stream, &rtc_tx, candidate_addr, &auth) {
                                     Ok(HttpResult::WsUpgrade) => {
                                         spawn_ws_connection(stream, ws_tx);
                                         return;
@@ -262,6 +363,7 @@ impl WebServerTransport {
                     let tls = tls_acceptor.clone();
                     let ws_tx = ws_tx.clone();
                     let audio_ws_tx = audio_ws_tx.clone();
+                    let auth = auth_secret.clone();
                     std::thread::Builder::new()
                         .name("http-handler".into())
                         .spawn(move || {
@@ -275,7 +377,7 @@ impl WebServerTransport {
                             let _ = stream.sock.set_read_timeout(Some(KEEPALIVE_TIMEOUT));
 
                             for _req_num in 0..MAX_REQUESTS_PER_CONN {
-                                match handle_http_rw(&mut stream) {
+                                match handle_http_rw(&mut stream, &auth) {
                                     Ok(HttpResult::WsUpgrade) => {
                                         spawn_ws_connection(stream, ws_tx);
                                         return;
@@ -368,11 +470,10 @@ fn wants_close(request: &str) -> bool {
 
 /// HTTP handler WITHOUT WebRTC (no POST /rtc).
 #[cfg(not(feature = "webrtc"))]
-fn handle_http_rw(stream: &mut (impl Read + Write)) -> Result<HttpResult> {
+fn handle_http_rw(stream: &mut (impl Read + Write), auth_secret: &Option<Vec<u8>>) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
     if n == 0 {
-        // Client closed the connection
         anyhow::bail!("client closed");
     }
     buf.truncate(n);
@@ -385,6 +486,7 @@ fn handle_http_rw(stream: &mut (impl Read + Write)) -> Result<HttpResult> {
     // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
+        check_ws_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
             return Ok(HttpResult::WsUpgradeAudio);
@@ -406,6 +508,7 @@ fn handle_http_rw_rtc(
     stream: &mut (impl Read + Write),
     rtc_tx: &mpsc::Sender<str0m::Rtc>,
     candidate_addr: std::net::SocketAddr,
+    auth_secret: &Option<Vec<u8>>,
 ) -> Result<HttpResult> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf)?;
@@ -423,6 +526,7 @@ fn handle_http_rw_rtc(
     // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
+        check_ws_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
             return Ok(HttpResult::WsUpgradeAudio);

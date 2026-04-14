@@ -61,6 +61,9 @@ struct Args {
     /// Send a file to the server after connecting.
     #[arg(long)]
     send_file: Option<String>,
+    /// JWT token for authenticated WebSocket connections.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 /// Try to create an NVDEC hardware decoder. Returns None if unavailable.

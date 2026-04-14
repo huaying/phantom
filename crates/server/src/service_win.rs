@@ -169,7 +169,7 @@ fn run_server_loop(
 
     // Start Web/WS listener
     let ws_transport =
-        transport_ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3)?;
+        transport_ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3, None)?;
     let tx = conn_tx.clone();
     std::thread::Builder::new()
         .name("svc-web-accept".into())
