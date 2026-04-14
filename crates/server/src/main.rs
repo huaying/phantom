@@ -993,102 +993,242 @@ fn run_agent_mode() -> Result<()> {
     }
 
     agent_log("Connecting to IPC pipe...");
-    tracing::info!("Agent: connecting to service IPC pipe...");
     let ipc = match ipc_pipe::IpcClient::connect() {
         Ok(c) => { agent_log("IPC connected!"); c }
         Err(e) => { agent_log(&format!("IPC connect FAILED: {e}")); return Err(e); }
     };
-    tracing::info!("Agent: IPC connected");
-    // Wait for service to start its read thread after ConnectNamedPipe returns.
-    // Without this, the agent can fill the pipe buffer before the service reads.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    agent_log("Post-connect wait done, starting capture");
-
-    // Set up capture (try scrap/DXGI first — we're in the user's session so it should work)
-    let mut capture: Box<dyn phantom_core::capture::FrameCapture> =
-        match capture_scrap::ScrapCapture::new() {
-            Ok(cap) => {
-                tracing::info!("Agent: using scrap (DXGI) capture");
-                Box::new(cap)
-            }
-            Err(e) => {
-                tracing::error!("Agent: scrap capture failed: {e}");
-                anyhow::bail!("No capture method available in agent mode: {e}");
-            }
-        };
 
     // Set up input injection
     let mut injector = match input_injector::InputInjector::new() {
-        Ok(inj) => {
-            tracing::info!("Agent: input injection ready");
-            Some(inj)
-        }
-        Err(e) => {
-            tracing::warn!("Agent: input injection unavailable: {e}");
-            None
-        }
+        Ok(inj) => Some(inj),
+        Err(e) => { agent_log(&format!("Input injection unavailable: {e}")); None }
     };
 
     // Graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = Arc::clone(&shutdown);
-        ctrlc::set_handler(move || {
-            shutdown.store(true, Ordering::SeqCst);
-        })
-        .ok(); // May fail if handler already set
+        ctrlc::set_handler(move || { shutdown.store(true, Ordering::SeqCst); }).ok();
     }
 
-    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-    let mut last_frame_time = Instant::now();
+    // Run agent capture+encode loop.
+    // Like RustDesk/Sunshine: calls OpenInputDesktop+SetThreadDesktop before capture,
+    // reinits DXGI on ACCESS_LOST (desktop switch: lock/unlock).
+    run_agent_loop(&ipc, &mut injector, &shutdown)
+}
 
-    agent_log("Entering capture loop");
+/// Agent capture+encode loop following RustDesk/Sunshine pattern:
+/// - Calls OpenInputDesktop + SetThreadDesktop before capture (follows desktop switches)
+/// - On DXGI error: reinit pipeline (don't crash)
+/// - Survives lock/unlock transitions
+#[cfg(target_os = "windows")]
+fn run_agent_loop(
+    ipc: &ipc_pipe::IpcClient,
+    injector: &mut Option<input_injector::InputInjector>,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+    };
+
+    fn agent_log(msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(r"C:\Users\horde\phantom-agent.log") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let _ = writeln!(f, "[{:.1}s] {}", now.as_secs_f64(), msg);
+        }
+    }
+
+    /// Switch thread to whichever desktop is receiving input (user or Winlogon).
+    /// Called before every capture attempt, like RustDesk/Sunshine.
+    /// Uses GENERIC_ALL for full desktop access (required for DXGI).
+    fn switch_to_input_desktop() -> bool {
+        unsafe {
+            let hdesk = match OpenInputDesktop(
+                windows::Win32::System::StationsAndDesktops::DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_ALL.0),
+            ) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+            let ok = SetThreadDesktop(hdesk).is_ok();
+            let _ = CloseDesktop(hdesk);
+            ok
+        }
+    }
+
+    use phantom_core::capture::FrameCapture;
+    use phantom_core::encode::FrameEncoder;
+
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+
+    // Two capture modes: DXGI+NVENC (GPU) and GDI+OpenH264 (CPU, lock screen fallback)
+    let mut gpu_pipeline: Option<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> = None;
+    let mut gdi_capture: Option<capture_gdi::GdiCapture> = None;
+    let mut cpu_encoder: Option<Box<dyn FrameEncoder>> = None;
+
     let mut frame_count = 0u64;
+    let mut last_keyframe = Instant::now();
+    let mut last_init_attempt = Instant::now() - Duration::from_secs(10);
+    let mut width = 1920u32;
+    let mut height = 1080u32;
+    let mut using_gdi = false;
+
+    agent_log("Starting agent loop");
+
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
-        let now = Instant::now();
-        let elapsed = now.duration_since(last_frame_time);
+        let loop_start = Instant::now();
+        switch_to_input_desktop();
+
+        // Try to init/reinit DXGI pipeline (preferred, GPU zero-copy)
+        if gpu_pipeline.is_none() && last_init_attempt.elapsed() > Duration::from_secs(1) {
+            last_init_attempt = Instant::now();
+            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(30, 5000) {
+                Ok(mut gpu) => {
+                    width = gpu.width;
+                    height = gpu.height;
+                    gpu.force_keyframe();
+                    if using_gdi {
+                        agent_log(&format!("Switched back to DXGI→NVENC: {width}x{height}"));
+                    } else {
+                        agent_log(&format!("DXGI→NVENC ready: {width}x{height}"));
+                    }
+                    gpu_pipeline = Some(gpu);
+                    gdi_capture = None;
+                    cpu_encoder = None;
+                    using_gdi = false;
+                }
+                Err(_) => {
+                    // DXGI unavailable (locked, no display) — use GDI fallback
+                    if gdi_capture.is_none() {
+                        match capture_gdi::GdiCapture::new() {
+                            Ok(gdi) => {
+                                let (w, h) = gdi.resolution();
+                                width = w;
+                                height = h;
+                                match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
+                                    Ok(mut e) => {
+                                        e.force_keyframe();
+                                        agent_log(&format!("GDI+OpenH264 fallback: {w}x{h}"));
+                                        cpu_encoder = Some(Box::new(e));
+                                        gdi_capture = Some(gdi);
+                                        using_gdi = true;
+                                    }
+                                    Err(e) => agent_log(&format!("OpenH264 init failed: {e}")),
+                                }
+                            }
+                            Err(e) => {
+                                if frame_count == 0 {
+                                    agent_log(&format!("GDI also failed: {e} (will retry)"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle keyframe requests
+        if ipc.take_keyframe_request() {
+            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
+            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            last_keyframe = Instant::now();
+        }
+        if last_keyframe.elapsed() > Duration::from_secs(2) {
+            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
+            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            last_keyframe = Instant::now();
+        }
+
+        // Capture + encode: GPU path (DXGI→NVENC)
+        if let Some(ref mut gpu) = gpu_pipeline {
+            match gpu.capture_and_encode() {
+                Ok(Some(encoded)) => {
+                    frame_count += 1;
+                    if frame_count <= 3 || frame_count % 300 == 0 {
+                        agent_log(&format!(
+                            "Frame #{frame_count}: {width}x{height} h264={} kf={} [GPU]",
+                            encoded.data.len(), encoded.is_keyframe
+                        ));
+                    }
+                    if encoded.is_keyframe { last_keyframe = Instant::now(); }
+                    if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                        agent_log(&format!("send FAILED: {e}"));
+                        break;
+                    }
+                }
+                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
+                Err(e) => {
+                    agent_log(&format!("DXGI error: {e} — falling back to GDI"));
+                    gpu_pipeline = None;
+                    // Will try DXGI again in 1s, GDI immediately
+                }
+            }
+        }
+        // Capture + encode: GDI fallback path (lock screen, no display)
+        else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder) {
+            match gdi.capture() {
+                Ok(Some(frame)) => {
+                    match enc.encode_frame(&frame) {
+                        Ok(encoded) => {
+                            frame_count += 1;
+                            if frame_count <= 3 || frame_count % 300 == 0 {
+                                agent_log(&format!(
+                                    "Frame #{frame_count}: {width}x{height} h264={} kf={} [GDI]",
+                                    encoded.data.len(), encoded.is_keyframe
+                                ));
+                            }
+                            if encoded.is_keyframe { last_keyframe = Instant::now(); }
+                            if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                                agent_log(&format!("send FAILED: {e}"));
+                                break;
+                            }
+                        }
+                        Err(e) => agent_log(&format!("GDI encode error: {e}")),
+                    }
+                }
+                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
+                Err(e) => {
+                    agent_log(&format!("GDI capture error: {e}"));
+                    gdi_capture = None;
+                    cpu_encoder = None;
+                }
+            }
+        } else {
+            // Neither available yet — wait for retry
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // Forward input events
+        for event in ipc.recv_inputs() {
+            switch_to_input_desktop();
+            if let Some(ref mut inj) = injector {
+                let _ = inj.inject(&event);
+            }
+        }
+
+        let elapsed = loop_start.elapsed();
         if elapsed < frame_interval {
             std::thread::sleep(frame_interval - elapsed);
         }
-
-        match capture.capture() {
-            Ok(Some(frame)) => {
-                last_frame_time = Instant::now();
-                frame_count += 1;
-                if frame_count <= 3 || frame_count % 100 == 0 {
-                    agent_log(&format!("Frame #{frame_count}: {}x{} {} bytes", frame.width, frame.height, frame.data.len()));
-                }
-                if let Err(e) = ipc.send_frame(&frame) {
-                    agent_log(&format!("send_frame FAILED: {e}"));
-                    break;
-                }
-            }
-            Ok(None) => {
-                // No new frame available, brief sleep
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => {
-                tracing::warn!("Agent: capture error: {e}");
-                // Try to reset capture
-                if let Err(re) = capture.reset() {
-                    tracing::error!("Agent: capture reset failed: {re}");
-                    break;
-                }
-            }
-        }
-
-        // Process input events from service
-        for event in ipc.recv_inputs() {
-            if let Some(ref mut inj) = injector {
-                if let Err(e) = inj.inject(&event) {
-                    tracing::trace!("Agent: input inject error: {e}");
-                }
-            }
-        }
     }
 
-    tracing::info!("Agent: shutting down");
+    agent_log("Agent shutting down");
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_agent_loop(
+    _ipc: &ipc_pipe::IpcClient,
+    _injector: &mut Option<input_injector::InputInjector>,
+    _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    anyhow::bail!("Agent mode only supported on Windows")
 }
 
 fn print_connection_code(addr: &str) {

@@ -1,23 +1,26 @@
 //! Named-pipe IPC between Service (Session 0) and Agent (user session).
 //!
+//! Uses TWO separate unidirectional pipes to avoid Windows synchronous I/O
+//! deadlock (only one I/O operation can be pending per handle at a time):
+//! - `\\.\pipe\PhantomIPC_up`   — agent → service (encoded H.264 frames, heartbeat)
+//! - `\\.\pipe\PhantomIPC_down` — service → agent (input, heartbeat, shutdown, keyframe-request)
+//!
 //! Protocol (little-endian, binary):
 //! ```text
 //! [u8 msg_type][u32 payload_len][payload...]
 //! ```
 //!
 //! Message types:
-//! - 0x01 Frame (agent → service): [u32 width][u32 height][zstd-compressed BGRA data]
+//! - 0x01 EncodedFrame (agent → service): [u8 is_keyframe][u32 width][u32 height][H.264 data]
 //! - 0x02 InputEvent (service → agent): bincode-serialized InputEvent
 //! - 0x03 Heartbeat (bidirectional): empty payload
 //! - 0x04 Shutdown (service → agent): empty payload
-//!
-//! Frames are zstd-compressed before sending (~8MB raw → ~200KB-2MB compressed)
-//! to keep pipe throughput manageable at 30 FPS.
+//! - 0x05 ForceKeyframe (service → agent): empty payload
 
 #[cfg(target_os = "windows")]
 mod platform {
     use anyhow::{Context, Result};
-    use phantom_core::frame::{Frame, PixelFormat};
+    use phantom_core::encode::{EncodedFrame, VideoCodec};
     use phantom_core::input::InputEvent;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -34,29 +37,26 @@ mod platform {
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
-    /// Wrapper to allow HANDLE to be sent between threads.
-    /// HANDLE is a kernel object handle (pointer-sized integer) — safe to use from any thread.
     #[derive(Clone, Copy)]
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
-
     impl SendHandle {
-        fn get(self) -> HANDLE {
-            self.0
-        }
+        fn get(self) -> HANDLE { self.0 }
     }
 
-    const PIPE_NAME: &str = r"\\.\pipe\PhantomIPC";
-    const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024; // 4MB buffer
-    const MSG_FRAME: u8 = 0x01;
+    /// Upstream pipe: agent writes encoded frames → service reads
+    const PIPE_UP: &str = r"\\.\pipe\PhantomIPC_up";
+    /// Downstream pipe: service writes input/control → agent reads
+    const PIPE_DOWN: &str = r"\\.\pipe\PhantomIPC_down";
+    const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
+    const MSG_ENCODED_FRAME: u8 = 0x01;
     const MSG_INPUT: u8 = 0x02;
     const MSG_HEARTBEAT: u8 = 0x03;
     const MSG_SHUTDOWN: u8 = 0x04;
-    const ZSTD_LEVEL: i32 = 1; // Fast compression for real-time frames
+    const MSG_FORCE_KEYFRAME: u8 = 0x05;
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
-    /// Write exactly `buf` bytes to a pipe handle.
     unsafe fn pipe_write_all(handle: HANDLE, buf: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < buf.len() {
@@ -68,7 +68,6 @@ mod platform {
         Ok(())
     }
 
-    /// Read exactly `len` bytes from a pipe handle.
     unsafe fn pipe_read_exact(handle: HANDLE, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
         let mut offset = 0;
@@ -84,7 +83,6 @@ mod platform {
         Ok(buf)
     }
 
-    /// Send a message over the pipe.
     unsafe fn send_message(handle: HANDLE, msg_type: u8, payload: &[u8]) -> Result<()> {
         let mut header = [0u8; 5];
         header[0] = msg_type;
@@ -96,7 +94,6 @@ mod platform {
         Ok(())
     }
 
-    /// Receive a message from the pipe. Returns (msg_type, payload).
     unsafe fn recv_message(handle: HANDLE) -> Result<(u8, Vec<u8>)> {
         let header = pipe_read_exact(handle, 5)?;
         let msg_type = header[0];
@@ -109,245 +106,248 @@ mod platform {
         Ok((msg_type, payload))
     }
 
-    /// Encode a Frame into the wire format: [u32 width][u32 height][zstd(bgra_data)]
-    fn encode_frame(frame: &Frame) -> Result<Vec<u8>> {
-        let compressed =
-            zstd::encode_all(frame.data.as_slice(), ZSTD_LEVEL).context("zstd compress frame")?;
-        let mut payload = Vec::with_capacity(8 + compressed.len());
-        payload.extend_from_slice(&frame.width.to_le_bytes());
-        payload.extend_from_slice(&frame.height.to_le_bytes());
-        payload.extend_from_slice(&compressed);
-        Ok(payload)
+    /// Encode an EncodedFrame into the wire format:
+    /// [u8 is_keyframe][u32 width][u32 height][H.264/AV1 data]
+    fn encode_ipc_frame(frame: &EncodedFrame, width: u32, height: u32) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(9 + frame.data.len());
+        payload.push(if frame.is_keyframe { 1 } else { 0 });
+        payload.extend_from_slice(&width.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
+        payload.extend_from_slice(&frame.data);
+        payload
     }
 
-    /// Decode a Frame from the wire format.
-    fn decode_frame(payload: &[u8]) -> Result<Frame> {
-        if payload.len() < 8 {
-            anyhow::bail!("frame payload too short: {} bytes", payload.len());
+    /// Decode an EncodedFrame from the wire format.
+    fn decode_ipc_frame(payload: &[u8]) -> Result<(EncodedFrame, u32, u32)> {
+        if payload.len() < 9 {
+            anyhow::bail!("encoded frame payload too short: {} bytes", payload.len());
         }
-        let width = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        let height = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        let data = zstd::decode_all(&payload[8..]).context("zstd decompress frame")?;
-        let expected = (width * height * 4) as usize;
-        if data.len() != expected {
-            anyhow::bail!(
-                "frame size mismatch: got {} bytes, expected {} ({}x{}x4)",
-                data.len(),
-                expected,
-                width,
-                height
-            );
-        }
-        Ok(Frame {
+        let is_keyframe = payload[0] != 0;
+        let width = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        let height = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+        let data = payload[9..].to_vec();
+        Ok((
+            EncodedFrame {
+                codec: VideoCodec::H264,
+                data,
+                is_keyframe,
+            },
             width,
             height,
-            format: PixelFormat::Bgra8,
-            data,
-            timestamp: Instant::now(),
-        })
+        ))
+    }
+
+    /// Helper: create a named pipe server-side handle.
+    fn create_pipe(name: &str) -> Result<HANDLE> {
+        unsafe {
+            let h = CreateNamedPipeW(
+                &HSTRING::from(name),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                PIPE_BUFFER_SIZE,
+                PIPE_BUFFER_SIZE,
+                0,
+                None,
+            );
+            if h.is_invalid() {
+                anyhow::bail!("CreateNamedPipe({name}) failed: {}", windows::core::Error::from_win32());
+            }
+            Ok(h)
+        }
+    }
+
+    fn wait_connect(handle: HANDLE, name: &str, timeout: Duration) -> Result<bool> {
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > timeout {
+                tracing::warn!("IPC: {name} connection timed out");
+                return Ok(false);
+            }
+            let result = unsafe { ConnectNamedPipe(handle, None) };
+            match result {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    let code = e.code().0;
+                    if code == 0x80070217u32 as i32 || code == 535 {
+                        return Ok(true);
+                    }
+                    if code == 0x800700E8u32 as i32 || code == 232 {
+                        return Ok(false);
+                    }
+                    return Err(e).context(format!("ConnectNamedPipe({name})"));
+                }
+            }
+        }
+    }
+
+    fn open_pipe(name: &str, max_attempts: u32) -> Result<HANDLE> {
+        let mut last_err = None;
+        for attempt in 0..max_attempts {
+            match unsafe {
+                CreateFileW(
+                    &HSTRING::from(name),
+                    (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            } {
+                Ok(h) => {
+                    tracing::info!("IPC: connected to {name} on attempt {}", attempt + 1);
+                    return Ok(h);
+                }
+                Err(e) => {
+                    if attempt < max_attempts - 1 {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap()).context(format!("open {name} after {max_attempts} attempts"))
     }
 
     // ── IPC Server (Service side) ───────────────────────────────────────────
 
-    /// IPC server running in the service process (Session 0).
-    /// Creates a named pipe and waits for the agent to connect.
+    /// Received encoded frame with resolution info.
+    pub struct IpcEncodedFrame {
+        pub encoded: EncodedFrame,
+        pub width: u32,
+        pub height: u32,
+    }
+
     pub struct IpcServer {
-        handle: HANDLE,
+        up_handle: HANDLE,
+        down_handle: HANDLE,
         connected: bool,
-        frame_rx: Option<mpsc::Receiver<Frame>>,
+        frame_rx: Option<mpsc::Receiver<IpcEncodedFrame>>,
         input_tx: Option<mpsc::Sender<InputEvent>>,
         shutdown: Arc<AtomicBool>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
-        _write_thread: Option<std::thread::JoinHandle<()>>,
     }
 
-    // HANDLE is Send-safe (it's just a pointer-sized value used for kernel calls)
     unsafe impl Send for IpcServer {}
 
     impl IpcServer {
-        /// Create the named pipe and wait for the agent to connect.
-        /// Returns immediately after pipe creation; call `wait_for_connection`
-        /// to block until an agent connects.
         pub fn new() -> Result<Self> {
-            let handle = unsafe {
-                let h = CreateNamedPipeW(
-                    &HSTRING::from(PIPE_NAME),
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    PIPE_UNLIMITED_INSTANCES,
-                    PIPE_BUFFER_SIZE,
-                    PIPE_BUFFER_SIZE,
-                    0,
-                    None,
-                );
-                if h.is_invalid() {
-                    anyhow::bail!("CreateNamedPipe failed: {}", windows::core::Error::from_win32());
-                }
-                h
-            };
+            let up_handle = create_pipe(PIPE_UP)?;
+            let down_handle = create_pipe(PIPE_DOWN)?;
 
             Ok(Self {
-                handle,
+                up_handle,
+                down_handle,
                 connected: false,
                 frame_rx: None,
                 input_tx: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 _read_thread: None,
-                _write_thread: None,
             })
         }
 
-        /// Block until an agent connects to the pipe, or timeout expires.
-        /// After connection, spawns read/write threads.
         pub fn wait_for_connection(&mut self, timeout: Duration) -> Result<bool> {
-            tracing::info!("IPC: waiting for agent connection (timeout {:?})", timeout);
-
-            // Poll-based approach: periodically check if someone connected
-            // by trying to do a peek. ConnectNamedPipe + thread had race conditions.
-            let start = std::time::Instant::now();
-
-            // First try ConnectNamedPipe synchronously with short timeouts
-            loop {
-                if start.elapsed() > timeout {
-                    tracing::warn!("IPC: connection timed out after {:?}", timeout);
-                    return Ok(false);
-                }
-
-                let result = unsafe { ConnectNamedPipe(self.handle, None) };
-                match result {
-                    Ok(()) => {
-                        tracing::info!("IPC: ConnectNamedPipe succeeded");
-                        break;
-                    }
-                    Err(e) => {
-                        let code = e.code().0;
-                        // ERROR_PIPE_CONNECTED = 535 → HRESULT 0x80070217
-                        if code == 0x80070217u32 as i32 || code == 535 {
-                            tracing::info!("IPC: client already connected (ERROR_PIPE_CONNECTED)");
-                            break;
-                        }
-                        // ERROR_NO_DATA = 232 → pipe was closed by client
-                        if code == 0x800700E8u32 as i32 || code == 232 {
-                            tracing::warn!("IPC: pipe broken, client disconnected");
-                            return Ok(false);
-                        }
-                        tracing::warn!("IPC: ConnectNamedPipe error: 0x{:08X} ({})", code as u32, code);
-                        return Err(e).context("ConnectNamedPipe");
-                    }
-                }
+            tracing::info!("IPC: waiting for agent on both pipes (timeout {:?})", timeout);
+            if !wait_connect(self.up_handle, "up", timeout)? {
+                return Ok(false);
             }
-
+            if !wait_connect(self.down_handle, "down", timeout)? {
+                return Ok(false);
+            }
             self.connected = true;
-            self.start_io_threads()?;
-            tracing::info!("IPC: agent connected, IO threads started");
+            self.start_io()?;
+            tracing::info!("IPC: agent connected on both pipes");
             Ok(true)
         }
 
-        /// Start read (frame) and write (input) threads.
-        fn start_io_threads(&mut self) -> Result<()> {
+        fn start_io(&mut self) -> Result<()> {
             let (frame_tx, frame_rx) = mpsc::channel();
             let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
-
             self.frame_rx = Some(frame_rx);
             self.input_tx = Some(input_tx);
 
-            // Read thread: receives frames from agent
-            let handle = SendHandle(self.handle);
+            // Read thread: reads encoded H.264 frames from upstream pipe
+            let up = SendHandle(self.up_handle);
             let shutdown = Arc::clone(&self.shutdown);
-            let read_thread =
-                std::thread::Builder::new()
-                    .name("ipc-read".into())
-                    .spawn(move || {
-                        let handle = handle.get();
-                        super::service_win::svc_log("IPC read thread started");
-                        let mut frame_count = 0u64;
-                        while !shutdown.load(Ordering::Relaxed) {
-                            super::service_win::svc_log(&format!("IPC read thread: calling recv_message (frame_count={frame_count})"));
-                            match unsafe { recv_message(handle) } {
-                                Ok((MSG_FRAME, payload)) => {
-                                    frame_count += 1;
-                                    super::service_win::svc_log(&format!("IPC: received frame #{frame_count} ({} bytes payload)", payload.len()));
-                                    match decode_frame(&payload) {
-                                        Ok(frame) => {
-                                            let _ = frame_tx.send(frame);
-                                        }
-                                        Err(e) => {
-                                            super::service_win::svc_log(&format!("IPC: bad frame: {e}"));
-                                        }
+            let read_thread = std::thread::Builder::new()
+                .name("ipc-read".into())
+                .spawn(move || {
+                    let handle = up.get();
+                    while !shutdown.load(Ordering::Relaxed) {
+                        match unsafe { recv_message(handle) } {
+                            Ok((MSG_ENCODED_FRAME, payload)) => {
+                                match decode_ipc_frame(&payload) {
+                                    Ok((encoded, w, h)) => {
+                                        let _ = frame_tx.send(IpcEncodedFrame {
+                                            encoded,
+                                            width: w,
+                                            height: h,
+                                        });
                                     }
+                                    Err(e) => tracing::warn!("IPC: bad encoded frame: {e}"),
                                 }
-                                Ok((MSG_HEARTBEAT, _)) => {}
-                                Ok((msg_type, _)) => {
-                                    super::service_win::svc_log(&format!("IPC: unexpected message type 0x{msg_type:02x}"));
+                            }
+                            Ok((MSG_HEARTBEAT, _)) => {}
+                            Ok((t, _)) => tracing::debug!("IPC up: unexpected 0x{t:02x}"),
+                            Err(e) => {
+                                if !shutdown.load(Ordering::Relaxed) {
+                                    tracing::warn!("IPC read error: {e}");
                                 }
-                                Err(e) => {
-                                    if !shutdown.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC read error (agent disconnected?): {e}");
+                                break;
+                            }
+                        }
+                    }
+                })?;
+
+            // Write thread: writes input to downstream pipe
+            let down = SendHandle(self.down_handle);
+            let shutdown2 = Arc::clone(&self.shutdown);
+            let _write_thread = std::thread::Builder::new()
+                .name("ipc-write".into())
+                .spawn(move || {
+                    let handle = down.get();
+                    while !shutdown2.load(Ordering::Relaxed) {
+                        match input_rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(event) => {
+                                let payload = match bincode::serialize(&event) {
+                                    Ok(p) => p,
+                                    Err(e) => { tracing::warn!("IPC serialize: {e}"); continue; }
+                                };
+                                if let Err(e) = unsafe { send_message(handle, MSG_INPUT, &payload) } {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC write error: {e}");
                                     }
                                     break;
                                 }
                             }
-                        }
-                    })?;
-
-            // Write thread: sends input events to agent
-            let handle = SendHandle(self.handle);
-            let shutdown = Arc::clone(&self.shutdown);
-            let write_thread =
-                std::thread::Builder::new()
-                    .name("ipc-write".into())
-                    .spawn(move || {
-                        let handle = handle.get();
-                        while !shutdown.load(Ordering::Relaxed) {
-                            match input_rx.recv_timeout(Duration::from_secs(5)) {
-                                Ok(event) => {
-                                    let payload = match bincode::serialize(&event) {
-                                        Ok(p) => p,
-                                        Err(e) => {
-                                            tracing::warn!("IPC: serialize input: {e}");
-                                            continue;
-                                        }
-                                    };
-                                    if let Err(e) =
-                                        unsafe { send_message(handle, MSG_INPUT, &payload) }
-                                    {
-                                        if !shutdown.load(Ordering::Relaxed) {
-                                            tracing::warn!("IPC write error: {e}");
-                                        }
-                                        break;
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if let Err(e) = unsafe { send_message(handle, MSG_HEARTBEAT, &[]) } {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC heartbeat error: {e}");
                                     }
+                                    break;
                                 }
-                                Err(mpsc::RecvTimeoutError::Timeout) => {
-                                    // Send heartbeat to detect broken pipe
-                                    if let Err(e) =
-                                        unsafe { send_message(handle, MSG_HEARTBEAT, &[]) }
-                                    {
-                                        if !shutdown.load(Ordering::Relaxed) {
-                                            tracing::warn!("IPC heartbeat write error: {e}");
-                                        }
-                                        break;
-                                    }
-                                }
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                    })?;
+                    }
+                })?;
 
             self._read_thread = Some(read_thread);
-            self._write_thread = Some(write_thread);
             Ok(())
         }
 
-        /// Try to receive the latest frame from the agent.
-        /// Returns the most recent frame, dropping any older queued frames.
-        pub fn recv_frame(&self) -> Option<Frame> {
-            let rx = self.frame_rx.as_ref()?;
-            let mut latest = None;
-            // Drain to get the most recent frame (skip stale ones)
-            while let Ok(frame) = rx.try_recv() {
-                latest = Some(frame);
+        /// Receive all queued encoded frames from the agent.
+        /// H.264 frames MUST be forwarded in order — never skip frames.
+        pub fn recv_encoded_frames(&self) -> Vec<IpcEncodedFrame> {
+            let mut frames = Vec::new();
+            if let Some(ref rx) = self.frame_rx {
+                while let Ok(frame) = rx.try_recv() {
+                    frames.push(frame);
+                }
             }
-            latest
+            frames
         }
 
         /// Send an input event to the agent for injection.
@@ -358,33 +358,38 @@ mod platform {
             Ok(())
         }
 
-        /// Get a cloneable input sender for use as an InputForwarder.
-        /// Returns None if IPC I/O threads haven't been started.
         pub fn input_sender(&self) -> Option<mpsc::Sender<InputEvent>> {
             self.input_tx.clone()
         }
 
-        /// Send shutdown command to agent.
-        pub fn send_shutdown(&self) -> Result<()> {
+        /// Request the agent to send a keyframe.
+        pub fn request_keyframe(&self) -> Result<()> {
             if self.connected {
-                unsafe { send_message(self.handle, MSG_SHUTDOWN, &[]) }
+                unsafe { send_message(self.down_handle, MSG_FORCE_KEYFRAME, &[]) }
             } else {
                 Ok(())
             }
         }
 
-        /// Whether the agent is connected.
+        pub fn send_shutdown(&self) -> Result<()> {
+            if self.connected {
+                unsafe { send_message(self.down_handle, MSG_SHUTDOWN, &[]) }
+            } else {
+                Ok(())
+            }
+        }
+
         pub fn is_connected(&self) -> bool {
             self.connected
         }
 
-        /// Disconnect and clean up.
         pub fn disconnect(&mut self) {
             self.shutdown.store(true, Ordering::SeqCst);
             if self.connected {
                 let _ = self.send_shutdown();
                 unsafe {
-                    let _ = DisconnectNamedPipe(self.handle);
+                    let _ = DisconnectNamedPipe(self.up_handle);
+                    let _ = DisconnectNamedPipe(self.down_handle);
                 }
                 self.connected = false;
             }
@@ -397,18 +402,19 @@ mod platform {
         fn drop(&mut self) {
             self.disconnect();
             unsafe {
-                let _ = CloseHandle(self.handle);
+                let _ = CloseHandle(self.up_handle);
+                let _ = CloseHandle(self.down_handle);
             }
         }
     }
 
     // ── IPC Client (Agent side) ─────────────────────────────────────────────
 
-    /// IPC client running in the agent process (user session).
-    /// Connects to the service's named pipe.
     pub struct IpcClient {
-        handle: HANDLE,
+        up_handle: HANDLE,
+        down_handle: HANDLE,
         shutdown: Arc<AtomicBool>,
+        keyframe_requested: Arc<AtomicBool>,
         input_rx: Option<mpsc::Receiver<InputEvent>>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -416,77 +422,40 @@ mod platform {
     unsafe impl Send for IpcClient {}
 
     impl IpcClient {
-        /// Connect to the service's named pipe.
         pub fn connect() -> Result<Self> {
-            // Retry connecting to the pipe — service may not have created it yet.
-            let handle = {
-                let mut last_err = None;
-                let mut h = None;
-                for attempt in 0..50u32 {
-                    match unsafe {
-                        CreateFileW(
-                            &HSTRING::from(PIPE_NAME),
-                            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-                            FILE_SHARE_NONE,
-                            None,
-                            OPEN_EXISTING,
-                            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-                            None,
-                        )
-                    } {
-                        Ok(handle) => {
-                            tracing::info!("IPC: connected to pipe on attempt {}", attempt + 1);
-                            h = Some(handle);
-                            break;
-                        }
-                        Err(e) => {
-                            if attempt < 49 {
-                                std::thread::sleep(std::time::Duration::from_millis(200));
-                            }
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                match h {
-                    Some(handle) => handle,
-                    None => return Err(last_err.unwrap()).context("connect to IPC pipe after 50 attempts"),
-                }
-            };
+            let up_handle = open_pipe(PIPE_UP, 50)?;
+            let down_handle = open_pipe(PIPE_DOWN, 50)?;
 
             let shutdown = Arc::new(AtomicBool::new(false));
+            let keyframe_requested = Arc::new(AtomicBool::new(false));
 
-            // Read thread: receives input events and shutdown from service
             let (input_tx, input_rx) = mpsc::channel();
-            let read_handle = SendHandle(handle);
+            let down = SendHandle(down_handle);
             let read_shutdown = Arc::clone(&shutdown);
+            let read_kf = Arc::clone(&keyframe_requested);
 
             let read_thread = std::thread::Builder::new()
                 .name("ipc-agent-read".into())
                 .spawn(move || {
-                    let read_handle = read_handle.get();
+                    let handle = down.get();
                     while !read_shutdown.load(Ordering::Relaxed) {
-                        match unsafe { recv_message(read_handle) } {
+                        match unsafe { recv_message(handle) } {
                             Ok((MSG_INPUT, payload)) => {
                                 match bincode::deserialize::<InputEvent>(&payload) {
-                                    Ok(event) => {
-                                        let _ = input_tx.send(event);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("IPC: deserialize input: {e}");
-                                    }
+                                    Ok(event) => { let _ = input_tx.send(event); }
+                                    Err(e) => tracing::warn!("IPC: deserialize input: {e}"),
                                 }
                             }
                             Ok((MSG_SHUTDOWN, _)) => {
-                                tracing::info!("IPC: received shutdown from service");
+                                tracing::info!("IPC: shutdown from service");
                                 read_shutdown.store(true, Ordering::SeqCst);
                                 break;
                             }
-                            Ok((MSG_HEARTBEAT, _)) => {
-                                tracing::trace!("IPC: heartbeat from service");
+                            Ok((MSG_FORCE_KEYFRAME, _)) => {
+                                read_kf.store(true, Ordering::SeqCst);
                             }
-                            Ok((msg_type, _)) => {
-                                tracing::debug!("IPC: unexpected message 0x{:02x}", msg_type);
-                            }
+                            Ok((MSG_HEARTBEAT, _)) => {}
+                            Ok((t, _)) => tracing::debug!("IPC down: unexpected 0x{t:02x}"),
                             Err(e) => {
                                 if !read_shutdown.load(Ordering::Relaxed) {
                                     tracing::warn!("IPC agent read error: {e}");
@@ -498,23 +467,28 @@ mod platform {
                     }
                 })?;
 
-            tracing::info!("IPC: connected to service pipe");
+            tracing::info!("IPC: connected to service (two pipes)");
             Ok(Self {
-                handle,
+                up_handle,
+                down_handle,
                 shutdown,
+                keyframe_requested,
                 input_rx: Some(input_rx),
                 _read_thread: Some(read_thread),
             })
         }
 
-        /// Send a captured frame to the service.
-        pub fn send_frame(&self, frame: &Frame) -> Result<()> {
-            let payload = encode_frame(frame)?;
-            unsafe { send_message(self.handle, MSG_FRAME, &payload) }
+        /// Send an encoded H.264 frame to the service via upstream pipe.
+        pub fn send_encoded_frame(&self, frame: &EncodedFrame, width: u32, height: u32) -> Result<()> {
+            let payload = encode_ipc_frame(frame, width, height);
+            unsafe { send_message(self.up_handle, MSG_ENCODED_FRAME, &payload) }
         }
 
-        /// Try to receive pending input events from the service.
-        /// Returns all queued events (non-blocking).
+        /// Check and clear the keyframe request flag.
+        pub fn take_keyframe_request(&self) -> bool {
+            self.keyframe_requested.swap(false, Ordering::SeqCst)
+        }
+
         pub fn recv_inputs(&self) -> Vec<InputEvent> {
             let mut events = Vec::new();
             if let Some(ref rx) = self.input_rx {
@@ -525,7 +499,6 @@ mod platform {
             events
         }
 
-        /// Whether the service has requested shutdown.
         pub fn should_shutdown(&self) -> bool {
             self.shutdown.load(Ordering::Relaxed)
         }
@@ -535,7 +508,8 @@ mod platform {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::SeqCst);
             unsafe {
-                let _ = CloseHandle(self.handle);
+                let _ = CloseHandle(self.up_handle);
+                let _ = CloseHandle(self.down_handle);
             }
         }
     }
@@ -547,9 +521,15 @@ mod platform {
 #[allow(dead_code)]
 mod platform {
     use anyhow::Result;
-    use phantom_core::frame::Frame;
+    use phantom_core::encode::EncodedFrame;
     use phantom_core::input::InputEvent;
     use std::time::Duration;
+
+    pub struct IpcEncodedFrame {
+        pub encoded: EncodedFrame,
+        pub width: u32,
+        pub height: u32,
+    }
 
     pub struct IpcServer;
     impl IpcServer {
@@ -559,14 +539,17 @@ mod platform {
         pub fn wait_for_connection(&mut self, _timeout: Duration) -> Result<bool> {
             Ok(false)
         }
-        pub fn recv_frame(&self) -> Option<Frame> {
-            None
+        pub fn recv_encoded_frames(&self) -> Vec<IpcEncodedFrame> {
+            Vec::new()
         }
         pub fn send_input(&self, _event: InputEvent) -> Result<()> {
             Ok(())
         }
         pub fn input_sender(&self) -> Option<std::sync::mpsc::Sender<InputEvent>> {
             None
+        }
+        pub fn request_keyframe(&self) -> Result<()> {
+            Ok(())
         }
         pub fn send_shutdown(&self) -> Result<()> {
             Ok(())
@@ -582,8 +565,11 @@ mod platform {
         pub fn connect() -> Result<Self> {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
-        pub fn send_frame(&self, _frame: &Frame) -> Result<()> {
+        pub fn send_encoded_frame(&self, _frame: &EncodedFrame, _w: u32, _h: u32) -> Result<()> {
             Ok(())
+        }
+        pub fn take_keyframe_request(&self) -> bool {
+            false
         }
         pub fn recv_inputs(&self) -> Vec<InputEvent> {
             Vec::new()
@@ -595,4 +581,4 @@ mod platform {
 }
 
 #[allow(unused_imports)]
-pub use platform::{IpcClient, IpcServer};
+pub use platform::{IpcClient, IpcEncodedFrame, IpcServer};

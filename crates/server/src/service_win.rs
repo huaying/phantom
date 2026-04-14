@@ -309,7 +309,6 @@ fn create_service_session(
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<crate::session::SessionResult> {
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-    let quality_delay = Duration::from_millis(2000);
 
     // Check if agent IPC is available
     #[cfg(target_os = "windows")]
@@ -321,34 +320,27 @@ fn create_service_session(
     if has_ipc {
         #[cfg(target_os = "windows")]
         {
-            use phantom_core::capture::FrameCapture as _;
             let ipc = session_mgr.ipc.as_ref().unwrap();
-            let mut capture = IpcFrameCapture::new(ipc);
-            // We need to get a first frame to know the resolution
-            // Wait briefly for agent to start sending
+
+            // Wait for first encoded frame from agent to get resolution
             let mut attempts = 0;
-            svc_log("Waiting for first frame from agent IPC...");
+            svc_log("Waiting for first encoded frame from agent...");
             let (width, height) = loop {
-                if let Some(frame) = ipc.recv_frame() {
-                    svc_log(&format!("Got frame from IPC: {}x{} {} bytes", frame.width, frame.height, frame.data.len()));
-                    capture.last_frame = Some(frame);
-                    break capture.resolution();
+                if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
+                    svc_log(&format!("Got encoded frame: {}x{} {} bytes kf={}",
+                        ef.width, ef.height, ef.encoded.data.len(), ef.encoded.is_keyframe));
+                    break (ef.width, ef.height);
                 }
                 attempts += 1;
                 if attempts % 10 == 0 {
-                    svc_log(&format!("Still waiting for frame... attempt {attempts}/100"));
+                    svc_log(&format!("Still waiting... attempt {attempts}/100"));
                 }
                 if attempts > 100 {
-                    svc_log("No frames from agent after 2s — falling back to GDI");
+                    svc_log("No encoded frames after 2s — falling back to GDI");
                     return create_service_session_gdi(sender, receiver, cancel);
                 }
                 std::thread::sleep(Duration::from_millis(20));
             };
-
-            let mut encoder = Box::new(crate::encode_h264::OpenH264Encoder::new(
-                width, height, 30.0, 2000,
-            )?);
-            let mut differ = phantom_core::tile::TileDiffer::new();
 
             // Create input forwarder to send input events to agent via IPC
             let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
@@ -356,15 +348,13 @@ fn create_service_session(
                     Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
                 });
 
-            let result = crate::session::run_session_cpu(
-                &mut capture,
-                &mut *encoder,
-                &mut differ,
+            let result = crate::session::run_session_ipc(
+                ipc,
                 crate::session::SessionConfig {
                     sender,
                     receiver,
                     frame_interval,
-                    quality_delay,
+                    quality_delay: Duration::from_millis(2000),
                     cancel,
                     send_file: None,
                     video_codec: phantom_core::encode::VideoCodec::H264,
@@ -372,8 +362,9 @@ fn create_service_session(
                     input_forwarder,
                     audio_ws_rx: None,
                 },
+                width,
+                height,
             );
-            differ.reset();
             return Ok(result);
         }
     }
@@ -413,13 +404,6 @@ fn create_service_session_gdi(
     Ok(result)
 }
 
-/// A FrameCapture adapter that pulls frames from the IPC pipe (agent's DXGI capture).
-#[cfg(target_os = "windows")]
-struct IpcFrameCapture<'a> {
-    ipc: &'a crate::ipc_pipe::IpcServer,
-    last_frame: Option<phantom_core::frame::Frame>,
-}
-
 /// An InputForwarder that sends input events to the agent via IPC.
 #[cfg(target_os = "windows")]
 struct IpcInputForwarder {
@@ -432,45 +416,6 @@ impl crate::session::InputForwarder for IpcInputForwarder {
         self.tx
             .send(event.clone())
             .map_err(|e| anyhow::anyhow!("IPC input forward failed: {e}"))
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl<'a> IpcFrameCapture<'a> {
-    fn new(ipc: &'a crate::ipc_pipe::IpcServer) -> Self {
-        Self {
-            ipc,
-            last_frame: None,
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl phantom_core::capture::FrameCapture for IpcFrameCapture<'_> {
-    fn capture(&mut self) -> anyhow::Result<Option<phantom_core::frame::Frame>> {
-        if let Some(frame) = self.ipc.recv_frame() {
-            self.last_frame = Some(phantom_core::frame::Frame {
-                width: frame.width,
-                height: frame.height,
-                format: frame.format,
-                data: Vec::new(), // keep metadata only for resolution tracking
-                timestamp: frame.timestamp,
-            });
-            Ok(Some(frame))
-        } else {
-            Ok(None) // No new frame from agent yet
-        }
-    }
-
-    fn resolution(&self) -> (u32, u32) {
-        self.last_frame
-            .as_ref()
-            .map(|f| (f.width, f.height))
-            .unwrap_or((1920, 1080))
-    }
-
-    fn reset(&mut self) -> anyhow::Result<()> {
-        Ok(()) // Nothing to reset — agent handles its own capture lifecycle
     }
 }
 
@@ -708,8 +653,11 @@ fn get_active_console_session_id() -> u32 {
 }
 
 /// Launch the phantom agent process in a specific user session.
-/// Uses WTSQueryUserToken + DuplicateTokenEx + CreateProcessAsUser to inject
-/// into the user's interactive desktop (winsta0\default).
+/// Launch agent in the target session using SYSTEM token (like Sunshine).
+///
+/// Uses the service's own SYSTEM token with the session ID set to the target session.
+/// This gives the agent SYSTEM privileges, allowing access to both user desktop
+/// and Winlogon desktop (lock screen) — required for desktop switching on lock/unlock.
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
@@ -720,49 +668,43 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     use windows::Win32::Security::{
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
     };
-    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    use windows::Win32::Security::TOKEN_QUERY;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION, STARTUPINFOW,
     };
 
     unsafe {
-        // Get the user's token for the target session.
-        // Retry a few times — WTSQueryUserToken can fail early in logon
-        // before the user profile is fully loaded.
-        let mut user_token = HANDLE::default();
-        let mut last_err = None;
-        for attempt in 0..5u64 {
-            match WTSQueryUserToken(session_id, &mut user_token) {
-                Ok(_) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    if attempt < 4 {
-                        std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
-                    }
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            return Err(e).context(
-                "WTSQueryUserToken failed after 5 attempts (need LocalSystem or SeTcbPrivilege)",
-            );
-        }
-
-        // Duplicate as primary token for CreateProcessAsUser
+        // Get the service's own SYSTEM token (we run as LocalSystem).
+        // Then set the session ID so the process launches in the user's session
+        // but with SYSTEM privileges (can access Winlogon desktop).
+        let mut service_token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS | TOKEN_QUERY, &mut service_token)
+            .context("OpenProcessToken failed")?;
         let mut dup_token = HANDLE::default();
         let dup_result = DuplicateTokenEx(
-            user_token,
+            service_token,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenPrimary,
             &mut dup_token,
         );
-        let _ = CloseHandle(user_token);
-        dup_result.context("DuplicateTokenEx failed")?;
+        let _ = CloseHandle(service_token);
+        dup_result.context("DuplicateTokenEx (SYSTEM token) failed")?;
+
+        // Set the session ID on the duplicated token
+        let sid = session_id;
+        let result = windows::Win32::Security::SetTokenInformation(
+            dup_token,
+            windows::Win32::Security::TokenSessionId,
+            &sid as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if result.is_err() {
+            let _ = CloseHandle(dup_token);
+            anyhow::bail!("SetTokenInformation(TokenSessionId={session_id}) failed");
+        }
 
         // Build command line
         let exe_path = std::env::current_exe().context("get current exe")?;
@@ -770,7 +712,6 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             "\"{}\" --agent-mode --listen 127.0.0.1:9910 --no-encrypt",
             exe_path.display()
         );
-        // CreateProcessAsUserW needs a mutable wide string
         let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut si: STARTUPINFOW = mem::zeroed();
@@ -797,7 +738,6 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         let _ = CloseHandle(dup_token);
         result.context("CreateProcessAsUserW failed")?;
 
-        // Close thread handle (we only need the process handle)
         let _ = CloseHandle(pi.hThread);
 
         Ok(WinProcessHandle {

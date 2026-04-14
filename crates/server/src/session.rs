@@ -966,6 +966,70 @@ fn run_session_cpu_inner(
     }
 }
 
+/// IPC forwarding session: receives pre-encoded H.264 from agent, forwards to client.
+/// Used by Windows Service mode — agent does DXGI capture + NVENC encode in user session,
+/// service just relays the encoded bytes. No re-encoding, no raw frame transfer.
+pub fn run_session_ipc(
+    ipc: &crate::ipc_pipe::IpcServer,
+    cfg: SessionConfig<'_>,
+    initial_width: u32,
+    initial_height: u32,
+) -> SessionResult {
+    let result = run_session_ipc_inner(ipc, cfg, initial_width, initial_height);
+    match result {
+        Ok(token) => SessionResult {
+            session_token: token,
+            error: anyhow::anyhow!("session ended cleanly"),
+        },
+        Err(e) => SessionResult {
+            session_token: vec![],
+            error: e,
+        },
+    }
+}
+
+fn run_session_ipc_inner(
+    ipc: &crate::ipc_pipe::IpcServer,
+    cfg: SessionConfig<'_>,
+    initial_width: u32,
+    initial_height: u32,
+) -> Result<Vec<u8>> {
+    let mut runner = SessionRunner::new(
+        cfg.sender,
+        cfg.receiver,
+        initial_width,
+        initial_height,
+        cfg.frame_interval,
+        cfg.cancel,
+        cfg.video_codec,
+        cfg.is_resume,
+    )?;
+    runner.input_forwarder = cfg.input_forwarder;
+    runner.audio_ws_rx = cfg.audio_ws_rx;
+
+    // Request keyframe from agent for the new client
+    let _ = ipc.request_keyframe();
+
+    loop {
+        runner.check_cancelled()?;
+        let loop_start = Instant::now();
+
+        runner.pump_events()?;
+        runner.poll_clipboard()?;
+        runner.drain_audio()?;
+
+        // Forward ALL queued encoded frames from agent (H.264 must be sequential)
+        for ipc_frame in ipc.recv_encoded_frames() {
+            runner.send_video_frame(ipc_frame.encoded, None)?;
+        }
+
+        runner.drain_file_transfers()?;
+        runner.log_stats("stats-ipc");
+        runner.keepalive_tick()?;
+        runner.frame_pace(loop_start)?;
+    }
+}
+
 /// Linux GPU zero-copy session: NVFBC grab → NVENC encode → send.
 #[cfg(target_os = "linux")]
 pub fn run_session_gpu(
