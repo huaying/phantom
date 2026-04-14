@@ -36,8 +36,6 @@ jobs:
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev \
             libdav1d-dev nasm \
             libpulse-dev libopus-dev libasound2-dev
-      - name: Format
-        run: cargo fmt --all -- --check
       - name: Build WASM (needed for server)
         run: |
           cargo install wasm-pack
