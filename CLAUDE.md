@@ -147,6 +147,17 @@ capture → TileDiffer (64x64 blocks) → any dirty?
 ```
 TileDiffer detects changes. If nothing changed, no encode. Hidden remote cursor means mouse movement alone = 0 dirty tiles = 0 CPU.
 
+### Windows Service mode (Session 0 + Agent)
+Architecture follows RustDesk/Sunshine pattern:
+- **Service** (Session 0, LocalSystem): manages lifecycle, accepts client connections, forwards encoded frames
+- **Agent** (user session): launched via `CreateProcessAsUser` with SYSTEM token (not user token — required for Winlogon desktop access on lock screen)
+- **IPC**: two named pipes (`PhantomIPC_up` for frames, `PhantomIPC_down` for input) — Windows synchronous I/O deadlocks if you use a single DUPLEX pipe with concurrent read+write on the same handle
+- Agent does DXGI→NVENC encoding and sends H.264 bytes over pipe (~50KB, not 8MB raw frames)
+- Service uses `run_session_ipc()` which reuses `SessionRunner` for input/clipboard/keepalive/audio/stats
+- On lock screen: DXGI fails → agent falls back to GDI capture + OpenH264 → auto-recovers to DXGI on unlock
+- Agent calls `OpenInputDesktop()` + `SetThreadDesktop()` before capture (follows active desktop like RustDesk/Sunshine)
+- `--install` / `--uninstall` for service management, `--agent-mode` for agent process
+
 ### Transport abstraction
 `run_session()` takes `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`. All transports (TCP, QUIC, WebSocket, WebRTC) implement same traits. Adding new transport = new file + implement traits + one-line init change.
 
@@ -230,10 +241,15 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 - **QUIC ALPN mismatch**: server sets `alpn_protocols = ["phantom"]` but client must also set it. Without matching ALPN, TLS handshake fails with "peer doesn't support any known protocol". Fixed in e4487ec.
 - **GNOME input**: enigo (XTest) works on GNOME when no other processes interfere. Previous "GNOME broken" diagnosis was caused by stale xdotool processes, not Mutter.
 - **WASM feature flag**: `--no-default-features` builds server without WASM (for GPU-only VMs without wasm-pack).
+- **Windows IPC pipe deadlock**: synchronous named pipes only allow ONE pending I/O per handle. Concurrent `ReadFile` + `WriteFile` on the same DUPLEX handle deadlocks. Fix: two unidirectional pipes (`PhantomIPC_up`/`PhantomIPC_down`).
+- **Windows agent SYSTEM token**: `WTSQueryUserToken` gives user token which can't access Winlogon desktop (lock screen). Use service's own SYSTEM token + `SetTokenInformation(TokenSessionId)` like Sunshine.
+- **DxgiNvencPipeline SPS/PPS**: `set_repeat_sps_pps(true)` is unreliable across drivers. SPS/PPS save+prepend now built into `DxgiNvencPipeline::capture_and_encode()` itself (shared by console mode and agent mode).
+- **IPC encoded frames must be sequential**: H.264 P-frames depend on previous frames. Never drain-to-latest — forward ALL queued frames in order.
+- **DXGI on lock screen**: `DXGI_ERROR_KEYED_MUTEX_ABANDONED` (0x887A0026) on desktop switch. Agent must drop pipeline, switch desktop, reinit. Some drivers (L40/virtual) lose DXGI entirely until reboot — GDI fallback essential.
 
 ---
 
-## Implemented Features (43)
+## Implemented Features (44)
 
 | # | Feature |
 |---|---------|
@@ -280,6 +296,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 41 | **RTT measurement** (Ping/Pong, server EMA α=0.2) |
 | 42 | **Web audio** (Opus decode via WebCodecs AudioDecoder, auto-resume on gesture) |
 | 43 | **Forward-compatible protocol** (read_message_lenient, skips unknown message variants) |
+| 44 | **Windows Service mode** (Session 0 service + agent in user session, IPC pipe, lock screen GDI fallback) |
 
 ---
 
@@ -333,6 +350,8 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | ~~File transfer~~ | ✅ done — bidirectional, chunked, SHA-256 verified |
 | ~~NAT discovery (STUN)~~ | ✅ done — `--stun auto` discovers public IP, prints connection code |
 | NAT relay (TURN) | symmetric NAT / firewall bypass without port forwarding |
+| ~~Windows Service mode~~ | ✅ done — Session 0 service + agent, IPC pipe, DXGI→NVENC in agent, GDI lock screen fallback |
+| Application-level auth | DCV-style web login form → LogonUser API (avoids Winlogon secure desktop entirely) |
 
 ### Enterprise
 | Task | Impact |
@@ -382,8 +401,11 @@ crates/core/src/
   crypto.rs       ChaCha20-Poly1305 EncryptedWriter/Reader (feature-gated)
 
 crates/server/src/
-  main.rs              CLI args, transport selection, codec/encoder/capture auto-detection
-  session.rs           SessionRunner: capture→encode→send loop, adaptive bitrate, RTT tracking, audio, file transfer, stats
+  main.rs              CLI args, transport selection, codec/encoder/capture auto-detection, agent mode (run_agent_loop)
+  session.rs           SessionRunner: capture→encode→send loop, adaptive bitrate, RTT tracking, audio, file transfer, stats, run_session_ipc (service mode forwarding)
+  service_win.rs       Windows Service: SCM dispatcher, SessionManager, agent lifecycle (CreateProcessAsUser w/ SYSTEM token), install/uninstall
+  ipc_pipe.rs          Named pipe IPC: two-pipe (up/down), encoded H.264 frames + input events + keyframe requests
+  capture_gdi.rs       GDI BitBlt capture for lock screen / Session 0 fallback (OpenInputDesktop + SetThreadDesktop)
   audio_capture.rs     Cross-platform audio dispatch (cfg-selects pulse/wasapi)
   audio_capture_pulse.rs   PulseAudio monitor → Opus 48kHz stereo (Linux)
   audio_capture_wasapi.rs  WASAPI loopback → Opus 48kHz stereo (Windows)
