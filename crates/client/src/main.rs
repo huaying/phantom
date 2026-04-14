@@ -315,16 +315,28 @@ impl App {
 
         // Create window
         let win_size = display_winit::fit_window_size(width, height);
+        let mut attrs = WindowAttributes::default()
+            .with_title("Phantom")
+            .with_inner_size(win_size)
+            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+
+        // macOS: transparent title bar with traffic lights, content extends behind it
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true);
+        }
+        // Other platforms: no title bar
+        #[cfg(not(target_os = "macos"))]
+        {
+            attrs = attrs.with_decorations(false);
+        }
+
         let window = Rc::new(
-            event_loop
-                .create_window(
-                    WindowAttributes::default()
-                        .with_title("Phantom")
-                        .with_inner_size(win_size)
-                        .with_decorations(false)
-                        .with_fullscreen(Some(Fullscreen::Borderless(None))),
-                )
-                .expect("create window"),
+            event_loop.create_window(attrs).expect("create window"),
         );
 
         let display = match display_winit::WinitDisplay::new(window.clone(), width, height) {
@@ -754,7 +766,9 @@ impl ApplicationHandler for App {
                     } else {
                         Some(Fullscreen::Borderless(None))
                     });
-                    session.display.window.set_decorations(is_fs); // show title bar in windowed
+                    // On non-macOS, toggle decorations. macOS uses transparent title bar always.
+                    #[cfg(not(target_os = "macos"))]
+                    session.display.window.set_decorations(is_fs);
                     return;
                 }
 
@@ -767,6 +781,7 @@ impl ApplicationHandler for App {
                     && session.display.window.fullscreen().is_some()
                 {
                     session.display.window.set_fullscreen(None);
+                    #[cfg(not(target_os = "macos"))]
                     session.display.window.set_decorations(true);
                     return;
                 }
