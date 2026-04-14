@@ -168,8 +168,25 @@ fn run_server_loop(
         })?;
 
     // Start Web/WS listener
+    // Read JWT auth secret from environment variable (hex string)
+    let auth_secret: Option<Vec<u8>> = std::env::var("PHANTOM_AUTH_SECRET").ok().and_then(|hex| {
+        let bytes: Result<Vec<u8>, _> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect();
+        match bytes {
+            Ok(b) => {
+                svc_log(&format!("JWT authentication ENABLED ({} byte secret)", b.len()));
+                Some(b)
+            }
+            Err(_) => {
+                svc_log("WARNING: PHANTOM_AUTH_SECRET invalid hex, auth disabled");
+                None
+            }
+        }
+    });
     let ws_transport =
-        transport_ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3, None)?;
+        transport_ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3, auth_secret)?;
     let tx = conn_tx.clone();
     std::thread::Builder::new()
         .name("svc-web-accept".into())
