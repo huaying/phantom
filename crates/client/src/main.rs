@@ -319,7 +319,7 @@ impl App {
             event_loop
                 .create_window(
                     WindowAttributes::default()
-                        .with_title("Phantom Remote Desktop")
+                        .with_title("Phantom")
                         .with_inner_size(win_size)
                         .with_decorations(false)
                         .with_fullscreen(Some(Fullscreen::Borderless(None))),
