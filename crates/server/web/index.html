@@ -16,9 +16,12 @@
   </style>
 </head>
 <body>
-  <canvas id="screen"></canvas>
+  <canvas id="screen" tabindex="0"></canvas>
   <script type="module">
     import init from './phantom_web.js';
+    // Focus canvas immediately so Chrome considers tab active
+    // (hardware WebCodecs decoder defers output if tab unfocused)
+    document.getElementById('screen').focus();
     try { await init(); } catch(e) { console.error('WASM init failed:', e); }
   </script>
 </body>

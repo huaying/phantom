@@ -588,6 +588,17 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             s.last_video_sequence = sequence;
             let fc = s.frame_count;
             if let Some(ref decoder) = s.decoder {
+                // If tab was backgrounded, decoder may be stale. Reset on keyframe.
+                if is_key {
+                    let state_str = js_sys::Reflect::get(decoder.as_ref(), &"state".into())
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_default();
+                    if state_str == "closed" {
+                        console::warn_1(&"Decoder closed, skipping frame".into());
+                        return;
+                    }
+                }
                 let data_js = js_sys::Uint8Array::from(frame.data.as_slice());
                 let init = js_sys::Object::new();
                 js_sys::Reflect::set(
@@ -600,6 +611,9 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     .unwrap();
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
+                if fc <= 3 {
+                    console::log_1(&format!("Submitting frame #{fc} to decoder (key={is_key})").into());
+                }
                 decoder.decode(&chunk);
             }
         }
@@ -736,9 +750,11 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
         if *count <= 3 {
             console::log_1(&format!("Decoded frame #{}", *count).into());
         }
+        // Use the canvas 2D context directly via web-sys instead of eval
+        // to avoid potential timing issues with js_sys::eval.
         let st = s.borrow();
-        let w = st.canvas.width();
-        let h = st.canvas.height();
+        let w = st.server_width;
+        let h = st.server_height;
         js_sys::Reflect::set(&js_sys::global(), &"__phantom_frame".into(), &frame).unwrap();
         let js_code = format!(
             "var c=document.getElementById('screen').getContext('2d'); c.drawImage(__phantom_frame, 0, 0, {w}, {h}); __phantom_frame.close();"
@@ -1604,6 +1620,12 @@ fn setup_input(
             if code == "MetaLeft" || code == "MetaRight" {
                 return;
             }
+            // Don't forward keys when Cmd/Meta is held — those are browser
+            // shortcuts (Cmd+R, Cmd+T, Cmd+W). The keyup will never arrive
+            // because the browser navigates away, causing stuck keys on server.
+            if e.meta_key() {
+                return;
+            }
             // F11: toggle browser fullscreen
             if pressed && code == "F11" {
                 if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
@@ -1652,12 +1674,50 @@ fn setup_input(
                 }
             }
             if let Some(kc) = js_code_to_keycode(&code) {
+                console::log_1(&format!("key: {code} pressed={pressed} repeat={}", e.repeat()).into());
                 send_input(&st, InputEvent::Key { key: kc, pressed });
             }
         });
         document
             .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
             .unwrap();
+        cb.forget();
+    }
+
+    // Release all keys on page unload (prevents stuck keys on refresh/navigate)
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let st = s.borrow();
+            // Release all common modifier and letter keys
+            for kc in [
+                KeyCode::LeftShift, KeyCode::RightShift,
+                KeyCode::LeftCtrl, KeyCode::RightCtrl,
+                KeyCode::LeftAlt, KeyCode::RightAlt,
+            ] {
+                send_input(&st, InputEvent::Key { key: kc, pressed: false });
+            }
+        });
+        let window = web_sys::window().unwrap();
+        let _ = window.add_event_listener_with_callback("beforeunload", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    // Release all keys on tab focus loss (prevents stuck keys on Alt+Tab etc.)
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let st = s.borrow();
+            for kc in [
+                KeyCode::LeftShift, KeyCode::RightShift,
+                KeyCode::LeftCtrl, KeyCode::RightCtrl,
+                KeyCode::LeftAlt, KeyCode::RightAlt,
+            ] {
+                send_input(&st, InputEvent::Key { key: kc, pressed: false });
+            }
+        });
+        let window = web_sys::window().unwrap();
+        let _ = window.add_event_listener_with_callback("blur", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 }
