@@ -785,14 +785,14 @@ mod tests {
         let mut y_data = vec![0u8; w * h];
         let mut u_data = vec![0u8; w / 2 * h / 2];
         let mut v_data = vec![0u8; w / 2 * h / 2];
-        for i in 0..y_data.len() {
-            y_data[i] = (16 + (i % 220)) as u8;
+        for (i, val) in y_data.iter_mut().enumerate() {
+            *val = (16 + (i % 220)) as u8;
         }
-        for i in 0..u_data.len() {
-            u_data[i] = (64 + (i % 128)) as u8;
+        for (i, val) in u_data.iter_mut().enumerate() {
+            *val = (64 + (i % 128)) as u8;
         }
-        for i in 0..v_data.len() {
-            v_data[i] = (64 + (i % 128)) as u8;
+        for (i, val) in v_data.iter_mut().enumerate() {
+            *val = (64 + (i % 128)) as u8;
         }
 
         let mut rgb_scalar = vec![0u32; w * h];
@@ -811,8 +811,8 @@ mod tests {
                        // Create plausible NV12 data
         let mut nv12 = vec![0u8; pitch * h * 3 / 2];
         // Y plane
-        for i in 0..pitch * h {
-            nv12[i] = (16 + (i % 220)) as u8;
+        for (i, val) in nv12.iter_mut().enumerate().take(pitch * h) {
+            *val = (16 + (i % 220)) as u8;
         }
         // UV plane (interleaved)
         let uv_start = pitch * h;

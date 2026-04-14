@@ -969,6 +969,7 @@ fn run_session_cpu_inner(
 /// IPC forwarding session: receives pre-encoded H.264 from agent, forwards to client.
 /// Used by Windows Service mode — agent does DXGI capture + NVENC encode in user session,
 /// service just relays the encoded bytes. No re-encoding, no raw frame transfer.
+#[cfg(target_os = "windows")]
 pub fn run_session_ipc(
     ipc: &crate::ipc_pipe::IpcServer,
     cfg: SessionConfig<'_>,
@@ -988,6 +989,7 @@ pub fn run_session_ipc(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn run_session_ipc_inner(
     ipc: &crate::ipc_pipe::IpcServer,
     cfg: SessionConfig<'_>,

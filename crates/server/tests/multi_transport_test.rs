@@ -77,7 +77,7 @@ fn transport_name_parsing() {
 #[test]
 fn multi_transport_port_assignment() {
     let base_port: u16 = 9900;
-    let transports = vec!["tcp", "web"];
+    let transports = ["tcp", "web"];
 
     // When multiple transports, web gets base_port + 1
     let web_port = if transports.len() > 1 {
@@ -88,7 +88,7 @@ fn multi_transport_port_assignment() {
     assert_eq!(web_port, 9901);
 
     // When single transport, web gets base_port
-    let single = vec!["web"];
+    let single = ["web"];
     let web_port_single = if single.len() > 1 {
         base_port + 1
     } else {

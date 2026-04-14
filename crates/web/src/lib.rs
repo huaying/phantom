@@ -169,13 +169,14 @@ pub fn main() {
     let use_rtc = query.contains("rtc");
 
     // Extract ?token=<jwt> for authenticated connections
-    let auth_token: Option<String> = query
-        .trim_start_matches('?')
-        .split('&')
-        .find_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            if k == "token" { Some(v.to_string()) } else { None }
-        });
+    let auth_token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k == "token" {
+            Some(v.to_string())
+        } else {
+            None
+        }
+    });
     let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
     console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
 
@@ -468,10 +469,18 @@ fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
     let s = state.clone();
     let cb = Closure::<dyn FnMut()>::once(move || {
         // Re-extract token from page URL for reconnect
-        let query = web_sys::window().unwrap().location().search().unwrap_or_default();
+        let query = web_sys::window()
+            .unwrap()
+            .location()
+            .search()
+            .unwrap_or_default();
         let token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            if k == "token" { Some(v.to_string()) } else { None }
+            if k == "token" {
+                Some(v.to_string())
+            } else {
+                None
+            }
         });
         let url = ws_url(&token);
         connect_ws(&s, &url, delay_ms);
@@ -775,12 +784,20 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
     let window = web_sys::window().unwrap();
     let location = window.location();
     let host = location.host().unwrap_or_default();
-    let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
+    let protocol = if location.protocol().unwrap_or_default() == "https:" {
+        "wss"
+    } else {
+        "ws"
+    };
     // Include auth token in audio WS URL if present
     let query = location.search().unwrap_or_default();
     let token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        if k == "token" { Some(v.to_string()) } else { None }
+        if k == "token" {
+            Some(v.to_string())
+        } else {
+            None
+        }
     });
     let audio_url = match &token {
         Some(t) => format!("{protocol}://{host}/ws/audio?token={t}"),
@@ -801,7 +818,9 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
             console::log_1(&format!("audio WebSocket connected to {audio_url}").into());
         }
         Err(e) => {
-            console::warn_1(&format!("audio WebSocket failed ({e:?}), using main WS fallback").into());
+            console::warn_1(
+                &format!("audio WebSocket failed ({e:?}), using main WS fallback").into(),
+            );
         }
     }
 
@@ -1170,8 +1189,11 @@ registerProcessor('phantom-sab-audio', PhantomSABProcessor);
         let _ = js_sys::Reflect::set(&opts, &"outputChannelCount".into(), &out_ch);
 
         let node = web_sys::AudioWorkletNode::new_with_options(
-            &ctx_clone, "phantom-sab-audio", &opts.unchecked_into(),
-        ).unwrap();
+            &ctx_clone,
+            "phantom-sab-audio",
+            &opts.unchecked_into(),
+        )
+        .unwrap();
         let _ = node.connect_with_audio_node(&ctx_clone.destination());
 
         // Set up AudioDecoder that writes directly to SharedArrayBuffer
@@ -1218,7 +1240,7 @@ fn setup_audio_decoder_sab(
         audio_data.copyTo(&arr, &opts);
         arr.copy_to(&mut left);
 
-        let mut right = if dec_channels >= 2 {
+        let right = if dec_channels >= 2 {
             let mut r = vec![0f32; frames as usize];
             let opts_r = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&opts_r, &"planeIndex".into(), &1u32.into());
@@ -1288,7 +1310,7 @@ fn setup_audio_decoder_sab(
 /// Decoded PCM accumulates in a buffer. A 40ms timer drains it into
 /// BufferSourceNodes, smoothing out bursty AudioDecoder callbacks.
 fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::AudioContext) {
-    let ctx_clone = audio_ctx.clone();
+    let _ctx_clone = audio_ctx.clone();
     let ctx_drain = audio_ctx.clone();
 
     // Jitter buffer: accumulates decoded PCM (interleaved stereo f32)
@@ -1347,7 +1369,9 @@ fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::
     // Periodic drain: every 40ms, take accumulated PCM and schedule playback
     let drain_cb = Closure::<dyn FnMut()>::new(move || {
         let mut buf = pcm_buf_drain.borrow_mut();
-        if buf.is_empty() { return; }
+        if buf.is_empty() {
+            return;
+        }
 
         let current_time = ctx_drain.current_time();
         let mut scheduled = next_time_drain.borrow_mut();
@@ -1364,7 +1388,9 @@ fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::
 
         // Drain all accumulated samples into one AudioBuffer
         let total_samples = buf.len() / 2; // stereo interleaved
-        if total_samples == 0 { return; }
+        if total_samples == 0 {
+            return;
+        }
 
         let buffer = match ctx_drain.create_buffer(2, total_samples as u32, 48000.0) {
             Ok(b) => b,
@@ -1396,7 +1422,8 @@ fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::
     // Start 20ms drain timer (matches Opus frame duration for smooth playback)
     let window = web_sys::window().unwrap();
     let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-        drain_cb.as_ref().unchecked_ref(), 20,
+        drain_cb.as_ref().unchecked_ref(),
+        20,
     );
     drain_cb.forget();
 
@@ -1533,7 +1560,13 @@ fn setup_input(
                     let mut acc = sa.borrow_mut();
                     if acc.0 != 0.0 || acc.1 != 0.0 {
                         let st = ss.borrow();
-                        send_input(&st, InputEvent::MouseScroll { dx: acc.0, dy: acc.1 });
+                        send_input(
+                            &st,
+                            InputEvent::MouseScroll {
+                                dx: acc.0,
+                                dy: acc.1,
+                            },
+                        );
                         acc.0 = 0.0;
                         acc.1 = 0.0;
                     }

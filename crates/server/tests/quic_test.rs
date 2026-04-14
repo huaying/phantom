@@ -369,7 +369,7 @@ fn quic_datagram_multiple_frames() {
                 sequence: i as u64 + 1,
                 frame: Box::new(EncodedFrame {
                     codec: VideoCodec::H264,
-                    data: vec![(i as u8 + 0xA0); 100],
+                    data: vec![i as u8 + 0xA0; 100],
                     is_keyframe: false,
                 }),
             };

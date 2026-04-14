@@ -376,13 +376,10 @@ fn run_wan_e2e(profile: WanProfile, num_frames: u32, label: &str) -> (u32, Durat
                     Err(_) => break,
                 };
 
-                match msg {
-                    Message::VideoFrame { frame, .. } => {
-                        let _yuv = decoder.decode(&frame.data);
-                        frame_times.push(frame_start.elapsed());
-                        frames_received_client.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {}
+                if let Message::VideoFrame { frame, .. } = msg {
+                    let _yuv = decoder.decode(&frame.data);
+                    frame_times.push(frame_start.elapsed());
+                    frames_received_client.fetch_add(1, Ordering::Relaxed);
                 }
             }
 

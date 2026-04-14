@@ -2,10 +2,10 @@
 //!
 //! Provides an all-in-one API: HTTP viewer + WebSocket H.264/AV1 streaming.
 
+use crate::pipeline::{StreamConfig, StreamPipeline};
 use crate::source::StreamSource;
-use crate::pipeline::{StreamPipeline, StreamConfig};
-use phantom_core::encode::VideoCodec;
 use anyhow::Result;
+use phantom_core::encode::VideoCodec;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,10 +21,10 @@ struct SharedState {
     /// Frame sequence number.
     frame_num: u64,
     /// Video codec (for client initialization).
-    codec: VideoCodec,
+    _codec: VideoCodec,
     /// Resolution.
-    width: u32,
-    height: u32,
+    _width: u32,
+    _height: u32,
     /// Number of connected clients.
     client_count: usize,
 }
@@ -71,9 +71,9 @@ impl StreamServer {
         let state = Arc::new(Mutex::new(SharedState {
             latest_frame: None,
             frame_num: 0,
-            codec: self.config.codec,
-            width: w,
-            height: h,
+            _codec: self.config.codec,
+            _width: w,
+            _height: h,
             client_count: 0,
         }));
 
@@ -87,8 +87,10 @@ impl StreamServer {
         println!("  🌐 Viewer: http://localhost:{}", self.http_port);
         println!("  📡 Stream: ws://localhost:{}", self.ws_port);
         println!("  Resolution: {}×{}", w, h);
-        println!("  Codec: {:?}, Bitrate: {}kbps, FPS: {}",
-            self.config.codec, self.config.bitrate_kbps, self.config.fps);
+        println!(
+            "  Codec: {:?}, Bitrate: {}kbps, FPS: {}",
+            self.config.codec, self.config.bitrate_kbps, self.config.fps
+        );
 
         // Encode loop
         let mut pipeline = StreamPipeline::new(self.config);

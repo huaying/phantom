@@ -243,7 +243,7 @@ fn h264_pframe_smaller_than_keyframe() {
         raw_size as f64 / data2.len() as f64
     );
 
-    assert!(data1.len() > 0);
+    assert!(!data1.is_empty());
     assert!(
         data2.len() < data1.len(),
         "P-frame of same content should be smaller than keyframe"

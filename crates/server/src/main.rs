@@ -414,7 +414,8 @@ fn main() -> Result<()> {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(Into::into))
                 .collect();
-            let bytes = bytes.map_err(|_| anyhow::anyhow!("invalid --auth-secret: expected hex string"))?;
+            let bytes =
+                bytes.map_err(|_| anyhow::anyhow!("invalid --auth-secret: expected hex string"))?;
             tracing::info!("JWT authentication ENABLED for WebSocket connections");
             Some(bytes)
         }
@@ -472,8 +473,12 @@ fn main() -> Result<()> {
                 } else {
                     base_port
                 };
-                let mut ws_transport =
-                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2, auth_secret.clone())?;
+                let mut ws_transport = transport_ws::WebServerTransport::start(
+                    web_port,
+                    web_port + 1,
+                    web_port + 2,
+                    auth_secret.clone(),
+                )?;
                 tracing::info!("open https://localhost:{web_port} in browser");
                 // Share audio WS receiver with the session loop
                 audio_ws_rx_shared = Some(Arc::new(std::sync::Mutex::new(
@@ -649,7 +654,9 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
-                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                    audio_ws_rx: audio_ws_rx_shared
+                        .as_ref()
+                        .and_then(|s| s.lock().ok()?.take()),
                 },
             )
         } else {
@@ -667,7 +674,9 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
-                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                    audio_ws_rx: audio_ws_rx_shared
+                        .as_ref()
+                        .and_then(|s| s.lock().ok()?.take()),
                 },
             )
         };
@@ -690,7 +699,9 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
-                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                    audio_ws_rx: audio_ws_rx_shared
+                        .as_ref()
+                        .and_then(|s| s.lock().ok()?.take()),
                 },
             )
         } else {
@@ -708,7 +719,9 @@ fn main() -> Result<()> {
                     video_codec,
                     is_resume,
                     input_forwarder: None,
-                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                    audio_ws_rx: audio_ws_rx_shared
+                        .as_ref()
+                        .and_then(|s| s.lock().ok()?.take()),
                 },
             )
         };
@@ -727,7 +740,9 @@ fn main() -> Result<()> {
                 video_codec,
                 is_resume,
                 input_forwarder: None,
-                audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                audio_ws_rx: audio_ws_rx_shared
+                    .as_ref()
+                    .and_then(|s| s.lock().ok()?.take()),
             },
         );
 
@@ -1036,21 +1051,33 @@ fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
 
     tracing::info!("Connecting to IPC pipe...");
     let ipc = match ipc_pipe::IpcClient::connect(ipc_session) {
-        Ok(c) => { tracing::info!("IPC connected"); c }
-        Err(e) => { tracing::error!("IPC connect FAILED: {e}"); return Err(e); }
+        Ok(c) => {
+            tracing::info!("IPC connected");
+            c
+        }
+        Err(e) => {
+            tracing::error!("IPC connect FAILED: {e}");
+            return Err(e);
+        }
     };
 
     // Set up input injection
     let mut injector = match input_injector::InputInjector::new() {
         Ok(inj) => Some(inj),
-        Err(e) => { tracing::warn!("Input injection unavailable: {e}"); None }
+        Err(e) => {
+            tracing::warn!("Input injection unavailable: {e}");
+            None
+        }
     };
 
     // Graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = Arc::clone(&shutdown);
-        ctrlc::set_handler(move || { shutdown.store(true, Ordering::SeqCst); }).ok();
+        ctrlc::set_handler(move || {
+            shutdown.store(true, Ordering::SeqCst);
+        })
+        .ok();
     }
 
     // Run agent capture+encode loop.
@@ -1124,7 +1151,11 @@ fn run_agent_loop(
                                 match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
                                     Ok(mut e) => {
                                         e.force_keyframe();
-                                        tracing::info!(width = w, height = h, "GDI+OpenH264 fallback");
+                                        tracing::info!(
+                                            width = w,
+                                            height = h,
+                                            "GDI+OpenH264 fallback"
+                                        );
                                         cpu_encoder = Some(Box::new(e));
                                         gdi_capture = Some(gdi);
                                         using_gdi = true;
@@ -1145,13 +1176,21 @@ fn run_agent_loop(
 
         // Handle keyframe requests
         if ipc.take_keyframe_request() {
-            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
-            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            if let Some(ref mut gpu) = gpu_pipeline {
+                gpu.force_keyframe();
+            }
+            if let Some(ref mut enc) = cpu_encoder {
+                enc.force_keyframe();
+            }
             last_keyframe = Instant::now();
         }
         if last_keyframe.elapsed() > Duration::from_secs(2) {
-            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
-            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            if let Some(ref mut gpu) = gpu_pipeline {
+                gpu.force_keyframe();
+            }
+            if let Some(ref mut enc) = cpu_encoder {
+                enc.force_keyframe();
+            }
             last_keyframe = Instant::now();
         }
 
@@ -1162,18 +1201,25 @@ fn run_agent_loop(
                     frame_count += 1;
                     if frame_count <= 3 || frame_count % 300 == 0 {
                         tracing::info!(
-                            frame = frame_count, width, height,
-                            bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
+                            frame = frame_count,
+                            width,
+                            height,
+                            bytes = encoded.data.len(),
+                            keyframe = encoded.is_keyframe,
                             "GPU frame"
                         );
                     }
-                    if encoded.is_keyframe { last_keyframe = Instant::now(); }
+                    if encoded.is_keyframe {
+                        last_keyframe = Instant::now();
+                    }
                     if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
                         tracing::error!("IPC send failed: {e}");
                         break;
                     }
                 }
-                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Err(e) => {
                     tracing::warn!("DXGI error: {e}, falling back to GDI");
                     gpu_pipeline = None;
@@ -1182,29 +1228,35 @@ fn run_agent_loop(
             }
         }
         // Capture + encode: GDI fallback path (lock screen, no display)
-        else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder) {
+        else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder)
+        {
             match gdi.capture() {
-                Ok(Some(frame)) => {
-                    match enc.encode_frame(&frame) {
-                        Ok(encoded) => {
-                            frame_count += 1;
-                            if frame_count <= 3 || frame_count % 300 == 0 {
-                                tracing::info!(
-                                    frame = frame_count, width, height,
-                                    bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
-                                    "GDI frame"
-                                );
-                            }
-                            if encoded.is_keyframe { last_keyframe = Instant::now(); }
-                            if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
-                                tracing::error!("IPC send failed: {e}");
-                                break;
-                            }
+                Ok(Some(frame)) => match enc.encode_frame(&frame) {
+                    Ok(encoded) => {
+                        frame_count += 1;
+                        if frame_count <= 3 || frame_count % 300 == 0 {
+                            tracing::info!(
+                                frame = frame_count,
+                                width,
+                                height,
+                                bytes = encoded.data.len(),
+                                keyframe = encoded.is_keyframe,
+                                "GDI frame"
+                            );
                         }
-                        Err(e) => tracing::warn!("GDI encode error: {e}"),
+                        if encoded.is_keyframe {
+                            last_keyframe = Instant::now();
+                        }
+                        if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                            tracing::error!("IPC send failed: {e}");
+                            break;
+                        }
                     }
+                    Err(e) => tracing::warn!("GDI encode error: {e}"),
+                },
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
                 Err(e) => {
                     tracing::warn!("GDI capture error: {e}");
                     gdi_capture = None;
@@ -1232,15 +1284,6 @@ fn run_agent_loop(
 
     tracing::info!("Agent shutting down");
     Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn run_agent_loop(
-    _ipc: &ipc_pipe::IpcClient,
-    _injector: &mut Option<input_injector::InputInjector>,
-    _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
-    anyhow::bail!("Agent mode only supported on Windows")
 }
 
 fn print_connection_code(addr: &str) {
