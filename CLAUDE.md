@@ -246,10 +246,15 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 - **DxgiNvencPipeline SPS/PPS**: `set_repeat_sps_pps(true)` is unreliable across drivers. SPS/PPS save+prepend now built into `DxgiNvencPipeline::capture_and_encode()` itself (shared by console mode and agent mode).
 - **IPC encoded frames must be sequential**: H.264 P-frames depend on previous frames. Never drain-to-latest — forward ALL queued frames in order.
 - **DXGI on lock screen**: `DXGI_ERROR_KEYED_MUTEX_ABANDONED` (0x887A0026) on desktop switch. Agent must drop pipeline, switch desktop, reinit. Some drivers (L40/virtual) lose DXGI entirely until reboot — GDI fallback essential.
+- **Chrome hardware WebCodecs black screen**: hardware VideoDecoder defers output callback when tab isn't fully focused (after URL navigation). Fix: use `prefer-software` for decode (~2-4ms vs ~0.5ms at 1080p, negligible vs network RTT).
+- **Canvas focus required for keyboard**: without `tabindex="0"` + `canvas.focus()`, first keypresses go to browser address bar. Must auto-focus canvas on page load.
+- **Cmd+R stuck keys on macOS**: Meta key is blocked but 'r' keydown is sent, page refreshes before keyup. Fix: skip ALL keys when `e.meta_key()` is true. Also release modifiers on `beforeunload` and `blur`.
+- **ABR spiral on high-latency links**: previous ABR decreased bitrate whenever RTT >100ms (fixed latency). Fix: track baseline RTT (minimum observed), only decrease when RTT rises >50% above baseline (actual congestion).
+- **Scroll direction**: browser `deltaY` already reflects client OS direction (macOS natural scroll). Do NOT negate. winit (native) has opposite convention from enigo — DO negate there.
 
 ---
 
-## Implemented Features (45)
+## Implemented Features (48)
 
 | # | Feature |
 |---|---------|
@@ -290,14 +295,17 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 35 | **AV1 encoder** (NVENC hardware AV1, Ada Lovelace+, `--codec av1`) |
 | 36 | **AV1 decoder** (dav1d software + NVDEC hardware, WebCodecs for web) |
 | 37 | **NVDEC hardware decode** (client-side H.264 + AV1, runtime dlopen, feature-gated) |
-| 38 | **Adaptive bitrate** (RTT-based: >100ms → decrease ×0.7, stable 10s → increase ×1.2, NVENC reconfigure API) |
+| 38 | **Adaptive bitrate** (baseline RTT tracking, congestion-based decrease, min 1500kbps, NVENC reconfigure API) |
 | 39 | **Connection quality stats** (Stats message every 5s: RTT, FPS, bandwidth, encode_us) |
-| 40 | **Web stats overlay** (floating HUD, green/yellow/red RTT, F11 fullscreen, Ctrl+Shift+S toggle) |
+| 40 | **Server stats logging** (GPU stats with FPS, RTT, bandwidth, encode time — server-side only) |
 | 41 | **RTT measurement** (Ping/Pong, server EMA α=0.2) |
 | 42 | **Web audio** (Opus decode via WebCodecs AudioDecoder, auto-resume on gesture) |
 | 43 | **Forward-compatible protocol** (read_message_lenient, skips unknown message variants) |
 | 44 | **Windows Service mode** (Session 0 service + agent in user session, IPC pipe, lock screen GDI fallback) |
 | 45 | **JWT token auth** (`--auth-secret`, HMAC-SHA256, platform signs `{sub, vm_id, exp}`, HTTP 401 on invalid) |
+| 46 | **Scroll redesign** (Sunshine-style pixel accumulation, client-native direction, no magic multipliers) |
+| 47 | **ABR baseline RTT** (track minimum RTT, only decrease on congestion not fixed latency, min 1500kbps) |
+| 48 | **Native client UI** (borderless fullscreen, macOS transparent title bar, F11/Esc toggle) |
 
 ---
 
@@ -306,6 +314,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 ### Next Up
 | Task | Impact | Notes |
 |------|--------|-------|
+| CI/CD + install.sh E2E | Release-ready | Test on clean Ubuntu 22/24, Win 10/11. Verify install.sh deps + binary work |
 | NAT relay (TURN) | Symmetric NAT / firewall bypass | Only remaining networking gap for "works everywhere" |
 | VAAPI GPU encoding | AMD/Intel GPU encode on Linux | Broadens GPU support beyond NVIDIA |
 | DMA-BUF/KMS capture | Linux zero-copy capture | Eliminates CPU readback on Linux (like NVFBC but vendor-neutral) |
@@ -324,7 +333,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ### Completed
 <details>
-<summary>45 features shipped (click to expand)</summary>
+<summary>48 features shipped (click to expand)</summary>
 
 | Task | Status |
 |------|--------|
@@ -354,6 +363,9 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 4K support | ✅ bilinear downscale, aspect-ratio letterbox |
 | Windows Service mode | ✅ Session 0 + agent, IPC pipe, DXGI→NVENC, GDI lock screen fallback |
 | JWT token auth | ✅ `--auth-secret` / `PHANTOM_AUTH_SECRET`, platform integration, 10/10 security tests passed |
+| Scroll redesign | ✅ Sunshine-style pixel accumulation, client-native direction |
+| ABR baseline RTT | ✅ congestion-based only, min 1500kbps, no more spiral-to-floor |
+| Native client UI | ✅ borderless fullscreen, macOS transparent title bar, F11/Esc toggle |
 
 </details>
 
@@ -414,15 +426,15 @@ crates/server/src/
   input_injector.rs    enigo: mouse/keyboard injection + type_text for paste, modifier release
   transport_tcp.rs     TCP: Plain/Encrypted sender/receiver, split via try_clone
   transport_quic.rs    QUIC: quinn, self-signed TLS, keep-alive
-  transport_ws.rs      WebServerTransport: HTTPS static + WSS upgrade (same port) + WebRTC POST /rtc + HTTP keep-alive + connection pool
+  transport_ws.rs      WebServerTransport: HTTPS static + WSS upgrade (same port) + WebRTC POST /rtc + HTTP keep-alive + connection pool + JWT auth (verify_jwt)
   transport_webrtc.rs  str0m 0.18 run_loop, ActiveClient, chunked writes (>16KB), 1ms polling
   bin/mock_server.rs   Animated H.264 frames without screen capture
   tests/wan_test.rs    WAN simulation: TCP proxy with configurable delay/jitter, 8 E2E tests
 
 crates/client/src/
-  main.rs              winit ApplicationHandler, reconnect loop, transport selection
+  main.rs              winit ApplicationHandler, reconnect loop, borderless fullscreen, macOS transparent title bar
   display_winit.rs     softbuffer rendering, coordinate mapping, cursor overlay
-  input_capture.rs     winit KeyCode → phantom KeyCode mapping
+  input_capture.rs     winit KeyCode → phantom KeyCode mapping, Sunshine-style scroll accumulation
   decode_h264.rs       OpenH264Decoder (impl FrameDecoder, CPU fallback)
   decode_av1.rs        Dav1dDecoder (AV1 software decode via dav1d, uses color.rs SIMD)
   decode_videotoolbox.rs  VideoToolbox hardware decoder (macOS, Annex B→AVCC)
@@ -435,8 +447,9 @@ crates/client/src/
 crates/web/src/
   lib.rs               WASM entry, setup_webrtc (POST /rtc) + setup_ws (?ws fallback),
                        ChunkAssembler (reassembles >16KB DataChannel messages),
-                       WebCodecs decode, Canvas render, got_keyframe guard,
-                       mouse/keyboard/scroll/paste input capture, h264_has_idr() NAL parser
+                       WebCodecs software decode, Canvas render, got_keyframe guard,
+                       mouse/keyboard/scroll (pixel accumulation)/paste input,
+                       JWT token passthrough, stuck key prevention (Meta skip, blur/unload release)
 
 crates/gpu/src/
   lib.rs               Module exports (cuda, nvenc, nvdec[feature-gated], nvfbc[linux], dxgi[win], dxgi_nvenc[win])
