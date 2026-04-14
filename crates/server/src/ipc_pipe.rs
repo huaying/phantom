@@ -401,7 +401,12 @@ mod platform {
                                         heartbeat_elapsed = Instant::now();
                                     }
                                 }
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    // input_tx dropped (session ended) — don't exit.
+                                    // Keep running to send heartbeats and keyframe requests.
+                                    // Agent must stay alive across session boundaries.
+                                    std::thread::sleep(Duration::from_millis(200));
+                                }
                             }
                         }
                     })?;

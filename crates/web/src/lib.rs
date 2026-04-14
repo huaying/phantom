@@ -1649,25 +1649,7 @@ fn setup_input(
             if code == "MetaLeft" || code == "MetaRight" {
                 return;
             }
-            // Don't forward keys when Cmd/Meta is held — those are browser
-            // shortcuts (Cmd+R, Cmd+T, Cmd+W). The keyup will never arrive
-            // because the browser navigates away, causing stuck keys on server.
-            if e.meta_key() {
-                return;
-            }
-            // F11: toggle browser fullscreen
-            if pressed && code == "F11" {
-                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                    let is_fullscreen = doc.fullscreen_element().is_some();
-                    if is_fullscreen {
-                        doc.exit_fullscreen();
-                    } else if let Some(el) = doc.document_element() {
-                        let _ = el.request_fullscreen();
-                    }
-                }
-                return; // Don't forward F11 to remote
-            }
-            // Paste
+            // Paste: Cmd+V / Ctrl+V — must check BEFORE the meta_key() guard
             if pressed && code == "KeyV" && (e.ctrl_key() || e.meta_key()) {
                 if let Some(w) = web_sys::window() {
                     let cb = w.navigator().clipboard();
@@ -1690,6 +1672,40 @@ fn setup_input(
                         }
                     });
                     return;
+                }
+            }
+            // F11: toggle browser fullscreen
+            if pressed && code == "F11" {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    let is_fullscreen = doc.fullscreen_element().is_some();
+                    if is_fullscreen {
+                        doc.exit_fullscreen();
+                    } else if let Some(el) = doc.document_element() {
+                        let _ = el.request_fullscreen();
+                    }
+                }
+                return;
+            }
+            // Cmd/Meta key remapping (macOS → Linux/Windows):
+            // Cmd+C/X/Z/A/S → Ctrl+C/X/Z/A/S (remap Cmd to Ctrl)
+            // Cmd+R/T/W/Q/L → block (browser shortcuts, page will navigate away)
+            if e.meta_key() {
+                match code.as_str() {
+                    // Browser shortcuts — block entirely (keyup will never arrive)
+                    "KeyR" | "KeyT" | "KeyW" | "KeyQ" | "KeyL" | "KeyN" => return,
+                    // Remap Cmd+key → Ctrl+key for the remote system
+                    _ => {
+                        if let Some(kc) = js_code_to_keycode(&code) {
+                            if pressed {
+                                // Send Ctrl down, key down, key up, Ctrl up
+                                send_input(&st, InputEvent::Key { key: KeyCode::LeftCtrl, pressed: true });
+                                send_input(&st, InputEvent::Key { key: kc, pressed: true });
+                                send_input(&st, InputEvent::Key { key: kc, pressed: false });
+                                send_input(&st, InputEvent::Key { key: KeyCode::LeftCtrl, pressed: false });
+                            }
+                        }
+                        return;
+                    }
                 }
             }
             if let Some(kc) = js_code_to_keycode(&code) {
