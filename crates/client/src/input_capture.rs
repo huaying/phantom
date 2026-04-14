@@ -33,11 +33,29 @@ pub fn mouse_move_event(x: i32, y: i32) -> InputEvent {
     InputEvent::MouseMove { x, y }
 }
 
+/// Accumulated sub-notch pixel deltas for smooth trackpad→line conversion.
+static SCROLL_REMAINDER: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
+
 /// Convert winit scroll event.
+/// LineDelta: mouse wheel, already in line units (1.0 = one notch).
+/// PixelDelta: trackpad, accumulate until a full notch (120px).
+///
+/// Negate because macOS/winit convention (positive = scroll up) is opposite
+/// to enigo/X11 (positive = ScrollDown). Browser deltaY doesn't need this
+/// because its convention already matches enigo.
 pub fn scroll_event(delta: MouseScrollDelta) -> Option<InputEvent> {
     let (dx, dy) = match delta {
-        MouseScrollDelta::LineDelta(x, y) => (x, y),
-        MouseScrollDelta::PixelDelta(pos) => (pos.x as f32 / 120.0, pos.y as f32 / 120.0),
+        MouseScrollDelta::LineDelta(x, y) => (-x, -y),
+        MouseScrollDelta::PixelDelta(pos) => {
+            let mut rem = SCROLL_REMAINDER.lock().unwrap();
+            rem.0 += -pos.x;
+            rem.1 += -pos.y;
+            let lines_x = (rem.0 / 120.0).trunc();
+            let lines_y = (rem.1 / 120.0).trunc();
+            rem.0 -= lines_x * 120.0;
+            rem.1 -= lines_y * 120.0;
+            (lines_x as f32, lines_y as f32)
+        }
     };
     if dx.abs() > 0.01 || dy.abs() > 0.01 {
         Some(InputEvent::MouseScroll { dx, dy })

@@ -1533,53 +1533,60 @@ fn setup_input(
     }
     {
         let s = state.clone();
-        // Batch scroll events: send first immediately, then batch per rAF.
-        let scroll_accum = Rc::new(RefCell::new((0.0f32, 0.0f32)));
-        let scroll_pending = Rc::new(RefCell::new(false));
+        // Scroll: accumulate pixel deltas per rAF frame, convert to line counts.
+        // Uses Sunshine-style accumulation: fractional deltas build up until they
+        // reach a full "notch" (120 pixels = 1 discrete scroll unit).
+        // Direction follows the client's native behavior (browser already applies
+        // macOS natural scroll, etc.) — we just negate to match X11/enigo convention.
+        let scroll_accum = Rc::new(RefCell::new((0.0f64, 0.0f64)));
+        let scroll_raf_pending = Rc::new(RefCell::new(false));
         let scroll_accum2 = scroll_accum.clone();
-        let scroll_pending2 = scroll_pending.clone();
+        let scroll_raf2 = scroll_raf_pending.clone();
         let s2 = s.clone();
         let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
             e.prevent_default();
-            // Negate: browser deltaY positive = "scroll down" (content up),
-            // but server (enigo) expects positive = "scroll up" (content down).
-            let dx = -(e.delta_x() as f32 / 120.0);
-            let dy = -(e.delta_y() as f32 / 120.0);
 
-            if !*scroll_pending.borrow() {
-                // First scroll: send immediately (no delay)
-                {
-                    let st = s.borrow();
-                    send_input(&st, InputEvent::MouseScroll { dx, dy });
-                }
-                *scroll_pending.borrow_mut() = true;
+            // Pass through client's scroll direction as-is.
+            // Browser deltaY already reflects the client OS settings (macOS natural
+            // scroll, etc.). Positive = scroll down, which maps to enigo ScrollDown.
+            let mut acc = scroll_accum.borrow_mut();
+            acc.0 += e.delta_x() as f64;
+            acc.1 += e.delta_y() as f64;
+            drop(acc);
+
+            // Schedule flush on next rAF (one flush per frame, ~60Hz)
+            if !*scroll_raf_pending.borrow() {
+                *scroll_raf_pending.borrow_mut() = true;
                 let sa = scroll_accum2.clone();
-                let sp = scroll_pending2.clone();
+                let sp = scroll_raf2.clone();
                 let ss = s2.clone();
                 let flush = Closure::<dyn FnMut(f64)>::once(move |_: f64| {
                     let mut acc = sa.borrow_mut();
-                    if acc.0 != 0.0 || acc.1 != 0.0 {
+                    // Convert pixel delta to line counts.
+                    // Mouse wheel: 120px per notch → 1 line.
+                    // Trackpad: small deltas accumulate across frames.
+                    let lines_x = (acc.0 / 120.0).trunc();
+                    let lines_y = (acc.1 / 120.0).trunc();
+                    // Keep the remainder for next frame (smooth sub-notch accumulation)
+                    acc.0 -= lines_x * 120.0;
+                    acc.1 -= lines_y * 120.0;
+                    drop(acc);
+
+                    if lines_x != 0.0 || lines_y != 0.0 {
                         let st = ss.borrow();
                         send_input(
                             &st,
                             InputEvent::MouseScroll {
-                                dx: acc.0,
-                                dy: acc.1,
+                                dx: lines_x as f32,
+                                dy: lines_y as f32,
                             },
                         );
-                        acc.0 = 0.0;
-                        acc.1 = 0.0;
                     }
                     *sp.borrow_mut() = false;
                 });
                 let window = web_sys::window().unwrap();
                 let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
                 flush.forget();
-            } else {
-                // Subsequent scrolls: accumulate for next rAF
-                let mut acc = scroll_accum.borrow_mut();
-                acc.0 += dx;
-                acc.1 += dy;
             }
         });
         canvas

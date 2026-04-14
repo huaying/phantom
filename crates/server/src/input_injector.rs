@@ -54,15 +54,16 @@ impl InputInjector {
                     .map_err(|e| anyhow::anyhow!("mouse button: {e}"))?;
             }
             InputEvent::MouseScroll { dx, dy } => {
-                // enigo scroll takes i32 (lines)
+                // dx/dy are line counts (1.0 = one scroll notch).
+                // enigo scroll(N) sends N button clicks (ScrollUp/Down/Left/Right).
                 if *dy != 0.0 {
                     self.enigo
-                        .scroll((*dy * 3.0) as i32, enigo::Axis::Vertical)
+                        .scroll(*dy as i32, enigo::Axis::Vertical)
                         .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
                 }
                 if *dx != 0.0 {
                     self.enigo
-                        .scroll((*dx * 3.0) as i32, enigo::Axis::Horizontal)
+                        .scroll(*dx as i32, enigo::Axis::Horizontal)
                         .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
                 }
             }

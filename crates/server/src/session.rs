@@ -410,7 +410,7 @@ impl SessionRunner {
             keepalive_time: Instant::now(),
             had_input: false,
             frame_interval,
-            last_keyframe_time: Instant::now(),
+            last_keyframe_time: Instant::now() - Duration::from_secs(10),
             ping_sent_at: None,
             rtt_us: None,
             stats_encode_us: 0,
