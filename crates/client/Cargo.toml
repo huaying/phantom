@@ -19,13 +19,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 openh264 = "0.6"
 dirs-next = "2"
-dav1d = "0.10"
+dav1d = { version = "0.10", optional = true }
 winit = "0.30"
 softbuffer = "0.4"
 # Audio playback (optional)
 cpal = { version = "0.15", optional = true }
 audiopus = { version = "0.3.0-rc.0", optional = true }
+audiopus_sys = { version = "0.2", optional = true, features = ["static"] }
 
 [features]
-default = ["audio"]
-audio = ["cpal", "audiopus"]
+default = ["audio", "av1"]
+av1 = ["dav1d"]  # AV1 software decode via libdav1d (requires libdav1d at runtime)
+audio = ["cpal", "audiopus", "audiopus_sys"]

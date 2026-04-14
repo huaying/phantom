@@ -3,6 +3,7 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
 #
 # Installs phantom-server and/or phantom-client to /usr/local/bin.
+# On Linux, also installs required runtime libraries.
 
 set -e
 
@@ -44,6 +45,55 @@ else
         linux) INSTALL_SERVER=true ;;
         macos) INSTALL_CLIENT=true ;;
     esac
+fi
+
+# --- Install Linux runtime dependencies ---
+install_linux_deps() {
+    echo "Installing runtime dependencies..."
+
+    if command -v apt-get > /dev/null 2>&1; then
+        # Debian / Ubuntu
+        PKGS="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3"
+        if [ "$INSTALL_SERVER" = true ]; then
+            PKGS="$PKGS libpulse0"
+        fi
+        if [ "$INSTALL_CLIENT" = true ]; then
+            PKGS="$PKGS libdav1d7 || libdav1d6 || libdav1d5 || true"
+        fi
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends $PKGS 2>/dev/null || {
+            # Retry without versioned dav1d (name varies by distro version)
+            sudo apt-get install -y --no-install-recommends \
+                libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0 2>/dev/null || true
+        }
+    elif command -v dnf > /dev/null 2>&1; then
+        # Fedora / RHEL
+        PKGS="libxcb libxdo libXtst"
+        if [ "$INSTALL_SERVER" = true ]; then
+            PKGS="$PKGS pulseaudio-libs"
+        fi
+        if [ "$INSTALL_CLIENT" = true ]; then
+            PKGS="$PKGS dav1d"
+        fi
+        sudo dnf install -y $PKGS 2>/dev/null || true
+    elif command -v pacman > /dev/null 2>&1; then
+        # Arch Linux
+        PKGS="libxcb xdotool libxtst"
+        if [ "$INSTALL_SERVER" = true ]; then
+            PKGS="$PKGS libpulse"
+        fi
+        if [ "$INSTALL_CLIENT" = true ]; then
+            PKGS="$PKGS dav1d"
+        fi
+        sudo pacman -S --needed --noconfirm $PKGS 2>/dev/null || true
+    else
+        echo "Warning: could not detect package manager."
+        echo "You may need to install X11/XCB libraries manually."
+    fi
+}
+
+if [ "$OS" = "linux" ]; then
+    install_linux_deps
 fi
 
 # --- Get latest release URL ---

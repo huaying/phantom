@@ -102,10 +102,14 @@ jobs:
         if: matrix.build_server && (contains(matrix.target, 'windows') || matrix.cross)
         run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio
 
-      # Build client
+      # Build client (without av1/dav1d on Windows — no vcpkg in release build)
       - name: Build client
-        if: matrix.build_client
+        if: matrix.build_client && !contains(matrix.target, 'windows')
         run: cargo build --release --target ${{ matrix.target }} -p phantom-client
+
+      - name: Build client (Windows, no dav1d)
+        if: matrix.build_client && contains(matrix.target, 'windows')
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-client --no-default-features --features audio
 
       # Package — Unix
       - name: Package binaries (Unix)

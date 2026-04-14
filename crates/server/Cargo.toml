@@ -7,7 +7,7 @@ edition = "2021"
 default = ["web-client", "audio"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
-audio = ["audiopus", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
+audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
 wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + XDG Portal
 
 [dependencies]
@@ -34,8 +34,9 @@ enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"
 phantom-gpu = { path = "../gpu" }
-# Audio: Opus encoding (cross-platform)
+# Audio: Opus encoding (cross-platform, static link to avoid libopus runtime dep)
 audiopus = { version = "0.3.0-rc.0", optional = true }
+audiopus_sys = { version = "0.2", optional = true, features = ["static"] }
 ctrlc = "3"
 # Wayland screen capture (optional, Linux only)
 pipewire = { version = "0.8", optional = true }

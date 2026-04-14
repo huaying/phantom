@@ -7,6 +7,7 @@
 
 #[cfg(feature = "audio")]
 mod audio_playback;
+#[cfg(feature = "av1")]
 mod decode_av1;
 mod decode_h264;
 #[cfg(target_os = "macos")]
@@ -370,13 +371,21 @@ impl App {
                 if let Some(decoder) = try_nvdec(width, height, video_codec) {
                     decoder
                 } else if video_codec == phantom_core::encode::VideoCodec::Av1 {
-                    // AV1 software fallback: dav1d
-                    match decode_av1::Dav1dDecoder::new(width, height) {
-                        Ok(d) => Box::new(d),
-                        Err(e) => {
-                            tracing::error!("AV1 decoder init failed: {e}");
-                            return;
+                    // AV1 software fallback: dav1d (requires "av1" feature)
+                    #[cfg(feature = "av1")]
+                    {
+                        match decode_av1::Dav1dDecoder::new(width, height) {
+                            Ok(d) => Box::new(d),
+                            Err(e) => {
+                                tracing::error!("AV1 decoder init failed: {e}");
+                                return;
+                            }
                         }
+                    }
+                    #[cfg(not(feature = "av1"))]
+                    {
+                        tracing::error!("Server sent AV1 but client built without 'av1' feature (needs libdav1d)");
+                        return;
                     }
                 } else {
                     // H.264 software fallback: OpenH264
