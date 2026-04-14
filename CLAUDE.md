@@ -249,7 +249,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ---
 
-## Implemented Features (44)
+## Implemented Features (45)
 
 | # | Feature |
 |---|---------|
@@ -297,6 +297,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 42 | **Web audio** (Opus decode via WebCodecs AudioDecoder, auto-resume on gesture) |
 | 43 | **Forward-compatible protocol** (read_message_lenient, skips unknown message variants) |
 | 44 | **Windows Service mode** (Session 0 service + agent in user session, IPC pipe, lock screen GDI fallback) |
+| 45 | **JWT token auth** (`--auth-secret`, HMAC-SHA256, platform signs `{sub, vm_id, exp}`, HTTP 401 on invalid) |
 
 ---
 
@@ -305,7 +306,6 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 ### Next Up
 | Task | Impact | Notes |
 |------|--------|-------|
-| Application-level auth | DCV-style web login form → `LogonUser` API | Avoids Winlogon secure desktop entirely. Cleaner than remote-controlling lock screen. Used by DCV, Parsec, RDP, TeamViewer |
 | NAT relay (TURN) | Symmetric NAT / firewall bypass | Only remaining networking gap for "works everywhere" |
 | VAAPI GPU encoding | AMD/Intel GPU encode on Linux | Broadens GPU support beyond NVIDIA |
 | DMA-BUF/KMS capture | Linux zero-copy capture | Eliminates CPU readback on Linux (like NVFBC but vendor-neutral) |
@@ -324,7 +324,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 
 ### Completed
 <details>
-<summary>44 features shipped (click to expand)</summary>
+<summary>45 features shipped (click to expand)</summary>
 
 | Task | Status |
 |------|--------|
@@ -353,6 +353,7 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | VideoToolbox decode | ✅ macOS hardware H.264 decode |
 | 4K support | ✅ bilinear downscale, aspect-ratio letterbox |
 | Windows Service mode | ✅ Session 0 + agent, IPC pipe, DXGI→NVENC, GDI lock screen fallback |
+| JWT token auth | ✅ `--auth-secret` / `PHANTOM_AUTH_SECRET`, platform integration, 10/10 security tests passed |
 
 </details>
 
