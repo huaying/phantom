@@ -246,20 +246,26 @@ pub struct AdaptiveBitrate {
     max_kbps: u32,
     last_change: Instant,
     stable_since: Option<Instant>,
+    /// Baseline RTT (minimum observed). Used to detect congestion vs fixed latency.
+    baseline_rtt_ms: Option<f64>,
 }
 
 impl AdaptiveBitrate {
     pub fn new(initial_kbps: u32) -> Self {
         Self {
             current_kbps: initial_kbps,
-            min_kbps: 500,
+            min_kbps: 1500, // Don't go below 1500kbps (was 500 — too low, causes blur)
             max_kbps: initial_kbps * 3,
             last_change: Instant::now(),
             stable_since: None,
+            baseline_rtt_ms: None,
         }
     }
 
     /// Evaluate whether to change bitrate. Returns Some(new_kbps) if a change is needed.
+    ///
+    /// Key insight: only decrease on CONGESTION (RTT increasing above baseline),
+    /// not on fixed high latency (e.g. 100ms to a distant server).
     pub fn evaluate(&mut self, rtt_us: Option<u64>, congestion_skip_ratio: u32) -> Option<u32> {
         // Don't change more than once every 5s
         if self.last_change.elapsed() < Duration::from_secs(5) {
@@ -267,9 +273,29 @@ impl AdaptiveBitrate {
         }
 
         let rtt_ms = rtt_us.map(|us| us as f64 / 1000.0).unwrap_or(0.0);
+        if rtt_ms <= 0.0 {
+            return None;
+        }
 
-        // Decrease: high RTT or congested
-        if rtt_ms > 100.0 || congestion_skip_ratio > 1 {
+        // Track baseline RTT (minimum observed = fixed network latency)
+        match self.baseline_rtt_ms {
+            None => self.baseline_rtt_ms = Some(rtt_ms),
+            Some(ref mut base) => {
+                // Slowly adapt baseline upward (EMA) but snap down immediately
+                if rtt_ms < *base {
+                    *base = rtt_ms;
+                } else {
+                    *base = *base * 0.95 + rtt_ms * 0.05;
+                }
+            }
+        }
+        let baseline = self.baseline_rtt_ms.unwrap_or(rtt_ms);
+
+        // Congestion = RTT significantly above baseline (>50% increase)
+        let congested = rtt_ms > baseline * 1.5 && rtt_ms > baseline + 30.0;
+
+        // Decrease: actual congestion or frame skip
+        if congested || congestion_skip_ratio > 1 {
             let new = ((self.current_kbps as f64 * 0.7) as u32).max(self.min_kbps);
             if new < self.current_kbps {
                 self.stable_since = None;
@@ -277,12 +303,11 @@ impl AdaptiveBitrate {
             }
         }
 
-        // Track stability (low RTT, no congestion)
-        if rtt_ms > 0.0 && rtt_ms < 50.0 && congestion_skip_ratio <= 1 {
+        // Increase: RTT near baseline (not congested) and stable for 10s
+        if !congested && congestion_skip_ratio <= 1 {
             if self.stable_since.is_none() {
                 self.stable_since = Some(Instant::now());
             }
-            // Increase: stable for 10s and below max
             if let Some(since) = self.stable_since {
                 if since.elapsed() >= Duration::from_secs(10) && self.current_kbps < self.max_kbps {
                     let new = ((self.current_kbps as f64 * 1.2) as u32).min(self.max_kbps);
