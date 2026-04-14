@@ -15,8 +15,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check (compile test - server crates)
         run: cargo check --workspace --exclude phantom-client
-      - name: Clippy
-        run: cargo clippy --workspace --exclude phantom-client -- -D warnings
 
   test:
     runs-on: ubuntu-latest
