@@ -739,6 +739,20 @@ fn h264_has_idr(data: &[u8]) -> bool {
     false
 }
 
+fn create_decoder_config(width: u32, height: u32, codec: VideoCodec, hw_accel: &str) -> js_sys::Object {
+    let config = js_sys::Object::new();
+    let codec_str = match codec {
+        VideoCodec::Av1 => "av01.0.08M.08",
+        _ => "avc1.42c028",
+    };
+    js_sys::Reflect::set(&config, &"codec".into(), &codec_str.into()).unwrap();
+    js_sys::Reflect::set(&config, &"codedWidth".into(), &(width).into()).unwrap();
+    js_sys::Reflect::set(&config, &"codedHeight".into(), &(height).into()).unwrap();
+    js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &true.into()).unwrap();
+    js_sys::Reflect::set(&config, &"hardwareAcceleration".into(), &hw_accel.into()).unwrap();
+    config
+}
+
 fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: VideoCodec) {
     let s = state.clone();
     let decode_count = Rc::new(RefCell::new(0u64));
@@ -750,8 +764,6 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
         if *count <= 3 {
             console::log_1(&format!("Decoded frame #{}", *count).into());
         }
-        // Use the canvas 2D context directly via web-sys instead of eval
-        // to avoid potential timing issues with js_sys::eval.
         let st = s.borrow();
         let w = st.server_width;
         let h = st.server_height;
@@ -771,15 +783,12 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
     js_sys::Reflect::set(&init, &"error".into(), error_cb.as_ref()).unwrap();
     let decoder = JsVideoDecoder::new(&init);
 
-    let config = js_sys::Object::new();
-    let codec_str = match codec {
-        VideoCodec::Av1 => "av01.0.08M.08", // AV1 Main Profile, Level 4.0, 8-bit
-        _ => "avc1.42c028",                 // H.264 Baseline, Level 4.0
-    };
-    js_sys::Reflect::set(&config, &"codec".into(), &codec_str.into()).unwrap();
-    js_sys::Reflect::set(&config, &"codedWidth".into(), &(width).into()).unwrap();
-    js_sys::Reflect::set(&config, &"codedHeight".into(), &(height).into()).unwrap();
-    js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &true.into()).unwrap();
+    // Use software decode: Chrome's hardware WebCodecs decoder defers output
+    // callback when tab isn't fully focused (after URL navigation), causing
+    // black screen until click. Software decode (~2-4ms/frame at 1080p) is
+    // fast enough and guarantees immediate first frame. The bottleneck is
+    // network RTT (~100ms), not decode time.
+    let config = create_decoder_config(width, height, codec, "prefer-software");
     decoder.configure(&config);
 
     state.borrow_mut().decoder = Some(decoder);
