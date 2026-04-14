@@ -611,11 +611,6 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     .unwrap();
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
-                if fc <= 3 {
-                    console::log_1(
-                        &format!("Submitting frame #{fc} to decoder (key={is_key})").into(),
-                    );
-                }
                 decoder.decode(&chunk);
             }
         }
@@ -781,9 +776,6 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
     let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |frame: JsValue| {
         let mut count = dc.borrow_mut();
         *count += 1;
-        if *count <= 3 {
-            console::log_1(&format!("Decoded frame #{}", *count).into());
-        }
         let st = s.borrow();
         let w = st.server_width;
         let h = st.server_height;
@@ -1709,9 +1701,6 @@ fn setup_input(
                 }
             }
             if let Some(kc) = js_code_to_keycode(&code) {
-                console::log_1(
-                    &format!("key: {code} pressed={pressed} repeat={}", e.repeat()).into(),
-                );
                 send_input(&st, InputEvent::Key { key: kc, pressed });
             }
         });

@@ -466,10 +466,6 @@ function __wbg_get_imports() {
             const ret = arg0.readyState;
             return (__wbindgen_enum_RtcDataChannelState.indexOf(ret) + 1 || 5) - 1;
         },
-        __wbg_repeat_44d6eeebd275606f: function(arg0) {
-            const ret = arg0.repeat;
-            return ret;
-        },
         __wbg_requestAnimationFrame_206c97f410e7a383: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.requestAnimationFrame(arg1);
             return ret;
