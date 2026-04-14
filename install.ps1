@@ -47,9 +47,8 @@ Write-Host ""
 Write-Host "Done! Phantom $version installed to $installDir" -ForegroundColor Green
 Write-Host ""
 Write-Host "Quick start:" -ForegroundColor Cyan
-Write-Host "  phantom-server.exe --no-encrypt --transport web"
-Write-Host "  # then open https://localhost:9900 in browser"
+Write-Host "  phantom-server.exe"
+Write-Host "  # TCP:9900 (native client) + Web:9901 (browser: https://localhost:9901)"
 Write-Host ""
-Write-Host "Note: Windows server builds without embedded web client." -ForegroundColor Yellow
-Write-Host "      Use --transport tcp with native client instead," -ForegroundColor Yellow
-Write-Host "      or build from source with wasm-pack for web access." -ForegroundColor Yellow
+Write-Host "Install as Windows Service (auto-start, pre-login access):" -ForegroundColor Cyan
+Write-Host "  phantom-server.exe --install"

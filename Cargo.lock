@@ -2521,7 +2521,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "openh264",
@@ -2531,11 +2531,12 @@ dependencies = [
 
 [[package]]
 name = "phantom-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
  "audiopus",
+ "audiopus_sys",
  "bincode",
  "clap",
  "cpal",
@@ -2557,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2570,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "phantom-core",
@@ -2580,11 +2581,12 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
  "audiopus",
+ "audiopus_sys",
  "base64",
  "bincode",
  "bytes",
@@ -2617,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-stream"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "phantom-core",
@@ -2630,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "js-sys",

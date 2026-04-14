@@ -48,52 +48,54 @@ else
 fi
 
 # --- Install Linux runtime dependencies ---
-install_linux_deps() {
+if [ "$OS" = "linux" ]; then
     echo "Installing runtime dependencies..."
 
     if command -v apt-get > /dev/null 2>&1; then
         # Debian / Ubuntu
-        PKGS="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3"
+        PKGS=""
         if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="$PKGS libpulse0"
+            PKGS="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0"
         fi
         if [ "$INSTALL_CLIENT" = true ]; then
-            PKGS="$PKGS libdav1d7 || libdav1d6 || libdav1d5 || true"
+            PKGS="$PKGS libasound2"
         fi
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends $PKGS 2>/dev/null || {
-            # Retry without versioned dav1d (name varies by distro version)
-            sudo apt-get install -y --no-install-recommends \
-                libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0 2>/dev/null || true
-        }
+        if [ -n "$PKGS" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends $PKGS || true
+        fi
+
     elif command -v dnf > /dev/null 2>&1; then
         # Fedora / RHEL
-        PKGS="libxcb libxdo libXtst"
+        PKGS=""
         if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="$PKGS pulseaudio-libs"
+            PKGS="libxcb libxdo libXtst pulseaudio-libs"
         fi
         if [ "$INSTALL_CLIENT" = true ]; then
-            PKGS="$PKGS dav1d"
+            PKGS="$PKGS alsa-lib"
         fi
-        sudo dnf install -y $PKGS 2>/dev/null || true
+        if [ -n "$PKGS" ]; then
+            sudo dnf install -y $PKGS || true
+        fi
+
     elif command -v pacman > /dev/null 2>&1; then
         # Arch Linux
-        PKGS="libxcb xdotool libxtst"
+        PKGS=""
         if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="$PKGS libpulse"
+            PKGS="libxcb xdotool libxtst libpulse"
         fi
         if [ "$INSTALL_CLIENT" = true ]; then
-            PKGS="$PKGS dav1d"
+            PKGS="$PKGS alsa-lib"
         fi
-        sudo pacman -S --needed --noconfirm $PKGS 2>/dev/null || true
-    else
-        echo "Warning: could not detect package manager."
-        echo "You may need to install X11/XCB libraries manually."
-    fi
-}
+        if [ -n "$PKGS" ]; then
+            sudo pacman -S --needed --noconfirm $PKGS || true
+        fi
 
-if [ "$OS" = "linux" ]; then
-    install_linux_deps
+    else
+        echo "Warning: could not detect package manager. You may need to install runtime libraries manually."
+        echo "  Server: libxcb, libxdo, libpulse"
+        echo "  Client: libasound (ALSA)"
+    fi
 fi
 
 # --- Get latest release URL ---
@@ -140,14 +142,14 @@ echo "Done!"
 if [ "$INSTALL_SERVER" = true ]; then
     echo ""
     echo "Start server:"
-    echo "  phantom-server --no-encrypt --transport web"
-    echo "  # then open https://localhost:9900 in browser"
+    echo "  phantom-server"
+    echo "  # TCP:9900 (native client) + Web:9901 (browser: https://localhost:9901)"
     echo ""
     echo "With GPU (NVIDIA):"
-    echo "  DISPLAY=:0 phantom-server --capture nvfbc --encoder nvenc --no-encrypt --transport tcp"
+    echo "  DISPLAY=:0 phantom-server --capture nvfbc --encoder nvenc"
 fi
 if [ "$INSTALL_CLIENT" = true ]; then
     echo ""
     echo "Connect to server:"
-    echo "  phantom-client --no-encrypt -c <server-ip>:9900"
+    echo "  phantom-client -c <server-ip>:9900"
 fi

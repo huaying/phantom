@@ -13,8 +13,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check (compile test - server crates)
-        run: cargo check --workspace --exclude phantom-client
+      - name: Check server (Windows features)
+        run: cargo check -p phantom-server --features audio
+      - name: Check client (Windows features, no dav1d)
+        run: cargo check -p phantom-client --no-default-features --features audio
+      - name: Clippy
+        run: cargo clippy -p phantom-server --features audio -p phantom-client --no-default-features --features audio -p phantom-core -p phantom-gpu -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -28,8 +32,10 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev \
-            libdav1d-dev nasm \
+            libdav1d-dev nasm cmake \
             libpulse-dev libopus-dev libasound2-dev
+      - name: Format
+        run: cargo fmt --all -- --check
       - name: Build WASM (needed for server)
         run: |
           cargo install wasm-pack

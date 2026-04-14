@@ -2,7 +2,7 @@ FROM rust:1.94-bookworm AS builder
 
 # Install build deps for openh264 (needs nasm), scrap (needs X11 dev libs), and audio (PulseAudio + Opus)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nasm \
+    nasm cmake \
     libx11-dev \
     libxext-dev \
     libxrandr-dev \
