@@ -1,12 +1,17 @@
 //! Phantom remote desktop server.
 //!
-//! Captures the screen (via scrap, NVFBC, PipeWire, or DXGI), encodes it
+//! Captures the screen (via scrap, NVFBC, PipeWire, DXGI, or GDI), encodes it
 //! (OpenH264 or NVENC), and streams to connected clients over TCP, QUIC,
 //! WebSocket, or WebRTC. Supports encrypted connections, audio capture,
 //! bidirectional file transfer, and clipboard synchronization.
+//!
+//! On Windows, can run as a Windows Service (Session 0) for pre-login access.
+//! Use `--install` to register the service, `--uninstall` to remove it.
 
 #[cfg(feature = "audio")]
 mod audio_capture;
+#[cfg(target_os = "windows")]
+mod capture_gdi;
 #[cfg(feature = "wayland")]
 mod capture_pipewire;
 mod capture_scrap;
@@ -14,6 +19,9 @@ mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
 mod input_injector;
+mod ipc_pipe;
+#[cfg(target_os = "windows")]
+mod service_win;
 mod session;
 mod transport_quic;
 mod transport_tcp;
@@ -95,19 +103,67 @@ struct Args {
     /// Override public address (skip STUN discovery). Format: IP:port.
     #[arg(long)]
     public_addr: Option<String>,
+
+    /// HMAC-SHA256 shared secret (hex-encoded) for JWT token authentication.
+    /// When set, WebSocket clients must provide a valid JWT via ?token= query param.
+    /// The JWT is signed by an external platform (e.g. CloudStack, Horde).
+    #[arg(long)]
+    auth_secret: Option<String>,
+
+    /// Run as agent process (launched by service in user session).
+    /// Handles DXGI capture + input injection, connects back to service.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    agent_mode: bool,
+
+    /// Windows session ID for IPC pipe isolation (passed by service to agent).
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    ipc_session: Option<u32>,
+
+    /// Run as Windows Service (invoked by SCM — do not use manually).
+    /// Use `--install` to register the service instead.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    service: bool,
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // ── Windows: agent/service modes need early detection before tracing init ──
+    #[cfg(target_os = "windows")]
+    {
+        if args.service {
+            // Service mode: tracing will be set up by the service itself.
+            // Initialize console tracing for the SCM dispatcher.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive("phantom=info".parse().unwrap()),
+                )
+                .init();
+            tracing::info!("Entering Windows Service dispatcher mode");
+            return service_win::run_as_service()
+                .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
+        }
+
+        if args.agent_mode {
+            // Agent mode: no console, write tracing output to a log file
+            // in the system temp directory.
+            return run_agent_mode(args.ipc_session);
+        }
+    }
+
+    // ── Normal console mode: tracing to stdout ─────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("phantom=info".parse().unwrap()),
         )
         .init();
-
-    let args = Args::parse();
 
     // ── Graceful shutdown signal (Ctrl+C / SIGTERM) ─────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -351,6 +407,20 @@ fn main() -> Result<()> {
         .unwrap_or("0.0.0.0")
         .to_string();
 
+    // Parse JWT auth secret (hex → bytes)
+    let auth_secret: Option<Vec<u8>> = match &args.auth_secret {
+        Some(hex) => {
+            let bytes: Result<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(Into::into))
+                .collect();
+            let bytes = bytes.map_err(|_| anyhow::anyhow!("invalid --auth-secret: expected hex string"))?;
+            tracing::info!("JWT authentication ENABLED for WebSocket connections");
+            Some(bytes)
+        }
+        None => None,
+    };
+
     for transport in &transports {
         match *transport {
             "tcp" => {
@@ -403,7 +473,7 @@ fn main() -> Result<()> {
                     base_port
                 };
                 let mut ws_transport =
-                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2)?;
+                    transport_ws::WebServerTransport::start(web_port, web_port + 1, web_port + 2, auth_secret.clone())?;
                 tracing::info!("open https://localhost:{web_port} in browser");
                 // Share audio WS receiver with the session loop
                 audio_ws_rx_shared = Some(Arc::new(std::sync::Mutex::new(
@@ -578,6 +648,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                     audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
@@ -595,6 +666,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                     audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
@@ -617,6 +689,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                     audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
@@ -634,6 +707,7 @@ fn main() -> Result<()> {
                     send_file: send_file_path.as_deref(),
                     video_codec,
                     is_resume,
+                    input_forwarder: None,
                     audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
                 },
             )
@@ -652,7 +726,8 @@ fn main() -> Result<()> {
                 send_file: send_file_path.as_deref(),
                 video_codec,
                 is_resume,
-                    audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
+                input_forwarder: None,
+                audio_ws_rx: audio_ws_rx_shared.as_ref().and_then(|s| s.lock().ok()?.take()),
             },
         );
 
@@ -865,29 +940,7 @@ fn install_autostart() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("schtasks")
-            .args([
-                "/Create",
-                "/TN",
-                "PhantomServer",
-                "/TR",
-                &format!("\"{exe_str}\" --no-encrypt --transport web"),
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "HIGHEST",
-                "/IT",
-                "/F",
-            ])
-            .status()
-            .context("schtasks")?;
-        if status.success() {
-            println!("Installed: PhantomServer scheduled task (runs at logon)");
-            println!("  To start now: schtasks /Run /TN PhantomServer");
-            println!("  To remove:    phantom-server --uninstall");
-        } else {
-            anyhow::bail!("schtasks failed with {status}");
-        }
+        return service_win::install_service();
     }
 
     #[cfg(target_os = "linux")]
@@ -926,15 +979,7 @@ fn uninstall_autostart() -> Result<()> {
     use anyhow::Context;
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", "PhantomServer", "/F"])
-            .status()
-            .context("schtasks delete")?;
-        if status.success() {
-            println!("Removed: PhantomServer scheduled task");
-        } else {
-            anyhow::bail!("schtasks delete failed");
-        }
+        return service_win::uninstall_service();
     }
 
     #[cfg(target_os = "linux")]
@@ -954,6 +999,248 @@ fn uninstall_autostart() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Agent mode (Windows only) ───────────────────────────────────────────────
+
+/// Run as an agent process in the user's session.
+/// Captures the screen via DXGI/scrap, sends frames to the service via IPC,
+/// and receives input events to inject into the desktop.
+#[cfg(target_os = "windows")]
+fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // Agent has no console (spawned by the service). Set up tracing to write
+    // to a log file in the system temp directory instead of stdout.
+    let log_file = std::env::temp_dir().join("phantom-agent.log");
+    if let Ok(file) = std::fs::File::create(&log_file) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("phantom=info".parse().unwrap()),
+            )
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    } else {
+        // Fallback: if we can't create the log file, init with default (stdout).
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("phantom=info".parse().unwrap()),
+            )
+            .init();
+    }
+
+    tracing::info!("Connecting to IPC pipe...");
+    let ipc = match ipc_pipe::IpcClient::connect(ipc_session) {
+        Ok(c) => { tracing::info!("IPC connected"); c }
+        Err(e) => { tracing::error!("IPC connect FAILED: {e}"); return Err(e); }
+    };
+
+    // Set up input injection
+    let mut injector = match input_injector::InputInjector::new() {
+        Ok(inj) => Some(inj),
+        Err(e) => { tracing::warn!("Input injection unavailable: {e}"); None }
+    };
+
+    // Graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        ctrlc::set_handler(move || { shutdown.store(true, Ordering::SeqCst); }).ok();
+    }
+
+    // Run agent capture+encode loop.
+    // Like RustDesk/Sunshine: calls OpenInputDesktop+SetThreadDesktop before capture,
+    // reinits DXGI on ACCESS_LOST (desktop switch: lock/unlock).
+    run_agent_loop(&ipc, &mut injector, &shutdown)
+}
+
+/// Agent capture+encode loop following RustDesk/Sunshine pattern:
+/// - Calls OpenInputDesktop + SetThreadDesktop before capture (follows desktop switches)
+/// - On DXGI error: reinit pipeline (don't crash)
+/// - Survives lock/unlock transitions
+#[cfg(target_os = "windows")]
+fn run_agent_loop(
+    ipc: &ipc_pipe::IpcClient,
+    injector: &mut Option<input_injector::InputInjector>,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use phantom_core::capture::FrameCapture;
+    use phantom_core::encode::FrameEncoder;
+
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+
+    // Two capture modes: DXGI+NVENC (GPU) and GDI+OpenH264 (CPU, lock screen fallback)
+    let mut gpu_pipeline: Option<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> = None;
+    let mut gdi_capture: Option<capture_gdi::GdiCapture> = None;
+    let mut cpu_encoder: Option<Box<dyn FrameEncoder>> = None;
+
+    let mut frame_count = 0u64;
+    let mut last_keyframe = Instant::now();
+    let mut last_init_attempt = Instant::now() - Duration::from_secs(10);
+    let mut width = 1920u32;
+    let mut height = 1080u32;
+    let mut using_gdi = false;
+
+    tracing::info!("Starting agent loop");
+
+    while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
+        let loop_start = Instant::now();
+        capture_gdi::switch_to_input_desktop();
+
+        // Try to init/reinit DXGI pipeline (preferred, GPU zero-copy)
+        if gpu_pipeline.is_none() && last_init_attempt.elapsed() > Duration::from_secs(1) {
+            last_init_attempt = Instant::now();
+            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(30, 5000) {
+                Ok(mut gpu) => {
+                    width = gpu.width;
+                    height = gpu.height;
+                    gpu.force_keyframe();
+                    if using_gdi {
+                        tracing::info!(width, height, "Switched back to DXGI→NVENC");
+                    } else {
+                        tracing::info!(width, height, "DXGI→NVENC ready");
+                    }
+                    gpu_pipeline = Some(gpu);
+                    gdi_capture = None;
+                    cpu_encoder = None;
+                    using_gdi = false;
+                }
+                Err(_) => {
+                    // DXGI unavailable (locked, no display) — use GDI fallback
+                    if gdi_capture.is_none() {
+                        match capture_gdi::GdiCapture::new() {
+                            Ok(gdi) => {
+                                let (w, h) = gdi.resolution();
+                                width = w;
+                                height = h;
+                                match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
+                                    Ok(mut e) => {
+                                        e.force_keyframe();
+                                        tracing::info!(width = w, height = h, "GDI+OpenH264 fallback");
+                                        cpu_encoder = Some(Box::new(e));
+                                        gdi_capture = Some(gdi);
+                                        using_gdi = true;
+                                    }
+                                    Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
+                                }
+                            }
+                            Err(e) => {
+                                if frame_count == 0 {
+                                    tracing::warn!("GDI also failed: {e} (will retry)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle keyframe requests
+        if ipc.take_keyframe_request() {
+            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
+            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            last_keyframe = Instant::now();
+        }
+        if last_keyframe.elapsed() > Duration::from_secs(2) {
+            if let Some(ref mut gpu) = gpu_pipeline { gpu.force_keyframe(); }
+            if let Some(ref mut enc) = cpu_encoder { enc.force_keyframe(); }
+            last_keyframe = Instant::now();
+        }
+
+        // Capture + encode: GPU path (DXGI→NVENC)
+        if let Some(ref mut gpu) = gpu_pipeline {
+            match gpu.capture_and_encode() {
+                Ok(Some(encoded)) => {
+                    frame_count += 1;
+                    if frame_count <= 3 || frame_count % 300 == 0 {
+                        tracing::info!(
+                            frame = frame_count, width, height,
+                            bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
+                            "GPU frame"
+                        );
+                    }
+                    if encoded.is_keyframe { last_keyframe = Instant::now(); }
+                    if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                        tracing::error!("IPC send failed: {e}");
+                        break;
+                    }
+                }
+                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
+                Err(e) => {
+                    tracing::warn!("DXGI error: {e}, falling back to GDI");
+                    gpu_pipeline = None;
+                    // Will try DXGI again in 1s, GDI immediately
+                }
+            }
+        }
+        // Capture + encode: GDI fallback path (lock screen, no display)
+        else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder) {
+            match gdi.capture() {
+                Ok(Some(frame)) => {
+                    match enc.encode_frame(&frame) {
+                        Ok(encoded) => {
+                            frame_count += 1;
+                            if frame_count <= 3 || frame_count % 300 == 0 {
+                                tracing::info!(
+                                    frame = frame_count, width, height,
+                                    bytes = encoded.data.len(), keyframe = encoded.is_keyframe,
+                                    "GDI frame"
+                                );
+                            }
+                            if encoded.is_keyframe { last_keyframe = Instant::now(); }
+                            if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                                tracing::error!("IPC send failed: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!("GDI encode error: {e}"),
+                    }
+                }
+                Ok(None) => { std::thread::sleep(Duration::from_millis(1)); }
+                Err(e) => {
+                    tracing::warn!("GDI capture error: {e}");
+                    gdi_capture = None;
+                    cpu_encoder = None;
+                }
+            }
+        } else {
+            // Neither available yet — wait for retry
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // Forward input events
+        for event in ipc.recv_inputs() {
+            capture_gdi::switch_to_input_desktop();
+            if let Some(ref mut inj) = injector {
+                let _ = inj.inject(&event);
+            }
+        }
+
+        let elapsed = loop_start.elapsed();
+        if elapsed < frame_interval {
+            std::thread::sleep(frame_interval - elapsed);
+        }
+    }
+
+    tracing::info!("Agent shutting down");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_agent_loop(
+    _ipc: &ipc_pipe::IpcClient,
+    _injector: &mut Option<input_injector::InputInjector>,
+    _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    anyhow::bail!("Agent mode only supported on Windows")
 }
 
 fn print_connection_code(addr: &str) {

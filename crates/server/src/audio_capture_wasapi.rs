@@ -16,7 +16,6 @@ use tracing::{info, warn};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -50,7 +49,10 @@ impl AudioCapture {
             })
             .context("spawn audio capture thread")?;
 
-        info!(sample_rate, channels, "WASAPI loopback audio capture started");
+        info!(
+            sample_rate,
+            channels, "WASAPI loopback audio capture started"
+        );
 
         Ok((
             AudioCapture {
@@ -99,9 +101,7 @@ fn wasapi_capture_loop(
             .context("activate IAudioClient")?;
 
         // Get the mix format (the format the device is currently using)
-        let mix_format_ptr = audio_client
-            .GetMixFormat()
-            .context("GetMixFormat")?;
+        let mix_format_ptr = audio_client.GetMixFormat().context("GetMixFormat")?;
         let mix_format = &*mix_format_ptr;
 
         let device_sample_rate = mix_format.nSamplesPerSec;
@@ -110,9 +110,7 @@ fn wasapi_capture_loop(
 
         info!(
             device_sample_rate,
-            device_channels,
-            bits_per_sample,
-            "WASAPI device format"
+            device_channels, bits_per_sample, "WASAPI device format"
         );
 
         // Request 20ms buffer for loopback capture
@@ -148,7 +146,8 @@ fn wasapi_capture_loop(
 
         // 20ms of audio at 48kHz stereo = 960 frames
         let opus_frame_samples = (target_sample_rate / 50) as usize; // 960
-        let mut pcm_accumulator: Vec<i16> = Vec::with_capacity(opus_frame_samples * target_channels as usize * 2);
+        let mut pcm_accumulator: Vec<i16> =
+            Vec::with_capacity(opus_frame_samples * target_channels as usize * 2);
         let mut opus_buf = vec![0u8; 4000];
 
         // Resampler state (simple linear resampling if device rate != 48kHz)
@@ -198,17 +197,13 @@ fn wasapi_capture_loop(
                 // Convert device samples to i16 stereo at 48kHz
                 let pcm_i16: Vec<i16> = if is_float {
                     // f32 → i16
-                    let f32_slice = std::slice::from_raw_parts(
-                        buffer_ptr as *const f32,
-                        total_samples,
-                    );
+                    let f32_slice =
+                        std::slice::from_raw_parts(buffer_ptr as *const f32, total_samples);
                     f32_to_i16(f32_slice)
                 } else if bits_per_sample == 16 {
                     // Already i16
-                    let i16_slice = std::slice::from_raw_parts(
-                        buffer_ptr as *const i16,
-                        total_samples,
-                    );
+                    let i16_slice =
+                        std::slice::from_raw_parts(buffer_ptr as *const i16, total_samples);
                     i16_slice.to_vec()
                 } else if bits_per_sample == 24 {
                     // 24-bit PCM → i16 (drop lower 8 bits)

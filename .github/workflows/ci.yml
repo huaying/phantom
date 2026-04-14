@@ -7,6 +7,21 @@ on:
     branches: [main]
 
 jobs:
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies (vcpkg)
+        run: |
+          vcpkg install dav1d:x64-windows
+          echo "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib\pkgconfig" >> $env:GITHUB_ENV
+      - name: Check (compile test)
+        run: cargo check --workspace
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:

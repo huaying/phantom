@@ -22,6 +22,14 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// ── Input forwarding (for service mode IPC) ─────────────────────────────────
+
+/// Trait for forwarding input events to a remote agent instead of local injection.
+/// Used by Windows Service mode to send input over IPC to the agent process.
+pub trait InputForwarder: Send {
+    fn forward_input(&self, event: &InputEvent) -> Result<()>;
+}
+
 // ── Inbound events from the network receive thread ──────────────────────────
 
 pub enum InboundEvent {
@@ -347,6 +355,9 @@ pub struct SessionRunner {
     pub file_transfer: crate::file_transfer::ServerFileTransfer,
     /// Session token for reconnect validation.
     pub session_token: Vec<u8>,
+    /// Optional input forwarder (e.g. IPC to agent in service mode).
+    /// When set, input events are forwarded instead of locally injected.
+    pub input_forwarder: Option<Box<dyn InputForwarder>>,
 }
 
 impl SessionRunner {
@@ -410,6 +421,7 @@ impl SessionRunner {
             _audio_capture: audio_capture,
             file_transfer: crate::file_transfer::ServerFileTransfer::new(),
             session_token: Vec::new(),
+            input_forwarder: None,
         };
 
         // Generate session token for reconnect
@@ -483,7 +495,11 @@ impl SessionRunner {
         loop {
             match self.event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
-                    if let Some(ref mut inj) = self.injector {
+                    // If we have an input forwarder (e.g. IPC to agent), use it.
+                    // Otherwise inject locally (console mode).
+                    if let Some(ref fwd) = self.input_forwarder {
+                        let _ = fwd.forward_input(&event);
+                    } else if let Some(ref mut inj) = self.injector {
                         let _ = inj.inject(&event);
                     }
                     self.had_input = true;
@@ -500,6 +516,7 @@ impl SessionRunner {
                         let _ = ab.set_text(&text);
                     }
                     self.clipboard.on_remote_update(&text);
+                    // TODO: forward paste to agent via IPC in service mode
                     if let Some(ref mut inj) = self.injector {
                         let _ = inj.type_text(&text);
                         self.had_input = true;
@@ -813,6 +830,8 @@ pub struct SessionConfig<'a> {
     pub video_codec: phantom_core::encode::VideoCodec,
     /// If true, this is a resumed session — skip Hello, send keyframe immediately.
     pub is_resume: bool,
+    /// Optional input forwarder for service mode (IPC to agent).
+    pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Receiver for audio-only WebSocket connections (independent from video).
     pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
 }
@@ -860,6 +879,7 @@ fn run_session_cpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Send file if requested via --send-file
@@ -946,6 +966,70 @@ fn run_session_cpu_inner(
     }
 }
 
+/// IPC forwarding session: receives pre-encoded H.264 from agent, forwards to client.
+/// Used by Windows Service mode — agent does DXGI capture + NVENC encode in user session,
+/// service just relays the encoded bytes. No re-encoding, no raw frame transfer.
+pub fn run_session_ipc(
+    ipc: &crate::ipc_pipe::IpcServer,
+    cfg: SessionConfig<'_>,
+    initial_width: u32,
+    initial_height: u32,
+) -> SessionResult {
+    let result = run_session_ipc_inner(ipc, cfg, initial_width, initial_height);
+    match result {
+        Ok(token) => SessionResult {
+            session_token: token,
+            error: anyhow::anyhow!("session ended cleanly"),
+        },
+        Err(e) => SessionResult {
+            session_token: vec![],
+            error: e,
+        },
+    }
+}
+
+fn run_session_ipc_inner(
+    ipc: &crate::ipc_pipe::IpcServer,
+    cfg: SessionConfig<'_>,
+    initial_width: u32,
+    initial_height: u32,
+) -> Result<Vec<u8>> {
+    let mut runner = SessionRunner::new(
+        cfg.sender,
+        cfg.receiver,
+        initial_width,
+        initial_height,
+        cfg.frame_interval,
+        cfg.cancel,
+        cfg.video_codec,
+        cfg.is_resume,
+    )?;
+    runner.input_forwarder = cfg.input_forwarder;
+    runner.audio_ws_rx = cfg.audio_ws_rx;
+
+    // Request keyframe from agent for the new client
+    let _ = ipc.request_keyframe();
+
+    loop {
+        runner.check_cancelled()?;
+        let loop_start = Instant::now();
+
+        runner.pump_events()?;
+        runner.poll_clipboard()?;
+        runner.drain_audio()?;
+
+        // Forward ALL queued encoded frames from agent (H.264 must be sequential)
+        for ipc_frame in ipc.recv_encoded_frames() {
+            runner.send_video_frame(ipc_frame.encoded, None)?;
+        }
+
+        runner.drain_file_transfers()?;
+        runner.log_stats("stats-ipc");
+        runner.keepalive_tick()?;
+        runner.frame_pace(loop_start)?;
+    }
+}
+
 /// Linux GPU zero-copy session: NVFBC grab → NVENC encode → send.
 #[cfg(target_os = "linux")]
 pub fn run_session_gpu(
@@ -986,6 +1070,7 @@ fn run_session_gpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {
@@ -1082,6 +1167,7 @@ fn run_session_dxgi_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    runner.input_forwarder = cfg.input_forwarder;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {

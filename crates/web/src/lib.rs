@@ -165,11 +165,17 @@ pub fn main() {
     let document = window.document().unwrap();
 
     // Default: WebSocket. Add ?rtc to URL for WebRTC DataChannel mode.
-    let use_rtc = window
-        .location()
-        .search()
-        .unwrap_or_default()
-        .contains("rtc");
+    let query = window.location().search().unwrap_or_default();
+    let use_rtc = query.contains("rtc");
+
+    // Extract ?token=<jwt> for authenticated connections
+    let auth_token: Option<String> = query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == "token" { Some(v.to_string()) } else { None }
+        });
     let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
     console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
 
@@ -212,7 +218,7 @@ pub fn main() {
     if use_rtc {
         setup_webrtc(&state);
     } else {
-        setup_ws(&state);
+        setup_ws(&state, &auth_token);
     }
 }
 
@@ -370,7 +376,7 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
 }
 
-fn ws_url() -> String {
+fn ws_url(token: &Option<String>) -> String {
     let window = web_sys::window().unwrap();
     let location = window.location();
     let host = location.host().unwrap_or_default();
@@ -379,11 +385,14 @@ fn ws_url() -> String {
     } else {
         "ws"
     };
-    format!("{protocol}://{host}/ws")
+    match token {
+        Some(t) => format!("{protocol}://{host}/ws?token={t}"),
+        None => format!("{protocol}://{host}/ws"),
+    }
 }
 
-fn setup_ws(state: &Rc<RefCell<AppState>>) {
-    let url = ws_url();
+fn setup_ws(state: &Rc<RefCell<AppState>>, token: &Option<String>) {
+    let url = ws_url(token);
     connect_ws(state, &url, 1000);
 }
 
@@ -458,7 +467,13 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
 fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
     let s = state.clone();
     let cb = Closure::<dyn FnMut()>::once(move || {
-        let url = ws_url();
+        // Re-extract token from page URL for reconnect
+        let query = web_sys::window().unwrap().location().search().unwrap_or_default();
+        let token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == "token" { Some(v.to_string()) } else { None }
+        });
+        let url = ws_url(&token);
         connect_ws(&s, &url, delay_ms);
     });
     let window = web_sys::window().unwrap();
@@ -761,7 +776,16 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
     let location = window.location();
     let host = location.host().unwrap_or_default();
     let protocol = if location.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
-    let audio_url = format!("{protocol}://{host}/ws/audio");
+    // Include auth token in audio WS URL if present
+    let query = location.search().unwrap_or_default();
+    let token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k == "token" { Some(v.to_string()) } else { None }
+    });
+    let audio_url = match &token {
+        Some(t) => format!("{protocol}://{host}/ws/audio?token={t}"),
+        None => format!("{protocol}://{host}/ws/audio"),
+    };
 
     let s = state.clone();
     match WebSocket::new(&audio_url) {

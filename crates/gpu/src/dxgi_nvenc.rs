@@ -23,6 +23,8 @@ pub struct DxgiNvencPipeline {
     pub height: u32,
     force_idr: bool,
     frame_idx: u64,
+    /// Saved SPS/PPS NAL units from first keyframe (prepended to subsequent keyframes).
+    sps_pps: Vec<u8>,
     _nvenc_lib: DynLib,
 }
 
@@ -182,6 +184,7 @@ impl DxgiNvencPipeline {
             height,
             force_idr: true,
             frame_idx: 0,
+            sps_pps: Vec::new(),
             _nvenc_lib: nvenc_lib,
         })
     }
@@ -257,7 +260,7 @@ impl DxgiNvencPipeline {
         let size = lock.bitstream_size() as usize;
         let ptr = lock.bitstream_ptr();
         let pic_type = lock.picture_type();
-        let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        let mut data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
         let is_keyframe = pic_type == NV_ENC_PIC_TYPE_IDR || pic_type == NV_ENC_PIC_TYPE_I;
 
         // Unlock + unmap
@@ -266,6 +269,25 @@ impl DxgiNvencPipeline {
         }
         if let Some(f) = self.api.unmap_input_resource() {
             unsafe { f(self.encoder, mapped) };
+        }
+
+        // SPS/PPS handling: NVENC only outputs SPS/PPS on first encode after init.
+        // set_repeat_sps_pps is unreliable across drivers. Save and prepend manually.
+        if is_keyframe {
+            let has_sps = data.windows(5)
+                .any(|w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1F) == 7);
+            if has_sps && self.sps_pps.is_empty() {
+                if let Some(idr_pos) = data.windows(5).position(
+                    |w| w[0..4] == [0, 0, 0, 1] && (w[4] & 0x1F) == 5
+                ) {
+                    self.sps_pps = data[..idr_pos].to_vec();
+                    tracing::debug!(len = self.sps_pps.len(), "DxgiNvenc: saved SPS/PPS");
+                }
+            } else if !has_sps && !self.sps_pps.is_empty() {
+                let mut with_sps = self.sps_pps.clone();
+                with_sps.extend_from_slice(&data);
+                data = with_sps;
+            }
         }
 
         Ok(Some(EncodedFrame {
@@ -398,6 +420,7 @@ impl DxgiNvencPipeline {
 
         self.force_idr = true;
         self.frame_idx = 0;
+        self.sps_pps.clear();
         tracing::info!("DXGI→NVENC pipeline reset for new session");
         Ok(())
     }
