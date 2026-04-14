@@ -1753,6 +1753,7 @@ fn get_or_create_stats_overlay() -> Option<web_sys::HtmlElement> {
         "pointer-events:none",
         "line-height:1.4",
         "white-space:pre",
+        "display:none",
     ]
     .join(";");
     let _ = div.set_attribute("style", &style);
