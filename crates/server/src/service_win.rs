@@ -117,7 +117,7 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     })?;
 
     // Run the actual server logic.
-    let result = run_server_loop(Arc::clone(&shutdown), session_changed);
+    let result = run_server_loop(Arc::clone(&shutdown), session_changed, cancel);
 
     if let Err(ref e) = result {
         tracing::error!("Server loop error: {e}");
@@ -142,6 +142,7 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
 fn run_server_loop(
     shutdown: Arc<AtomicBool>,
     session_changed: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     use crate::transport_tcp;
     use crate::transport_ws;
@@ -245,7 +246,7 @@ fn run_server_loop(
     // Main loop: accept connections and run sessions
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
         Arc::new(std::sync::Mutex::new(None));
-    // cancel is already defined above (shared with Stop handler)
+    // cancel: shared with Stop handler (passed from run_service)
     let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
 
     // Doorbell thread
