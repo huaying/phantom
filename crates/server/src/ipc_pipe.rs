@@ -296,7 +296,9 @@ mod platform {
         }
 
         fn start_io(&mut self) -> Result<()> {
-            let (frame_tx, frame_rx) = mpsc::channel();
+            // Bounded channel — drops old frames when no session is draining.
+            // Prevents unbounded memory growth between sessions (agent sends 30fps).
+            let (frame_tx, frame_rx) = mpsc::sync_channel(30);
             let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
             self.frame_rx = Some(frame_rx);
             self.input_tx = Some(input_tx);
@@ -314,7 +316,8 @@ mod platform {
                                 Ok((MSG_ENCODED_FRAME, payload)) => {
                                     match decode_ipc_frame(&payload) {
                                         Ok((encoded, w, h)) => {
-                                            let _ = frame_tx.send(IpcEncodedFrame {
+                                            // try_send: drop frame if buffer full (backpressure).
+                                            let _ = frame_tx.try_send(IpcEncodedFrame {
                                                 encoded,
                                                 width: w,
                                                 height: h,
@@ -459,7 +462,28 @@ mod platform {
         }
 
         pub fn is_connected(&self) -> bool {
-            self.connected
+            if !self.connected {
+                return false;
+            }
+            // Check if IO threads are still alive — a dead thread means
+            // the pipe broke and this IPC is no longer usable.
+            let read_dead = self
+                ._read_thread
+                .as_ref()
+                .map_or(true, |h| h.is_finished());
+            let write_dead = self
+                ._write_thread
+                .as_ref()
+                .map_or(true, |h| h.is_finished());
+            if read_dead || write_dead {
+                tracing::warn!(
+                    read_dead,
+                    write_dead,
+                    "IPC IO thread died — marking disconnected"
+                );
+                return false;
+            }
+            true
         }
 
         pub fn disconnect(&mut self) {

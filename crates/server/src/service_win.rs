@@ -288,7 +288,7 @@ fn run_server_loop(
         // - Agent crash recovery
         if session_changed.swap(false, Ordering::Relaxed)
             || session_mgr.agent.is_none()
-            || session_mgr.ipc.is_none()
+            || session_mgr.ipc().is_none()
         {
             session_mgr.update();
         }
@@ -526,7 +526,16 @@ impl SessionManager {
                 self.ipc.is_some()
             ));
 
-            if session_id == self.current_session_id && self.agent.is_some() && self.ipc.is_some() {
+            // Check IPC health — if IO threads died, clean up so we relaunch.
+            let ipc_alive = self.ipc.as_ref().map_or(false, |ipc| ipc.is_connected());
+            if self.ipc.is_some() && !ipc_alive {
+                svc_log("IPC IO threads dead — cleaning up for relaunch");
+                if let Some(mut ipc) = self.ipc.take() {
+                    ipc.disconnect();
+                }
+            }
+
+            if session_id == self.current_session_id && self.agent.is_some() && ipc_alive {
                 return; // Session unchanged and agent is healthy — nothing to do
             }
 
@@ -546,7 +555,7 @@ impl SessionManager {
             }
 
             // Already have a working agent — nothing to do
-            if self.agent.is_some() && self.ipc.is_some() {
+            if self.agent.is_some() && ipc_alive {
                 return;
             }
 
