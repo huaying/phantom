@@ -4,11 +4,16 @@
 //! starting at boot — before any user logs in. This enables remote access to the
 //! lock screen and login screen.
 //!
-//! Architecture:
-//! - Service (Session 0): handles network connections, manages agent lifecycle
-//! - Agent (User Session): launched via CreateProcessAsUser when a user logs in,
-//!   handles DXGI capture + input injection in the interactive desktop
-//! - Fallback: when no user is logged in, service captures the lock screen via GDI
+//! Architecture (like Sunshine/RustDesk):
+//! - Service (Session 0): handles network connections, manages agent lifecycle.
+//!   Polls `WTSGetActiveConsoleSessionId()` until a console session appears
+//!   (Session 1+ is created by winlogon a few seconds after boot).
+//! - Agent (User Session): launched via CreateProcessAsUser into the active
+//!   console session. Uses `OpenInputDesktop()` + `SetThreadDesktop()` each
+//!   frame to follow desktop switches (user desktop ↔ Winlogon lock screen).
+//!   Handles DXGI capture + input injection in the interactive desktop.
+//! - No Session 0 capture: GDI/DXGI cannot capture cross-session desktops.
+//!   The service waits for the agent to be ready before serving frames.
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,7 +226,11 @@ fn run_server_loop(
     let mut session_mgr = SessionManager::new();
     svc_log("Initial session update");
     session_mgr.update();
-    svc_log(&format!("After update: agent={} ipc={}", session_mgr.agent.is_some(), session_mgr.ipc.is_some()));
+    svc_log(&format!(
+        "After update: agent={} ipc={}",
+        session_mgr.agent.is_some(),
+        session_mgr.ipc.is_some()
+    ));
     tracing::info!(
         has_agent = session_mgr.agent.is_some(),
         has_ipc = session_mgr.ipc.is_some(),
@@ -258,10 +267,16 @@ fn run_server_loop(
     }
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Check for session changes (driven by SCM SESSION_CHANGE events)
-        // Also periodically poll — auto-logon may complete after service starts,
-        // and the session_changed event may have been missed.
-        if session_changed.swap(false, Ordering::Relaxed) || session_mgr.ipc.is_none() {
+        // Check for session changes (driven by SCM SESSION_CHANGE events).
+        // Also poll when agent/IPC are not ready — like Sunshine, we poll every
+        // iteration (~100ms) until an agent is connected. This handles:
+        // - Boot race: service starts before winlogon creates Session 1
+        // - Missed SESSION_CHANGE events
+        // - Agent crash recovery
+        if session_changed.swap(false, Ordering::Relaxed)
+            || session_mgr.agent.is_none()
+            || session_mgr.ipc.is_none()
+        {
             session_mgr.update();
         }
         // Also check if agent died unexpectedly
@@ -361,7 +376,13 @@ fn create_service_session(
             svc_log("Waiting for first encoded frame from agent...");
             let (width, height) = loop {
                 if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
-                    svc_log(&format!("Got frame: {}x{} {} bytes kf={}", ef.width, ef.height, ef.encoded.data.len(), ef.encoded.is_keyframe));
+                    svc_log(&format!(
+                        "Got frame: {}x{} {} bytes kf={}",
+                        ef.width,
+                        ef.height,
+                        ef.encoded.data.len(),
+                        ef.encoded.is_keyframe
+                    ));
                     tracing::info!(
                         width = ef.width,
                         height = ef.height,
@@ -537,23 +558,55 @@ impl SessionManager {
 
     /// React to a session change event. Check current active session and
     /// launch/kill agent as needed.
+    ///
+    /// Called periodically from the main loop. Handles:
+    /// - Session transitions (logon/logoff/lock/unlock)
+    /// - Boot race condition (Session 1 not yet created when service starts)
+    /// - Agent recovery after crash
     fn update(&mut self) {
         #[cfg(target_os = "windows")]
         {
             let session_id = get_active_console_session_id();
-            svc_log(&format!("update: current={} detected={}", self.current_session_id, session_id));
+            svc_log(&format!(
+                "update: current={} detected={} agent={} ipc={}",
+                self.current_session_id,
+                session_id,
+                self.agent.is_some(),
+                self.ipc.is_some()
+            ));
 
-            if session_id == self.current_session_id {
-                return; // No change
+            if session_id == self.current_session_id && self.agent.is_some() && self.ipc.is_some() {
+                return; // Session unchanged and agent is healthy — nothing to do
             }
 
-            svc_log(&format!("Session changed: {} -> {}", self.current_session_id, session_id));
-            self.current_session_id = session_id;
+            // Session changed — kill old agent before launching new one
+            if session_id != self.current_session_id {
+                svc_log(&format!(
+                    "Session changed: {} -> {}",
+                    self.current_session_id, session_id
+                ));
+                self.current_session_id = session_id;
+                self.kill_agent();
+            }
 
-            // Kill existing agent
-            self.kill_agent();
+            // No valid session yet (boot race: winlogon hasn't created Session 1)
+            if session_id == 0xFFFFFFFF || session_id == 0 {
+                return;
+            }
 
-            if session_id != 0xFFFFFFFF && session_id != 0 {
+            // Already have a working agent — nothing to do
+            if self.agent.is_some() && self.ipc.is_some() {
+                return;
+            }
+
+            // Need to launch agent (first time, or after crash/session change)
+            if self.agent.is_some() {
+                // Agent exists but IPC is broken — kill and relaunch
+                svc_log("Agent exists but IPC disconnected, relaunching");
+                self.kill_agent();
+            }
+
+            {
                 svc_log(&format!("Creating IPC pipe for session {session_id}"));
                 match crate::ipc_pipe::IpcServer::new(session_id) {
                     Ok(mut ipc_server) => {
@@ -608,51 +661,24 @@ impl SessionManager {
         }
     }
 
-    /// Check if the agent process is still alive. If it died, attempt relaunch.
+    /// Check if the agent process is still alive. If it died, clean up state.
+    /// The next `update()` call will detect `agent.is_none()` and relaunch.
     fn check_agent_health(&mut self) {
         #[cfg(target_os = "windows")]
         {
             if let Some(ref agent) = self.agent {
                 if let Some(exit_code) = agent.try_wait() {
                     tracing::warn!(pid = agent.pid, exit_code, "Agent exited unexpectedly");
+                    svc_log(&format!(
+                        "Agent PID={} exited with code {exit_code}",
+                        agent.pid
+                    ));
                     self.agent = None;
-                    // Clean up IPC
+                    // Clean up IPC — next update() will relaunch
                     if let Some(ref mut ipc) = self.ipc {
                         ipc.disconnect();
                     }
                     self.ipc = None;
-
-                    // Attempt relaunch if there's still an active user session
-                    if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
-                        tracing::info!(session_id = self.current_session_id, "Relaunching agent");
-                        // Create fresh IPC pipe for the new agent
-                        if let Ok(mut ipc_server) =
-                            crate::ipc_pipe::IpcServer::new(self.current_session_id)
-                        {
-                            match launch_agent_in_session(self.current_session_id) {
-                                Ok(proc) => {
-                                    tracing::info!(pid = proc.pid, "Agent relaunched");
-                                    self.agent = Some(proc);
-                                    match ipc_server.wait_for_connection(Duration::from_secs(10)) {
-                                        Ok(true) => {
-                                            tracing::info!("Relaunched agent connected to IPC");
-                                            self.ipc = Some(ipc_server);
-                                        }
-                                        _ => {
-                                            tracing::warn!(
-                                                "Relaunched agent did not connect to IPC"
-                                            );
-                                            ipc_server.disconnect();
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Agent relaunch failed: {e}");
-                                    ipc_server.disconnect();
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -711,10 +737,7 @@ fn get_session_username(session_id: u32) -> Option<String> {
             if let Ok(id) = part.parse::<u32>() {
                 if id == session_id && i >= 2 {
                     let username = parts[i - 1];
-                    if !username.is_empty()
-                        && username != "services"
-                        && username != "console"
-                    {
+                    if !username.is_empty() && username != "services" && username != "console" {
                         return Some(username.to_string());
                     }
                 }
