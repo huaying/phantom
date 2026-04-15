@@ -1928,20 +1928,55 @@ fn send_input(state: &AppState, event: InputEvent) {
     send_message(state, &msg);
 }
 
+/// Standard resolutions supported by VDD (must match vdd_settings.xml).
+const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
+    (640, 480),
+    (800, 600),
+    (1024, 768),
+    (1152, 864),
+    (1280, 720),
+    (1280, 800),
+    (1280, 960),
+    (1280, 1024),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1600, 1200),
+    (1680, 1050),
+    (1920, 1080),
+    (1920, 1200),
+    (2560, 1440),
+    (2560, 1600),
+    (3440, 1440),
+    (3840, 2160),
+];
+
+/// Find the closest standard resolution that fits within the given viewport.
+fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
+    // Pick the largest standard resolution that fits in the viewport
+    let mut best = (640, 480);
+    for &(w, h) in STANDARD_RESOLUTIONS {
+        if w <= vw && h <= vh {
+            best = (w, h);
+        }
+    }
+    best
+}
+
 /// Send a ResolutionChange message matching the browser viewport size.
 /// Server adjusts VDD virtual display to match (adaptive resolution like DCV/Sunshine).
 fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
     let window = web_sys::window().unwrap();
-    let w = window.inner_width().unwrap().as_f64().unwrap() as u32;
-    let h = window.inner_height().unwrap().as_f64().unwrap() as u32;
-    // Clamp to reasonable range and round to even (H.264 requires even dimensions)
-    let w = (w.max(640).min(3840)) & !1;
-    let h = (h.max(480).min(2160)) & !1;
+    // Use devicePixelRatio for HiDPI displays
+    let dpr = window.device_pixel_ratio().max(1.0);
+    let vw = (window.inner_width().unwrap().as_f64().unwrap() * dpr) as u32;
+    let vh = (window.inner_height().unwrap().as_f64().unwrap() * dpr) as u32;
+    let (w, h) = closest_resolution(vw, vh);
     let st = state.borrow();
     if st.server_width == w && st.server_height == h {
         return; // Already at this resolution
     }
-    console::log_1(&format!("Requesting resolution: {w}x{h}").into());
+    console::log_1(&format!("Requesting resolution: {w}x{h} (viewport {vw}x{vh})").into());
     let msg = Message::ResolutionChange { width: w, height: h };
     send_message(&st, &msg);
 }

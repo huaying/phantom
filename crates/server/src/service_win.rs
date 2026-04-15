@@ -846,26 +846,25 @@ fn vdd_settings_xml() -> String {
         <g_refresh_rate>60</g_refresh_rate>
     </global>
     <resolutions>
-        <resolution>
-            <width>1920</width>
-            <height>1080</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
-        <resolution>
-            <width>2560</width>
-            <height>1440</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
-        <resolution>
-            <width>3840</width>
-            <height>2160</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
-        <resolution>
-            <width>1366</width>
-            <height>768</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
+        <resolution><width>640</width><height>480</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>800</width><height>600</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1024</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1152</width><height>864</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1280</width><height>720</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1280</width><height>800</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1280</width><height>960</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1280</width><height>1024</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1366</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1440</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1600</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1600</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1680</width><height>1050</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1920</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>1920</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2560</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>2560</width><height>1600</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3440</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
+        <resolution><width>3840</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>
     </resolutions>
     <options>
         <CustomEdid>false</CustomEdid>
