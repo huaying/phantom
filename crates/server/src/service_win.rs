@@ -73,9 +73,12 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
+    // Cancel flag shared with active session — Stop handler sets this
+    // to break out of create_service_session's blocking loop.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel);
+
     // Register the service control handler.
-    // Accept SESSION_CHANGE events so SCM notifies us of logon/logoff
-    // instead of polling WTSGetActiveConsoleSessionId.
     let session_changed = Arc::new(AtomicBool::new(false));
     let session_changed_clone = Arc::clone(&session_changed);
 
@@ -85,6 +88,8 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
                     shutdown_clone.store(true, Ordering::SeqCst);
+                    // Also cancel any active session so main loop unblocks
+                    cancel_clone.store(true, Ordering::SeqCst);
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -240,7 +245,7 @@ fn run_server_loop(
     // Main loop: accept connections and run sessions
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let cancel = Arc::new(AtomicBool::new(false));
+    // cancel is already defined above (shared with Stop handler)
     let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
 
     // Doorbell thread
@@ -803,12 +808,17 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
 pub fn install_service() -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let exe = std::env::current_exe().context("get current exe path")?;
-    let exe_str = exe.to_string_lossy();
+    // Copy exe to a fixed install location. This avoids binPath being tied
+    // to the build directory — updates just overwrite the fixed path.
+    let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
+    std::fs::create_dir_all(&install_dir).context("create install dir")?;
+    let install_exe = install_dir.join("phantom-server.exe");
 
-    // sc.exe syntax: each `key=` and its value are SEPARATE arguments.
-    // e.g. sc create Foo binPath= "C:\foo.exe --flag" start= auto
-    let bin_path = format!("\"{}\" --service", exe_str);
+    let src_exe = std::env::current_exe().context("get current exe path")?;
+    std::fs::copy(&src_exe, &install_exe)
+        .context("copy exe to install dir (is the service already running? --uninstall first)")?;
+
+    let bin_path = format!("\"{}\" --service", install_exe.display());
     let status = std::process::Command::new("sc")
         .args([
             "create",
@@ -873,15 +883,26 @@ pub fn install_service() -> anyhow::Result<()> {
 pub fn uninstall_service() -> anyhow::Result<()> {
     use anyhow::Context;
 
-    // Stop first (ignore errors if already stopped)
+    // Stop the service gracefully
     let _ = std::process::Command::new("sc")
         .args(["stop", SERVICE_NAME])
         .status();
 
-    // Wait a moment for the service to stop
+    // Wait for graceful stop (Bug 1 fix: Stop handler now cancels active session)
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Force kill fallback — if sc stop didn't work, kill the process directly
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/FI", &format!("SERVICES eq {SERVICE_NAME}")])
+        .status();
+    // Also kill any agent processes
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "phantom-server.exe"])
+        .status();
+
     std::thread::sleep(Duration::from_secs(2));
 
-    // Delete
+    // Delete service
     let status = std::process::Command::new("sc")
         .args(["delete", SERVICE_NAME])
         .status()
@@ -893,7 +914,7 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
     }
 
-    // Also clean up old schtasks entry if it exists (from pre-service installs)
+    // Clean up schtasks
     let _ = std::process::Command::new("schtasks")
         .args(["/Delete", "/TN", "PhantomServer", "/F"])
         .status();
