@@ -32,10 +32,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Returns true if the switch succeeded, false otherwise.
 pub fn switch_to_input_desktop() -> bool {
     unsafe {
+        // Use the same access flags as RustDesk — GENERIC_WRITE is required
+        // for SendInput to work from the switched desktop context.
         let hdesk = match OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
-            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
+            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_WRITE.0 | windows::Win32::Foundation::GENERIC_READ.0),
         ) {
             Ok(d) => d,
             Err(_) => return false,

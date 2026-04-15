@@ -239,7 +239,9 @@ fn run_server_loop(
 
     while !shutdown.load(Ordering::Relaxed) {
         // Check for session changes (driven by SCM SESSION_CHANGE events)
-        if session_changed.swap(false, Ordering::Relaxed) {
+        // Also periodically poll — auto-logon may complete after service starts,
+        // and the session_changed event may have been missed.
+        if session_changed.swap(false, Ordering::Relaxed) || session_mgr.ipc.is_none() {
             session_mgr.update();
         }
         // Also check if agent died unexpectedly
@@ -459,12 +461,14 @@ impl WinProcessHandle {
 
     /// Check if the process has exited. Returns Some(exit_code) if exited.
     fn try_wait(&self) -> Option<u32> {
+        if self.handle.is_invalid() || self.pid == 0 {
+            return None; // No handle (schtasks-launched agent)
+        }
         unsafe {
             use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-            // Non-blocking check (WAIT_TIMEOUT = 258)
             let wait_result = WaitForSingleObject(self.handle, 0);
             if wait_result.0 == 258 {
-                return None; // Still running
+                return None;
             }
             let mut exit_code: u32 = 0;
             let _ = GetExitCodeProcess(self.handle, &mut exit_code);
@@ -476,8 +480,10 @@ impl WinProcessHandle {
 #[cfg(target_os = "windows")]
 impl Drop for WinProcessHandle {
     fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+            }
         }
     }
 }
@@ -670,13 +676,45 @@ fn get_active_console_session_id() -> u32 {
 }
 
 /// Launch the phantom agent process in a specific user session.
-/// Launch agent in the target session via schtasks (interactive task).
+/// Get the username associated with a Windows session ID.
+#[cfg(target_os = "windows")]
+fn get_session_username(session_id: u32) -> Option<String> {
+    let output = std::process::Command::new("query")
+        .args(["session"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // Format: " SESSIONNAME  USERNAME  ID  STATE  TYPE  DEVICE"
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Find the line where session ID matches
+        for (i, part) in parts.iter().enumerate() {
+            if let Ok(id) = part.parse::<u32>() {
+                if id == session_id && i >= 2 {
+                    let username = parts[i - 1];
+                    if !username.is_empty()
+                        && username != "services"
+                        && username != "console"
+                    {
+                        return Some(username.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Launch agent in the target session via schtasks /IT (interactive task).
 ///
-/// CreateProcessAsUser from a service creates processes with wrong UIPI
-/// integrity level — SendInput gets "Access denied". Using schtasks /IT
-/// launches the agent in the user's full interactive context, matching
-/// the security level of processes started by the user's shell (explorer).
-/// This is the same context as console mode, where input works correctly.
+/// CreateProcessAsUser from a service (any token: SYSTEM, WTSQueryUserToken,
+/// explorer.exe raw token) creates processes with wrong UIPI integrity —
+/// enigo's SendInput always gets "Access denied". This is a Windows security
+/// model limitation, not a token issue.
+///
+/// schtasks /IT launches the process in the user's actual interactive context,
+/// identical to how explorer.exe launches programs. Verified to work where
+/// CreateProcessAsUser fails.
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
@@ -696,16 +734,22 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         .args(["/Delete", "/TN", &task_name, "/F"])
         .output();
 
-    // Create a one-time interactive task
+    // Get username for the target session
+    let username = get_session_username(session_id)
+        .unwrap_or_else(|| "SYSTEM".to_string());
+    tracing::info!(session_id, %username, "Launching agent via schtasks");
+
+    // Create a one-time interactive task as the session user.
+    // /RU is required when called from SYSTEM context.
+    // /IT ensures the task runs in the user's interactive desktop.
     let create = std::process::Command::new("schtasks")
         .args([
-            "/Create",
-            "/TN", &task_name,
+            "/Create", "/TN", &task_name,
             "/TR", &cmd,
-            "/SC", "ONCE",
-            "/ST", "00:00",
+            "/SC", "ONCE", "/ST", "00:00",
             "/RL", "HIGHEST",
-            "/IT",      // Interactive Token — runs in user's desktop context
+            "/RU", &username, // Run as the session user (required from SYSTEM)
+            "/IT", // Interactive Token — correct UIPI level
             "/F",
         ])
         .output()
@@ -727,59 +771,15 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         anyhow::bail!("schtasks /Run failed: {stderr}");
     }
 
-    // Wait briefly for the process to start, then find its PID
-    std::thread::sleep(Duration::from_secs(2));
+    tracing::info!(session_id, task = %task_name, "Agent launched via schtasks");
 
-    // Find the agent process by command line
-    let pid = find_agent_pid(session_id);
-    match pid {
-        Some(pid) => {
-            tracing::info!(pid, session_id, "Agent launched via schtasks");
-            // Open handle for lifecycle management
-            unsafe {
-                let handle = windows::Win32::System::Threading::OpenProcess(
-                    windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
-                    false,
-                    pid,
-                )
-                .context("OpenProcess for agent")?;
-                Ok(WinProcessHandle { handle, pid })
-            }
-        }
-        None => {
-            anyhow::bail!("Agent process not found after schtasks launch");
-        }
-    }
-}
-
-/// Find the agent process PID in the target session.
-#[cfg(target_os = "windows")]
-fn find_agent_pid(session_id: u32) -> Option<u32> {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq phantom-server.exe", "/FO", "CSV", "/V"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines().skip(1) {
-        // CSV format: "Image Name","PID","Session Name","Session#",...
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() >= 4 {
-            let pid: u32 = fields[1].trim_matches('"').parse().ok()?;
-            let sess: u32 = fields[3].trim_matches('"').parse().unwrap_or(0);
-            if sess == session_id && pid != std::process::id() {
-                // Check if this is the agent (not the service)
-                if let Some(cmd) = fields.last() {
-                    if cmd.contains("agent-mode") {
-                        return Some(pid);
-                    }
-                }
-                // If no command line info, check if it's in the user session
-                // and not the current process
-                return Some(pid);
-            }
-        }
-    }
-    None
+    // Don't try to find PID — schtasks process discovery is unreliable.
+    // Return a dummy handle. The IPC connection (wait_for_connection) is
+    // the real success indicator. Agent lifecycle is managed by schtasks.
+    Ok(WinProcessHandle {
+        handle: windows::Win32::Foundation::HANDLE::default(),
+        pid: 0,
+    })
 }
 
 // ── Service installation helpers ────────────────────────────────────────────
