@@ -1106,8 +1106,12 @@ fn run_agent_loop(
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
-    // Two capture modes: DXGI+NVENC (GPU) and GDI+OpenH264 (CPU, lock screen fallback)
+    // Three capture tiers (best to worst):
+    // 1. DXGI→NVENC zero-copy (GPU capture + GPU encode, ~4ms)
+    // 2. ScrapCapture (DXGI) + OpenH264 (CPU capture + CPU encode, picks VDD 1920x1080)
+    // 3. GDI + OpenH264 (lock screen fallback, 800x600)
     let mut gpu_pipeline: Option<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> = None;
+    let mut scrap_capture: Option<capture_scrap::ScrapCapture> = None;
     let mut gdi_capture: Option<capture_gdi::GdiCapture> = None;
     let mut cpu_encoder: Option<Box<dyn FrameEncoder>> = None;
 
@@ -1116,7 +1120,7 @@ fn run_agent_loop(
     let mut last_init_attempt = Instant::now() - Duration::from_secs(10);
     let mut width = 1920u32;
     let mut height = 1080u32;
-    let mut using_gdi = false;
+    let mut capture_mode = "none";
 
     tracing::info!("Starting agent loop");
 
@@ -1124,50 +1128,95 @@ fn run_agent_loop(
         let loop_start = Instant::now();
         capture_gdi::switch_to_input_desktop();
 
-        // Try to init/reinit DXGI pipeline (preferred, GPU zero-copy)
-        if gpu_pipeline.is_none() && last_init_attempt.elapsed() > Duration::from_secs(1) {
+        // Try to init/reinit capture pipeline (best available)
+        if gpu_pipeline.is_none()
+            && scrap_capture.is_none()
+            && gdi_capture.is_none()
+            && last_init_attempt.elapsed() > Duration::from_secs(1)
+        {
             last_init_attempt = Instant::now();
+
+            // Tier 1: DXGI→NVENC zero-copy
             match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(30, 5000) {
                 Ok(mut gpu) => {
                     width = gpu.width;
                     height = gpu.height;
                     gpu.force_keyframe();
-                    if using_gdi {
-                        tracing::info!(width, height, "Switched back to DXGI→NVENC");
-                    } else {
-                        tracing::info!(width, height, "DXGI→NVENC ready");
-                    }
+                    tracing::info!(width, height, "Tier 1: DXGI→NVENC ready");
                     gpu_pipeline = Some(gpu);
+                    scrap_capture = None;
                     gdi_capture = None;
                     cpu_encoder = None;
-                    using_gdi = false;
+                    capture_mode = "dxgi_nvenc";
                 }
-                Err(_) => {
-                    // DXGI unavailable (locked, no display) — use GDI fallback
-                    if gdi_capture.is_none() {
-                        match capture_gdi::GdiCapture::new() {
-                            Ok(gdi) => {
-                                let (w, h) = gdi.resolution();
-                                width = w;
-                                height = h;
-                                match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
-                                    Ok(mut e) => {
-                                        e.force_keyframe();
-                                        tracing::info!(
-                                            width = w,
-                                            height = h,
-                                            "GDI+OpenH264 fallback"
-                                        );
-                                        cpu_encoder = Some(Box::new(e));
-                                        gdi_capture = Some(gdi);
-                                        using_gdi = true;
-                                    }
-                                    Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
+                Err(e) => {
+                    tracing::debug!("DXGI→NVENC unavailable: {e}");
+
+                    // Tier 2: ScrapCapture (DXGI + CPU readback) — picks highest-res display (VDD)
+                    let scrap_result = {
+                        // Enumerate displays, pick the highest-res one
+                        let displays =
+                            capture_scrap::ScrapCapture::list_displays().unwrap_or_default();
+                        let best_idx = displays
+                            .iter()
+                            .max_by_key(|d| (d.width as u64) * (d.height as u64))
+                            .map(|d| d.index)
+                            .unwrap_or(0);
+                        tracing::info!(
+                            best_idx,
+                            displays = ?displays.iter().map(|d| format!("{}:{}x{}", d.index, d.width, d.height)).collect::<Vec<_>>(),
+                            "ScrapCapture display selection"
+                        );
+                        capture_scrap::ScrapCapture::with_display(best_idx)
+                    };
+                    match scrap_result {
+                        Ok(scrap) => {
+                            let (w, h) = scrap.resolution();
+                            width = w;
+                            height = h;
+                            match encode_h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
+                                Ok(mut enc) => {
+                                    enc.force_keyframe();
+                                    tracing::info!(
+                                        width,
+                                        height,
+                                        "Tier 2: ScrapCapture+OpenH264 (DXGI CPU path)"
+                                    );
+                                    scrap_capture = Some(scrap);
+                                    cpu_encoder = Some(Box::new(enc));
+                                    capture_mode = "scrap_h264";
                                 }
+                                Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
                             }
-                            Err(e) => {
-                                if frame_count == 0 {
-                                    tracing::warn!("GDI also failed: {e} (will retry)");
+                        }
+                        Err(e) => {
+                            tracing::debug!("ScrapCapture unavailable: {e}");
+
+                            // Tier 3: GDI + OpenH264 (lock screen fallback)
+                            match capture_gdi::GdiCapture::new() {
+                                Ok(gdi) => {
+                                    let (w, h) = gdi.resolution();
+                                    width = w;
+                                    height = h;
+                                    match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
+                                        Ok(mut enc) => {
+                                            enc.force_keyframe();
+                                            tracing::info!(
+                                                width = w,
+                                                height = h,
+                                                "Tier 3: GDI+OpenH264 fallback"
+                                            );
+                                            cpu_encoder = Some(Box::new(enc));
+                                            gdi_capture = Some(gdi);
+                                            capture_mode = "gdi_h264";
+                                        }
+                                        Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
+                                    }
+                                }
+                                Err(e) => {
+                                    if frame_count == 0 {
+                                        tracing::warn!("All capture methods failed: {e}");
+                                    }
                                 }
                             }
                         }
@@ -1196,7 +1245,7 @@ fn run_agent_loop(
             last_keyframe = Instant::now();
         }
 
-        // Capture + encode: GPU path (DXGI→NVENC)
+        // Capture + encode: Tier 1 — GPU path (DXGI→NVENC zero-copy)
         if let Some(ref mut gpu) = gpu_pipeline {
             match gpu.capture_and_encode() {
                 Ok(Some(encoded)) => {
@@ -1223,13 +1272,51 @@ fn run_agent_loop(
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
-                    tracing::warn!("DXGI error: {e}, falling back to GDI");
+                    tracing::warn!("DXGI→NVENC error: {e}, falling back");
                     gpu_pipeline = None;
-                    // Will try DXGI again in 1s, GDI immediately
                 }
             }
         }
-        // Capture + encode: GDI fallback path (lock screen, no display)
+        // Capture + encode: Tier 2 — ScrapCapture (DXGI CPU) + OpenH264
+        else if let (Some(ref mut scrap), Some(ref mut enc)) =
+            (&mut scrap_capture, &mut cpu_encoder)
+        {
+            match scrap.capture() {
+                Ok(Some(frame)) => match enc.encode_frame(&frame) {
+                    Ok(encoded) => {
+                        frame_count += 1;
+                        if frame_count <= 3 || frame_count % 300 == 0 {
+                            tracing::info!(
+                                frame = frame_count,
+                                width,
+                                height,
+                                bytes = encoded.data.len(),
+                                keyframe = encoded.is_keyframe,
+                                mode = capture_mode,
+                                "DXGI CPU frame"
+                            );
+                        }
+                        if encoded.is_keyframe {
+                            last_keyframe = Instant::now();
+                        }
+                        if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                            tracing::error!("IPC send failed: {e}");
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!("ScrapCapture encode error: {e}"),
+                },
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => {
+                    tracing::warn!("ScrapCapture error: {e}, falling back to GDI");
+                    scrap_capture = None;
+                    cpu_encoder = None;
+                }
+            }
+        }
+        // Capture + encode: Tier 3 — GDI fallback (lock screen, no display)
         else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder)
         {
             match gdi.capture() {
@@ -1266,7 +1353,7 @@ fn run_agent_loop(
                 }
             }
         } else {
-            // Neither available yet — wait for retry
+            // No capture available yet — wait for retry
             std::thread::sleep(Duration::from_millis(200));
         }
 
