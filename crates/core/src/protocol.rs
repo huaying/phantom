@@ -123,6 +123,14 @@ pub enum Message {
         sha256: [u8; 32],
     },
 
+    /// Client → Server: request display resolution change.
+    /// Server adjusts the virtual display (VDD) to match client's viewport.
+    /// Same approach as DCV/Sunshine — match server resolution to client window.
+    ResolutionChange {
+        width: u32,
+        height: u32,
+    },
+
     /// Server → Client: connection quality statistics (sent periodically).
     Stats {
         /// Server-measured round-trip time in microseconds (Ping→Pong EMA).

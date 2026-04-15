@@ -392,6 +392,18 @@ fn create_service_session(
                 Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
             });
 
+        // Resolution change callback — forwards to agent via IPC
+        let resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>> = {
+            let ipc_ref = session_mgr.ipc.as_ref();
+            ipc_ref.map(|ipc| {
+                // Clone the resolution_change Arc for the closure
+                let res_arc = Arc::clone(&ipc.resolution_change_arc());
+                Box::new(move |w: u32, h: u32| {
+                    *res_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
+                }) as Box<dyn Fn(u32, u32) + Send>
+            })
+        };
+
         let result = crate::session::run_session_ipc(
             ipc,
             crate::session::SessionConfig {
@@ -405,6 +417,7 @@ fn create_service_session(
                 is_resume: false,
                 input_forwarder,
                 audio_ws_rx: None,
+                resolution_change_fn,
             },
             width,
             height,
@@ -827,7 +840,7 @@ fn vdd_settings_xml() -> String {
         <count>1</count>
     </monitors>
     <gpu>
-        <friendlyname>default</friendlyname>
+        <friendlyname>NVIDIA</friendlyname>
     </gpu>
     <global>
         <g_refresh_rate>60</g_refresh_rate>

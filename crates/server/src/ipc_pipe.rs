@@ -63,6 +63,7 @@ mod platform {
     const MSG_HEARTBEAT: u8 = 0x03;
     const MSG_SHUTDOWN: u8 = 0x04;
     const MSG_FORCE_KEYFRAME: u8 = 0x05;
+    const MSG_RESOLUTION_CHANGE: u8 = 0x06;
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -252,6 +253,8 @@ mod platform {
         keyframe_requested: Arc<AtomicBool>,
         /// Flag set by send_shutdown(), cleared by the write thread after sending.
         shutdown_requested: Arc<AtomicBool>,
+        /// Pending resolution change (width, height). Write thread picks it up.
+        resolution_change: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
         _write_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -273,6 +276,7 @@ mod platform {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 keyframe_requested: Arc::new(AtomicBool::new(false)),
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
+                resolution_change: Arc::new(std::sync::Mutex::new(None)),
                 _read_thread: None,
                 _write_thread: None,
             })
@@ -345,6 +349,7 @@ mod platform {
             let shutdown2 = Arc::clone(&self.shutdown);
             let kf_flag = Arc::clone(&self.keyframe_requested);
             let shutdown_flag = Arc::clone(&self.shutdown_requested);
+            let res_change = Arc::clone(&self.resolution_change);
             let write_thread =
                 std::thread::Builder::new()
                     .name("ipc-write".into())
@@ -365,6 +370,32 @@ mod platform {
                                 {
                                     if !shutdown2.load(Ordering::Relaxed) {
                                         tracing::warn!("IPC keyframe write error: {e}");
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Check resolution change request
+                            if let Some((w, h)) = res_change
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                            {
+                                let payload = [
+                                    w.to_le_bytes()[0],
+                                    w.to_le_bytes()[1],
+                                    w.to_le_bytes()[2],
+                                    w.to_le_bytes()[3],
+                                    h.to_le_bytes()[0],
+                                    h.to_le_bytes()[1],
+                                    h.to_le_bytes()[2],
+                                    h.to_le_bytes()[3],
+                                ];
+                                if let Err(e) = unsafe {
+                                    send_message(handle, MSG_RESOLUTION_CHANGE, &payload)
+                                } {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC resolution change write error: {e}");
                                     }
                                     break;
                                 }
@@ -452,6 +483,19 @@ mod platform {
             Ok(())
         }
 
+        /// Get a clone of the resolution change Arc (for closures).
+        pub fn resolution_change_arc(&self) -> Arc<std::sync::Mutex<Option<(u32, u32)>>> {
+            Arc::clone(&self.resolution_change)
+        }
+
+        /// Request the agent to change display resolution.
+        pub fn request_resolution_change(&self, width: u32, height: u32) {
+            if self.connected {
+                *self.resolution_change.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((width, height));
+            }
+        }
+
         /// Request orderly shutdown of the agent.
         /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn send_shutdown(&self) -> Result<()> {
@@ -518,6 +562,7 @@ mod platform {
         down_handle: HANDLE,
         shutdown: Arc<AtomicBool>,
         keyframe_requested: Arc<AtomicBool>,
+        resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
         input_rx: Option<mpsc::Receiver<InputEvent>>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -553,11 +598,14 @@ mod platform {
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let keyframe_requested = Arc::new(AtomicBool::new(false));
+            let resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>> =
+                Arc::new(std::sync::Mutex::new(None));
 
             let (input_tx, input_rx) = mpsc::channel();
             let down = SendHandle(down_handle);
             let read_shutdown = Arc::clone(&shutdown);
             let read_kf = Arc::clone(&keyframe_requested);
+            let read_res = Arc::clone(&resolution_requested);
 
             let read_thread = std::thread::Builder::new()
                 .name("ipc-agent-read".into())
@@ -581,6 +629,17 @@ mod platform {
                             Ok((MSG_FORCE_KEYFRAME, _)) => {
                                 read_kf.store(true, Ordering::SeqCst);
                             }
+                            Ok((MSG_RESOLUTION_CHANGE, payload)) if payload.len() >= 8 => {
+                                let w = u32::from_le_bytes([
+                                    payload[0], payload[1], payload[2], payload[3],
+                                ]);
+                                let h = u32::from_le_bytes([
+                                    payload[4], payload[5], payload[6], payload[7],
+                                ]);
+                                tracing::info!(w, h, "IPC: resolution change request");
+                                *read_res.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some((w, h));
+                            }
                             Ok((MSG_HEARTBEAT, _)) => {}
                             Ok((t, _)) => tracing::debug!("IPC down: unexpected 0x{t:02x}"),
                             Err(e) => {
@@ -600,6 +659,7 @@ mod platform {
                 down_handle,
                 shutdown,
                 keyframe_requested,
+                resolution_requested,
                 input_rx: Some(input_rx),
                 _read_thread: Some(read_thread),
             })
@@ -619,6 +679,14 @@ mod platform {
         /// Check and clear the keyframe request flag.
         pub fn take_keyframe_request(&self) -> bool {
             self.keyframe_requested.swap(false, Ordering::SeqCst)
+        }
+
+        /// Take pending resolution change request (if any).
+        pub fn take_resolution_request(&self) -> Option<(u32, u32)> {
+            self.resolution_requested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
         }
 
         pub fn recv_inputs(&self) -> Vec<InputEvent> {

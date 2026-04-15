@@ -659,6 +659,7 @@ fn main() -> Result<()> {
                     audio_ws_rx: audio_ws_rx_shared
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
+                    resolution_change_fn: None,
                 },
             )
         } else {
@@ -679,6 +680,7 @@ fn main() -> Result<()> {
                     audio_ws_rx: audio_ws_rx_shared
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
+                    resolution_change_fn: None,
                 },
             )
         };
@@ -704,6 +706,7 @@ fn main() -> Result<()> {
                     audio_ws_rx: audio_ws_rx_shared
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
+                    resolution_change_fn: None,
                 },
             )
         } else {
@@ -724,6 +727,7 @@ fn main() -> Result<()> {
                     audio_ws_rx: audio_ws_rx_shared
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
+                    resolution_change_fn: None,
                 },
             )
         };
@@ -745,6 +749,7 @@ fn main() -> Result<()> {
                 audio_ws_rx: audio_ws_rx_shared
                     .as_ref()
                     .and_then(|s| s.lock().ok()?.take()),
+                resolution_change_fn: None,
             },
         );
 
@@ -1135,6 +1140,97 @@ fn get_display_origin(target_width: u32, target_height: u32, display_index: usiz
     }
 }
 
+/// Change the display resolution using ChangeDisplaySettingsExW.
+/// Targets the VDD virtual display (highest-res non-primary monitor).
+/// Same approach as Sunshine: find the right display device and change its settings.
+#[cfg(target_os = "windows")]
+fn change_display_resolution(width: u32, height: u32) -> bool {
+    use windows::Win32::Graphics::Gdi::*;
+
+    unsafe {
+        // Enumerate display devices to find VDD
+        let mut device_idx = 0u32;
+        let mut target_device: Option<String> = None;
+
+        loop {
+            let mut dd = DISPLAY_DEVICEW::default();
+            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(None, device_idx, &mut dd, 0).as_bool() {
+                break;
+            }
+            let name = String::from_utf16_lossy(
+                &dd.DeviceName[..dd
+                    .DeviceName
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceName.len())],
+            );
+            let desc = String::from_utf16_lossy(
+                &dd.DeviceString[..dd
+                    .DeviceString
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceString.len())],
+            );
+            tracing::debug!(device_idx, name, desc, "Display device");
+
+            // Look for VDD or any non-primary display with current high res
+            if desc.contains("Virtual Display") || desc.contains("VDD") {
+                target_device = Some(name);
+                break;
+            }
+            device_idx += 1;
+        }
+
+        let device_name = match target_device {
+            Some(name) => name,
+            None => {
+                tracing::warn!("No VDD device found for resolution change");
+                return false;
+            }
+        };
+
+        // Get current settings
+        let device_name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let pcwstr = windows::core::PCWSTR(device_name_w.as_ptr());
+        let mut dm = DEVMODEW::default();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        if !EnumDisplaySettingsW(pcwstr, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            tracing::warn!("EnumDisplaySettingsW failed for {device_name}");
+            return false;
+        }
+
+        // Set new resolution
+        dm.dmPelsWidth = width;
+        dm.dmPelsHeight = height;
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+
+        let result = ChangeDisplaySettingsExW(
+            pcwstr,
+            Some(&dm),
+            None,
+            CDS_UPDATEREGISTRY | CDS_NORESET,
+            None,
+        );
+
+        if result == DISP_CHANGE_SUCCESSFUL {
+            // Apply the change
+            let _ = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
+            tracing::info!(width, height, device = device_name, "Display resolution changed");
+            true
+        } else {
+            tracing::warn!(
+                ?result,
+                width,
+                height,
+                "ChangeDisplaySettingsExW failed"
+            );
+            false
+        }
+    }
+}
+
 /// Agent capture+encode loop following RustDesk/Sunshine pattern:
 /// - Calls OpenInputDesktop + SetThreadDesktop before capture (follows desktop switches)
 /// - On DXGI error: reinit pipeline (don't crash)
@@ -1277,6 +1373,29 @@ fn run_agent_loop(
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Handle resolution change requests (adaptive resolution like DCV/Sunshine)
+        if let Some((new_w, new_h)) = ipc.take_resolution_request() {
+            if new_w != width || new_h != height {
+                tracing::info!(
+                    old_w = width,
+                    old_h = height,
+                    new_w,
+                    new_h,
+                    "Resolution change requested"
+                );
+                if change_display_resolution(new_w, new_h) {
+                    // Force reinit of all capture pipelines at the new resolution
+                    gpu_pipeline = None;
+                    scrap_capture = None;
+                    gdi_capture = None;
+                    cpu_encoder = None;
+                    last_init_attempt = Instant::now() - Duration::from_secs(10);
+                    // Give Windows a moment to apply the resolution change
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
         }

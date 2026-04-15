@@ -63,6 +63,8 @@ pub enum InboundEvent {
         session_token: Vec<u8>,
         last_sequence: u64,
     },
+    /// Client requests display resolution change (adaptive resolution).
+    ResolutionChange { width: u32, height: u32 },
     Disconnected,
 }
 
@@ -139,6 +141,9 @@ pub fn spawn_receive_thread(
                         session_token,
                         last_sequence,
                     });
+                }
+                Ok(Message::ResolutionChange { width, height }) => {
+                    let _ = tx.send(InboundEvent::ResolutionChange { width, height });
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -383,6 +388,8 @@ pub struct SessionRunner {
     /// Optional input forwarder (e.g. IPC to agent in service mode).
     /// When set, input events are forwarded instead of locally injected.
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
+    /// Optional callback for resolution change (service mode → IPC to agent).
+    pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
 }
 
 impl SessionRunner {
@@ -447,6 +454,7 @@ impl SessionRunner {
             file_transfer: crate::file_transfer::ServerFileTransfer::new(),
             session_token: Vec::new(),
             input_forwarder: None,
+            resolution_change_fn: None,
         };
 
         // Generate session token for reconnect
@@ -616,6 +624,12 @@ impl SessionRunner {
                         self.sequence = last_sequence;
                     } else {
                         tracing::warn!("client sent Resume with invalid token");
+                    }
+                }
+                Ok(InboundEvent::ResolutionChange { width, height }) => {
+                    tracing::info!(width, height, "Client requested resolution change");
+                    if let Some(ref f) = self.resolution_change_fn {
+                        f(width, height);
                     }
                 }
                 Ok(InboundEvent::Disconnected) => {
@@ -861,6 +875,8 @@ pub struct SessionConfig<'a> {
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Receiver for audio-only WebSocket connections (independent from video).
     pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
+    /// Optional callback for resolution change (service mode → IPC to agent).
+    pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -907,6 +923,7 @@ fn run_session_cpu_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Send file if requested via --send-file
@@ -1034,6 +1051,7 @@ fn run_session_ipc_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Request keyframe from agent for the new client
@@ -1100,6 +1118,7 @@ fn run_session_gpu_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {
@@ -1197,6 +1216,7 @@ fn run_session_dxgi_inner(
         cfg.is_resume,
     )?;
     runner.input_forwarder = cfg.input_forwarder;
+    runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {

@@ -536,6 +536,8 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if audio {
                 setup_audio(state);
             }
+            // Send our viewport size so server can match resolution (adaptive, like DCV)
+            send_resolution_change(state);
         }
         Message::VideoFrame { sequence, frame } => {
             if frame.data.is_empty() {
@@ -1907,11 +1909,41 @@ fn setup_input(
         let _ = canvas.add_event_listener_with_callback("drop", cb.as_ref().unchecked_ref());
         cb.forget();
     }
+
+    // Window resize → send new resolution to server (adaptive resolution)
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+            send_resolution_change(&s);
+        });
+        let window = web_sys::window().unwrap();
+        let _ =
+            window.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
 }
 
 fn send_input(state: &AppState, event: InputEvent) {
     let msg = Message::Input(event);
     send_message(state, &msg);
+}
+
+/// Send a ResolutionChange message matching the browser viewport size.
+/// Server adjusts VDD virtual display to match (adaptive resolution like DCV/Sunshine).
+fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
+    let window = web_sys::window().unwrap();
+    let w = window.inner_width().unwrap().as_f64().unwrap() as u32;
+    let h = window.inner_height().unwrap().as_f64().unwrap() as u32;
+    // Clamp to reasonable range and round to even (H.264 requires even dimensions)
+    let w = (w.max(640).min(3840)) & !1;
+    let h = (h.max(480).min(2160)) & !1;
+    let st = state.borrow();
+    if st.server_width == w && st.server_height == h {
+        return; // Already at this resolution
+    }
+    console::log_1(&format!("Requesting resolution: {w}x{h}").into());
+    let msg = Message::ResolutionChange { width: w, height: h };
+    send_message(&st, &msg);
 }
 
 fn send_message(state: &AppState, msg: &Message) {
