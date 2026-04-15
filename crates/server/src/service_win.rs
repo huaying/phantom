@@ -51,6 +51,13 @@ const SERVICE_DISPLAY_NAME: &str = "Phantom Remote Desktop Server";
 const SERVICE_DESCRIPTION: &str =
     "Phantom remote desktop server — provides remote access including pre-login lock screen.";
 
+// Virtual Display Driver (VDD) — provides a virtual monitor on headless GPU servers
+// so DXGI Desktop Duplication can capture from the NVIDIA GPU.
+const VDD_HARDWARE_ID: &str = r"Root\MttVDD";
+const VDD_CLASS_GUID: &str = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
+const VDD_DRIVER_URL: &str = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip";
+const NEFCON_URL: &str = "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip";
+
 /// Entry point when invoked by the Windows Service Control Manager.
 /// Call this from main() when `--service` flag is passed.
 pub fn run_as_service() -> Result<(), windows_service::Error> {
@@ -801,6 +808,220 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     }
 }
 
+// ── Virtual Display Driver (VDD) helpers ───────────────────────────────────
+
+/// Generate vdd_settings.xml content with desired resolution and GPU.
+fn vdd_settings_xml() -> String {
+    r#"<?xml version='1.0' encoding='utf-8'?>
+<vdd_settings>
+    <monitors>
+        <count>1</count>
+    </monitors>
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+    <global>
+        <g_refresh_rate>60</g_refresh_rate>
+    </global>
+    <resolutions>
+        <resolution>
+            <width>1920</width>
+            <height>1080</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <resolution>
+            <width>2560</width>
+            <height>1440</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <resolution>
+            <width>3840</width>
+            <height>2160</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <resolution>
+            <width>1366</width>
+            <height>768</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+    </resolutions>
+    <options>
+        <CustomEdid>false</CustomEdid>
+        <HardwareCursor>true</HardwareCursor>
+        <SDR10bit>false</SDR10bit>
+        <HDRPlus>false</HDRPlus>
+        <logging>false</logging>
+        <debuglogging>false</debuglogging>
+    </options>
+</vdd_settings>"#
+        .to_string()
+}
+
+/// Download a file using PowerShell (no extra Rust deps needed).
+fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                 $ProgressPreference = 'SilentlyContinue'; \
+                 Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
+                url,
+                dest.display()
+            ),
+        ])
+        .status()
+        .context("powershell download")?;
+    if !status.success() {
+        anyhow::bail!("download failed: {url}");
+    }
+    Ok(())
+}
+
+/// Extract a zip file using PowerShell.
+fn ps_unzip(zip: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                zip.display(),
+                dest.display()
+            ),
+        ])
+        .status()
+        .context("powershell unzip")?;
+    if !status.success() {
+        anyhow::bail!("unzip failed: {}", zip.display());
+    }
+    Ok(())
+}
+
+/// Install the Virtual Display Driver for headless GPU servers.
+/// Downloads VDD + nefcon from GitHub, installs driver via nefconw.
+pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let vdd_dir = install_dir.join("vdd");
+    std::fs::create_dir_all(&vdd_dir).context("create vdd dir")?;
+
+    let tmp = std::env::temp_dir();
+
+    // Download VDD driver
+    println!("  Downloading Virtual Display Driver...");
+    let vdd_zip = tmp.join("phantom-vdd.zip");
+    ps_download(VDD_DRIVER_URL, &vdd_zip)?;
+    ps_unzip(&vdd_zip, &tmp.join("phantom-vdd"))?;
+    let _ = std::fs::remove_file(&vdd_zip);
+
+    // Copy driver files to install dir
+    let extracted = tmp.join("phantom-vdd").join("VirtualDisplayDriver");
+    for name in ["MttVDD.dll", "MttVDD.inf", "mttvdd.cat"] {
+        let src = extracted.join(name);
+        let dst = vdd_dir.join(name);
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("copy {name} to vdd dir"))?;
+    }
+
+    // Write settings to the path VDD reads from (fixed location).
+    let vdd_config_dir = std::path::PathBuf::from(r"C:\VirtualDisplayDriver");
+    std::fs::create_dir_all(&vdd_config_dir).context("create VDD config dir")?;
+    std::fs::write(vdd_config_dir.join("vdd_settings.xml"), vdd_settings_xml())
+        .context("write vdd_settings.xml")?;
+    // Also keep a copy in our install dir for reference.
+    std::fs::write(vdd_dir.join("vdd_settings.xml"), vdd_settings_xml()).ok();
+
+    // Download nefcon
+    println!("  Downloading nefcon (driver installer)...");
+    let nefcon_zip = tmp.join("phantom-nefcon.zip");
+    ps_download(NEFCON_URL, &nefcon_zip)?;
+    ps_unzip(&nefcon_zip, &tmp.join("phantom-nefcon"))?;
+    let _ = std::fs::remove_file(&nefcon_zip);
+
+    let nefconw = tmp.join("phantom-nefcon").join("x64").join("nefconw.exe");
+    let nefconw_dst = vdd_dir.join("nefconw.exe");
+    std::fs::copy(&nefconw, &nefconw_dst).context("copy nefconw.exe")?;
+
+    // Clean up temp dirs
+    let _ = std::fs::remove_dir_all(tmp.join("phantom-vdd"));
+    let _ = std::fs::remove_dir_all(tmp.join("phantom-nefcon"));
+
+    // Import signing certificates from the .cat file into TrustedPublisher store.
+    // Without this, Windows shows a "publisher not trusted" dialog blocking silent install.
+    println!("  Importing driver certificates...");
+    let cat_path = vdd_dir.join("mttvdd.cat");
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$cms = New-Object System.Security.Cryptography.Pkcs.SignedCms; \
+                 $cms.Decode([System.IO.File]::ReadAllBytes('{}')); \
+                 foreach ($cert in $cms.Certificates) {{ \
+                     $f = [System.IO.Path]::GetTempFileName() + '.cer'; \
+                     [System.IO.File]::WriteAllBytes($f, $cert.Export(\
+                         [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)); \
+                     Import-Certificate -FilePath $f -CertStoreLocation 'Cert:\\LocalMachine\\TrustedPublisher' | Out-Null; \
+                     Remove-Item $f \
+                 }}",
+                cat_path.display()
+            ),
+        ])
+        .status();
+
+    // Install driver using nefcon (devcon-compatible syntax: install <inf> <hwid>).
+    // This creates the device node + installs the driver in one step.
+    println!("  Installing Virtual Display Driver...");
+    let inf_path = vdd_dir.join("MttVDD.inf");
+    let status = std::process::Command::new(&nefconw_dst)
+        .args(["install", &inf_path.to_string_lossy(), VDD_HARDWARE_ID])
+        .status()
+        .context("nefconw install")?;
+
+    // Exit code 0 = success, 3010 = success but reboot required.
+    let code = status.code().unwrap_or(-1);
+    if code == 0 || code == 3010 {
+        println!("  Virtual Display Driver installed (1920x1080 default).");
+        if code == 3010 {
+            println!("  Note: A reboot may be required for the display to appear.");
+        }
+    } else {
+        println!("  Warning: Virtual Display Driver install returned exit code {code}.");
+        println!("  The server will still work but may capture at low resolution on headless VMs.");
+    }
+
+    Ok(())
+}
+
+/// Uninstall the Virtual Display Driver.
+pub fn uninstall_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
+    let vdd_dir = install_dir.join("vdd");
+    let nefconw = vdd_dir.join("nefconw.exe");
+
+    if nefconw.exists() {
+        println!("  Removing Virtual Display Driver...");
+        let _ = std::process::Command::new(&nefconw)
+            .args([
+                "--remove-device-node",
+                "--hardware-id",
+                VDD_HARDWARE_ID,
+                "--class-guid",
+                VDD_CLASS_GUID,
+            ])
+            .status();
+    }
+
+    // Clean up files
+    let _ = std::fs::remove_dir_all(&vdd_dir);
+    let _ = std::fs::remove_dir_all(r"C:\VirtualDisplayDriver");
+
+    Ok(())
+}
+
 // ── Service installation helpers ────────────────────────────────────────────
 
 /// Install Phantom as a Windows Service (replaces schtasks approach).
@@ -860,6 +1081,19 @@ pub fn install_service() -> anyhow::Result<()> {
         ])
         .status();
 
+    // Install Virtual Display Driver (for headless GPU servers).
+    // Non-fatal: server works without it, just at lower resolution on headless VMs.
+    println!();
+    println!("Installing Virtual Display Driver (for headless GPU servers)...");
+    match install_vdd(&install_dir) {
+        Ok(()) => {}
+        Err(e) => {
+            println!("  Warning: VDD install failed: {e}");
+            println!("  The server will still work. Install VDD manually if needed.");
+        }
+    }
+
+    println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");
     println!("  The service runs at boot as LocalSystem (Session 0).");
     println!("  Remote access works even before user login.");
@@ -916,6 +1150,12 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         println!("Removed: {SERVICE_DISPLAY_NAME} (Windows Service)");
     } else {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
+    }
+
+    // Remove Virtual Display Driver
+    let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
+    if let Err(e) = uninstall_vdd(&install_dir) {
+        println!("  Warning: VDD uninstall failed: {e}");
     }
 
     // Clean up schtasks

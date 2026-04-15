@@ -23,18 +23,45 @@ unsafe impl Send for DxgiCapture {}
 impl DxgiCapture {
     pub fn new() -> Result<Self> {
         unsafe {
-            // Create D3D11 device on the default adapter
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let adapter = factory.EnumAdapters1(0)?;
-            let desc = adapter.GetDesc1()?;
-            let name = String::from_utf16_lossy(
-                &desc.Description[..desc
-                    .Description
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(desc.Description.len())],
-            );
-            tracing::info!("DXGI adapter: {name}");
+
+            // Enumerate all adapters and pick the best one with an active output.
+            // Prefer NVIDIA adapters (for NVENC zero-copy), fall back to any with outputs.
+            let mut nvidia_adapter: Option<(IDXGIAdapter1, String)> = None;
+            let mut fallback_adapter: Option<(IDXGIAdapter1, String)> = None;
+
+            let mut idx = 0u32;
+            while let Ok(adapter) = factory.EnumAdapters1(idx) {
+                let desc = adapter.GetDesc1()?;
+                let name = String::from_utf16_lossy(
+                    &desc.Description[..desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len())],
+                );
+                let has_output = adapter.EnumOutputs(0).is_ok();
+                tracing::info!(
+                    idx,
+                    name = %name,
+                    has_output,
+                    "DXGI adapter"
+                );
+                if has_output {
+                    let is_nvidia = name.to_uppercase().contains("NVIDIA");
+                    if is_nvidia && nvidia_adapter.is_none() {
+                        nvidia_adapter = Some((adapter, name));
+                    } else if fallback_adapter.is_none() {
+                        fallback_adapter = Some((adapter, name));
+                    }
+                }
+                idx += 1;
+            }
+
+            let (adapter, name) = nvidia_adapter
+                .or(fallback_adapter)
+                .context("no DXGI adapter with active output found")?;
+            tracing::info!("Selected DXGI adapter: {name}");
 
             let mut device = None;
             let mut context = None;
@@ -163,8 +190,33 @@ impl DxgiCapture {
                 let _ = self.duplication.ReleaseFrame();
                 self.frame_acquired = false;
             }
+            // Re-enumerate adapters — same preference logic as new().
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let adapter = factory.EnumAdapters1(0)?;
+            let mut nvidia_adapter: Option<IDXGIAdapter1> = None;
+            let mut fallback_adapter: Option<IDXGIAdapter1> = None;
+            let mut idx = 0u32;
+            while let Ok(adapter) = factory.EnumAdapters1(idx) {
+                let desc = adapter.GetDesc1()?;
+                let name = String::from_utf16_lossy(
+                    &desc.Description[..desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len())],
+                );
+                if adapter.EnumOutputs(0).is_ok() {
+                    if name.to_uppercase().contains("NVIDIA") && nvidia_adapter.is_none() {
+                        nvidia_adapter = Some(adapter);
+                    } else if fallback_adapter.is_none() {
+                        fallback_adapter = Some(adapter);
+                    }
+                }
+                idx += 1;
+            }
+            let adapter = nvidia_adapter
+                .or(fallback_adapter)
+                .context("no DXGI adapter with active output")?;
+
             let output: IDXGIOutput = adapter.EnumOutputs(0)?;
             let output1: IDXGIOutput1 = output.cast()?;
             self.duplication = output1.DuplicateOutput(&self.device)?;
