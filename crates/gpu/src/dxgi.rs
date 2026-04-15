@@ -25,48 +25,88 @@ impl DxgiCapture {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
-            // Enumerate all adapters and pick the best one with an active output.
-            // Prefer NVIDIA adapters (for NVENC zero-copy), fall back to any with outputs.
-            let mut nvidia_adapter: Option<(IDXGIAdapter1, String)> = None;
-            let mut fallback_adapter: Option<(IDXGIAdapter1, String)> = None;
+            // Enumerate ALL adapters and ALL outputs to find the best one.
+            // Strategy: pick the output with the highest resolution.
+            // On headless VMs with VDD, the virtual display (1920x1080) is typically
+            // on the software renderer alongside the 800x600 default output.
+            struct Candidate {
+                adapter: IDXGIAdapter1,
+                adapter_name: String,
+                output_idx: u32,
+                width: u32,
+                height: u32,
+                is_nvidia: bool,
+            }
 
-            let mut idx = 0u32;
-            while let Ok(adapter) = factory.EnumAdapters1(idx) {
+            let mut best: Option<Candidate> = None;
+
+            let mut adapter_idx = 0u32;
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
                 let desc = adapter.GetDesc1()?;
-                let name = String::from_utf16_lossy(
+                let adapter_name = String::from_utf16_lossy(
                     &desc.Description[..desc
                         .Description
                         .iter()
                         .position(|&c| c == 0)
                         .unwrap_or(desc.Description.len())],
                 );
-                let has_output = adapter.EnumOutputs(0).is_ok();
-                tracing::info!(
-                    idx,
-                    name = %name,
-                    has_output,
-                    "DXGI adapter"
-                );
-                if has_output {
-                    let is_nvidia = name.to_uppercase().contains("NVIDIA");
-                    if is_nvidia && nvidia_adapter.is_none() {
-                        nvidia_adapter = Some((adapter, name));
-                    } else if fallback_adapter.is_none() {
-                        fallback_adapter = Some((adapter, name));
+                let is_nvidia = adapter_name.to_uppercase().contains("NVIDIA");
+
+                let mut output_idx = 0u32;
+                while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                    let out_desc = output.GetDesc()?;
+                    let r = out_desc.DesktopCoordinates;
+                    let w = (r.right - r.left) as u32;
+                    let h = (r.bottom - r.top) as u32;
+                    tracing::info!(
+                        adapter = adapter_idx,
+                        output = output_idx,
+                        name = %adapter_name,
+                        width = w,
+                        height = h,
+                        is_nvidia,
+                        "DXGI output"
+                    );
+
+                    // Prefer: NVIDIA with highest res > any with highest res
+                    let dominated = best.as_ref().is_some_and(|b| {
+                        if is_nvidia && !b.is_nvidia {
+                            false // NVIDIA always beats non-NVIDIA
+                        } else if !is_nvidia && b.is_nvidia {
+                            true // non-NVIDIA never beats NVIDIA
+                        } else {
+                            (w as u64) * (h as u64) <= (b.width as u64) * (b.height as u64)
+                        }
+                    });
+
+                    if !dominated {
+                        best = Some(Candidate {
+                            adapter: adapter.clone(),
+                            adapter_name: adapter_name.clone(),
+                            output_idx,
+                            width: w,
+                            height: h,
+                            is_nvidia,
+                        });
                     }
+                    output_idx += 1;
                 }
-                idx += 1;
+                adapter_idx += 1;
             }
 
-            let (adapter, name) = nvidia_adapter
-                .or(fallback_adapter)
-                .context("no DXGI adapter with active output found")?;
-            tracing::info!("Selected DXGI adapter: {name}");
+            let c = best.context("no DXGI adapter with active output found")?;
+            tracing::info!(
+                "Selected DXGI: {} output {} ({}x{})",
+                c.adapter_name,
+                c.output_idx,
+                c.width,
+                c.height
+            );
 
             let mut device = None;
             let mut context = None;
             let feature_levels = [windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0];
-            let adapter_base: IDXGIAdapter = adapter.cast()?;
+            let adapter_base: IDXGIAdapter = c.adapter.cast()?;
             D3D11CreateDevice(
                 &adapter_base,
                 D3D_DRIVER_TYPE_UNKNOWN,
@@ -81,8 +121,8 @@ impl DxgiCapture {
             let device = device.context("D3D11 device creation failed")?;
             let context = context.context("D3D11 context creation failed")?;
 
-            // Get primary output and duplicate
-            let output: IDXGIOutput = adapter.EnumOutputs(0)?;
+            // Duplicate the selected output
+            let output: IDXGIOutput = c.adapter.EnumOutputs(c.output_idx)?;
             let output1: IDXGIOutput1 = output.cast()?;
             let duplication = output1.DuplicateOutput(&device)?;
 
@@ -190,41 +230,39 @@ impl DxgiCapture {
                 let _ = self.duplication.ReleaseFrame();
                 self.frame_acquired = false;
             }
-            // Re-enumerate adapters — same preference logic as new().
+            // Re-enumerate adapters+outputs — pick highest resolution output.
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let mut nvidia_adapter: Option<IDXGIAdapter1> = None;
-            let mut fallback_adapter: Option<IDXGIAdapter1> = None;
-            let mut idx = 0u32;
-            while let Ok(adapter) = factory.EnumAdapters1(idx) {
-                let desc = adapter.GetDesc1()?;
-                let name = String::from_utf16_lossy(
-                    &desc.Description[..desc
-                        .Description
-                        .iter()
-                        .position(|&c| c == 0)
-                        .unwrap_or(desc.Description.len())],
-                );
-                if adapter.EnumOutputs(0).is_ok() {
-                    if name.to_uppercase().contains("NVIDIA") && nvidia_adapter.is_none() {
-                        nvidia_adapter = Some(adapter);
-                    } else if fallback_adapter.is_none() {
-                        fallback_adapter = Some(adapter);
-                    }
-                }
-                idx += 1;
-            }
-            let adapter = nvidia_adapter
-                .or(fallback_adapter)
-                .context("no DXGI adapter with active output")?;
+            let mut best_adapter: Option<IDXGIAdapter1> = None;
+            let mut best_output_idx = 0u32;
+            let mut best_pixels: u64 = 0;
 
-            let output: IDXGIOutput = adapter.EnumOutputs(0)?;
+            let mut adapter_idx = 0u32;
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+                let mut output_idx = 0u32;
+                while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                    let out_desc = output.GetDesc()?;
+                    let r = out_desc.DesktopCoordinates;
+                    let pixels =
+                        ((r.right - r.left) as u64) * ((r.bottom - r.top) as u64);
+                    if pixels > best_pixels {
+                        best_pixels = pixels;
+                        best_adapter = Some(adapter.clone());
+                        best_output_idx = output_idx;
+                    }
+                    output_idx += 1;
+                }
+                adapter_idx += 1;
+            }
+            let adapter = best_adapter.context("no DXGI adapter with active output")?;
+
+            let output: IDXGIOutput = adapter.EnumOutputs(best_output_idx)?;
             let output1: IDXGIOutput1 = output.cast()?;
             self.duplication = output1.DuplicateOutput(&self.device)?;
 
             let dup_desc = self.duplication.GetDesc();
             self.width = dup_desc.ModeDesc.Width;
             self.height = dup_desc.ModeDesc.Height;
-            tracing::debug!("DXGI duplicator recreated");
+            tracing::debug!(self.width, self.height, "DXGI duplicator recreated");
             Ok(())
         }
     }
