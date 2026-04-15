@@ -1088,6 +1088,53 @@ fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
     run_agent_loop(&ipc, &mut injector, &shutdown)
 }
 
+/// Get the origin (left, top) of a display on the virtual desktop by matching resolution.
+/// Returns (0, 0) if no matching display found (safe fallback for primary monitor).
+#[cfg(target_os = "windows")]
+fn get_display_origin(target_width: u32, target_height: u32, display_index: usize) -> (i32, i32) {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        // Collect all monitor rects
+        let mut monitors: Vec<(i32, i32, u32, u32)> = Vec::new();
+        unsafe extern "system" fn callback(
+            _hmon: HMONITOR,
+            _hdc: HDC,
+            rect: *mut windows::Win32::Foundation::RECT,
+            data: windows::Win32::Foundation::LPARAM,
+        ) -> windows::Win32::Foundation::BOOL {
+            if !rect.is_null() {
+                let r = &*rect;
+                let v = &mut *(data.0 as *mut Vec<(i32, i32, u32, u32)>);
+                v.push((
+                    r.left,
+                    r.top,
+                    (r.right - r.left) as u32,
+                    (r.bottom - r.top) as u32,
+                ));
+            }
+            true.into()
+        }
+        let data = windows::Win32::Foundation::LPARAM(&mut monitors as *mut _ as isize);
+        let _ = EnumDisplayMonitors(None, None, Some(callback), data);
+
+        tracing::info!(?monitors, "Virtual desktop monitors");
+
+        // Find all monitors matching target resolution, pick by index
+        let matching: Vec<_> = monitors
+            .iter()
+            .filter(|(_, _, w, h)| *w == target_width && *h == target_height)
+            .collect();
+        if let Some(&&(x, y, _, _)) = matching.get(display_index.min(matching.len().saturating_sub(1)))
+        {
+            tracing::info!(x, y, target_width, target_height, "Display origin found");
+            (x, y)
+        } else {
+            tracing::warn!("No monitor matching {}x{}, using (0,0)", target_width, target_height);
+            (0, 0)
+        }
+    }
+}
+
 /// Agent capture+encode loop following RustDesk/Sunshine pattern:
 /// - Calls OpenInputDesktop + SetThreadDesktop before capture (follows desktop switches)
 /// - On DXGI error: reinit pipeline (don't crash)
@@ -1102,6 +1149,7 @@ fn run_agent_loop(
     use std::time::{Duration, Instant};
 
     use phantom_core::capture::FrameCapture;
+    use phantom_core::input::InputEvent;
     use phantom_core::encode::FrameEncoder;
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
@@ -1121,6 +1169,10 @@ fn run_agent_loop(
     let mut width = 1920u32;
     let mut height = 1080u32;
     let mut capture_mode = "none";
+    // Display offset on virtual desktop — needed to map mouse coordinates
+    // when capturing from a secondary display (e.g. VDD).
+    let mut display_x: i32 = 0;
+    let mut display_y: i32 = 0;
 
     tracing::info!("Starting agent loop");
 
@@ -1174,6 +1226,10 @@ fn run_agent_loop(
                             let (w, h) = scrap.resolution();
                             width = w;
                             height = h;
+                            // Get display origin on virtual desktop for mouse offset
+                            let (dx, dy) = get_display_origin(w, h, 0);
+                            display_x = dx;
+                            display_y = dy;
                             match encode_h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
                                 Ok(mut enc) => {
                                     enc.force_keyframe();
@@ -1362,8 +1418,14 @@ fn run_agent_loop(
         if !inputs.is_empty() {
             tracing::info!(count = inputs.len(), "agent received input events");
         }
-        for event in inputs {
+        for mut event in inputs {
             capture_gdi::switch_to_input_desktop();
+            // Offset mouse coordinates to the captured display's position
+            // on the virtual desktop (needed for secondary displays like VDD).
+            if let InputEvent::MouseMove { ref mut x, ref mut y } = event {
+                *x += display_x;
+                *y += display_y;
+            }
             if let Some(ref mut inj) = injector {
                 if let Err(e) = inj.inject(&event) {
                     tracing::warn!("input inject failed: {e}");
