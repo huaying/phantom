@@ -1298,7 +1298,7 @@ fn run_agent_loop(
                     capture_mode = "dxgi_nvenc";
                 }
                 Err(e) => {
-                    tracing::debug!("DXGI→NVENC unavailable: {e}");
+                    tracing::warn!("DXGI→NVENC unavailable: {e:#}");
 
                     // Tier 2: ScrapCapture (DXGI + CPU readback) — picks highest-res display (VDD)
                     let scrap_result = {
