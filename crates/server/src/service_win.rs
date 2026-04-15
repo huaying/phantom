@@ -846,7 +846,9 @@ pub fn install_service() -> anyhow::Result<()> {
         .args(["description", SERVICE_NAME, SERVICE_DESCRIPTION])
         .status();
 
-    // Configure service recovery: restart on failure (5s, 10s, 30s)
+    // No automatic restart on failure — sc stop must actually stop the service.
+    // If restart-on-crash is needed, use "actions= restart/30000///" (one restart
+    // after 30s, then nothing) instead of the aggressive policy below.
     let _ = std::process::Command::new("sc")
         .args([
             "failure",
@@ -854,7 +856,7 @@ pub fn install_service() -> anyhow::Result<()> {
             "reset=",
             "86400",
             "actions=",
-            "restart/5000/restart/10000/restart/30000",
+            "\"\"",  // No actions — don't auto-restart
         ])
         .status();
 
