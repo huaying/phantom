@@ -1910,11 +1910,28 @@ fn setup_input(
         cb.forget();
     }
 
-    // Window resize → send new resolution to server (adaptive resolution)
+    // Window resize → send new resolution to server (debounced 500ms)
     {
         let s = state.clone();
+        let timeout_id: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+        let timeout_id2 = timeout_id.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
-            send_resolution_change(&s);
+            let window = web_sys::window().unwrap();
+            // Cancel previous timer (debounce)
+            if let Some(id) = timeout_id2.borrow_mut().take() {
+                window.clear_timeout_with_handle(id);
+            }
+            let s2 = s.clone();
+            let fire = Closure::once_into_js(move || {
+                send_resolution_change(&s2);
+            });
+            let id = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    fire.as_ref().unchecked_ref(),
+                    500,
+                )
+                .unwrap_or(0);
+            *timeout_id2.borrow_mut() = Some(id);
         });
         let window = web_sys::window().unwrap();
         let _ =
