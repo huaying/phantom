@@ -707,7 +707,8 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
         PROCESS_INFORMATION, STARTUPINFOW,
     };
 
@@ -775,7 +776,7 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             if env_block.is_null() {
                 None
             } else {
