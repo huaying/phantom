@@ -830,6 +830,86 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     }
 }
 
+// ── GPU setup helpers ──────────────────────────────────────────────────────
+
+/// Detect NVIDIA GPU and ensure it's in WDDM mode (required for display rendering).
+/// Returns true if a reboot is needed (TCC→WDDM switch requires reboot).
+/// Same approach as DCV: auto-detect GPU, auto-switch to WDDM.
+fn setup_nvidia_gpu() -> anyhow::Result<bool> {
+    // Check if nvidia-smi is available
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=driver_model.current,name",
+            "--format=csv,noheader",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => {
+            println!("  No NVIDIA GPU detected (nvidia-smi not found).");
+            return Ok(false);
+        }
+    };
+
+    let line = output.trim();
+    if line.is_empty() {
+        println!("  No NVIDIA GPU detected.");
+        return Ok(false);
+    }
+
+    // Parse "TCC, NVIDIA L40" or "WDDM, NVIDIA A40"
+    let parts: Vec<&str> = line.splitn(2, ',').map(|s| s.trim()).collect();
+    let (mode, gpu_name) = match parts.as_slice() {
+        [mode, name] => (*mode, *name),
+        _ => {
+            println!("  Could not parse GPU info: {line}");
+            return Ok(false);
+        }
+    };
+
+    println!("  GPU: {gpu_name} (mode: {mode})");
+
+    if mode == "WDDM" {
+        println!("  Already in WDDM mode — good.");
+        return Ok(false);
+    }
+
+    // TCC mode — switch to WDDM for display rendering
+    println!("  Switching from TCC to WDDM mode (required for display rendering)...");
+    let status = std::process::Command::new("nvidia-smi")
+        .args(["-fdm", "0"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("  Switched to WDDM mode. Reboot required to take effect.");
+            Ok(true) // reboot needed
+        }
+        Ok(s) => {
+            println!("  Warning: nvidia-smi -fdm 0 failed (exit {s}). GPU may stay in TCC mode.");
+            Ok(false)
+        }
+        Err(e) => {
+            println!("  Warning: nvidia-smi -fdm 0 failed: {e}");
+            Ok(false)
+        }
+    }
+}
+
+/// Disable the Microsoft Basic Display Adapter so Windows uses only the NVIDIA GPU.
+/// This ensures VDD renders on the GPU and prevents multi-display confusion.
+fn disable_basic_display_adapter() {
+    println!("  Disabling Microsoft Basic Display Adapter...");
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -like '*Basic Display*' } | Disable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue",
+        ])
+        .status();
+}
+
 // ── Virtual Display Driver (VDD) helpers ───────────────────────────────────
 
 /// Generate vdd_settings.xml content with desired resolution and GPU.
@@ -995,8 +1075,20 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
         ])
         .status();
 
+    // Remove any existing VDD device nodes (prevents duplicates from repeated installs).
+    println!("  Removing old VDD device nodes...");
+    let _ = std::process::Command::new(&nefconw_dst)
+        .args([
+            "--remove-device-node",
+            "--hardware-id",
+            VDD_HARDWARE_ID,
+            "--class-guid",
+            VDD_CLASS_GUID,
+        ])
+        .status();
+
     // Install driver using nefcon (devcon-compatible syntax: install <inf> <hwid>).
-    // This creates the device node + installs the driver in one step.
+    // This creates exactly one device node + installs the driver.
     println!("  Installing Virtual Display Driver...");
     let inf_path = vdd_dir.join("MttVDD.inf");
     let status = std::process::Command::new(&nefconw_dst)
@@ -1103,10 +1195,21 @@ pub fn install_service() -> anyhow::Result<()> {
         ])
         .status();
 
+    // ── GPU setup (like DCV: auto-detect, auto-configure) ──
+    println!();
+    println!("Configuring GPU...");
+    let needs_reboot = match setup_nvidia_gpu() {
+        Ok(reboot) => reboot,
+        Err(e) => {
+            println!("  Warning: GPU setup failed: {e}");
+            false
+        }
+    };
+
     // Install Virtual Display Driver (for headless GPU servers).
     // Non-fatal: server works without it, just at lower resolution on headless VMs.
     println!();
-    println!("Installing Virtual Display Driver (for headless GPU servers)...");
+    println!("Installing Virtual Display Driver...");
     match install_vdd(&install_dir) {
         Ok(()) => {}
         Err(e) => {
@@ -1115,26 +1218,40 @@ pub fn install_service() -> anyhow::Result<()> {
         }
     }
 
+    // Disable Basic Display Adapter to prevent multi-display confusion
+    // and ensure VDD renders on NVIDIA GPU.
+    disable_basic_display_adapter();
+
     println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");
     println!("  The service runs at boot as LocalSystem (Session 0).");
     println!("  Remote access works even before user login.");
     println!();
 
-    // Start the service
-    let start_status = std::process::Command::new("sc")
-        .args(["start", SERVICE_NAME])
-        .status()
-        .context("sc start")?;
-
-    if start_status.success() {
-        println!("  Service started successfully.");
+    if needs_reboot {
+        println!("  *** REBOOT REQUIRED ***");
+        println!("  GPU was switched from TCC to WDDM mode.");
+        println!("  Run: shutdown /r /t 10");
+        println!("  After reboot, the service starts automatically with GPU acceleration.");
+        println!();
+        println!("  To check status: sc query {SERVICE_NAME}");
+        println!("  To remove:       phantom-server --uninstall");
     } else {
-        println!("  Service created but could not start (start manually or reboot).");
-    }
+        // Start the service immediately (no reboot needed)
+        let start_status = std::process::Command::new("sc")
+            .args(["start", SERVICE_NAME])
+            .status()
+            .context("sc start")?;
 
-    println!("  To check status: sc query {SERVICE_NAME}");
-    println!("  To remove:       phantom-server --uninstall");
+        if start_status.success() {
+            println!("  Service started successfully.");
+        } else {
+            println!("  Service created but could not start (start manually or reboot).");
+        }
+
+        println!("  To check status: sc query {SERVICE_NAME}");
+        println!("  To remove:       phantom-server --uninstall");
+    }
 
     Ok(())
 }
