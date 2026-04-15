@@ -959,7 +959,8 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
             "-NoProfile",
             "-Command",
             &format!(
-                "$cms = New-Object System.Security.Cryptography.Pkcs.SignedCms; \
+                "Add-Type -AssemblyName System.Security; \
+                 $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms; \
                  $cms.Decode([System.IO.File]::ReadAllBytes('{}')); \
                  foreach ($cert in $cms.Certificates) {{ \
                      $f = [System.IO.Path]::GetTempFileName() + '.cer'; \
