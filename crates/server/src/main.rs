@@ -1,11 +1,13 @@
 //! Phantom remote desktop server.
 //!
-//! Captures the screen (via scrap, NVFBC, PipeWire, DXGI, or GDI), encodes it
+//! Captures the screen (via scrap, NVFBC, PipeWire, or DXGI), encodes it
 //! (OpenH264 or NVENC), and streams to connected clients over TCP, QUIC,
 //! WebSocket, or WebRTC. Supports encrypted connections, audio capture,
 //! bidirectional file transfer, and clipboard synchronization.
 //!
 //! On Windows, can run as a Windows Service (Session 0) for pre-login access.
+//! The service spawns an agent in the user's session for capture; GDI is used
+//! as a fallback within the agent when DXGI is unavailable (e.g. lock screen).
 //! Use `--install` to register the service, `--uninstall` to remove it.
 
 #[cfg(feature = "audio")]

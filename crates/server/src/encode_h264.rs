@@ -28,6 +28,7 @@ pub struct OpenH264Encoder {
     encoder: Encoder,
     width: u32,
     height: u32,
+    fps: f32,
     bitrate_kbps: u32,
 }
 
@@ -54,6 +55,7 @@ impl OpenH264Encoder {
             encoder,
             width,
             height,
+            fps,
             bitrate_kbps,
         })
     }
@@ -92,7 +94,7 @@ impl FrameEncoder for OpenH264Encoder {
         }
         // OpenH264 doesn't support runtime reconfiguration,
         // so we recreate the encoder with the new bitrate.
-        let fps = 30.0; // TODO: store fps in struct
+        let fps = self.fps;
         let config = EncoderConfig::new()
             .max_frame_rate(fps)
             .set_bitrate_bps(kbps * 1000)

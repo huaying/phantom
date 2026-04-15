@@ -4,11 +4,16 @@
 //! starting at boot — before any user logs in. This enables remote access to the
 //! lock screen and login screen.
 //!
-//! Architecture:
-//! - Service (Session 0): handles network connections, manages agent lifecycle
-//! - Agent (User Session): launched via CreateProcessAsUser when a user logs in,
-//!   handles DXGI capture + input injection in the interactive desktop
-//! - Fallback: when no user is logged in, service captures the lock screen via GDI
+//! Architecture (like Sunshine/RustDesk):
+//! - Service (Session 0): handles network connections, manages agent lifecycle.
+//!   Polls `WTSGetActiveConsoleSessionId()` until a console session appears
+//!   (Session 1+ is created by winlogon a few seconds after boot).
+//! - Agent (User Session): launched via CreateProcessAsUser into the active
+//!   console session. Uses `OpenInputDesktop()` + `SetThreadDesktop()` each
+//!   frame to follow desktop switches (user desktop ↔ Winlogon lock screen).
+//!   Handles DXGI capture + input injection in the interactive desktop.
+//! - No Session 0 capture: GDI/DXGI cannot capture cross-session desktops.
+//!   The service waits for the agent to be ready before serving frames.
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,9 +73,12 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
+    // Cancel flag shared with active session — Stop handler sets this
+    // to break out of create_service_session's blocking loop.
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel);
+
     // Register the service control handler.
-    // Accept SESSION_CHANGE events so SCM notifies us of logon/logoff
-    // instead of polling WTSGetActiveConsoleSessionId.
     let session_changed = Arc::new(AtomicBool::new(false));
     let session_changed_clone = Arc::clone(&session_changed);
 
@@ -80,6 +88,8 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
                     shutdown_clone.store(true, Ordering::SeqCst);
+                    // Also cancel any active session so main loop unblocks
+                    cancel_clone.store(true, Ordering::SeqCst);
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -107,7 +117,7 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
     })?;
 
     // Run the actual server logic.
-    let result = run_server_loop(Arc::clone(&shutdown), session_changed);
+    let result = run_server_loop(Arc::clone(&shutdown), session_changed, cancel);
 
     if let Err(ref e) = result {
         tracing::error!("Server loop error: {e}");
@@ -132,6 +142,7 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
 fn run_server_loop(
     shutdown: Arc<AtomicBool>,
     session_changed: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     use crate::transport_tcp;
     use crate::transport_ws;
@@ -221,7 +232,11 @@ fn run_server_loop(
     let mut session_mgr = SessionManager::new();
     svc_log("Initial session update");
     session_mgr.update();
-    svc_log(&format!("After update: agent={} ipc={}", session_mgr.agent.is_some(), session_mgr.ipc.is_some()));
+    svc_log(&format!(
+        "After update: agent={} ipc={}",
+        session_mgr.agent.is_some(),
+        session_mgr.ipc.is_some()
+    ));
     tracing::info!(
         has_agent = session_mgr.agent.is_some(),
         has_ipc = session_mgr.ipc.is_some(),
@@ -231,7 +246,7 @@ fn run_server_loop(
     // Main loop: accept connections and run sessions
     let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let cancel = Arc::new(AtomicBool::new(false));
+    // cancel: shared with Stop handler (passed from run_service)
     let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
 
     // Doorbell thread
@@ -258,10 +273,16 @@ fn run_server_loop(
     }
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Check for session changes (driven by SCM SESSION_CHANGE events)
-        // Also periodically poll — auto-logon may complete after service starts,
-        // and the session_changed event may have been missed.
-        if session_changed.swap(false, Ordering::Relaxed) || session_mgr.ipc.is_none() {
+        // Check for session changes (driven by SCM SESSION_CHANGE events).
+        // Also poll when agent/IPC are not ready — like Sunshine, we poll every
+        // iteration (~100ms) until an agent is connected. This handles:
+        // - Boot race: service starts before winlogon creates Session 1
+        // - Missed SESSION_CHANGE events
+        // - Agent crash recovery
+        if session_changed.swap(false, Ordering::Relaxed)
+            || session_mgr.agent.is_none()
+            || session_mgr.ipc.is_none()
+        {
             session_mgr.update();
         }
         // Also check if agent died unexpectedly
@@ -273,12 +294,8 @@ fn run_server_loop(
             cancel.store(false, Ordering::Relaxed);
             let session_cancel = Arc::clone(&cancel);
 
-            let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-            let quality_delay = Duration::from_millis(2000);
-
-            // In service mode, prefer agent frames via IPC (DXGI quality).
-            // Fall back to local GDI capture when agent is not connected
-            // (lock screen, no user logged in, agent crashed).
+            // In service mode, relay agent frames via IPC (DXGI/GDI from user session).
+            // If agent is not connected yet, reject the client.
             match create_service_session(&mut session_mgr, sender, receiver, session_cancel) {
                 Ok(result) => {
                     tracing::info!("Service session ended: {}", result.error);
@@ -298,44 +315,12 @@ fn run_server_loop(
     Ok(())
 }
 
-/// Create capture/encoder for service mode (Session 0 fallback).
-/// Uses scrap (which uses DXGI on Windows) or GDI as last resort.
-fn create_service_capture() -> anyhow::Result<(
-    Box<dyn phantom_core::capture::FrameCapture>,
-    Box<dyn phantom_core::encode::FrameEncoder>,
-    phantom_core::tile::TileDiffer,
-)> {
-    // Try scrap first (works if a desktop is available)
-    let capture: Box<dyn phantom_core::capture::FrameCapture> =
-        match crate::capture_scrap::ScrapCapture::new() {
-            Ok(cap) => Box::new(cap),
-            Err(_e) => {
-                // Fall back to GDI capture for lock screen / no desktop
-                #[cfg(target_os = "windows")]
-                {
-                    Box::new(crate::capture_gdi::GdiCapture::new()?)
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    anyhow::bail!("No capture method available: {_e}");
-                }
-            }
-        };
-
-    let (width, height) = capture.resolution();
-    let encoder = Box::new(crate::encode_h264::OpenH264Encoder::new(
-        width, height, 30.0, 2000,
-    )?);
-    let differ = phantom_core::tile::TileDiffer::new();
-
-    Ok((capture, encoder, differ))
-}
-
 /// Run a service-mode session with IPC agent frame proxying.
 ///
-/// If the agent is connected via IPC, uses its DXGI frames (high quality).
-/// Otherwise falls back to local GDI capture (lock screen / no agent).
-/// Input events from the remote client are forwarded to the agent via IPC.
+/// The agent (running in the user's session) captures the screen via DXGI/GDI
+/// and sends pre-encoded H.264 frames over IPC. The service just relays them.
+/// If the agent is not connected, returns an error — Session 0 cannot capture
+/// cross-session desktops (Windows Vista+ session isolation).
 fn create_service_session(
     session_mgr: &mut SessionManager,
     sender: Box<dyn phantom_core::transport::MessageSender>,
@@ -351,97 +336,77 @@ fn create_service_session(
     let has_ipc = false;
 
     svc_log(&format!("create_service_session: has_ipc={has_ipc}"));
-    if has_ipc {
-        #[cfg(target_os = "windows")]
-        {
-            let ipc = session_mgr.ipc.as_ref().unwrap();
-
-            // Wait for first encoded frame from agent to get resolution
-            let mut attempts = 0;
-            svc_log("Waiting for first encoded frame from agent...");
-            let (width, height) = loop {
-                if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
-                    svc_log(&format!("Got frame: {}x{} {} bytes kf={}", ef.width, ef.height, ef.encoded.data.len(), ef.encoded.is_keyframe));
-                    tracing::info!(
-                        width = ef.width,
-                        height = ef.height,
-                        bytes = ef.encoded.data.len(),
-                        keyframe = ef.encoded.is_keyframe,
-                        "Got encoded frame from agent"
-                    );
-                    break (ef.width, ef.height);
-                }
-                attempts += 1;
-                if attempts % 10 == 0 {
-                    tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
-                }
-                if attempts > 100 {
-                    svc_log("No frames after 2s — falling back to GDI");
-                    return create_service_session_gdi(sender, receiver, cancel);
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-
-            // Create input forwarder to send input events to agent via IPC
-            let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
-                ipc.input_sender().map(|tx| {
-                    Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
-                });
-
-            let result = crate::session::run_session_ipc(
-                ipc,
-                crate::session::SessionConfig {
-                    sender,
-                    receiver,
-                    frame_interval,
-                    quality_delay: Duration::from_millis(2000),
-                    cancel,
-                    send_file: None,
-                    video_codec: phantom_core::encode::VideoCodec::H264,
-                    is_resume: false,
-                    input_forwarder,
-                    audio_ws_rx: None,
-                },
-                width,
-                height,
-            );
-            return Ok(result);
-        }
+    if !has_ipc {
+        anyhow::bail!(
+            "no agent connected — cannot capture screen from Session 0 \
+             (waiting for user session agent to connect)"
+        );
     }
 
-    // No IPC — use local capture (GDI fallback)
-    create_service_session_gdi(sender, receiver, cancel)
-}
+    #[cfg(target_os = "windows")]
+    {
+        let ipc = session_mgr.ipc.as_ref().unwrap();
 
-/// Fallback: run session with local GDI/scrap capture.
-fn create_service_session_gdi(
-    sender: Box<dyn phantom_core::transport::MessageSender>,
-    receiver: Box<dyn phantom_core::transport::MessageReceiver>,
-    cancel: Arc<AtomicBool>,
-) -> anyhow::Result<crate::session::SessionResult> {
-    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-    let quality_delay = Duration::from_millis(2000);
+        // Wait for first encoded frame from agent to get resolution
+        let mut attempts = 0;
+        svc_log("Waiting for first encoded frame from agent...");
+        let (width, height) = loop {
+            if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
+                svc_log(&format!(
+                    "Got frame: {}x{} {} bytes kf={}",
+                    ef.width,
+                    ef.height,
+                    ef.encoded.data.len(),
+                    ef.encoded.is_keyframe
+                ));
+                tracing::info!(
+                    width = ef.width,
+                    height = ef.height,
+                    bytes = ef.encoded.data.len(),
+                    keyframe = ef.encoded.is_keyframe,
+                    "Got encoded frame from agent"
+                );
+                break (ef.width, ef.height);
+            }
+            attempts += 1;
+            if attempts % 10 == 0 {
+                tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
+            }
+            if attempts > 100 {
+                svc_log("No frames after 2s — agent not producing frames");
+                anyhow::bail!("agent connected but not producing frames after 2s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
 
-    let (mut capture, mut encoder, mut differ) = create_service_capture()?;
-    let result = crate::session::run_session_cpu(
-        &mut *capture,
-        &mut *encoder,
-        &mut differ,
-        crate::session::SessionConfig {
-            sender,
-            receiver,
-            frame_interval,
-            quality_delay,
-            cancel,
-            send_file: None,
-            video_codec: phantom_core::encode::VideoCodec::H264,
-            is_resume: false,
-            input_forwarder: None,
-            audio_ws_rx: None,
-        },
-    );
-    differ.reset();
-    Ok(result)
+        // Create input forwarder to send input events to agent via IPC
+        let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
+            ipc.input_sender().map(|tx| {
+                Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
+            });
+
+        let result = crate::session::run_session_ipc(
+            ipc,
+            crate::session::SessionConfig {
+                sender,
+                receiver,
+                frame_interval,
+                quality_delay: Duration::from_millis(2000),
+                cancel,
+                send_file: None,
+                video_codec: phantom_core::encode::VideoCodec::H264,
+                is_resume: false,
+                input_forwarder,
+                audio_ws_rx: None,
+            },
+            width,
+            height,
+        );
+        return Ok(result);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    unreachable!()
 }
 
 /// An InputForwarder that sends input events to the agent via IPC.
@@ -537,23 +502,55 @@ impl SessionManager {
 
     /// React to a session change event. Check current active session and
     /// launch/kill agent as needed.
+    ///
+    /// Called periodically from the main loop. Handles:
+    /// - Session transitions (logon/logoff/lock/unlock)
+    /// - Boot race condition (Session 1 not yet created when service starts)
+    /// - Agent recovery after crash
     fn update(&mut self) {
         #[cfg(target_os = "windows")]
         {
             let session_id = get_active_console_session_id();
-            svc_log(&format!("update: current={} detected={}", self.current_session_id, session_id));
+            svc_log(&format!(
+                "update: current={} detected={} agent={} ipc={}",
+                self.current_session_id,
+                session_id,
+                self.agent.is_some(),
+                self.ipc.is_some()
+            ));
 
-            if session_id == self.current_session_id {
-                return; // No change
+            if session_id == self.current_session_id && self.agent.is_some() && self.ipc.is_some() {
+                return; // Session unchanged and agent is healthy — nothing to do
             }
 
-            svc_log(&format!("Session changed: {} -> {}", self.current_session_id, session_id));
-            self.current_session_id = session_id;
+            // Session changed — kill old agent before launching new one
+            if session_id != self.current_session_id {
+                svc_log(&format!(
+                    "Session changed: {} -> {}",
+                    self.current_session_id, session_id
+                ));
+                self.current_session_id = session_id;
+                self.kill_agent();
+            }
 
-            // Kill existing agent
-            self.kill_agent();
+            // No valid session yet (boot race: winlogon hasn't created Session 1)
+            if session_id == 0xFFFFFFFF || session_id == 0 {
+                return;
+            }
 
-            if session_id != 0xFFFFFFFF && session_id != 0 {
+            // Already have a working agent — nothing to do
+            if self.agent.is_some() && self.ipc.is_some() {
+                return;
+            }
+
+            // Need to launch agent (first time, or after crash/session change)
+            if self.agent.is_some() {
+                // Agent exists but IPC is broken — kill and relaunch
+                svc_log("Agent exists but IPC disconnected, relaunching");
+                self.kill_agent();
+            }
+
+            {
                 svc_log(&format!("Creating IPC pipe for session {session_id}"));
                 match crate::ipc_pipe::IpcServer::new(session_id) {
                     Ok(mut ipc_server) => {
@@ -608,51 +605,24 @@ impl SessionManager {
         }
     }
 
-    /// Check if the agent process is still alive. If it died, attempt relaunch.
+    /// Check if the agent process is still alive. If it died, clean up state.
+    /// The next `update()` call will detect `agent.is_none()` and relaunch.
     fn check_agent_health(&mut self) {
         #[cfg(target_os = "windows")]
         {
             if let Some(ref agent) = self.agent {
                 if let Some(exit_code) = agent.try_wait() {
                     tracing::warn!(pid = agent.pid, exit_code, "Agent exited unexpectedly");
+                    svc_log(&format!(
+                        "Agent PID={} exited with code {exit_code}",
+                        agent.pid
+                    ));
                     self.agent = None;
-                    // Clean up IPC
+                    // Clean up IPC — next update() will relaunch
                     if let Some(ref mut ipc) = self.ipc {
                         ipc.disconnect();
                     }
                     self.ipc = None;
-
-                    // Attempt relaunch if there's still an active user session
-                    if self.current_session_id != 0 && self.current_session_id != 0xFFFFFFFF {
-                        tracing::info!(session_id = self.current_session_id, "Relaunching agent");
-                        // Create fresh IPC pipe for the new agent
-                        if let Ok(mut ipc_server) =
-                            crate::ipc_pipe::IpcServer::new(self.current_session_id)
-                        {
-                            match launch_agent_in_session(self.current_session_id) {
-                                Ok(proc) => {
-                                    tracing::info!(pid = proc.pid, "Agent relaunched");
-                                    self.agent = Some(proc);
-                                    match ipc_server.wait_for_connection(Duration::from_secs(10)) {
-                                        Ok(true) => {
-                                            tracing::info!("Relaunched agent connected to IPC");
-                                            self.ipc = Some(ipc_server);
-                                        }
-                                        _ => {
-                                            tracing::warn!(
-                                                "Relaunched agent did not connect to IPC"
-                                            );
-                                            ipc_server.disconnect();
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Agent relaunch failed: {e}");
-                                    ipc_server.disconnect();
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -711,10 +681,7 @@ fn get_session_username(session_id: u32) -> Option<String> {
             if let Ok(id) = part.parse::<u32>() {
                 if id == session_id && i >= 2 {
                     let username = parts[i - 1];
-                    if !username.is_empty()
-                        && username != "services"
-                        && username != "console"
-                    {
+                    if !username.is_empty() && username != "services" && username != "console" {
                         return Some(username.to_string());
                     }
                 }
@@ -842,12 +809,17 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
 pub fn install_service() -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let exe = std::env::current_exe().context("get current exe path")?;
-    let exe_str = exe.to_string_lossy();
+    // Copy exe to a fixed install location. This avoids binPath being tied
+    // to the build directory — updates just overwrite the fixed path.
+    let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
+    std::fs::create_dir_all(&install_dir).context("create install dir")?;
+    let install_exe = install_dir.join("phantom-server.exe");
 
-    // sc.exe syntax: each `key=` and its value are SEPARATE arguments.
-    // e.g. sc create Foo binPath= "C:\foo.exe --flag" start= auto
-    let bin_path = format!("\"{}\" --service", exe_str);
+    let src_exe = std::env::current_exe().context("get current exe path")?;
+    std::fs::copy(&src_exe, &install_exe)
+        .context("copy exe to install dir (is the service already running? --uninstall first)")?;
+
+    let bin_path = format!("\"{}\" --service", install_exe.display());
     let status = std::process::Command::new("sc")
         .args([
             "create",
@@ -912,15 +884,26 @@ pub fn install_service() -> anyhow::Result<()> {
 pub fn uninstall_service() -> anyhow::Result<()> {
     use anyhow::Context;
 
-    // Stop first (ignore errors if already stopped)
+    // Stop the service gracefully
     let _ = std::process::Command::new("sc")
         .args(["stop", SERVICE_NAME])
         .status();
 
-    // Wait a moment for the service to stop
+    // Wait for graceful stop (Bug 1 fix: Stop handler now cancels active session)
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Force kill fallback — if sc stop didn't work, kill the process directly
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/FI", &format!("SERVICES eq {SERVICE_NAME}")])
+        .status();
+    // Also kill any agent processes
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "phantom-server.exe"])
+        .status();
+
     std::thread::sleep(Duration::from_secs(2));
 
-    // Delete
+    // Delete service
     let status = std::process::Command::new("sc")
         .args(["delete", SERVICE_NAME])
         .status()
@@ -932,7 +915,7 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
     }
 
-    // Also clean up old schtasks entry if it exists (from pre-service installs)
+    // Clean up schtasks
     let _ = std::process::Command::new("schtasks")
         .args(["/Delete", "/TN", "PhantomServer", "/F"])
         .status();
