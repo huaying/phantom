@@ -75,7 +75,7 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
 
     // Cancel flag shared with active session — Stop handler sets this
     // to break out of create_service_session's blocking loop.
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let cancel_clone = Arc::clone(&cancel);
 
     // Register the service control handler.
