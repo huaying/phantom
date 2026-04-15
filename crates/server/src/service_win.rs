@@ -13,6 +13,26 @@
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Debug logger for Windows Service (no stderr available).
+pub fn svc_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\Windows\Temp\phantom-debug.log")
+    {
+        let _ = writeln!(
+            f,
+            "[{:.1}s] {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+            msg
+        );
+    }
+}
 use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
@@ -197,11 +217,11 @@ fn run_server_loop(
     drop(conn_tx);
 
     // Session manager: monitors user sessions and launches agents
-    tracing::info!("Creating SessionManager");
+    svc_log("Creating SessionManager");
     let mut session_mgr = SessionManager::new();
-    // Do an initial poll to detect any already-logged-in user
-    tracing::info!("Initial session update");
+    svc_log("Initial session update");
     session_mgr.update();
+    svc_log(&format!("After update: agent={} ipc={}", session_mgr.agent.is_some(), session_mgr.ipc.is_some()));
     tracing::info!(
         has_agent = session_mgr.agent.is_some(),
         has_ipc = session_mgr.ipc.is_some(),
@@ -330,7 +350,7 @@ fn create_service_session(
     #[cfg(not(target_os = "windows"))]
     let has_ipc = false;
 
-    tracing::info!(has_ipc, "create_service_session");
+    svc_log(&format!("create_service_session: has_ipc={has_ipc}"));
     if has_ipc {
         #[cfg(target_os = "windows")]
         {
@@ -338,9 +358,10 @@ fn create_service_session(
 
             // Wait for first encoded frame from agent to get resolution
             let mut attempts = 0;
-            tracing::info!("Waiting for first encoded frame from agent...");
+            svc_log("Waiting for first encoded frame from agent...");
             let (width, height) = loop {
                 if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
+                    svc_log(&format!("Got frame: {}x{} {} bytes kf={}", ef.width, ef.height, ef.encoded.data.len(), ef.encoded.is_keyframe));
                     tracing::info!(
                         width = ef.width,
                         height = ef.height,
@@ -355,7 +376,7 @@ fn create_service_session(
                     tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
                 }
                 if attempts > 100 {
-                    tracing::warn!("No encoded frames after 2s — falling back to GDI");
+                    svc_log("No frames after 2s — falling back to GDI");
                     return create_service_session_gdi(sender, receiver, cancel);
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -520,43 +541,41 @@ impl SessionManager {
         #[cfg(target_os = "windows")]
         {
             let session_id = get_active_console_session_id();
+            svc_log(&format!("update: current={} detected={}", self.current_session_id, session_id));
 
             if session_id == self.current_session_id {
                 return; // No change
             }
 
-            tracing::info!(
-                old = self.current_session_id,
-                new = session_id,
-                "Active console session changed"
-            );
+            svc_log(&format!("Session changed: {} -> {}", self.current_session_id, session_id));
             self.current_session_id = session_id;
 
             // Kill existing agent
             self.kill_agent();
 
             if session_id != 0xFFFFFFFF && session_id != 0 {
-                tracing::info!(session_id, "Creating IPC pipe");
+                svc_log(&format!("Creating IPC pipe for session {session_id}"));
                 match crate::ipc_pipe::IpcServer::new(session_id) {
                     Ok(mut ipc_server) => {
-                        tracing::info!(session_id, "IPC pipe created, launching agent");
+                        svc_log("IPC pipe created, launching agent");
                         match launch_agent_in_session(session_id) {
                             Ok(proc) => {
-                                tracing::info!(pid = proc.pid, "Agent launched");
+                                svc_log(&format!("Agent launched PID={}", proc.pid));
                                 self.agent = Some(proc);
 
                                 // Wait for agent to connect to the IPC pipe (up to 10s)
+                                svc_log("Waiting for agent IPC connection (10s timeout)...");
                                 match ipc_server.wait_for_connection(Duration::from_secs(10)) {
                                     Ok(true) => {
-                                        tracing::info!("IPC: agent connected");
+                                        svc_log("IPC: agent connected!");
                                         self.ipc = Some(ipc_server);
                                     }
                                     Ok(false) => {
-                                        tracing::warn!("IPC: agent did not connect within timeout, GDI fallback");
+                                        svc_log("IPC: agent did not connect within timeout");
                                         ipc_server.disconnect();
                                     }
                                     Err(e) => {
-                                        tracing::warn!("IPC: connection error: {e}");
+                                        svc_log(&format!("IPC: connection error: {e}"));
                                         ipc_server.disconnect();
                                     }
                                 }
@@ -705,81 +724,113 @@ fn get_session_username(session_id: u32) -> Option<String> {
     None
 }
 
-/// Launch agent in the target session via schtasks /IT (interactive task).
+/// Launch agent in the target session using SYSTEM token + CreateProcessAsUser.
 ///
-/// CreateProcessAsUser from a service (any token: SYSTEM, WTSQueryUserToken,
-/// explorer.exe raw token) creates processes with wrong UIPI integrity —
-/// enigo's SendInput always gets "Access denied". This is a Windows security
-/// model limitation, not a token issue.
-///
-/// schtasks /IT launches the process in the user's actual interactive context,
-/// identical to how explorer.exe launches programs. Verified to work where
-/// CreateProcessAsUser fails.
+/// Uses the service's own SYSTEM token with the session ID set to the target
+/// session. This gives the agent SYSTEM privileges, allowing access to both
+/// user desktop and Winlogon desktop (lock screen).
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
 fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> {
     use anyhow::Context;
+    use std::mem;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
 
-    let exe_path = std::env::current_exe().context("get current exe")?;
-    let task_name = format!("PhantomAgent_{session_id}");
-    let cmd = format!(
-        "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
-        exe_path.display(),
-        session_id,
-    );
+    unsafe {
+        let mut service_token = HANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ALL_ACCESS | TOKEN_QUERY,
+            &mut service_token,
+        )
+        .context("OpenProcessToken failed")?;
 
-    // Delete any stale task from previous run
-    let _ = std::process::Command::new("schtasks")
-        .args(["/Delete", "/TN", &task_name, "/F"])
-        .output();
+        let mut dup_token = HANDLE::default();
+        let dup_result = DuplicateTokenEx(
+            service_token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut dup_token,
+        );
+        let _ = CloseHandle(service_token);
+        dup_result.context("DuplicateTokenEx (SYSTEM token) failed")?;
 
-    // Get username for the target session
-    let username = get_session_username(session_id)
-        .unwrap_or_else(|| "SYSTEM".to_string());
-    tracing::info!(session_id, %username, "Launching agent via schtasks");
+        // Set the session ID on the duplicated token
+        let sid = session_id;
+        let result = windows::Win32::Security::SetTokenInformation(
+            dup_token,
+            windows::Win32::Security::TokenSessionId,
+            &sid as *const u32 as *const std::ffi::c_void,
+            mem::size_of::<u32>() as u32,
+        );
+        if result.is_err() {
+            let _ = CloseHandle(dup_token);
+            anyhow::bail!("SetTokenInformation(TokenSessionId={session_id}) failed");
+        }
 
-    // Create a one-time interactive task as the session user.
-    // /RU is required when called from SYSTEM context.
-    // /IT ensures the task runs in the user's interactive desktop.
-    let create = std::process::Command::new("schtasks")
-        .args([
-            "/Create", "/TN", &task_name,
-            "/TR", &cmd,
-            "/SC", "ONCE", "/ST", "00:00",
-            "/RL", "HIGHEST",
-            "/RU", &username, // Run as the session user (required from SYSTEM)
-            "/IT", // Interactive Token — correct UIPI level
-            "/F",
-        ])
-        .output()
-        .context("schtasks /Create")?;
+        // Build user's environment block
+        let mut env_block: *mut std::ffi::c_void = std::ptr::null_mut();
+        let _ = windows::Win32::System::Environment::CreateEnvironmentBlock(
+            &mut env_block,
+            dup_token,
+            false,
+        );
 
-    if !create.status.success() {
-        let stderr = String::from_utf8_lossy(&create.stderr);
-        anyhow::bail!("schtasks /Create failed: {stderr}");
+        let exe_path = std::env::current_exe().context("get current exe")?;
+        let cmd_line = format!(
+            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
+            exe_path.display(),
+            session_id,
+        );
+        let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut si: STARTUPINFOW = mem::zeroed();
+        si.cb = mem::size_of::<STARTUPINFOW>() as u32;
+        let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+        si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
+
+        let mut pi: PROCESS_INFORMATION = mem::zeroed();
+
+        let result = CreateProcessAsUserW(
+            dup_token,
+            None,
+            windows::core::PWSTR(cmd_wide.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT,
+            if env_block.is_null() {
+                None
+            } else {
+                Some(env_block)
+            },
+            None,
+            &si,
+            &mut pi,
+        );
+        let _ = CloseHandle(dup_token);
+        if !env_block.is_null() {
+            let _ = windows::Win32::System::Environment::DestroyEnvironmentBlock(env_block);
+        }
+        result.context("CreateProcessAsUserW failed")?;
+
+        let _ = CloseHandle(pi.hThread);
+
+        Ok(WinProcessHandle {
+            handle: pi.hProcess,
+            pid: pi.dwProcessId,
+        })
     }
-
-    // Run it immediately
-    let run = std::process::Command::new("schtasks")
-        .args(["/Run", "/TN", &task_name])
-        .output()
-        .context("schtasks /Run")?;
-
-    if !run.status.success() {
-        let stderr = String::from_utf8_lossy(&run.stderr);
-        anyhow::bail!("schtasks /Run failed: {stderr}");
-    }
-
-    tracing::info!(session_id, task = %task_name, "Agent launched via schtasks");
-
-    // Don't try to find PID — schtasks process discovery is unreliable.
-    // Return a dummy handle. The IPC connection (wait_for_connection) is
-    // the real success indicator. Agent lifecycle is managed by schtasks.
-    Ok(WinProcessHandle {
-        handle: windows::Win32::Foundation::HANDLE::default(),
-        pid: 0,
-    })
 }
 
 // ── Service installation helpers ────────────────────────────────────────────
