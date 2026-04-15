@@ -1218,9 +1218,12 @@ pub fn install_service() -> anyhow::Result<()> {
         }
     }
 
-    // Disable Basic Display Adapter to prevent multi-display confusion
-    // and ensure VDD renders on NVIDIA GPU.
-    disable_basic_display_adapter();
+    // Only disable Basic Display Adapter if GPU is already in WDDM mode.
+    // If we just switched TCC→WDDM, wait until after reboot — otherwise
+    // the system has NO display adapter and can't boot properly.
+    if !needs_reboot {
+        disable_basic_display_adapter();
+    }
 
     println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");
@@ -1232,7 +1235,7 @@ pub fn install_service() -> anyhow::Result<()> {
         println!("  *** REBOOT REQUIRED ***");
         println!("  GPU was switched from TCC to WDDM mode.");
         println!("  Run: shutdown /r /t 10");
-        println!("  After reboot, the service starts automatically with GPU acceleration.");
+        println!("  After reboot, run --install again to finalize GPU display setup.");
         println!();
         println!("  To check status: sc query {SERVICE_NAME}");
         println!("  To remove:       phantom-server --uninstall");
