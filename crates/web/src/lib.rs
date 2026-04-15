@@ -1690,10 +1690,34 @@ fn setup_input(
                         if let Some(kc) = js_code_to_keycode(&code) {
                             if pressed {
                                 // Send Ctrl down, key down, key up, Ctrl up
-                                send_input(&st, InputEvent::Key { key: KeyCode::LeftCtrl, pressed: true });
-                                send_input(&st, InputEvent::Key { key: kc, pressed: true });
-                                send_input(&st, InputEvent::Key { key: kc, pressed: false });
-                                send_input(&st, InputEvent::Key { key: KeyCode::LeftCtrl, pressed: false });
+                                send_input(
+                                    &st,
+                                    InputEvent::Key {
+                                        key: KeyCode::LeftCtrl,
+                                        pressed: true,
+                                    },
+                                );
+                                send_input(
+                                    &st,
+                                    InputEvent::Key {
+                                        key: kc,
+                                        pressed: true,
+                                    },
+                                );
+                                send_input(
+                                    &st,
+                                    InputEvent::Key {
+                                        key: kc,
+                                        pressed: false,
+                                    },
+                                );
+                                send_input(
+                                    &st,
+                                    InputEvent::Key {
+                                        key: KeyCode::LeftCtrl,
+                                        pressed: false,
+                                    },
+                                );
                             }
                         }
                         return;

@@ -541,7 +541,9 @@ impl SessionRunner {
                         let _ = ab.set_text(&text);
                     }
                     self.clipboard.on_remote_update(&text);
-                    // TODO: forward paste to agent via IPC in service mode
+                    // In service mode (input_forwarder set), paste forwarding is not yet
+                    // supported — would need a PasteText IPC message type. For now,
+                    // paste only works in console mode via local injection.
                     if let Some(ref mut inj) = self.injector {
                         let _ = inj.type_text(&text);
                         self.had_input = true;
@@ -1353,13 +1355,15 @@ mod tests {
     }
 
     #[test]
-    fn abr_decreases_on_high_rtt() {
+    fn abr_decreases_on_congestion_rtt() {
         let mut abr = AdaptiveBitrate::new(5000);
         // Force past the 5s hysteresis
         abr.last_change = Instant::now() - Duration::from_secs(10);
-        // RTT = 150ms → should decrease
+        // Establish a low baseline RTT first
+        abr.baseline_rtt_ms = Some(30.0);
+        // RTT = 150ms with baseline 30ms → congested (150 > 30*1.5=45 && 150 > 30+30=60)
         let new = abr.evaluate(Some(150_000), 1);
-        assert!(new.is_some());
+        assert!(new.is_some(), "should decrease on congestion");
         let new_kbps = new.unwrap();
         assert!(new_kbps < 5000, "should decrease: got {new_kbps}");
         assert_eq!(new_kbps, 3500); // 5000 * 0.7 = 3500
@@ -1377,11 +1381,12 @@ mod tests {
 
     #[test]
     fn abr_respects_minimum() {
-        let mut abr = AdaptiveBitrate::new(500);
+        let mut abr = AdaptiveBitrate::new(1500); // min_kbps defaults to 1500
         abr.last_change = Instant::now() - Duration::from_secs(10);
-        // Already at minimum — should not go below 500
+        abr.baseline_rtt_ms = Some(30.0);
+        // Already at minimum — 1500 * 0.7 = 1050, clamped to 1500 = no change
         let new = abr.evaluate(Some(200_000), 1);
-        assert!(new.is_none()); // 500 * 0.7 = 350, but clamped to 500 = same
+        assert!(new.is_none(), "should not go below minimum");
     }
 
     #[test]

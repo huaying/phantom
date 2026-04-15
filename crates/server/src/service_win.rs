@@ -288,12 +288,8 @@ fn run_server_loop(
             cancel.store(false, Ordering::Relaxed);
             let session_cancel = Arc::clone(&cancel);
 
-            let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-            let quality_delay = Duration::from_millis(2000);
-
-            // In service mode, prefer agent frames via IPC (DXGI quality).
-            // Fall back to local GDI capture when agent is not connected
-            // (lock screen, no user logged in, agent crashed).
+            // In service mode, relay agent frames via IPC (DXGI/GDI from user session).
+            // If agent is not connected yet, reject the client.
             match create_service_session(&mut session_mgr, sender, receiver, session_cancel) {
                 Ok(result) => {
                     tracing::info!("Service session ended: {}", result.error);
@@ -313,44 +309,12 @@ fn run_server_loop(
     Ok(())
 }
 
-/// Create capture/encoder for service mode (Session 0 fallback).
-/// Uses scrap (which uses DXGI on Windows) or GDI as last resort.
-fn create_service_capture() -> anyhow::Result<(
-    Box<dyn phantom_core::capture::FrameCapture>,
-    Box<dyn phantom_core::encode::FrameEncoder>,
-    phantom_core::tile::TileDiffer,
-)> {
-    // Try scrap first (works if a desktop is available)
-    let capture: Box<dyn phantom_core::capture::FrameCapture> =
-        match crate::capture_scrap::ScrapCapture::new() {
-            Ok(cap) => Box::new(cap),
-            Err(_e) => {
-                // Fall back to GDI capture for lock screen / no desktop
-                #[cfg(target_os = "windows")]
-                {
-                    Box::new(crate::capture_gdi::GdiCapture::new()?)
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    anyhow::bail!("No capture method available: {_e}");
-                }
-            }
-        };
-
-    let (width, height) = capture.resolution();
-    let encoder = Box::new(crate::encode_h264::OpenH264Encoder::new(
-        width, height, 30.0, 2000,
-    )?);
-    let differ = phantom_core::tile::TileDiffer::new();
-
-    Ok((capture, encoder, differ))
-}
-
 /// Run a service-mode session with IPC agent frame proxying.
 ///
-/// If the agent is connected via IPC, uses its DXGI frames (high quality).
-/// Otherwise falls back to local GDI capture (lock screen / no agent).
-/// Input events from the remote client are forwarded to the agent via IPC.
+/// The agent (running in the user's session) captures the screen via DXGI/GDI
+/// and sends pre-encoded H.264 frames over IPC. The service just relays them.
+/// If the agent is not connected, returns an error — Session 0 cannot capture
+/// cross-session desktops (Windows Vista+ session isolation).
 fn create_service_session(
     session_mgr: &mut SessionManager,
     sender: Box<dyn phantom_core::transport::MessageSender>,
@@ -366,103 +330,77 @@ fn create_service_session(
     let has_ipc = false;
 
     svc_log(&format!("create_service_session: has_ipc={has_ipc}"));
-    if has_ipc {
-        #[cfg(target_os = "windows")]
-        {
-            let ipc = session_mgr.ipc.as_ref().unwrap();
-
-            // Wait for first encoded frame from agent to get resolution
-            let mut attempts = 0;
-            svc_log("Waiting for first encoded frame from agent...");
-            let (width, height) = loop {
-                if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
-                    svc_log(&format!(
-                        "Got frame: {}x{} {} bytes kf={}",
-                        ef.width,
-                        ef.height,
-                        ef.encoded.data.len(),
-                        ef.encoded.is_keyframe
-                    ));
-                    tracing::info!(
-                        width = ef.width,
-                        height = ef.height,
-                        bytes = ef.encoded.data.len(),
-                        keyframe = ef.encoded.is_keyframe,
-                        "Got encoded frame from agent"
-                    );
-                    break (ef.width, ef.height);
-                }
-                attempts += 1;
-                if attempts % 10 == 0 {
-                    tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
-                }
-                if attempts > 100 {
-                    svc_log("No frames after 2s — falling back to GDI");
-                    return create_service_session_gdi(sender, receiver, cancel);
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-
-            // Create input forwarder to send input events to agent via IPC
-            let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
-                ipc.input_sender().map(|tx| {
-                    Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
-                });
-
-            let result = crate::session::run_session_ipc(
-                ipc,
-                crate::session::SessionConfig {
-                    sender,
-                    receiver,
-                    frame_interval,
-                    quality_delay: Duration::from_millis(2000),
-                    cancel,
-                    send_file: None,
-                    video_codec: phantom_core::encode::VideoCodec::H264,
-                    is_resume: false,
-                    input_forwarder,
-                    audio_ws_rx: None,
-                },
-                width,
-                height,
-            );
-            return Ok(result);
-        }
+    if !has_ipc {
+        anyhow::bail!(
+            "no agent connected — cannot capture screen from Session 0 \
+             (waiting for user session agent to connect)"
+        );
     }
 
-    // No IPC — use local capture (GDI fallback)
-    create_service_session_gdi(sender, receiver, cancel)
-}
+    #[cfg(target_os = "windows")]
+    {
+        let ipc = session_mgr.ipc.as_ref().unwrap();
 
-/// Fallback: run session with local GDI/scrap capture.
-fn create_service_session_gdi(
-    sender: Box<dyn phantom_core::transport::MessageSender>,
-    receiver: Box<dyn phantom_core::transport::MessageReceiver>,
-    cancel: Arc<AtomicBool>,
-) -> anyhow::Result<crate::session::SessionResult> {
-    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
-    let quality_delay = Duration::from_millis(2000);
+        // Wait for first encoded frame from agent to get resolution
+        let mut attempts = 0;
+        svc_log("Waiting for first encoded frame from agent...");
+        let (width, height) = loop {
+            if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
+                svc_log(&format!(
+                    "Got frame: {}x{} {} bytes kf={}",
+                    ef.width,
+                    ef.height,
+                    ef.encoded.data.len(),
+                    ef.encoded.is_keyframe
+                ));
+                tracing::info!(
+                    width = ef.width,
+                    height = ef.height,
+                    bytes = ef.encoded.data.len(),
+                    keyframe = ef.encoded.is_keyframe,
+                    "Got encoded frame from agent"
+                );
+                break (ef.width, ef.height);
+            }
+            attempts += 1;
+            if attempts % 10 == 0 {
+                tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
+            }
+            if attempts > 100 {
+                svc_log("No frames after 2s — agent not producing frames");
+                anyhow::bail!("agent connected but not producing frames after 2s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
 
-    let (mut capture, mut encoder, mut differ) = create_service_capture()?;
-    let result = crate::session::run_session_cpu(
-        &mut *capture,
-        &mut *encoder,
-        &mut differ,
-        crate::session::SessionConfig {
-            sender,
-            receiver,
-            frame_interval,
-            quality_delay,
-            cancel,
-            send_file: None,
-            video_codec: phantom_core::encode::VideoCodec::H264,
-            is_resume: false,
-            input_forwarder: None,
-            audio_ws_rx: None,
-        },
-    );
-    differ.reset();
-    Ok(result)
+        // Create input forwarder to send input events to agent via IPC
+        let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
+            ipc.input_sender().map(|tx| {
+                Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
+            });
+
+        let result = crate::session::run_session_ipc(
+            ipc,
+            crate::session::SessionConfig {
+                sender,
+                receiver,
+                frame_interval,
+                quality_delay: Duration::from_millis(2000),
+                cancel,
+                send_file: None,
+                video_codec: phantom_core::encode::VideoCodec::H264,
+                is_resume: false,
+                input_forwarder,
+                audio_ws_rx: None,
+            },
+            width,
+            height,
+        );
+        return Ok(result);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    unreachable!()
 }
 
 /// An InputForwarder that sends input events to the agent via IPC.

@@ -37,7 +37,10 @@ pub fn switch_to_input_desktop() -> bool {
         let hdesk = match OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
-            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_WRITE.0 | windows::Win32::Foundation::GENERIC_READ.0),
+            DESKTOP_ACCESS_FLAGS(
+                windows::Win32::Foundation::GENERIC_WRITE.0
+                    | windows::Win32::Foundation::GENERIC_READ.0,
+            ),
         ) {
             Ok(d) => d,
             Err(_) => return false,
