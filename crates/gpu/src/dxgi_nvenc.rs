@@ -310,6 +310,10 @@ impl DxgiNvencPipeline {
 
     pub fn force_keyframe(&mut self) {
         self.force_idr = true;
+        // Reset DXGI duplicator so the next capture returns a frame even on
+        // a static desktop. Without this, keyframe requests on a static desktop
+        // are never fulfilled because AcquireNextFrame keeps timing out.
+        let _ = self.capture.reset();
     }
 
     /// Recreate NVENC encoder for new session (ensures SPS/PPS in first keyframe).

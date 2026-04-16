@@ -898,7 +898,6 @@ fn setup_nvidia_gpu() -> anyhow::Result<bool> {
 }
 
 /// Disable the Microsoft Basic Display Adapter so Windows uses only the NVIDIA GPU.
-/// This ensures VDD renders on the GPU and prevents multi-display confusion.
 fn disable_basic_display_adapter() {
     println!("  Disabling Microsoft Basic Display Adapter...");
     let _ = std::process::Command::new("powershell")
