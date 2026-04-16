@@ -310,9 +310,13 @@ impl DxgiNvencPipeline {
 
     pub fn force_keyframe(&mut self) {
         self.force_idr = true;
-        // Reset DXGI duplicator so the next capture returns a frame even on
-        // a static desktop. Without this, keyframe requests on a static desktop
-        // are never fulfilled because AcquireNextFrame keeps timing out.
+    }
+
+    /// Force keyframe AND reset DXGI capture — use only for new session requests,
+    /// not for periodic keyframes. Resetting the duplicator is expensive and can
+    /// fail, causing the pipeline to die and reinit in a loop.
+    pub fn force_keyframe_with_capture_reset(&mut self) {
+        self.force_idr = true;
         let _ = self.capture.reset();
     }
 

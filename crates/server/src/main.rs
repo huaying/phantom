@@ -1453,16 +1453,20 @@ fn run_agent_loop(
             }
         }
 
-        // Handle keyframe requests
+        // Handle keyframe requests from service (new session).
+        // Uses capture reset to force DXGI to return a frame on static desktop.
         if ipc.take_keyframe_request() {
             if let Some(ref mut gpu) = gpu_pipeline {
-                gpu.force_keyframe();
+                gpu.force_keyframe_with_capture_reset();
             }
             if let Some(ref mut enc) = cpu_encoder {
                 enc.force_keyframe();
             }
             last_keyframe = Instant::now();
         }
+        // Periodic keyframe (2s) — only marks encoder, does NOT reset capture.
+        // On static desktop, this is a no-op (no frame to encode). That's fine
+        // because the client already has the last keyframe.
         if last_keyframe.elapsed() > Duration::from_secs(2) {
             if let Some(ref mut gpu) = gpu_pipeline {
                 gpu.force_keyframe();
