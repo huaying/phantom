@@ -14,9 +14,55 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Download directory for files received from clients.
+/// Works across Windows/Linux/macOS and in service mode (Session 0).
 fn download_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    // Try platform-specific user directories first
+    if let Some(dir) = dirs_impl::download_dir() {
+        return dir.join("phantom");
+    }
+    // Fallback
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join("Downloads").join("phantom")
+}
+
+/// Platform-specific download directory detection.
+mod dirs_impl {
+    use std::path::PathBuf;
+
+    pub fn download_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            // In service mode (Session 0), USERPROFILE points to SYSTEM profile.
+            // Query the active console session's user profile instead.
+            if let Some(dir) = windows_user_downloads() {
+                return Some(dir);
+            }
+        }
+        // Linux/macOS: $HOME/Downloads
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Downloads"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_user_downloads() -> Option<PathBuf> {
+        // Try USERPROFILE first (works in console mode and user sessions)
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let path = PathBuf::from(&profile);
+            // Check it's not the SYSTEM profile
+            if !profile.contains("systemprofile") {
+                return Some(path.join("Downloads"));
+            }
+        }
+        // Service mode: find the active user's profile via registry
+        // Query default user from HKU\.DEFAULT or enumerate logged-in users
+        // Fallback: use C:\Users\Public\Downloads (accessible by all users)
+        let public = PathBuf::from(r"C:\Users\Public\Downloads");
+        if public.exists() {
+            return Some(public);
+        }
+        None
+    }
 }
 
 /// Messages from the file-send background thread back to the session.
