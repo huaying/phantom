@@ -98,6 +98,9 @@ struct PhantomDeviceContext
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(PhantomDeviceContext, GetDeviceContext);
 
+// Static context pointer (safe for single-monitor driver).
+static PhantomDeviceContext* g_ctx = nullptr;
+
 // ── IPC: Named pipe server for resolution changes ──────────────────────────
 
 void PhantomDeviceContext::StartPipeServer()
@@ -324,11 +327,6 @@ NTSTATUS PhantomDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousS
     ctx->InitAdapter();
     return STATUS_SUCCESS;
 }
-
-// Static context pointer (safe for single-monitor driver).
-// IddCx callbacks receive IDDCX_ADAPTER/MONITOR, not WDFDEVICE,
-// so we can't easily get the WDF context from them.
-static PhantomDeviceContext* g_ctx = nullptr;
 
 NTSTATUS PhantomAdapterInitFinished(IDDCX_ADAPTER Adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
