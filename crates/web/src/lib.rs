@@ -1859,6 +1859,7 @@ fn setup_input(
                 let file_name = name.clone();
 
                 console::log_1(&format!("file drop: sending {} ({} bytes)", name, size).into());
+                show_toast(&format!("Uploading: {file_name}"));
 
                 // Send FileOffer
                 {
@@ -1928,6 +1929,7 @@ fn setup_input(
                         send_message(&st, &msg);
                     }
                     console::log_1(&format!("file sent: {} ({} bytes)", file_name, total).into());
+                    show_toast(&format!("Uploaded: {file_name}"));
                 });
             }
         });
@@ -2034,6 +2036,21 @@ fn send_message(state: &AppState, msg: &Message) {
             let _ = ws.send_with_u8_array(&data);
         }
     }
+}
+
+/// Show a brief toast notification overlay.
+fn show_toast(msg: &str) {
+    let js = format!(
+        r#"(function(){{
+            var d=document.createElement('div');
+            d.textContent='{}';
+            d.style.cssText='position:fixed;top:20px;right:20px;background:rgba(0,0,0,0.8);color:#fff;padding:10px 20px;border-radius:6px;font:14px sans-serif;z-index:9999;transition:opacity 0.3s';
+            document.body.appendChild(d);
+            setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove()}},300)}},2000);
+        }})()"#,
+        msg.replace('\'', "\\'").replace('"', "\\\"")
+    );
+    let _ = js_sys::eval(&js);
 }
 
 fn map_mouse(canvas: &HtmlCanvasElement, cx: f64, cy: f64, sw: u32, sh: u32) -> (i32, i32) {

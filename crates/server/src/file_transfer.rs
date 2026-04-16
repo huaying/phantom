@@ -49,19 +49,80 @@ mod dirs_impl {
         // Try USERPROFILE first (works in console mode and user sessions)
         if let Ok(profile) = std::env::var("USERPROFILE") {
             let path = PathBuf::from(&profile);
-            // Check it's not the SYSTEM profile
             if !profile.contains("systemprofile") {
                 return Some(path.join("Downloads"));
             }
         }
-        // Service mode: find the active user's profile via registry
-        // Query default user from HKU\.DEFAULT or enumerate logged-in users
-        // Fallback: use C:\Users\Public\Downloads (accessible by all users)
+        // Service mode (Session 0): find the active console user's Downloads.
+        // Query username from the active console session via WTS API.
+        if let Some(dir) = service_mode_user_downloads() {
+            return Some(dir);
+        }
+        // Fallback
         let public = PathBuf::from(r"C:\Users\Public\Downloads");
         if public.exists() {
             return Some(public);
         }
         None
+    }
+
+    #[cfg(target_os = "windows")]
+    fn service_mode_user_downloads() -> Option<PathBuf> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        unsafe {
+            extern "system" {
+                fn WTSGetActiveConsoleSessionId() -> u32;
+                fn WTSQuerySessionInformationW(
+                    hServer: *mut std::ffi::c_void,
+                    SessionId: u32,
+                    WTSInfoClass: i32,
+                    ppBuffer: *mut *mut u16,
+                    pBytesReturned: *mut u32,
+                ) -> i32;
+                fn WTSFreeMemory(pMemory: *mut std::ffi::c_void);
+            }
+            const WTSUserName: i32 = 5;
+
+            let session_id = WTSGetActiveConsoleSessionId();
+            if session_id == 0xFFFFFFFF {
+                return None;
+            }
+
+            let mut buf: *mut u16 = std::ptr::null_mut();
+            let mut len: u32 = 0;
+            if WTSQuerySessionInformationW(
+                std::ptr::null_mut(),
+                session_id,
+                WTSUserName,
+                &mut buf,
+                &mut len,
+            ) == 0
+            {
+                return None;
+            }
+
+            let username = {
+                let slice = std::slice::from_raw_parts(buf, (len / 2) as usize);
+                let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+                OsString::from_wide(&slice[..end])
+                    .to_string_lossy()
+                    .to_string()
+            };
+            WTSFreeMemory(buf as *mut _);
+
+            if username.is_empty() {
+                return None;
+            }
+
+            let path = PathBuf::from(format!(r"C:\Users\{}\Downloads", username));
+            if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        }
     }
 }
 
