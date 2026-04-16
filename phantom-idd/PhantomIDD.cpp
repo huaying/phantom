@@ -19,6 +19,22 @@
 
 using namespace Microsoft::WRL;
 
+// ── Debug logging ──────────────────────────────────────────────────────────
+
+static void IddLog(const char* msg)
+{
+    HANDLE f = CreateFileW(L"C:\\Windows\\Temp\\phantom-idd.log",
+        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        DWORD written;
+        WriteFile(f, msg, (DWORD)strlen(msg), &written, nullptr);
+        WriteFile(f, "\r\n", 2, &written, nullptr);
+        CloseHandle(f);
+    }
+}
+
 // ── Constants ──────────────────────────────────────────────────────────────
 
 static constexpr DWORD DEFAULT_WIDTH = 1920;
@@ -202,8 +218,10 @@ void PhantomDeviceContext::InitAdapter()
     initArgs.pCaps = &caps;
     // ObjectAttributes left as default (nullptr)
 
+    IddLog("InitAdapter: calling IddCxAdapterInitAsync");
     IDARG_OUT_ADAPTER_INIT initOut;
     NTSTATUS status = IddCxAdapterInitAsync(&initArgs, &initOut);
+    char buf[64]; sprintf_s(buf, "IddCxAdapterInitAsync: 0x%08X", status); IddLog(buf);
     if (NT_SUCCESS(status))
     {
         adapter = initOut.AdapterObject;
@@ -231,15 +249,19 @@ void PhantomDeviceContext::CreateMonitor()
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     createArgs.ObjectAttributes = &attr;
 
+    IddLog("CreateMonitor: calling IddCxMonitorCreate");
     IDARG_OUT_MONITORCREATE createOut;
     NTSTATUS status = IddCxMonitorCreate(adapter, &createArgs, &createOut);
+    {char buf[64]; sprintf_s(buf, "IddCxMonitorCreate: 0x%08X", status); IddLog(buf);}
     if (!NT_SUCCESS(status))
         return;
 
     monitor = createOut.MonitorObject;
 
+    IddLog("CreateMonitor: calling IddCxMonitorArrival");
     IDARG_OUT_MONITORARRIVAL arrivalOut;
-    IddCxMonitorArrival(monitor, &arrivalOut);
+    status = IddCxMonitorArrival(monitor, &arrivalOut);
+    {char buf[64]; sprintf_s(buf, "IddCxMonitorArrival: 0x%08X", status); IddLog(buf);}
 
     // Try to set render adapter to NVIDIA GPU (for DXGI zero-copy)
 #if IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)
@@ -274,11 +296,14 @@ void PhantomDeviceContext::CreateMonitor()
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath)
 {
+    IddLog("DriverEntry called");
     WDF_DRIVER_CONFIG config;
     WDF_OBJECT_ATTRIBUTES attrs;
     WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
     WDF_DRIVER_CONFIG_INIT(&config, PhantomDeviceAdd);
-    return WdfDriverCreate(pDriverObject, pRegistryPath, &attrs, &config, WDF_NO_HANDLE);
+    NTSTATUS s = WdfDriverCreate(pDriverObject, pRegistryPath, &attrs, &config, WDF_NO_HANDLE);
+    char buf[64]; sprintf_s(buf, "DriverEntry result: 0x%08X", s); IddLog(buf);
+    return s;
 }
 
 NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
@@ -300,9 +325,13 @@ NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     iddConfig.EvtIddCxMonitorAssignSwapChain = PhantomMonitorAssignSwapChain;
     iddConfig.EvtIddCxMonitorUnassignSwapChain = PhantomMonitorUnassignSwapChain;
 
+    IddLog("DeviceAdd: IddCxDeviceInitConfig");
     NTSTATUS status = IddCxDeviceInitConfig(pDeviceInit, &iddConfig);
     if (!NT_SUCCESS(status))
+    {
+        char buf[64]; sprintf_s(buf, "IddCxDeviceInitConfig FAILED: 0x%08X", status); IddLog(buf);
         return status;
+    }
 
     WDF_OBJECT_ATTRIBUTES deviceAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttrs, PhantomDeviceContext);
@@ -310,19 +339,24 @@ NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&pDeviceInit, &deviceAttrs, &device);
     if (!NT_SUCCESS(status))
+    {
+        char buf[64]; sprintf_s(buf, "WdfDeviceCreate FAILED: 0x%08X", status); IddLog(buf);
         return status;
+    }
 
     auto* ctx = GetDeviceContext(device);
     ctx->wdfDevice = device;
     g_ctx = ctx;
 
     status = IddCxDeviceInitialize(device);
+    char buf[64]; sprintf_s(buf, "DeviceAdd done: 0x%08X", status); IddLog(buf);
     return status;
 }
 
 NTSTATUS PhantomDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
     UNREFERENCED_PARAMETER(PreviousState);
+    IddLog("D0Entry called");
     auto* ctx = GetDeviceContext(Device);
     ctx->InitAdapter();
     return STATUS_SUCCESS;
@@ -331,6 +365,7 @@ NTSTATUS PhantomDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousS
 NTSTATUS PhantomAdapterInitFinished(IDDCX_ADAPTER Adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
     UNREFERENCED_PARAMETER(Adapter);
+    char buf[64]; sprintf_s(buf, "AdapterInitFinished: status=0x%08X g_ctx=%p", pInArgs->AdapterInitStatus, g_ctx); IddLog(buf);
     if (NT_SUCCESS(pInArgs->AdapterInitStatus) && g_ctx)
     {
         g_ctx->CreateMonitor();
@@ -358,8 +393,9 @@ NTSTATUS PhantomMonitorGetDefaultModes(IDDCX_MONITOR Monitor,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
     UNREFERENCED_PARAMETER(Monitor);
+    {char buf[64]; sprintf_s(buf, "GetDefaultModes: input=%u", pInArgs->DefaultMonitorModeBufferInputCount); IddLog(buf);}
 
-    // Report default 1920x1080 mode. Will be updated via IddCxMonitorUpdateModes.
+    // Report default 1920x1080 mode.
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
     {
         pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
@@ -378,6 +414,7 @@ NTSTATUS PhantomMonitorQueryTargetModes(IDDCX_MONITOR Monitor,
     IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
     UNREFERENCED_PARAMETER(Monitor);
+    {char buf[64]; sprintf_s(buf, "QueryTargetModes: input=%u", pInArgs->TargetModeBufferInputCount); IddLog(buf);}
 
     IDDCX_TARGET_MODE mode = CreateTargetMode(DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_VREFRESH);
 
