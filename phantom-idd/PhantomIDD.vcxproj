@@ -39,7 +39,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(WdkRoot)Lib\$(WdkVersion)\um\x64;$(WdkRoot)Lib\$(WdkVersion)\um\x64\iddcx\1.10;$(WdkRoot)Lib\wdf\umdf\x64\2.25;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>WdfDriverStubUm.lib;iddcxstub.lib;dxgi.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>WdfDriverStubUm.lib;iddcxstub.lib;dxgi.lib;ole32.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
     </Link>
