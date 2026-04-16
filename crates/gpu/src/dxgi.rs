@@ -11,15 +11,13 @@ use windows::Win32::Graphics::Dxgi::*;
 pub struct DxgiCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    duplication: IDXGIOutputDuplication,
+    duplication: Option<IDXGIOutputDuplication>,
     staging: ID3D11Texture2D,
-    /// The adapter+output used for this capture (for recreate).
     adapter: IDXGIAdapter1,
     output_idx: u32,
     pub width: u32,
     pub height: u32,
     frame_acquired: bool,
-    /// Target device name for recreate (e.g. `\\.\DISPLAY11` = VDD).
     target_device: Option<String>,
 }
 
@@ -190,7 +188,7 @@ impl DxgiCapture {
             Ok(Self {
                 device,
                 context,
-                duplication,
+                duplication: Some(duplication),
                 staging,
                 adapter: c.adapter,
                 output_idx: c.output_idx,
@@ -206,20 +204,20 @@ impl DxgiCapture {
     /// Returns true if a new frame was captured, false if no new frame (static desktop).
     pub fn capture(&mut self) -> Result<bool> {
         unsafe {
+            let dup = self
+                .duplication
+                .as_ref()
+                .context("DXGI duplication not initialized")?;
+
             if self.frame_acquired {
-                self.duplication.ReleaseFrame()?;
+                dup.ReleaseFrame()?;
                 self.frame_acquired = false;
             }
 
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
 
-            // Use frame_interval timeout — blocks until DWM has a new frame.
-            // timeout=0 causes busy-loop and misses frames between polls.
-            match self
-                .duplication
-                .AcquireNextFrame(33, &mut frame_info, &mut resource)
-            {
+            match dup.AcquireNextFrame(33, &mut frame_info, &mut resource) {
                 Ok(_) => {}
                 Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT => {
                     return Ok(false)
@@ -261,23 +259,19 @@ impl DxgiCapture {
     fn recreate(&mut self) -> Result<()> {
         unsafe {
             if self.frame_acquired {
-                let _ = self.duplication.ReleaseFrame();
+                if let Some(ref dup) = self.duplication {
+                    let _ = dup.ReleaseFrame();
+                }
                 self.frame_acquired = false;
             }
-            // Must drop the old duplication BEFORE creating a new one —
-            // only one IDXGIOutputDuplication can be active per output.
-            // Rust evaluates RHS before dropping LHS on assignment, so we
-            // need to explicitly release it first.
-            drop(std::mem::replace(
-                &mut self.duplication,
-                std::mem::zeroed(),
-            ));
+            // Drop old duplication BEFORE creating new one — only one allowed per output.
+            self.duplication = None;
 
             let output: IDXGIOutput = self.adapter.EnumOutputs(self.output_idx)?;
             let output1: IDXGIOutput1 = output.cast()?;
-            self.duplication = output1.DuplicateOutput(&self.device)?;
+            self.duplication = Some(output1.DuplicateOutput(&self.device)?);
 
-            let dup_desc = self.duplication.GetDesc();
+            let dup_desc = self.duplication.as_ref().unwrap().GetDesc();
             self.width = dup_desc.ModeDesc.Width;
             self.height = dup_desc.ModeDesc.Height;
             tracing::debug!(self.width, self.height, "DXGI duplicator recreated");
@@ -289,8 +283,10 @@ impl DxgiCapture {
 impl Drop for DxgiCapture {
     fn drop(&mut self) {
         if self.frame_acquired {
-            unsafe {
-                let _ = self.duplication.ReleaseFrame();
+            if let Some(ref dup) = self.duplication {
+                unsafe {
+                    let _ = dup.ReleaseFrame();
+                }
             }
         }
     }
