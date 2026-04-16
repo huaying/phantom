@@ -365,6 +365,7 @@ mod platform {
 
                             // Check keyframe request flag (set by request_keyframe)
                             if kf_flag.swap(false, Ordering::SeqCst) {
+                                tracing::info!("IPC write thread: sending FORCE_KEYFRAME");
                                 if let Err(e) =
                                     unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) }
                                 {
@@ -477,6 +478,7 @@ mod platform {
         /// Request the agent to send a keyframe.
         /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn request_keyframe(&self) -> Result<()> {
+            tracing::info!(connected = self.connected, "IPC: request_keyframe called");
             if self.connected {
                 self.keyframe_requested.store(true, Ordering::SeqCst);
             }

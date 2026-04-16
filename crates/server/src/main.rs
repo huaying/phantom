@@ -1456,6 +1456,7 @@ fn run_agent_loop(
         // Handle keyframe requests from service (new session).
         // Uses capture reset to force DXGI to return a frame on static desktop.
         if ipc.take_keyframe_request() {
+            tracing::info!("Agent: received keyframe request from service");
             if let Some(ref mut gpu) = gpu_pipeline {
                 gpu.force_keyframe_with_capture_reset();
             }
