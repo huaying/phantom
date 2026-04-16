@@ -687,26 +687,28 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         }
         Message::FileSaved { path, .. } => {
             console::log_1(&format!("File saved: {path}").into());
-            // Extract just the filename from path for display
             let filename = path.rsplit(['\\', '/']).next().unwrap_or(&path);
-            // Extract directory
             let dir = path.rsplitn(2, ['\\', '/']).nth(1).unwrap_or("");
-            // Update batch counter and toast
+            let escaped_path = path.replace('\\', "\\\\").replace('\'', "\\'");
             let escaped_dir = dir.replace('\\', "\\\\").replace('\'', "\\'");
             let escaped_name = filename.replace('\\', "\\\\").replace('\'', "\\'");
             let js = format!(
                 r#"(function(){{
                     window.__phantom_upload_done=(window.__phantom_upload_done||0)+1;
-                    window.__phantom_upload_dir='{escaped_dir}';
                     var done=window.__phantom_upload_done;
                     var total=window.__phantom_upload_total||1;
-                    var msg=(done>=total)
-                        ? 'Saved '+total+' file'+(total>1?'s':'')+' to {escaped_dir}'
-                        : 'Saved '+done+'/'+total+': {escaped_name}';
+                    var msg;
+                    if(total==1){{
+                        msg='Saved: {escaped_path}';
+                    }} else if(done>=total){{
+                        msg='Saved '+total+' files to {escaped_dir}';
+                    }} else {{
+                        msg='Saved '+done+'/'+total+': {escaped_name}';
+                    }}
                     var d=document.getElementById('phantom-toast-upload-batch');
                     if(d){{d.textContent=msg;d.style.opacity='1';
                         if(d._timer)clearTimeout(d._timer);
-                        if(done>=total)d._timer=setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove()}},300)}},3000);
+                        if(done>=total||total==1)d._timer=setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove()}},300)}},3000);
                     }}
                 }})()"#
             );
@@ -1875,15 +1877,15 @@ fn setup_input(
             };
 
             let total = files.length();
-            // Init batch counter in JS for toast tracking
             let _ = js_sys::eval(&format!(
                 "window.__phantom_upload_total={total};window.__phantom_upload_done=0;window.__phantom_upload_dir=''"
             ));
-            show_toast_with_id(
-                &format!("Uploading {total} file{}...", if total == 1 { "" } else { "s" }),
-                "upload-batch",
-                0,
-            );
+            if total == 1 {
+                let name = files.get(0).map(|f| f.name()).unwrap_or_default();
+                show_toast_with_id(&format!("Uploading: {name}"), "upload-batch", 0);
+            } else {
+                show_toast_with_id(&format!("Uploading {total} files..."), "upload-batch", 0);
+            }
 
             for i in 0..total {
                 let file = match files.get(i) {
