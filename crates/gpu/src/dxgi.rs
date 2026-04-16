@@ -264,8 +264,15 @@ impl DxgiCapture {
                 let _ = self.duplication.ReleaseFrame();
                 self.frame_acquired = false;
             }
-            // Recreate duplicator on the SAME adapter+output. No re-enumeration needed.
-            // This avoids adapter/device mismatch (E_INVALIDARG) and is much faster.
+            // Must drop the old duplication BEFORE creating a new one —
+            // only one IDXGIOutputDuplication can be active per output.
+            // Rust evaluates RHS before dropping LHS on assignment, so we
+            // need to explicitly release it first.
+            drop(std::mem::replace(
+                &mut self.duplication,
+                std::mem::zeroed(),
+            ));
+
             let output: IDXGIOutput = self.adapter.EnumOutputs(self.output_idx)?;
             let output1: IDXGIOutput1 = output.cast()?;
             self.duplication = output1.DuplicateOutput(&self.device)?;
