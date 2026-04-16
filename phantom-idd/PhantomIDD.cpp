@@ -197,7 +197,7 @@ void PhantomDeviceContext::InitAdapter()
     IDARG_IN_ADAPTER_INIT initArgs = {};
     initArgs.WdfDevice = wdfDevice;
     initArgs.pCaps = &caps;
-    initArgs.ObjectAttributes.Size = sizeof(initArgs.ObjectAttributes);
+    // ObjectAttributes left as default (nullptr)
 
     IDARG_OUT_ADAPTER_INIT initOut;
     NTSTATUS status = IddCxAdapterInitAsync(&initArgs, &initOut);
@@ -311,6 +311,7 @@ NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 
     auto* ctx = GetDeviceContext(device);
     ctx->wdfDevice = device;
+    g_ctx = ctx;
 
     status = IddCxDeviceInitialize(device);
     return status;
@@ -324,15 +325,17 @@ NTSTATUS PhantomDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousS
     return STATUS_SUCCESS;
 }
 
+// Static context pointer (safe for single-monitor driver).
+// IddCx callbacks receive IDDCX_ADAPTER/MONITOR, not WDFDEVICE,
+// so we can't easily get the WDF context from them.
+static PhantomDeviceContext* g_ctx = nullptr;
+
 NTSTATUS PhantomAdapterInitFinished(IDDCX_ADAPTER Adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
-    if (NT_SUCCESS(pInArgs->AdapterInitStatus))
+    UNREFERENCED_PARAMETER(Adapter);
+    if (NT_SUCCESS(pInArgs->AdapterInitStatus) && g_ctx)
     {
-        // Get device context from adapter's parent device
-        WDFDEVICE device = WdfObjectGetTypedContext<WDFDEVICE>(Adapter) ? nullptr : nullptr;
-        // IddCx adapters don't directly give us the WDF device context.
-        // The adapter was created in InitAdapter which has access to the context.
-        // We'll use a static to bridge (single-monitor driver, safe).
+        g_ctx->CreateMonitor();
     }
     return STATUS_SUCCESS;
 }
