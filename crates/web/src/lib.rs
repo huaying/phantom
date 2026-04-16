@@ -2013,9 +2013,10 @@ fn send_input(state: &AppState, event: InputEvent) {
 }
 
 /// Standard resolutions supported by VDD (must match vdd_settings.xml).
-/// Minimum 1280x720 — below this, Windows moves windows between displays
+/// Minimum 1024x768 — below this, Windows moves windows between displays
 /// on multi-display VMs (VDD + NVIDIA native).
 const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
+    (1024, 768),
     (1280, 720),
     (1280, 800),
     (1280, 960),
@@ -2040,7 +2041,7 @@ fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
     let tw = (vw as f64 * scale) as u32;
     let th = (vh as f64 * scale) as u32;
 
-    let mut best = (1280, 720); // minimum — below this, Windows moves windows between displays
+    let mut best = (1024, 768); // minimum — below this, Windows moves windows between displays
     for &(w, h) in STANDARD_RESOLUTIONS {
         if w <= tw && h <= th {
             best = (w, h);

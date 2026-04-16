@@ -680,11 +680,11 @@ impl ApplicationHandler for App {
                             .filter(|&&(rw, rh)| rw <= tw && rh <= th)
                             .last()
                             .copied()
-                            .unwrap_or((1280, 720));
-                        // Don't go below 1280x720 — very small VDD resolutions cause
+                            .unwrap_or((1024, 768));
+                        // Don't go below 1024x768 — very small VDD resolutions cause
                         // Windows to move windows to the other display.
-                        if w >= 1280
-                            && h >= 720
+                        if w >= 1024
+                            && h >= 768
                             && (w != session.display.server_width()
                                 || h != session.display.server_height())
                         {
