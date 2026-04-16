@@ -1378,6 +1378,9 @@ fn run_agent_loop(
         }
 
         // Handle resolution change requests (adaptive resolution like DCV/Sunshine)
+        // TODO: disabled — resolution change causes DXGI to pick wrong output after reinit.
+        // Need to select the VDD output specifically instead of "highest resolution".
+        if false {
         if let Some((new_w, new_h)) = ipc.take_resolution_request() {
             if new_w != width || new_h != height {
                 tracing::info!(
@@ -1399,6 +1402,7 @@ fn run_agent_loop(
                 }
             }
         }
+        } // end disabled block
 
         // Handle keyframe requests
         if ipc.take_keyframe_request() {
