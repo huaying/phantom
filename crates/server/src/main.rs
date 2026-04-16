@@ -1387,6 +1387,14 @@ fn run_agent_loop(
         }
 
         // Handle resolution change requests (adaptive resolution like DCV/Sunshine)
+        // TODO: disabled — mid-session resolution change has multiple fatal issues:
+        // 1. Hello mid-stream breaks decoder (stale frames at old resolution)
+        // 2. High resolutions exceed H.264 Level 4.0 (WebCodecs rejects)
+        // 3. Need to negotiate resolution BEFORE session starts, not during
+        // Will redesign: client sends viewport in initial handshake, server sets
+        // VDD resolution before starting capture pipeline.
+        let _ = ipc.take_resolution_request(); // drain but ignore
+        if false {
         if let Some((new_w, new_h)) = ipc.take_resolution_request() {
             if new_w != width || new_h != height {
                 tracing::info!(
@@ -1409,6 +1417,7 @@ fn run_agent_loop(
                 }
             }
         }
+        } // end disabled block
 
         // Handle keyframe requests
         if ipc.take_keyframe_request() {

@@ -536,8 +536,8 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if audio {
                 setup_audio(state);
             }
-            // Send our viewport size so server can match resolution (adaptive, like DCV)
-            send_resolution_change(state);
+            // TODO: adaptive resolution disabled — will redesign as pre-session negotiation
+            // send_resolution_change(state);
         }
         Message::VideoFrame { sequence, frame } => {
             if frame.data.is_empty() {
