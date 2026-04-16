@@ -1866,7 +1866,7 @@ fn setup_input(
                 let file_name = name.clone();
 
                 console::log_1(&format!("file drop: sending {} ({} bytes)", name, size).into());
-                show_toast(&format!("Uploading: {file_name}"));
+                show_toast(&format!("Uploading... {file_name}"));
 
                 // Send FileOffer
                 {
