@@ -940,11 +940,6 @@ fn vdd_settings_xml() -> String {
         <resolution><width>1600</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
         <resolution><width>1680</width><height>1050</height><refresh_rate>60</refresh_rate></resolution>
         <resolution><width>1920</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1920</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>2560</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>2560</width><height>1600</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>3440</width><height>1440</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>3840</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>
     </resolutions>
     <options>
         <CustomEdid>false</CustomEdid>
