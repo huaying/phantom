@@ -32,7 +32,15 @@ unsafe impl Send for DxgiNvencPipeline {}
 
 impl DxgiNvencPipeline {
     pub fn new(fps: u32, bitrate_kbps: u32) -> Result<Self> {
-        let capture = DxgiCapture::new()?;
+        Self::with_target_resolution(fps, bitrate_kbps, None)
+    }
+
+    pub fn with_target_resolution(
+        fps: u32,
+        bitrate_kbps: u32,
+        target: Option<(u32, u32)>,
+    ) -> Result<Self> {
+        let capture = DxgiCapture::with_target_resolution(target)?;
         let width = capture.width;
         let height = capture.height;
 

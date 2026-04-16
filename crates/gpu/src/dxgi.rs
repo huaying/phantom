@@ -22,13 +22,19 @@ unsafe impl Send for DxgiCapture {}
 
 impl DxgiCapture {
     pub fn new() -> Result<Self> {
+        Self::with_target_resolution(None)
+    }
+
+    /// Create a new capture, optionally preferring an output matching the target resolution.
+    /// Used after resolution change to select the VDD output at the new resolution
+    /// instead of defaulting to the highest-res output.
+    pub fn with_target_resolution(target: Option<(u32, u32)>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
             // Enumerate ALL adapters and ALL outputs to find the best one.
-            // Strategy: pick the output with the highest resolution.
-            // On headless VMs with VDD, the virtual display (1920x1080) is typically
-            // on the software renderer alongside the 800x600 default output.
+            // Strategy: if target set, prefer output matching target resolution.
+            // Otherwise pick the output with the highest resolution.
             struct Candidate {
                 adapter: IDXGIAdapter1,
                 adapter_name: String,
@@ -68,12 +74,22 @@ impl DxgiCapture {
                         "DXGI output"
                     );
 
-                    // Prefer: NVIDIA with highest res > any with highest res
+                    // Scoring: exact target match > NVIDIA with highest res > any
+                    let matches_target = target
+                        .map_or(false, |(tw, th)| w == tw && h == th);
+                    let best_matches_target = best.as_ref().map_or(false, |b| {
+                        target.map_or(false, |(tw, th)| b.width == tw && b.height == th)
+                    });
+
                     let dominated = best.as_ref().is_some_and(|b| {
-                        if is_nvidia && !b.is_nvidia {
-                            false // NVIDIA always beats non-NVIDIA
+                        if matches_target && !best_matches_target {
+                            false // target match always wins
+                        } else if !matches_target && best_matches_target {
+                            true // can't beat a target match
+                        } else if is_nvidia && !b.is_nvidia {
+                            false // NVIDIA beats non-NVIDIA
                         } else if !is_nvidia && b.is_nvidia {
-                            true // non-NVIDIA never beats NVIDIA
+                            true // non-NVIDIA can't beat NVIDIA
                         } else {
                             (w as u64) * (h as u64) <= (b.width as u64) * (b.height as u64)
                         }

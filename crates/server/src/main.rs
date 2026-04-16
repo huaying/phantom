@@ -1172,10 +1172,12 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
                     .position(|&c| c == 0)
                     .unwrap_or(dd.DeviceString.len())],
             );
-            tracing::debug!(device_idx, name, desc, "Display device");
+            tracing::info!(device_idx, name, desc, "Display device");
 
-            // Look for VDD or any non-primary display with current high res
-            if desc.contains("Virtual Display") || desc.contains("VDD") {
+            // Match MttVDD (Virtual Display Driver by MiketheTech) specifically.
+            // "Virtual Display Driver" is the exact DeviceString for VDD.
+            // Do NOT match "AWS Indirect Display Device" (DCV) or other IDD drivers.
+            if desc == "Virtual Display Driver" {
                 target_device = Some(name);
                 break;
             }
@@ -1269,6 +1271,8 @@ fn run_agent_loop(
     // when capturing from a secondary display (e.g. VDD).
     let mut display_x: i32 = 0;
     let mut display_y: i32 = 0;
+    // Target resolution for DXGI output selection after resolution change.
+    let mut target_resolution: Option<(u32, u32)> = None;
 
     tracing::info!("Starting agent loop");
 
@@ -1285,7 +1289,11 @@ fn run_agent_loop(
             last_init_attempt = Instant::now();
 
             // Tier 1: DXGI→NVENC zero-copy
-            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(30, 5000) {
+            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_resolution(
+                30,
+                5000,
+                target_resolution,
+            ) {
                 Ok(mut gpu) => {
                     width = gpu.width;
                     height = gpu.height;
@@ -1296,6 +1304,7 @@ fn run_agent_loop(
                     gdi_capture = None;
                     cpu_encoder = None;
                     capture_mode = "dxgi_nvenc";
+                    target_resolution = None; // consumed
                 }
                 Err(e) => {
                     tracing::warn!("DXGI→NVENC unavailable: {e:#}");
@@ -1378,9 +1387,6 @@ fn run_agent_loop(
         }
 
         // Handle resolution change requests (adaptive resolution like DCV/Sunshine)
-        // TODO: disabled — resolution change causes DXGI to pick wrong output after reinit.
-        // Need to select the VDD output specifically instead of "highest resolution".
-        if false {
         if let Some((new_w, new_h)) = ipc.take_resolution_request() {
             if new_w != width || new_h != height {
                 tracing::info!(
@@ -1396,13 +1402,13 @@ fn run_agent_loop(
                     scrap_capture = None;
                     gdi_capture = None;
                     cpu_encoder = None;
+                    target_resolution = Some((new_w, new_h));
                     last_init_attempt = Instant::now() - Duration::from_secs(10);
                     // Give Windows a moment to apply the resolution change
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
         }
-        } // end disabled block
 
         // Handle keyframe requests
         if ipc.take_keyframe_request() {

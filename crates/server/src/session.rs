@@ -390,6 +390,9 @@ pub struct SessionRunner {
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
     pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
+    /// Current frame resolution (for detecting changes in IPC mode).
+    pub current_width: u32,
+    pub current_height: u32,
 }
 
 impl SessionRunner {
@@ -455,6 +458,8 @@ impl SessionRunner {
             session_token: Vec::new(),
             input_forwarder: None,
             resolution_change_fn: None,
+            current_width: width,
+            current_height: height,
         };
 
         // Generate session token for reconnect
@@ -1067,6 +1072,28 @@ fn run_session_ipc_inner(
 
         // Forward ALL queued encoded frames from agent (H.264 must be sequential)
         for ipc_frame in ipc.recv_encoded_frames() {
+            // Detect resolution change — send new Hello so client updates canvas
+            if ipc_frame.width != runner.current_width || ipc_frame.height != runner.current_height
+            {
+                tracing::info!(
+                    old_w = runner.current_width,
+                    old_h = runner.current_height,
+                    new_w = ipc_frame.width,
+                    new_h = ipc_frame.height,
+                    "Resolution changed, sending new Hello"
+                );
+                runner.current_width = ipc_frame.width;
+                runner.current_height = ipc_frame.height;
+                let _ = runner.sender.send_msg(&Message::Hello {
+                    width: ipc_frame.width,
+                    height: ipc_frame.height,
+                    format: phantom_core::frame::PixelFormat::BGRA,
+                    protocol_version: 3,
+                    audio: false,
+                    video_codec: phantom_core::encode::VideoCodec::H264,
+                    session_token: runner.session_token.clone(),
+                });
+            }
             runner.send_video_frame(ipc_frame.encoded, None)?;
         }
 
