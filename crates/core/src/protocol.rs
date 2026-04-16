@@ -123,6 +123,12 @@ pub enum Message {
         sha256: [u8; 32],
     },
 
+    /// Server → Client: file transfer completed, saved to this path.
+    FileSaved {
+        transfer_id: u64,
+        path: String,
+    },
+
     /// Client → Server: request display resolution change.
     /// Server adjusts the virtual display (VDD) to match client's viewport.
     /// Same approach as DCV/Sunshine — match server resolution to client window.

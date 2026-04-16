@@ -682,6 +682,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             }
         }
+        Message::FileSaved { path, .. } => {
+            console::log_1(&format!("File saved: {path}").into());
+            show_toast(&format!("Saved: {path}"));
+        }
         Message::AudioFrame { data, .. } => {
             let mut s = state.borrow_mut();
             if s.audio_decoder.is_none() {
@@ -1929,7 +1933,6 @@ fn setup_input(
                         send_message(&st, &msg);
                     }
                     console::log_1(&format!("file sent: {} ({} bytes)", file_name, total).into());
-                    show_toast(&format!("Uploaded: {file_name}"));
                 });
             }
         });

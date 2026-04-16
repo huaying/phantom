@@ -615,8 +615,15 @@ impl SessionRunner {
                     transfer_id,
                     sha256,
                 }) => {
-                    if let Err(e) = self.file_transfer.on_file_done(transfer_id, &sha256) {
-                        tracing::error!(transfer_id, "file done error: {e}");
+                    match self.file_transfer.on_file_done(transfer_id, &sha256) {
+                        Ok(Some(path)) => {
+                            let _ = self.sender.send_msg(&Message::FileSaved {
+                                transfer_id,
+                                path,
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::error!(transfer_id, "file done error: {e}"),
                     }
                 }
                 Ok(InboundEvent::Resume {

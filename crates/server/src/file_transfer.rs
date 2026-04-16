@@ -223,12 +223,12 @@ impl ServerFileTransfer {
     }
 
     /// Handle a FileDone from the client. Verify hash and move to final path.
-    pub fn on_file_done(&mut self, transfer_id: u64, sha256: &[u8; 32]) -> Result<()> {
+    /// Returns the final saved path on success.
+    pub fn on_file_done(&mut self, transfer_id: u64, sha256: &[u8; 32]) -> Result<Option<String>> {
         if let Some(recv) = self.receivers.remove(&transfer_id) {
             drop(recv.file); // flush and close
             let computed = recv.hasher.finalize();
             if &computed != sha256 {
-                // Hash mismatch — delete temp file
                 let _ = fs::remove_file(&recv.temp_path);
                 tracing::error!(
                     transfer_id,
@@ -243,17 +243,19 @@ impl ServerFileTransfer {
             let final_path = unique_path(&recv.final_path);
             fs::rename(&recv.temp_path, &final_path)?;
 
+            let path_str = final_path.display().to_string();
             let info = self.manager.on_done(transfer_id);
             tracing::info!(
                 transfer_id,
-                path = %final_path.display(),
+                path = %path_str,
                 size = recv.expected,
                 name = info.as_ref().map(|i| i.name.as_str()).unwrap_or("?"),
                 "file received successfully"
             );
             self.manager.cleanup();
+            return Ok(Some(path_str));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Handle a FileCancel from the client.
