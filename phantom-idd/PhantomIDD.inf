@@ -45,7 +45,7 @@ UmdfServiceOrder  = PhantomIDD
 UmdfKernelModeClientPolicy = AllowKernelModeClients
 
 [PhantomIDD_Install_Driver]
-UmdfLibraryVersion = 2.25.0
+UmdfLibraryVersion = $UMDFVERSION$
 ServiceBinary      = %12%\UMDF\PhantomIDD.dll
 UmdfExtensions     = IddCx0102
 
