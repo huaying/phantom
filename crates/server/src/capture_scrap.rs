@@ -7,7 +7,7 @@ use std::time::Instant;
 /// CPU-based screen capture using the `scrap` crate.
 /// Uses DXGI (Windows), Core Graphics (macOS), X11 (Linux).
 pub struct ScrapCapture {
-    capturer: Capturer,
+    capturer: Option<Capturer>,
     width: u32,
     height: u32,
     display_index: usize,
@@ -45,7 +45,7 @@ impl ScrapCapture {
         let capturer = Capturer::new(display).context("failed to create capturer")?;
         tracing::info!(index, width, height, "ScrapCapture initialized");
         Ok(Self {
-            capturer,
+            capturer: Some(capturer),
             width,
             height,
             display_index: index,
@@ -63,7 +63,9 @@ impl ScrapCapture {
             .context("display disappeared during reset")?;
         self.width = display.width() as u32;
         self.height = display.height() as u32;
-        self.capturer = Capturer::new(display).context("failed to recreate capturer")?;
+        // Drop old capturer BEFORE creating new — only one DuplicateOutput per output.
+        self.capturer = None;
+        self.capturer = Some(Capturer::new(display).context("failed to recreate capturer")?);
         self.display_index = index;
         tracing::debug!(index, "ScrapCapture reset");
         Ok(())
@@ -109,7 +111,8 @@ impl std::fmt::Display for DisplayInfo {
 
 impl FrameCapture for ScrapCapture {
     fn capture(&mut self) -> Result<Option<Frame>> {
-        match self.capturer.frame() {
+        let capturer = self.capturer.as_mut().context("capturer not initialized")?;
+        match capturer.frame() {
             Ok(frame) => {
                 // scrap returns BGRA on all platforms, but stride may differ
                 // from width * 4 due to padding. Copy row by row.
