@@ -498,7 +498,10 @@ fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
 fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
     let msg: Message = match bincode::deserialize(data) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            console::warn_1(&format!("deserialize error: {e} (len={})", data.len()).into());
+            return;
+        }
     };
 
     match msg {
