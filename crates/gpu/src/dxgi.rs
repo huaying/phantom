@@ -16,6 +16,8 @@ pub struct DxgiCapture {
     pub width: u32,
     pub height: u32,
     frame_acquired: bool,
+    /// Target device name for recreate (e.g. `\\.\DISPLAY11` = VDD).
+    target_device: Option<String>,
 }
 
 unsafe impl Send for DxgiCapture {}
@@ -190,6 +192,7 @@ impl DxgiCapture {
                 width,
                 height,
                 frame_acquired: false,
+                target_device: target_device.map(|s| s.to_string()),
             })
         }
     }
@@ -256,11 +259,14 @@ impl DxgiCapture {
                 let _ = self.duplication.ReleaseFrame();
                 self.frame_acquired = false;
             }
-            // Re-enumerate adapters+outputs — pick highest resolution output.
+            // Re-enumerate adapters+outputs using same target_device as initial creation.
+            // This ensures recreate picks the same VDD output, not the highest-res one.
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+            let target = self.target_device.as_deref();
             let mut best_adapter: Option<IDXGIAdapter1> = None;
             let mut best_output_idx = 0u32;
             let mut best_pixels: u64 = 0;
+            let mut best_matches_device = false;
 
             let mut adapter_idx = 0u32;
             while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
@@ -270,10 +276,25 @@ impl DxgiCapture {
                     let r = out_desc.DesktopCoordinates;
                     let pixels =
                         ((r.right - r.left) as u64) * ((r.bottom - r.top) as u64);
-                    if pixels > best_pixels {
+                    let device_name = String::from_utf16_lossy(
+                        &out_desc.DeviceName[..out_desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(out_desc.DeviceName.len())],
+                    );
+                    let matches = target.map_or(false, |t| device_name == t);
+
+                    // device match > highest res
+                    let dominated = best_adapter.is_some()
+                        && ((!matches && best_matches_device)
+                            || (matches == best_matches_device && pixels <= best_pixels));
+
+                    if !dominated {
                         best_pixels = pixels;
                         best_adapter = Some(adapter.clone());
                         best_output_idx = output_idx;
+                        best_matches_device = matches;
                     }
                     output_idx += 1;
                 }
