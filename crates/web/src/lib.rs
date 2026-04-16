@@ -1935,7 +1935,7 @@ fn setup_input(
         cb.forget();
     }
 
-    // Window resize → send new resolution to server (debounced 500ms)
+    // Window resize → send new resolution to server (debounced 300ms)
     {
         let s = state.clone();
         let timeout_id: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
@@ -1953,7 +1953,7 @@ fn setup_input(
             let id = window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
                     fire.as_ref().unchecked_ref(),
-                    500,
+                    300,
                 )
                 .unwrap_or(0);
             *timeout_id2.borrow_mut() = Some(id);
