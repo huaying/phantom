@@ -47,7 +47,7 @@ UmdfKernelModeClientPolicy = AllowKernelModeClients
 [PhantomIDD_Install_Driver]
 UmdfLibraryVersion = 2.25.0
 ServiceBinary      = %12%\UMDF\PhantomIDD.dll
-UmdfExtensions     = IddCx0102
+UmdfExtensions     = IddCx0110
 
 [WUDFRD_ServiceInstall]
 DisplayName   = %WudfRdDisplayName%
