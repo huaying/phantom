@@ -1087,7 +1087,7 @@ fn run_session_ipc_inner(
                 let _ = runner.sender.send_msg(&Message::Hello {
                     width: ipc_frame.width,
                     height: ipc_frame.height,
-                    format: phantom_core::frame::PixelFormat::BGRA,
+                    format: phantom_core::frame::PixelFormat::Bgra8,
                     protocol_version: 3,
                     audio: false,
                     video_codec: phantom_core::encode::VideoCodec::H264,
