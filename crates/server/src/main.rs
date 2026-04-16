@@ -1470,6 +1470,10 @@ fn run_agent_loop(
             if let Some(ref mut gpu) = gpu_pipeline {
                 gpu.force_keyframe_with_capture_reset();
             }
+            if let Some(ref mut scrap) = scrap_capture {
+                // Reset ScrapCapture so DXGI returns a frame on static desktop
+                let _ = scrap.reset();
+            }
             if let Some(ref mut enc) = cpu_encoder {
                 enc.force_keyframe();
             }
