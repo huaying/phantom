@@ -528,6 +528,10 @@ impl FrameDecoder for VideoToolboxDecoder {
             }
         }
     }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width as u32, self.height as u32)
+    }
 }
 
 impl Drop for VideoToolboxDecoder {

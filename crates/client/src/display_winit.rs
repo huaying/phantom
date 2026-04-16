@@ -53,6 +53,22 @@ impl WinitDisplay {
         self.server_height
     }
 
+    /// Resize the framebuffer for a new server resolution.
+    /// Called when decoder detects resolution change from SPS/PPS.
+    pub fn resize_server(&mut self, width: u32, height: u32) {
+        if width == self.server_width && height == self.server_height {
+            return;
+        }
+        tracing::info!(
+            old = format_args!("{}x{}", self.server_width, self.server_height),
+            new = format_args!("{}x{}", width, height),
+            "display: resizing framebuffer"
+        );
+        self.server_width = width;
+        self.server_height = height;
+        self.buffer = vec![0u32; (width * height) as usize];
+    }
+
     /// Apply decoded lossless tiles to the framebuffer.
     pub fn update_tiles(&mut self, tiles: &[DecodedTile]) {
         let bpp = 4;

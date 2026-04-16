@@ -552,6 +552,13 @@ impl ApplicationHandler for App {
                                 Ok(rgb32) => {
                                     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
                                     session.stats_decode_ms += decode_ms;
+                                    // Check if decoder resolution changed (SPS/PPS update)
+                                    let (dw, dh) = session.decoder.dimensions();
+                                    if dw != session.display.server_width()
+                                        || dh != session.display.server_height()
+                                    {
+                                        session.display.resize_server(dw, dh);
+                                    }
                                     last_decoded = Some(rgb32);
                                     session.stats_video += 1;
                                 }
@@ -862,11 +869,30 @@ impl ApplicationHandler for App {
                     }));
                 }
             }
-            // TODO: native client resolution change disabled — need to reinitialize
-            // decoder + framebuffer when server resolution changes mid-stream.
-            // Without this, resolution change causes visual corruption (decoder/buffer
-            // size mismatch). Web client handles this via WebCodecs auto-adaptation.
-            WindowEvent::Resized(_) => {}
+            WindowEvent::Resized(size) => {
+                // Adaptive resolution: send window size to server.
+                let scale = 1.3;
+                let tw = (size.width as f64 * scale) as u32;
+                let th = (size.height as f64 * scale) as u32;
+                let resolutions: &[(u32, u32)] = &[
+                    (1024, 768), (1152, 864), (1280, 720), (1280, 800),
+                    (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
+                    (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
+                ];
+                let (w, h) = resolutions
+                    .iter()
+                    .filter(|&&(rw, rh)| rw <= tw && rh <= th)
+                    .last()
+                    .copied()
+                    .unwrap_or((1024, 768));
+                if w != session.display.server_width() || h != session.display.server_height() {
+                    tracing::info!(w, h, "requesting resolution change");
+                    let _ = session.input_tx.send(Message::ResolutionChange {
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
             WindowEvent::DroppedFile(path) => {
                 tracing::info!(path = %path.display(), "file dropped on window");
                 match session.file_xfer.initiate_send(&path) {

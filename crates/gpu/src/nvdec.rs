@@ -501,6 +501,10 @@ impl phantom_core::encode::FrameDecoder for NvdecDecoder {
     fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>> {
         self.decode(data)
     }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
 }
 
 impl Drop for NvdecDecoder {

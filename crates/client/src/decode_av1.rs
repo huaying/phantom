@@ -65,4 +65,8 @@ impl FrameDecoder for Dav1dDecoder {
             }
         }
     }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
 }

@@ -67,4 +67,8 @@ pub trait FrameEncoder: Send {
 pub trait FrameDecoder: Send {
     /// Decode a video frame, returning raw pixel data in 0RGB u32 format (for display).
     fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u32>>;
+
+    /// Current decoded resolution. May change after decode_frame if the stream
+    /// contains new SPS/PPS (server changed resolution).
+    fn dimensions(&self) -> (u32, u32);
 }
