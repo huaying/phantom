@@ -784,10 +784,43 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                if let Some(input) =
+                if let Some(mut input) =
                     input_capture::key_event(&key_event.physical_key, key_event.state)
                 {
-                    let _ = session.input_tx.send(Message::Input(input));
+                    // macOS: remap Cmd+key → Ctrl+key (same as web client).
+                    // Cmd+C/X/A/Z/S etc. should send Ctrl to Windows server.
+                    #[cfg(target_os = "macos")]
+                    if mods.super_key() {
+                        if let InputEvent::Key { ref key, pressed } = input {
+                            // Skip Meta key itself — don't send to server (gets stuck)
+                            if matches!(
+                                key,
+                                phantom_core::input::KeyCode::LeftMeta
+                                    | phantom_core::input::KeyCode::RightMeta
+                            ) {
+                                return;
+                            }
+                            // Send Ctrl down before the key, Ctrl up after
+                            if pressed {
+                                let _ = session.input_tx.send(Message::Input(InputEvent::Key {
+                                    key: phantom_core::input::KeyCode::LeftCtrl,
+                                    pressed: true,
+                                }));
+                            }
+                        }
+                    }
+
+                    let _ = session.input_tx.send(Message::Input(input.clone()));
+
+                    #[cfg(target_os = "macos")]
+                    if mods.super_key() {
+                        if let InputEvent::Key { pressed: false, .. } = input {
+                            let _ = session.input_tx.send(Message::Input(InputEvent::Key {
+                                key: phantom_core::input::KeyCode::LeftCtrl,
+                                pressed: false,
+                            }));
+                        }
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
