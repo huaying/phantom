@@ -2051,15 +2051,17 @@ fn send_message(state: &AppState, msg: &Message) {
     }
 }
 
-/// Show a brief toast notification overlay.
+/// Show a brief toast notification overlay. Stacks multiple toasts vertically.
 fn show_toast(msg: &str) {
     let js = format!(
         r#"(function(){{
+            if(!window.__phantom_toast_n) window.__phantom_toast_n=0;
+            var n=window.__phantom_toast_n++;
             var d=document.createElement('div');
             d.textContent='{}';
-            d.style.cssText='position:fixed;top:20px;right:20px;background:rgba(0,0,0,0.8);color:#fff;padding:10px 20px;border-radius:6px;font:14px sans-serif;z-index:9999;transition:opacity 0.3s';
+            d.style.cssText='position:fixed;top:'+(20+n*50)+'px;right:20px;background:rgba(0,0,0,0.85);color:#fff;padding:10px 20px;border-radius:6px;font:14px sans-serif;z-index:99999;pointer-events:none;transition:opacity 0.3s';
             document.body.appendChild(d);
-            setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove()}},300)}},2000);
+            setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove();window.__phantom_toast_n=Math.max(0,window.__phantom_toast_n-1)}},300)}},3000);
         }})()"#,
         msg.replace('\'', "\\'").replace('"', "\\\"")
     );
