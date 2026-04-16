@@ -583,6 +583,7 @@ impl SessionRunner {
                     size,
                 }) => match self.file_transfer.on_file_offer(transfer_id, &name, size) {
                     Ok(reply) => {
+                        tracing::info!(transfer_id, name, size, "file offer accepted");
                         let _ = self.sender.send_msg(&reply);
                     }
                     Err(e) => {
@@ -616,14 +617,26 @@ impl SessionRunner {
                     sha256,
                 }) => {
                     match self.file_transfer.on_file_done(transfer_id, &sha256) {
-                        Ok(Some(path)) => {
+                        Ok(Some(ref path)) => {
+                            #[cfg(target_os = "windows")]
+                            crate::service_win::svc_log(&format!(
+                                "FileSaved: {path}"
+                            ));
                             let _ = self.sender.send_msg(&Message::FileSaved {
                                 transfer_id,
-                                path,
+                                path: path.clone(),
                             });
                         }
-                        Ok(None) => {}
-                        Err(e) => tracing::error!(transfer_id, "file done error: {e}"),
+                        Ok(None) => {
+                            #[cfg(target_os = "windows")]
+                            crate::service_win::svc_log("FileDone: no path");
+                        }
+                        Err(e) => {
+                            #[cfg(target_os = "windows")]
+                            crate::service_win::svc_log(&format!(
+                                "FileDone error: {e}"
+                            ));
+                        }
                     }
                 }
                 Ok(InboundEvent::Resume {
