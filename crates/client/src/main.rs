@@ -680,9 +680,13 @@ impl ApplicationHandler for App {
                             .filter(|&&(rw, rh)| rw <= tw && rh <= th)
                             .last()
                             .copied()
-                            .unwrap_or((1024, 768));
-                        if w != session.display.server_width()
-                            || h != session.display.server_height()
+                            .unwrap_or((1280, 720));
+                        // Don't go below 1280x720 — very small VDD resolutions cause
+                        // Windows to move windows to the other display.
+                        if w >= 1280
+                            && h >= 720
+                            && (w != session.display.server_width()
+                                || h != session.display.server_height())
                         {
                             tracing::info!(w, h, "requesting resolution change");
                             let _ = session.input_tx.send(Message::ResolutionChange {

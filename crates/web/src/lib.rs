@@ -2042,7 +2042,7 @@ fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
     let tw = (vw as f64 * scale) as u32;
     let th = (vh as f64 * scale) as u32;
 
-    let mut best = (1024, 768); // minimum usable resolution
+    let mut best = (1280, 720); // minimum — below this, Windows moves windows between displays
     for &(w, h) in STANDARD_RESOLUTIONS {
         if w <= tw && h <= th {
             best = (w, h);
