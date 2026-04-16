@@ -1505,7 +1505,7 @@ fn run_agent_loop(
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
-                    tracing::warn!("DXGI→NVENC error: {e}, falling back");
+                    tracing::warn!("DXGI→NVENC error: {e:#}, falling back");
                     gpu_pipeline = None;
                     // Cooldown before retrying Tier 1 — let Tier 2/3 take over.
                     // Without this, ACCESS_LOST on lock screen causes infinite

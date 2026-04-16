@@ -317,7 +317,10 @@ impl DxgiNvencPipeline {
     /// fail, causing the pipeline to die and reinit in a loop.
     pub fn force_keyframe_with_capture_reset(&mut self) {
         self.force_idr = true;
-        let _ = self.capture.reset();
+        match self.capture.reset() {
+            Ok(()) => tracing::info!("DXGI capture reset OK"),
+            Err(e) => tracing::warn!("DXGI capture reset failed: {e}"),
+        }
     }
 
     /// Recreate NVENC encoder for new session (ensures SPS/PPS in first keyframe).
