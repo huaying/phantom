@@ -64,6 +64,7 @@ mod platform {
     const MSG_SHUTDOWN: u8 = 0x04;
     const MSG_FORCE_KEYFRAME: u8 = 0x05;
     const MSG_RESOLUTION_CHANGE: u8 = 0x06;
+    const MSG_PASTE_TEXT: u8 = 0x07;
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -255,6 +256,8 @@ mod platform {
         shutdown_requested: Arc<AtomicBool>,
         /// Pending resolution change (width, height). Write thread picks it up.
         resolution_change: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+        /// Pending paste text. Write thread picks it up.
+        paste_text: Arc<std::sync::Mutex<Option<String>>>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
         _write_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -277,6 +280,7 @@ mod platform {
                 keyframe_requested: Arc::new(AtomicBool::new(false)),
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
                 resolution_change: Arc::new(std::sync::Mutex::new(None)),
+                paste_text: Arc::new(std::sync::Mutex::new(None)),
                 _read_thread: None,
                 _write_thread: None,
             })
@@ -350,6 +354,7 @@ mod platform {
             let kf_flag = Arc::clone(&self.keyframe_requested);
             let shutdown_flag = Arc::clone(&self.shutdown_requested);
             let res_change = Arc::clone(&self.resolution_change);
+            let paste_text = Arc::clone(&self.paste_text);
             let write_thread =
                 std::thread::Builder::new()
                     .name("ipc-write".into())
@@ -397,6 +402,23 @@ mod platform {
                                 } {
                                     if !shutdown2.load(Ordering::Relaxed) {
                                         tracing::warn!("IPC resolution change write error: {e}");
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Check paste text request
+                            if let Some(text) = paste_text
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                            {
+                                let payload = text.into_bytes();
+                                if let Err(e) = unsafe {
+                                    send_message(handle, MSG_PASTE_TEXT, &payload)
+                                } {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC paste write error: {e}");
                                     }
                                     break;
                                 }
@@ -498,6 +520,19 @@ mod platform {
             }
         }
 
+        /// Get a clone of the paste text Arc (for closures).
+        pub fn paste_arc(&self) -> Arc<std::sync::Mutex<Option<String>>> {
+            Arc::clone(&self.paste_text)
+        }
+
+        /// Send paste text to agent for injection.
+        pub fn send_paste(&self, text: &str) {
+            if self.connected {
+                *self.paste_text.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(text.to_string());
+            }
+        }
+
         /// Request orderly shutdown of the agent.
         /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn send_shutdown(&self) -> Result<()> {
@@ -565,6 +600,7 @@ mod platform {
         shutdown: Arc<AtomicBool>,
         keyframe_requested: Arc<AtomicBool>,
         resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+        paste_requested: Arc<std::sync::Mutex<Option<String>>>,
         input_rx: Option<mpsc::Receiver<InputEvent>>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -602,12 +638,15 @@ mod platform {
             let keyframe_requested = Arc::new(AtomicBool::new(false));
             let resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>> =
                 Arc::new(std::sync::Mutex::new(None));
+            let paste_requested: Arc<std::sync::Mutex<Option<String>>> =
+                Arc::new(std::sync::Mutex::new(None));
 
             let (input_tx, input_rx) = mpsc::channel();
             let down = SendHandle(down_handle);
             let read_shutdown = Arc::clone(&shutdown);
             let read_kf = Arc::clone(&keyframe_requested);
             let read_res = Arc::clone(&resolution_requested);
+            let read_paste = Arc::clone(&paste_requested);
 
             let read_thread = std::thread::Builder::new()
                 .name("ipc-agent-read".into())
@@ -630,6 +669,13 @@ mod platform {
                             }
                             Ok((MSG_FORCE_KEYFRAME, _)) => {
                                 read_kf.store(true, Ordering::SeqCst);
+                            }
+                            Ok((MSG_PASTE_TEXT, payload)) => {
+                                if let Ok(text) = String::from_utf8(payload) {
+                                    tracing::info!(len = text.len(), "IPC: paste text received");
+                                    *read_paste.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(text);
+                                }
                             }
                             Ok((MSG_RESOLUTION_CHANGE, payload)) if payload.len() >= 8 => {
                                 let w = u32::from_le_bytes([
@@ -662,6 +708,7 @@ mod platform {
                 shutdown,
                 keyframe_requested,
                 resolution_requested,
+                paste_requested,
                 input_rx: Some(input_rx),
                 _read_thread: Some(read_thread),
             })
@@ -681,6 +728,14 @@ mod platform {
         /// Check and clear the keyframe request flag.
         pub fn take_keyframe_request(&self) -> bool {
             self.keyframe_requested.swap(false, Ordering::SeqCst)
+        }
+
+        /// Take pending paste text (if any).
+        pub fn take_paste_request(&self) -> Option<String> {
+            self.paste_requested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
         }
 
         /// Take pending resolution change request (if any).

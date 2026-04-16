@@ -660,6 +660,7 @@ fn main() -> Result<()> {
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
                     resolution_change_fn: None,
+                    paste_fn: None,
                 },
             )
         } else {
@@ -681,6 +682,7 @@ fn main() -> Result<()> {
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
                     resolution_change_fn: None,
+                    paste_fn: None,
                 },
             )
         };
@@ -707,6 +709,7 @@ fn main() -> Result<()> {
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
                     resolution_change_fn: None,
+                    paste_fn: None,
                 },
             )
         } else {
@@ -728,6 +731,7 @@ fn main() -> Result<()> {
                         .as_ref()
                         .and_then(|s| s.lock().ok()?.take()),
                     resolution_change_fn: None,
+                    paste_fn: None,
                 },
             )
         };
@@ -750,6 +754,7 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|s| s.lock().ok()?.take()),
                 resolution_change_fn: None,
+                paste_fn: None,
             },
         );
 
@@ -1592,6 +1597,16 @@ fn run_agent_loop(
         } else {
             // No capture available yet — wait for retry
             std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // Handle paste text from service (clipboard forwarding)
+        if let Some(text) = ipc.take_paste_request() {
+            if let Some(ref mut inj) = injector {
+                tracing::info!(len = text.len(), "agent: pasting text");
+                if let Err(e) = inj.type_text(&text) {
+                    tracing::warn!("paste failed: {e}");
+                }
+            }
         }
 
         // Forward input events

@@ -390,6 +390,8 @@ pub struct SessionRunner {
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
     pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
+    /// Optional callback for paste text (service mode → IPC to agent).
+    pub paste_fn: Option<Box<dyn Fn(&str) + Send>>,
     /// Current frame resolution (for detecting changes in IPC mode).
     pub current_width: u32,
     pub current_height: u32,
@@ -458,6 +460,7 @@ impl SessionRunner {
             session_token: Vec::new(),
             input_forwarder: None,
             resolution_change_fn: None,
+            paste_fn: None,
             current_width: width,
             current_height: height,
         };
@@ -554,13 +557,14 @@ impl SessionRunner {
                         let _ = ab.set_text(&text);
                     }
                     self.clipboard.on_remote_update(&text);
-                    // In service mode (input_forwarder set), paste forwarding is not yet
-                    // supported — would need a PasteText IPC message type. For now,
-                    // paste only works in console mode via local injection.
-                    if let Some(ref mut inj) = self.injector {
+                    // Service mode: forward paste to agent via IPC
+                    if let Some(ref f) = self.paste_fn {
+                        f(&text);
+                    } else if let Some(ref mut inj) = self.injector {
+                        // Console mode: inject locally
                         let _ = inj.type_text(&text);
-                        self.had_input = true;
                     }
+                    self.had_input = true;
                     tracing::debug!("paste: {} chars", text.len());
                 }
                 Ok(InboundEvent::Pong) => {
@@ -882,6 +886,8 @@ pub struct SessionConfig<'a> {
     pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
     pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
+    /// Optional callback for paste text (service mode → IPC to agent).
+    pub paste_fn: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
@@ -929,6 +935,7 @@ fn run_session_cpu_inner(
     )?;
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
+    runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Send file if requested via --send-file
@@ -1057,6 +1064,7 @@ fn run_session_ipc_inner(
     )?;
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
+    runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     // Request keyframe from agent for the new client
@@ -1138,6 +1146,7 @@ fn run_session_gpu_inner(
     )?;
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
+    runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {
@@ -1236,6 +1245,7 @@ fn run_session_dxgi_inner(
     )?;
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
+    runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
     if let Some(path) = cfg.send_file {

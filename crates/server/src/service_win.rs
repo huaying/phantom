@@ -400,11 +400,22 @@ fn create_service_session(
         let resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>> = {
             let ipc_ref = session_mgr.ipc.as_ref();
             ipc_ref.map(|ipc| {
-                // Clone the resolution_change Arc for the closure
                 let res_arc = Arc::clone(&ipc.resolution_change_arc());
                 Box::new(move |w: u32, h: u32| {
                     *res_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
                 }) as Box<dyn Fn(u32, u32) + Send>
+            })
+        };
+
+        // Paste callback — forwards to agent via IPC
+        let paste_fn: Option<Box<dyn Fn(&str) + Send>> = {
+            let ipc_ref = session_mgr.ipc.as_ref();
+            ipc_ref.map(|ipc| {
+                let paste_arc = Arc::clone(&ipc.paste_arc());
+                Box::new(move |text: &str| {
+                    *paste_arc.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(text.to_string());
+                }) as Box<dyn Fn(&str) + Send>
             })
         };
 
@@ -422,6 +433,7 @@ fn create_service_session(
                 input_forwarder,
                 audio_ws_rx: None,
                 resolution_change_fn,
+                paste_fn,
             },
             width,
             height,
