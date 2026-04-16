@@ -685,9 +685,9 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             }
         }
-        Message::FileSaved { path, .. } => {
+        Message::FileSaved { transfer_id, path } => {
             console::log_1(&format!("File saved: {path}").into());
-            show_toast(&format!("Saved: {path}"));
+            show_toast_with_id(&format!("Saved: {path}"), &format!("upload-{transfer_id}"), 3000);
         }
         Message::AudioFrame { data, .. } => {
             let mut s = state.borrow_mut();
@@ -1866,7 +1866,7 @@ fn setup_input(
                 let file_name = name.clone();
 
                 console::log_1(&format!("file drop: sending {} ({} bytes)", name, size).into());
-                // Toast will be shown when server confirms save (FileSaved message)
+                show_toast_with_id(&format!("Uploading... {file_name}"), &format!("upload-{transfer_id}"), 0);
 
                 // Send FileOffer
                 {
@@ -2051,21 +2051,34 @@ fn send_message(state: &AppState, msg: &Message) {
     }
 }
 
-/// Show a brief toast notification overlay. Stacks multiple toasts vertically.
-fn show_toast(msg: &str) {
+/// Show a toast notification. If `id` is provided, replaces existing toast with same id.
+/// Auto-dismisses after `duration_ms` (0 = persistent until replaced).
+fn show_toast_with_id(msg: &str, id: &str, duration_ms: u32) {
+    let escaped_msg = msg.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"");
+    let escaped_id = id.replace('\\', "\\\\").replace('\'', "\\'");
     let js = format!(
         r#"(function(){{
-            if(!window.__phantom_toast_n) window.__phantom_toast_n=0;
-            var n=window.__phantom_toast_n++;
-            var d=document.createElement('div');
-            d.textContent='{}';
-            d.style.cssText='position:fixed;top:'+(20+n*50)+'px;right:20px;background:rgba(0,0,0,0.85);color:#fff;padding:10px 20px;border-radius:6px;font:14px sans-serif;z-index:99999;pointer-events:none;transition:opacity 0.3s';
-            document.body.appendChild(d);
-            setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove();window.__phantom_toast_n=Math.max(0,window.__phantom_toast_n-1)}},300)}},3000);
-        }})()"#,
-        msg.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"")
+            var id='phantom-toast-{escaped_id}';
+            var d=document.getElementById(id);
+            if(!d){{
+                d=document.createElement('div');
+                d.id=id;
+                d.style.cssText='position:fixed;top:20px;right:20px;background:rgba(0,0,0,0.85);color:#fff;padding:10px 20px;border-radius:6px;font:14px sans-serif;z-index:99999;pointer-events:none;transition:opacity 0.3s';
+                document.body.appendChild(d);
+            }}
+            d.textContent='{escaped_msg}';
+            d.style.opacity='1';
+            if(d._timer) clearTimeout(d._timer);
+            if({duration_ms}>0){{
+                d._timer=setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove()}},300)}},{duration_ms});
+            }}
+        }})()"#
     );
     let _ = js_sys::eval(&js);
+}
+
+fn show_toast(msg: &str) {
+    show_toast_with_id(msg, "default", 3000);
 }
 
 fn map_mouse(canvas: &HtmlCanvasElement, cx: f64, cy: f64, sw: u32, sh: u32) -> (i32, i32) {
