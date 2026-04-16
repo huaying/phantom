@@ -173,10 +173,6 @@ function __wbg_get_imports() {
             const ret = arg0.destination;
             return ret;
         },
-        __wbg_devicePixelRatio_c36a5fab28da634e: function(arg0) {
-            const ret = arg0.devicePixelRatio;
-            return ret;
-        },
         __wbg_digest_cb8de04aa7e6b6f1: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.digest(getStringFromWasm0(arg1, arg2), arg3);
             return ret;

@@ -2006,10 +2006,11 @@ fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
 /// Server adjusts VDD virtual display to match (adaptive resolution like DCV/Sunshine).
 fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
     let window = web_sys::window().unwrap();
-    // Use devicePixelRatio for HiDPI displays
-    let dpr = window.device_pixel_ratio().max(1.0);
-    let vw = (window.inner_width().unwrap().as_f64().unwrap() * dpr) as u32;
-    let vh = (window.inner_height().unwrap().as_f64().unwrap() * dpr) as u32;
+    // Use CSS pixel viewport (NOT multiplied by devicePixelRatio).
+    // DCV does the same — 1 remote pixel = 1 CSS pixel = readable text.
+    // Multiplying by dpr gives sharper image but text is too small.
+    let vw = window.inner_width().unwrap().as_f64().unwrap() as u32;
+    let vh = window.inner_height().unwrap().as_f64().unwrap() as u32;
     let (w, h) = closest_resolution(vw, vh);
     let st = state.borrow();
     if st.server_width == w && st.server_height == h {
