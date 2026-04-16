@@ -1070,9 +1070,10 @@ fn run_session_ipc_inner(
         runner.poll_clipboard()?;
         runner.drain_audio()?;
 
-        // Forward ALL queued encoded frames from agent (H.264 must be sequential)
+        // Forward ALL queued encoded frames from agent (H.264 must be sequential).
+        // Resolution changes are handled naturally: H.264 SPS/PPS in keyframes
+        // contains the new resolution, and WebCodecs adapts automatically.
         for ipc_frame in ipc.recv_encoded_frames() {
-            // Detect resolution change — send new Hello so client updates canvas
             if ipc_frame.width != runner.current_width || ipc_frame.height != runner.current_height
             {
                 tracing::info!(
@@ -1080,19 +1081,10 @@ fn run_session_ipc_inner(
                     old_h = runner.current_height,
                     new_w = ipc_frame.width,
                     new_h = ipc_frame.height,
-                    "Resolution changed, sending new Hello"
+                    "Frame resolution changed"
                 );
                 runner.current_width = ipc_frame.width;
                 runner.current_height = ipc_frame.height;
-                let _ = runner.sender.send_msg(&Message::Hello {
-                    width: ipc_frame.width,
-                    height: ipc_frame.height,
-                    format: phantom_core::frame::PixelFormat::Bgra8,
-                    protocol_version: 3,
-                    audio: false,
-                    video_codec: phantom_core::encode::VideoCodec::H264,
-                    session_token: runner.session_token.clone(),
-                });
             }
             runner.send_video_frame(ipc_frame.encoded, None)?;
         }

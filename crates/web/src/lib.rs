@@ -536,8 +536,8 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if audio {
                 setup_audio(state);
             }
-            // TODO: adaptive resolution disabled — will redesign as pre-session negotiation
-            // send_resolution_change(state);
+            // Send viewport size so server can match resolution (adaptive, like DCV)
+            send_resolution_change(state);
         }
         Message::VideoFrame { sequence, frame } => {
             if frame.data.is_empty() {
@@ -778,9 +778,34 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
     let output_cb = Closure::<dyn FnMut(JsValue)>::new(move |frame: JsValue| {
         let mut count = dc.borrow_mut();
         *count += 1;
-        let st = s.borrow();
+
+        // Read actual frame dimensions (may differ after resolution change).
+        // WebCodecs VideoFrame has displayWidth/displayHeight properties.
+        let fw = js_sys::Reflect::get(&frame, &"displayWidth".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u32;
+        let fh = js_sys::Reflect::get(&frame, &"displayHeight".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u32;
+
+        let mut st = s.borrow_mut();
+        // Detect resolution change from decoded frame — update canvas + mapping
+        if fw > 0 && fh > 0 && (fw != st.server_width || fh != st.server_height) {
+            console::log_1(
+                &format!("Resolution changed: {}x{} → {fw}x{fh}", st.server_width, st.server_height).into(),
+            );
+            st.server_width = fw;
+            st.server_height = fh;
+            st.canvas.set_width(fw);
+            st.canvas.set_height(fh);
+        }
+
         let w = st.server_width;
         let h = st.server_height;
+        drop(st);
+
         js_sys::Reflect::set(&js_sys::global(), &"__phantom_frame".into(), &frame).unwrap();
         let js_code = format!(
             "var c=document.getElementById('screen').getContext('2d'); c.drawImage(__phantom_frame, 0, 0, {w}, {h}); __phantom_frame.close();"
@@ -1961,11 +1986,8 @@ const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
     (1600, 1200),
     (1680, 1050),
     (1920, 1080),
-    (1920, 1200),
-    (2560, 1440),
-    (2560, 1600),
-    (3440, 1440),
-    (3840, 2160),
+    // Max 1920x1080 — H.264 Baseline Level 4.0 (avc1.42c028) limit.
+    // Higher resolutions need Level 5.1 codec string support.
 ];
 
 /// Find the closest standard resolution that fits within the given viewport.
