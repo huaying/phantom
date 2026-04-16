@@ -65,6 +65,7 @@ mod platform {
     const MSG_FORCE_KEYFRAME: u8 = 0x05;
     const MSG_RESOLUTION_CHANGE: u8 = 0x06;
     const MSG_PASTE_TEXT: u8 = 0x07;
+    const MSG_CLIPBOARD_SYNC: u8 = 0x08;  // agent → service (clipboard changed)
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -248,6 +249,7 @@ mod platform {
         down_handle: HANDLE,
         connected: bool,
         frame_rx: Option<mpsc::Receiver<IpcEncodedFrame>>,
+        clipboard_rx: Option<mpsc::Receiver<String>>,
         input_tx: Option<mpsc::Sender<InputEvent>>,
         shutdown: Arc<AtomicBool>,
         /// Flag set by request_keyframe(), cleared by the write thread after sending.
@@ -275,6 +277,7 @@ mod platform {
                 down_handle,
                 connected: false,
                 frame_rx: None,
+                clipboard_rx: None,
                 input_tx: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 keyframe_requested: Arc::new(AtomicBool::new(false)),
@@ -305,10 +308,11 @@ mod platform {
 
         fn start_io(&mut self) -> Result<()> {
             // Bounded channel — drops old frames when no session is draining.
-            // Prevents unbounded memory growth between sessions (agent sends 30fps).
             let (frame_tx, frame_rx) = mpsc::sync_channel(30);
+            let (clipboard_tx, clipboard_rx) = mpsc::sync_channel::<String>(4);
             let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
             self.frame_rx = Some(frame_rx);
+            self.clipboard_rx = Some(clipboard_rx);
             self.input_tx = Some(input_tx);
 
             // Read thread: reads encoded H.264 frames from upstream pipe
@@ -335,6 +339,11 @@ mod platform {
                                     }
                                 }
                                 Ok((MSG_HEARTBEAT, _)) => {}
+                                Ok((MSG_CLIPBOARD_SYNC, payload)) => {
+                                    if let Ok(text) = String::from_utf8(payload) {
+                                        let _ = clipboard_tx.try_send(text);
+                                    }
+                                }
                                 Ok((t, _)) => tracing::debug!("IPC up: unexpected 0x{t:02x}"),
                                 Err(e) => {
                                     if !shutdown.load(Ordering::Relaxed) {
@@ -473,6 +482,11 @@ mod platform {
             Ok(())
         }
 
+        /// Receive clipboard text from agent (if any).
+        pub fn recv_clipboard(&self) -> Option<String> {
+            self.clipboard_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        }
+
         /// Receive all queued encoded frames from the agent.
         /// H.264 frames MUST be forwarded in order — never skip frames.
         pub fn recv_encoded_frames(&self) -> Vec<IpcEncodedFrame> {
@@ -578,6 +592,7 @@ mod platform {
                 self.connected = false;
             }
             self.frame_rx = None;
+            self.clipboard_rx = None;
             self.input_tx = None;
         }
     }
@@ -723,6 +738,11 @@ mod platform {
         ) -> Result<()> {
             let payload = encode_ipc_frame(frame, width, height);
             unsafe { send_message(self.up_handle, MSG_ENCODED_FRAME, &payload) }
+        }
+
+        /// Send clipboard text to service (for forwarding to client).
+        pub fn send_clipboard(&self, text: &str) -> Result<()> {
+            unsafe { send_message(self.up_handle, MSG_CLIPBOARD_SYNC, text.as_bytes()) }
         }
 
         /// Check and clear the keyframe request flag.

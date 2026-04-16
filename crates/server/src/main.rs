@@ -1295,6 +1295,11 @@ fn run_agent_loop(
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
+    // Clipboard monitoring (agent → service → client)
+    let mut arboard = arboard::Clipboard::new().ok();
+    let mut last_clipboard = String::new();
+    let mut clipboard_poll = Instant::now();
+
     // Find VDD device name (e.g. \\.\DISPLAY10) — always capture from VDD.
     // Same approach as DCV/Parsec: target our own virtual display by device name.
     let vdd_device = find_vdd_device_name();
@@ -1628,6 +1633,19 @@ fn run_agent_loop(
                 }
             } else {
                 tracing::warn!("no injector available");
+            }
+        }
+
+        // Poll clipboard for changes (send to service → client)
+        if clipboard_poll.elapsed() > Duration::from_millis(500) {
+            clipboard_poll = Instant::now();
+            if let Some(ref mut ab) = arboard {
+                if let Ok(text) = ab.get_text() {
+                    if !text.is_empty() && text != last_clipboard {
+                        last_clipboard = text.clone();
+                        let _ = ipc.send_clipboard(&text);
+                    }
+                }
             }
         }
 

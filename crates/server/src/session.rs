@@ -1097,6 +1097,11 @@ fn run_session_ipc_inner(
             runner.send_video_frame(ipc_frame.encoded, None)?;
         }
 
+        // Forward clipboard from agent to client
+        if let Some(text) = ipc.recv_clipboard() {
+            let _ = runner.sender.send_msg(&Message::ClipboardSync(text));
+        }
+
         runner.drain_file_transfers()?;
         runner.log_stats("stats-ipc");
         runner.keepalive_tick()?;
