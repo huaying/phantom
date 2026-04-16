@@ -164,6 +164,8 @@ struct Session {
     clipboard: ClipboardTracker,
     arboard: Option<arboard::Clipboard>,
     clipboard_poll: Instant,
+    /// Pending resolution change (debounce 300ms)
+    pending_resize: Option<(u32, u32, Instant)>,
     stats_time: Instant,
     stats_video: u64,
     stats_decode_ms: f64,
@@ -488,6 +490,7 @@ impl App {
             clipboard: ClipboardTracker::default(),
             arboard: arboard::Clipboard::new().ok(),
             clipboard_poll: Instant::now(),
+            pending_resize: None,
             stats_time: Instant::now(),
             stats_video: 0,
             stats_decode_ms: 0.0,
@@ -651,6 +654,36 @@ impl ApplicationHandler for App {
                     if session.clipboard.on_remote_update(&text) {
                         if let Some(ref mut ab) = session.arboard {
                             let _ = ab.set_text(&text);
+                        }
+                    }
+                }
+
+                // Debounced resolution change (300ms after last resize)
+                if let Some((rw, rh, when)) = session.pending_resize {
+                    if when.elapsed() >= Duration::from_millis(300) {
+                        session.pending_resize = None;
+                        let scale = 1.3;
+                        let tw = (rw as f64 * scale) as u32;
+                        let th = (rh as f64 * scale) as u32;
+                        let resolutions: &[(u32, u32)] = &[
+                            (1024, 768), (1152, 864), (1280, 720), (1280, 800),
+                            (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
+                            (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
+                        ];
+                        let (w, h) = resolutions
+                            .iter()
+                            .filter(|&&(rw, rh)| rw <= tw && rh <= th)
+                            .last()
+                            .copied()
+                            .unwrap_or((1024, 768));
+                        if w != session.display.server_width()
+                            || h != session.display.server_height()
+                        {
+                            tracing::info!(w, h, "requesting resolution change");
+                            let _ = session.input_tx.send(Message::ResolutionChange {
+                                width: w,
+                                height: h,
+                            });
                         }
                     }
                 }
@@ -870,28 +903,8 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                // Adaptive resolution: send window size to server.
-                let scale = 1.3;
-                let tw = (size.width as f64 * scale) as u32;
-                let th = (size.height as f64 * scale) as u32;
-                let resolutions: &[(u32, u32)] = &[
-                    (1024, 768), (1152, 864), (1280, 720), (1280, 800),
-                    (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
-                    (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
-                ];
-                let (w, h) = resolutions
-                    .iter()
-                    .filter(|&&(rw, rh)| rw <= tw && rh <= th)
-                    .last()
-                    .copied()
-                    .unwrap_or((1024, 768));
-                if w != session.display.server_width() || h != session.display.server_height() {
-                    tracing::info!(w, h, "requesting resolution change");
-                    let _ = session.input_tx.send(Message::ResolutionChange {
-                        width: w,
-                        height: h,
-                    });
-                }
+                // Debounce: record pending resize, send after 300ms idle
+                session.pending_resize = Some((size.width, size.height, Instant::now()));
             }
             WindowEvent::DroppedFile(path) => {
                 tracing::info!(path = %path.display(), "file dropped on window");

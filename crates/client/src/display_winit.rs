@@ -40,9 +40,13 @@ impl WinitDisplay {
     }
 
     /// Replace entire framebuffer with decoded H.264 frame.
+    /// Skips if frame size doesn't match buffer (resolution change in progress).
     pub fn update_full_frame(&mut self, rgb32: &[u32]) {
-        let len = self.buffer.len().min(rgb32.len());
-        self.buffer[..len].copy_from_slice(&rgb32[..len]);
+        let expected = (self.server_width * self.server_height) as usize;
+        if rgb32.len() != expected {
+            return; // Skip mismatched frame during resolution transition
+        }
+        self.buffer.copy_from_slice(rgb32);
     }
 
     pub fn server_width(&self) -> u32 {
