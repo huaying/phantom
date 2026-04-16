@@ -1216,12 +1216,9 @@ pub fn install_service() -> anyhow::Result<()> {
         }
     }
 
-    // Only disable Basic Display Adapter if GPU is already in WDDM mode.
-    // If we just switched TCC→WDDM, wait until after reboot — otherwise
-    // the system has NO display adapter and can't boot properly.
-    if !needs_reboot {
-        disable_basic_display_adapter();
-    }
+    // NOTE: do NOT disable Basic Display Adapter — it causes boot failure
+    // on reboot. The VDD approach works without disabling other displays.
+    // DXGI targets VDD by device name, so other displays don't interfere.
 
     println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");
