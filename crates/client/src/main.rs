@@ -662,9 +662,9 @@ impl ApplicationHandler for App {
                 if let Some((rw, rh, when)) = session.pending_resize {
                     if when.elapsed() >= Duration::from_millis(300) {
                         session.pending_resize = None;
-                        let scale = 1.3;
-                        let tw = (rw as f64 * scale) as u32;
-                        let th = (rh as f64 * scale) as u32;
+                        // 1.3x scale same as web client
+                        let tw = (rw as f64 * 1.3) as u32;
+                        let th = (rh as f64 * 1.3) as u32;
                         let resolutions: &[(u32, u32)] = &[
                             (1024, 768), (1152, 864), (1280, 720), (1280, 800),
                             (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
@@ -902,9 +902,12 @@ impl ApplicationHandler for App {
                     }));
                 }
             }
-            WindowEvent::Resized(size) => {
-                // Debounce: record pending resize, send after 300ms idle
-                session.pending_resize = Some((size.width, size.height, Instant::now()));
+            WindowEvent::Resized(_) => {
+                // Use logical size (not physical) — macOS retina reports 2x physical pixels
+                let logical = session.display.window.inner_size().to_logical::<u32>(
+                    session.display.window.scale_factor(),
+                );
+                session.pending_resize = Some((logical.width, logical.height, Instant::now()));
             }
             WindowEvent::DroppedFile(path) => {
                 tracing::info!(path = %path.display(), "file dropped on window");
