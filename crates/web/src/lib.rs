@@ -2063,7 +2063,7 @@ fn show_toast(msg: &str) {
             document.body.appendChild(d);
             setTimeout(function(){{d.style.opacity='0';setTimeout(function(){{d.remove();window.__phantom_toast_n=Math.max(0,window.__phantom_toast_n-1)}},300)}},3000);
         }})()"#,
-        msg.replace('\'', "\\'").replace('"', "\\\"")
+        msg.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"")
     );
     let _ = js_sys::eval(&js);
 }
