@@ -1997,10 +1997,17 @@ const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
 
 /// Find the closest standard resolution that fits within the given viewport.
 fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
-    // Pick the largest standard resolution that fits in the viewport
-    let mut best = (640, 480);
+    // Scale up the viewport by 1.3x so small windows still get usable resolution.
+    // Example: 800x600 viewport → target 1040x780 → picks 1024x768
+    // Without scale: 800x600 → picks 800x600 (too low to be useful)
+    // Capped at 1920x1080 (H.264 Level 4.0 limit).
+    let scale = 1.3;
+    let tw = (vw as f64 * scale) as u32;
+    let th = (vh as f64 * scale) as u32;
+
+    let mut best = (1024, 768); // minimum usable resolution
     for &(w, h) in STANDARD_RESOLUTIONS {
-        if w <= vw && h <= vh {
+        if w <= tw && h <= th {
             best = (w, h);
         }
     }
