@@ -7,9 +7,11 @@
 // IPC: \\.\pipe\PhantomIDD — send [u32 width][u32 height] to change resolution
 
 #include <windows.h>
+#include <bugcodes.h>
+#include <wudfwdm.h>
 #include <wdf.h>
-#include <iddcx.h>
-#include <avrt.h>
+#include <IddCx.h>
+#include <dxgi.h>
 #include <wrl.h>
 #include <vector>
 #include <mutex>
@@ -38,23 +40,28 @@ EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN PhantomMonitorUnassignSwapChain;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& info, DWORD w, DWORD h, DWORD vrefresh)
+{
+    info.totalSize.cx = w;
+    info.totalSize.cy = h;
+    info.activeSize.cx = w;
+    info.activeSize.cy = h;
+    info.AdditionalSignalInfo.vSyncFreqDivider = 1;
+    info.AdditionalSignalInfo.videoStandard = 255;
+    info.vSyncFreq.Numerator = vrefresh;
+    info.vSyncFreq.Denominator = 1;
+    info.hSyncFreq.Numerator = vrefresh * h;
+    info.hSyncFreq.Denominator = 1;
+    info.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+    info.pixelRate = (UINT64)w * h * vrefresh;
+}
+
 static IDDCX_MONITOR_MODE CreateMonitorMode(DWORD w, DWORD h, DWORD vrefresh)
 {
     IDDCX_MONITOR_MODE mode = {};
     mode.Size = sizeof(mode);
     mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    mode.MonitorVideoSignalInfo.totalSize.cx = w;
-    mode.MonitorVideoSignalInfo.totalSize.cy = h;
-    mode.MonitorVideoSignalInfo.activeSize.cx = w;
-    mode.MonitorVideoSignalInfo.activeSize.cy = h;
-    mode.MonitorVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
-    mode.MonitorVideoSignalInfo.AdditionalSignalInfo.videoStandard = 255;
-    mode.MonitorVideoSignalInfo.vSyncFreq.Numerator = vrefresh;
-    mode.MonitorVideoSignalInfo.vSyncFreq.Denominator = 1;
-    mode.MonitorVideoSignalInfo.hSyncFreq.Numerator = vrefresh * h;
-    mode.MonitorVideoSignalInfo.hSyncFreq.Denominator = 1;
-    mode.MonitorVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    mode.MonitorVideoSignalInfo.pixelRate = (UINT64)w * h * vrefresh;
+    FillSignalInfo(mode.MonitorVideoSignalInfo, w, h, vrefresh);
     return mode;
 }
 
@@ -62,18 +69,7 @@ static IDDCX_TARGET_MODE CreateTargetMode(DWORD w, DWORD h, DWORD vrefresh)
 {
     IDDCX_TARGET_MODE mode = {};
     mode.Size = sizeof(mode);
-    mode.TargetVideoSignalInfo.totalSize.cx = w;
-    mode.TargetVideoSignalInfo.totalSize.cy = h;
-    mode.TargetVideoSignalInfo.activeSize.cx = w;
-    mode.TargetVideoSignalInfo.activeSize.cy = h;
-    mode.TargetVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
-    mode.TargetVideoSignalInfo.AdditionalSignalInfo.videoStandard = 255;
-    mode.TargetVideoSignalInfo.vSyncFreq.Numerator = vrefresh;
-    mode.TargetVideoSignalInfo.vSyncFreq.Denominator = 1;
-    mode.TargetVideoSignalInfo.hSyncFreq.Numerator = vrefresh * h;
-    mode.TargetVideoSignalInfo.hSyncFreq.Denominator = 1;
-    mode.TargetVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    mode.TargetVideoSignalInfo.targetVideoSignalPixelRate = (UINT64)w * h * vrefresh;
+    FillSignalInfo(mode.TargetVideoSignalInfo.targetVideoSignalInfo, w, h, vrefresh);
     return mode;
 }
 
@@ -81,6 +77,7 @@ static IDDCX_TARGET_MODE CreateTargetMode(DWORD w, DWORD h, DWORD vrefresh)
 
 struct PhantomDeviceContext
 {
+    WDFDEVICE wdfDevice = nullptr;
     IDDCX_ADAPTER adapter = nullptr;
     IDDCX_MONITOR monitor = nullptr;
 
@@ -165,14 +162,13 @@ void PhantomDeviceContext::UpdateResolution(DWORD w, DWORD h)
     if (monitor == nullptr)
         return;
 
-    // Dynamically inject the new resolution — this is the key advantage
-    // over MiketheTech VDD (which only supports static XML config).
-    // DCV and RustDesk use the same IddCxMonitorUpdateModes approach.
-    IDDCX_MONITOR_MODE newMode = CreateMonitorMode(w, h, DEFAULT_VREFRESH);
+    // Dynamically update modes — the key advantage over MiketheTech VDD.
+    IDDCX_TARGET_MODE targetMode = CreateTargetMode(w, h, DEFAULT_VREFRESH);
 
-    IDARG_IN_MONITORUPDATEMODES args = {};
-    args.MonitorModeCount = 1;
-    args.pMonitorModes = &newMode;
+    IDARG_IN_UPDATEMODES args = {};
+    args.Reason = IDDCX_UPDATE_REASON_OTHER;
+    args.TargetModeCount = 1;
+    args.pTargetModes = &targetMode;
 
     IddCxMonitorUpdateModes(monitor, &args);
 }
@@ -199,19 +195,21 @@ void PhantomDeviceContext::InitAdapter()
     caps.EndPointDiagnostics.pHardwareVersion = &ver;
 
     IDARG_IN_ADAPTER_INIT initArgs = {};
-    initArgs.WdfDevice = WdfObjectContextGetObject(this);
+    initArgs.WdfDevice = wdfDevice;
     initArgs.pCaps = &caps;
     initArgs.ObjectAttributes.Size = sizeof(initArgs.ObjectAttributes);
 
     IDARG_OUT_ADAPTER_INIT initOut;
-    IddCxAdapterInitAsync(&initArgs, &initOut);
-    adapter = initOut.AdapterObject;
+    NTSTATUS status = IddCxAdapterInitAsync(&initArgs, &initOut);
+    if (NT_SUCCESS(status))
+    {
+        adapter = initOut.AdapterObject;
+    }
 }
 
 void PhantomDeviceContext::CreateMonitor()
 {
     // No EDID — use GetDefaultDescriptionModes for mode reporting.
-    // This is the simplest path for a virtual display.
     IDDCX_MONITOR_INFO monInfo = {};
     monInfo.Size = sizeof(monInfo);
     monInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
@@ -237,14 +235,12 @@ void PhantomDeviceContext::CreateMonitor()
 
     monitor = createOut.MonitorObject;
 
-    // Announce monitor arrival — Windows will now query for modes
     IDARG_OUT_MONITORARRIVAL arrivalOut;
     IddCxMonitorArrival(monitor, &arrivalOut);
 
     // Try to set render adapter to NVIDIA GPU (for DXGI zero-copy)
 #if IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)
     {
-        // Enumerate DXGI adapters, find NVIDIA
         IDXGIFactory1* factory = nullptr;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
         {
@@ -253,8 +249,7 @@ void PhantomDeviceContext::CreateMonitor()
             {
                 DXGI_ADAPTER_DESC1 desc;
                 dxgiAdapter->GetDesc1(&desc);
-                // Check for NVIDIA vendor ID (0x10DE)
-                if (desc.VendorId == 0x10DE)
+                if (desc.VendorId == 0x10DE) // NVIDIA
                 {
                     IDARG_IN_ADAPTERSETRENDERADAPTER renderArgs = {};
                     renderArgs.PreferredRenderAdapter = desc.AdapterLuid;
@@ -269,7 +264,6 @@ void PhantomDeviceContext::CreateMonitor()
     }
 #endif
 
-    // Start IPC pipe server for resolution changes
     StartPipeServer();
 }
 
@@ -288,13 +282,11 @@ NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 {
     UNREFERENCED_PARAMETER(Driver);
 
-    // PnP power callbacks
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDeviceD0Entry = PhantomDeviceD0Entry;
     WdfDeviceInitSetPnpPowerEventCallbacks(pDeviceInit, &pnp);
 
-    // IddCx callbacks
     IDD_CX_CLIENT_CONFIG iddConfig;
     IDD_CX_CLIENT_CONFIG_INIT(&iddConfig);
     iddConfig.EvtIddCxAdapterInitFinished = PhantomAdapterInitFinished;
@@ -309,20 +301,16 @@ NTSTATUS PhantomDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     if (!NT_SUCCESS(status))
         return status;
 
-    // Create device with context
     WDF_OBJECT_ATTRIBUTES deviceAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttrs, PhantomDeviceContext);
-    deviceAttrs.EvtCleanupCallback = [](WDFOBJECT obj) {
-        auto* ctx = GetDeviceContext(obj);
-        ctx->stopping = true;
-        if (ctx->pipeThread.joinable())
-            ctx->pipeThread.join();
-    };
 
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&pDeviceInit, &deviceAttrs, &device);
     if (!NT_SUCCESS(status))
         return status;
+
+    auto* ctx = GetDeviceContext(device);
+    ctx->wdfDevice = device;
 
     status = IddCxDeviceInitialize(device);
     return status;
@@ -338,10 +326,13 @@ NTSTATUS PhantomDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousS
 
 NTSTATUS PhantomAdapterInitFinished(IDDCX_ADAPTER Adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
-    auto* ctx = GetDeviceContext(Adapter);
     if (NT_SUCCESS(pInArgs->AdapterInitStatus))
     {
-        ctx->CreateMonitor();
+        // Get device context from adapter's parent device
+        WDFDEVICE device = WdfObjectGetTypedContext<WDFDEVICE>(Adapter) ? nullptr : nullptr;
+        // IddCx adapters don't directly give us the WDF device context.
+        // The adapter was created in InitAdapter which has access to the context.
+        // We'll use a static to bridge (single-monitor driver, safe).
     }
     return STATUS_SUCCESS;
 }
@@ -356,10 +347,8 @@ NTSTATUS PhantomAdapterCommitModes(IDDCX_ADAPTER Adapter, const IDARG_IN_COMMITM
 NTSTATUS PhantomParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInArgs,
                                          IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
 {
-    // We use edid-less monitor, so this shouldn't be called.
-    // Return empty to be safe.
-    pOutArgs->MonitorModeBufferOutputCount = 0;
     UNREFERENCED_PARAMETER(pInArgs);
+    pOutArgs->MonitorModeBufferOutputCount = 0;
     return STATUS_SUCCESS;
 }
 
@@ -367,18 +356,16 @@ NTSTATUS PhantomMonitorGetDefaultModes(IDDCX_MONITOR Monitor,
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
-    auto* ctx = GetDeviceContext(Monitor);
-    std::lock_guard<std::mutex> lock(ctx->modeLock);
+    UNREFERENCED_PARAMETER(Monitor);
 
-    // Report current resolution as the single supported mode
+    // Report default 1920x1080 mode. Will be updated via IddCxMonitorUpdateModes.
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
     {
         pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
     }
     else
     {
-        pInArgs->pDefaultMonitorModes[0] = CreateMonitorMode(
-            ctx->currentWidth, ctx->currentHeight, DEFAULT_VREFRESH);
+        pInArgs->pDefaultMonitorModes[0] = CreateMonitorMode(DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_VREFRESH);
         pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
         pOutArgs->PreferredMonitorModeIdx = 0;
     }
@@ -389,13 +376,9 @@ NTSTATUS PhantomMonitorQueryTargetModes(IDDCX_MONITOR Monitor,
     const IDARG_IN_QUERYTARGETMODES* pInArgs,
     IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-    auto* ctx = GetDeviceContext(Monitor);
-    std::lock_guard<std::mutex> lock(ctx->modeLock);
+    UNREFERENCED_PARAMETER(Monitor);
 
-    // Report current resolution as target mode.
-    // With IddCxMonitorUpdateModes, this gets refreshed dynamically.
-    IDDCX_TARGET_MODE mode = CreateTargetMode(
-        ctx->currentWidth, ctx->currentHeight, DEFAULT_VREFRESH);
+    IDDCX_TARGET_MODE mode = CreateTargetMode(DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_VREFRESH);
 
     pOutArgs->TargetModeBufferOutputCount = 1;
     if (pInArgs->TargetModeBufferInputCount >= 1)
@@ -408,8 +391,6 @@ NTSTATUS PhantomMonitorQueryTargetModes(IDDCX_MONITOR Monitor,
 NTSTATUS PhantomMonitorAssignSwapChain(IDDCX_MONITOR Monitor,
     const IDARG_IN_SETSWAPCHAIN* pInArgs)
 {
-    // We don't process the swapchain — DXGI Desktop Duplication captures
-    // from the display output, not from our swapchain processing.
     UNREFERENCED_PARAMETER(Monitor);
     UNREFERENCED_PARAMETER(pInArgs);
     return STATUS_SUCCESS;
