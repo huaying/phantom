@@ -2013,11 +2013,9 @@ fn send_input(state: &AppState, event: InputEvent) {
 }
 
 /// Standard resolutions supported by VDD (must match vdd_settings.xml).
+/// Minimum 1280x720 — below this, Windows moves windows between displays
+/// on multi-display VMs (VDD + NVIDIA native).
 const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
-    (640, 480),
-    (800, 600),
-    (1024, 768),
-    (1152, 864),
     (1280, 720),
     (1280, 800),
     (1280, 960),
