@@ -903,11 +903,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(_) => {
-                // Use logical size (not physical) — macOS retina reports 2x physical pixels
-                let logical = session.display.window.inner_size().to_logical::<u32>(
-                    session.display.window.scale_factor(),
-                );
-                session.pending_resize = Some((logical.width, logical.height, Instant::now()));
+                // TODO: resolution change disabled on native client.
+                // VideoToolbox doesn't auto-adapt to SPS resolution changes
+                // (always reinits at original Hello dimensions). Need to parse
+                // new dimensions from SPS and recreate VT session properly.
+                // Web client handles this via WebCodecs auto-adaptation.
             }
             WindowEvent::DroppedFile(path) => {
                 tracing::info!(path = %path.display(), "file dropped on window");
