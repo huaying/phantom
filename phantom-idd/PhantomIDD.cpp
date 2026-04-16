@@ -182,14 +182,17 @@ void PhantomDeviceContext::UpdateResolution(DWORD w, DWORD h)
         return;
 
     // Dynamically update modes — the key advantage over MiketheTech VDD.
-    IDDCX_TARGET_MODE targetMode = CreateTargetMode(w, h, DEFAULT_VREFRESH);
+    if (IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes))
+    {
+        IDDCX_TARGET_MODE targetMode = CreateTargetMode(w, h, DEFAULT_VREFRESH);
 
-    IDARG_IN_UPDATEMODES args = {};
-    args.Reason = IDDCX_UPDATE_REASON_OTHER;
-    args.TargetModeCount = 1;
-    args.pTargetModes = &targetMode;
+        IDARG_IN_UPDATEMODES args = {};
+        args.Reason = IDDCX_UPDATE_REASON_OTHER;
+        args.TargetModeCount = 1;
+        args.pTargetModes = &targetMode;
 
-    IddCxMonitorUpdateModes(monitor, &args);
+        IddCxMonitorUpdateModes(monitor, &args);
+    }
 }
 
 // ── Adapter + Monitor lifecycle ────────────────────────────────────────────

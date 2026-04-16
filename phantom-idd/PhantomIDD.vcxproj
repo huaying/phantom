@@ -29,8 +29,8 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(WdkRoot)Include\$(WdkVersion)\km;$(WdkRoot)Include\$(WdkVersion)\shared;$(WdkRoot)Include\$(WdkVersion)\um;$(WdkRoot)Include\$(WdkVersion)\um\iddcx\1.10;$(WdkRoot)Include\wdf\umdf\2.25;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_WINDOWS;_USRDLL;UMDF_USING_NTSTATUS;IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=10;IDDCX_MINIMUM_VERSION_REQUIRED=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WdkRoot)Include\$(WdkVersion)\km;$(WdkRoot)Include\$(WdkVersion)\shared;$(WdkRoot)Include\$(WdkVersion)\um;$(WdkRoot)Include\$(WdkVersion)\um\iddcx\1.4;$(WdkRoot)Include\wdf\umdf\2.25;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_WINDOWS;_USRDLL;UMDF_USING_NTSTATUS;IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;IDDCX_MINIMUM_VERSION_REQUIRED=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
@@ -38,7 +38,7 @@
       <Optimization>MaxSpeed</Optimization>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>$(WdkRoot)Lib\$(WdkVersion)\um\x64;$(WdkRoot)Lib\$(WdkVersion)\um\x64\iddcx\1.10;$(WdkRoot)Lib\wdf\umdf\x64\2.25;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(WdkRoot)Lib\$(WdkVersion)\um\x64;$(WdkRoot)Lib\$(WdkVersion)\um\x64\iddcx\1.4;$(WdkRoot)Lib\wdf\umdf\x64\2.25;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>WdfDriverStubUm.lib;iddcxstub.lib;dxgi.lib;ole32.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>
       </ModuleDefinitionFile>
