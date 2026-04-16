@@ -547,6 +547,7 @@ impl ApplicationHandler for App {
                 let mut last_decoded = None;
                 let mut last_tiles = None;
                 let mut clipboard_msgs = Vec::new();
+                let mut title_toast: Option<(String, Instant)> = None;
                 while let Ok(msg) = session.frame_rx.try_recv() {
                     match msg {
                         Message::VideoFrame { frame, .. } => {
@@ -642,6 +643,10 @@ impl ApplicationHandler for App {
                                 tracing::error!(transfer_id, "file done error: {e}");
                             }
                         }
+                        Message::FileSaved { path, .. } => {
+                            tracing::info!(path, "file saved on server");
+                            title_toast = Some((format!("Phantom — Saved: {path}"), Instant::now()));
+                        }
                         _ => {}
                     }
                 }
@@ -685,6 +690,14 @@ impl ApplicationHandler for App {
                                 height: h,
                             });
                         }
+                    }
+                }
+
+                // Title toast (file transfer feedback)
+                if let Some((ref title, when)) = title_toast {
+                    session.display.window.set_title(title);
+                    if when.elapsed() > Duration::from_secs(3) {
+                        session.display.window.set_title("Phantom");
                     }
                 }
 
@@ -903,20 +916,23 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(_) => {
-                // TODO: resolution change disabled on native client.
-                // VideoToolbox doesn't auto-adapt to SPS resolution changes
-                // (always reinits at original Hello dimensions). Need to parse
-                // new dimensions from SPS and recreate VT session properly.
-                // Web client handles this via WebCodecs auto-adaptation.
+                // Debounced resolution change — use logical pixels (macOS retina = 2x physical)
+                let logical = session.display.window.inner_size().to_logical::<u32>(
+                    session.display.window.scale_factor(),
+                );
+                session.pending_resize = Some((logical.width, logical.height, Instant::now()));
             }
             WindowEvent::DroppedFile(path) => {
+                let filename = path.file_name().unwrap_or_default().to_string_lossy();
                 tracing::info!(path = %path.display(), "file dropped on window");
+                session.display.window.set_title(&format!("Phantom — Uploading: {filename}"));
                 match session.file_xfer.initiate_send(&path) {
                     Ok((_transfer_id, offer_msg)) => {
                         let _ = session.input_tx.send(offer_msg);
                     }
                     Err(e) => {
                         tracing::error!(path = %path.display(), "failed to initiate file send: {e}");
+                        session.display.window.set_title("Phantom");
                     }
                 }
             }

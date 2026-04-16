@@ -89,6 +89,12 @@ extern "C" {
     static kCFTypeDictionaryValueCallBacks: c_void;
 }
 
+#[repr(C)]
+struct CMVideoDimensions {
+    width: i32,
+    height: i32,
+}
+
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
     fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
@@ -99,6 +105,10 @@ extern "C" {
         nal_unit_header_length: i32,
         format_description_out: *mut CMVideoFormatDescriptionRef,
     ) -> OSStatus;
+
+    fn CMVideoFormatDescriptionGetDimensions(
+        video_desc: CMVideoFormatDescriptionRef,
+    ) -> CMVideoDimensions;
 
     fn CMBlockBufferCreateWithMemoryBlock(
         structure_allocator: CFAllocatorRef,
@@ -280,6 +290,22 @@ impl VideoToolboxDecoder {
             );
             if status != 0 {
                 bail!("CMVideoFormatDescriptionCreateFromH264ParameterSets failed: {status}");
+            }
+
+            // Read actual dimensions from SPS (handles resolution changes)
+            let dims = CMVideoFormatDescriptionGetDimensions(format_desc);
+            if dims.width > 0 && dims.height > 0 {
+                let new_w = dims.width as usize;
+                let new_h = dims.height as usize;
+                if new_w != self.width || new_h != self.height {
+                    tracing::info!(
+                        old_w = self.width, old_h = self.height,
+                        new_w, new_h,
+                        "VideoToolbox: resolution changed from SPS"
+                    );
+                    self.width = new_w;
+                    self.height = new_h;
+                }
             }
 
             // Create image buffer attributes requesting BGRA output
