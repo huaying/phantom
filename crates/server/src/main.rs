@@ -1140,6 +1140,44 @@ fn get_display_origin(target_width: u32, target_height: u32, display_index: usiz
     }
 }
 
+/// Find the VDD (Virtual Display Driver) device name (e.g. `\\.\DISPLAY10`).
+/// Used to tell DXGI which output to capture — same approach as DCV/Parsec.
+#[cfg(target_os = "windows")]
+fn find_vdd_device_name() -> Option<String> {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let mut device_idx = 0u32;
+        loop {
+            let mut dd = DISPLAY_DEVICEW::default();
+            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(None, device_idx, &mut dd, 0).as_bool() {
+                break;
+            }
+            let name = String::from_utf16_lossy(
+                &dd.DeviceName[..dd
+                    .DeviceName
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceName.len())],
+            );
+            let desc = String::from_utf16_lossy(
+                &dd.DeviceString[..dd
+                    .DeviceString
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceString.len())],
+            );
+            if desc == "Virtual Display Driver" {
+                tracing::info!(name, desc, "Found VDD device");
+                return Some(name);
+            }
+            device_idx += 1;
+        }
+        tracing::warn!("VDD device not found");
+        None
+    }
+}
+
 /// Change the display resolution using ChangeDisplaySettingsExW.
 /// Targets the VDD virtual display (highest-res non-primary monitor).
 /// Same approach as Sunshine: find the right display device and change its settings.
@@ -1252,10 +1290,19 @@ fn run_agent_loop(
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
-    // Three capture tiers (best to worst):
-    // 1. DXGI→NVENC zero-copy (GPU capture + GPU encode, ~4ms)
-    // 2. ScrapCapture (DXGI) + OpenH264 (CPU capture + CPU encode, picks VDD 1920x1080)
-    // 3. GDI + OpenH264 (lock screen fallback, 800x600)
+    // Find VDD device name (e.g. \\.\DISPLAY10) — always capture from VDD.
+    // Same approach as DCV/Parsec: target our own virtual display by device name.
+    let vdd_device = find_vdd_device_name();
+    if let Some(ref dev) = vdd_device {
+        tracing::info!(device = %dev, "Will capture from VDD");
+    } else {
+        tracing::info!("No VDD found — will capture from best available display");
+    }
+
+    // Capture tiers (best to worst):
+    // 1. DXGI(VDD)→NVENC zero-copy (GPU capture + GPU encode, ~4ms)
+    // 2. DXGI(VDD)→CPU encode     (any platform with VDD)
+    // 3. GDI→CPU encode            (lock screen fallback)
     let mut gpu_pipeline: Option<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> = None;
     let mut scrap_capture: Option<capture_scrap::ScrapCapture> = None;
     let mut gdi_capture: Option<capture_gdi::GdiCapture> = None;
@@ -1271,8 +1318,6 @@ fn run_agent_loop(
     // when capturing from a secondary display (e.g. VDD).
     let mut display_x: i32 = 0;
     let mut display_y: i32 = 0;
-    // Target resolution for DXGI output selection after resolution change.
-    let mut target_resolution: Option<(u32, u32)> = None;
 
     tracing::info!("Starting agent loop");
 
@@ -1288,11 +1333,11 @@ fn run_agent_loop(
         {
             last_init_attempt = Instant::now();
 
-            // Tier 1: DXGI→NVENC zero-copy
-            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_resolution(
+            // Tier 1: DXGI(VDD)→NVENC zero-copy
+            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_device(
                 30,
                 5000,
-                target_resolution,
+                vdd_device.as_deref(),
             ) {
                 Ok(mut gpu) => {
                     width = gpu.width;
@@ -1304,7 +1349,6 @@ fn run_agent_loop(
                     gdi_capture = None;
                     cpu_encoder = None;
                     capture_mode = "dxgi_nvenc";
-                    target_resolution = None; // consumed
                 }
                 Err(e) => {
                     tracing::warn!("DXGI→NVENC unavailable: {e:#}");
@@ -1402,7 +1446,6 @@ fn run_agent_loop(
                     scrap_capture = None;
                     gdi_capture = None;
                     cpu_encoder = None;
-                    target_resolution = Some((new_w, new_h));
                     last_init_attempt = Instant::now() - Duration::from_secs(10);
                     // Give Windows a moment to apply the resolution change
                     std::thread::sleep(Duration::from_millis(500));

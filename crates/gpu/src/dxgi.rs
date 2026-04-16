@@ -22,13 +22,14 @@ unsafe impl Send for DxgiCapture {}
 
 impl DxgiCapture {
     pub fn new() -> Result<Self> {
-        Self::with_target_resolution(None)
+        Self::with_target_device(None)
     }
 
-    /// Create a new capture, optionally preferring an output matching the target resolution.
-    /// Used after resolution change to select the VDD output at the new resolution
-    /// instead of defaulting to the highest-res output.
-    pub fn with_target_resolution(target: Option<(u32, u32)>) -> Result<Self> {
+    /// Create a new capture, optionally targeting a specific display device by name.
+    /// When `target_device` is set (e.g. `\\.\DISPLAY10`), only that output is selected.
+    /// This is how DCV/Parsec target their own VDD — by device name, not by resolution.
+    /// Falls back to highest-resolution NVIDIA output if target not found.
+    pub fn with_target_device(target_device: Option<&str>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
@@ -42,6 +43,7 @@ impl DxgiCapture {
                 width: u32,
                 height: u32,
                 is_nvidia: bool,
+                matches_device: bool,
             }
 
             let mut best: Option<Candidate> = None;
@@ -64,28 +66,35 @@ impl DxgiCapture {
                     let r = out_desc.DesktopCoordinates;
                     let w = (r.right - r.left) as u32;
                     let h = (r.bottom - r.top) as u32;
+                    let device_name = String::from_utf16_lossy(
+                        &out_desc.DeviceName[..out_desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(out_desc.DeviceName.len())],
+                    );
                     tracing::info!(
                         adapter = adapter_idx,
                         output = output_idx,
                         name = %adapter_name,
+                        device = %device_name,
                         width = w,
                         height = h,
                         is_nvidia,
                         "DXGI output"
                     );
 
-                    // Scoring: exact target match > NVIDIA with highest res > any
-                    let matches_target = target
-                        .map_or(false, |(tw, th)| w == tw && h == th);
-                    let best_matches_target = best.as_ref().map_or(false, |b| {
-                        target.map_or(false, |(tw, th)| b.width == tw && b.height == th)
-                    });
+                    // Match by device name (e.g. \\.\DISPLAY10 = VDD)
+                    let matches_device = target_device
+                        .map_or(false, |td| device_name == td);
+                    let best_matches_device = best.as_ref().map_or(false, |b| b.matches_device);
 
+                    // Scoring: device name match > NVIDIA highest res > any highest res
                     let dominated = best.as_ref().is_some_and(|b| {
-                        if matches_target && !best_matches_target {
-                            false // target match always wins
-                        } else if !matches_target && best_matches_target {
-                            true // can't beat a target match
+                        if matches_device && !best_matches_device {
+                            false // device name match always wins
+                        } else if !matches_device && best_matches_device {
+                            true // can't beat a device name match
                         } else if is_nvidia && !b.is_nvidia {
                             false // NVIDIA beats non-NVIDIA
                         } else if !is_nvidia && b.is_nvidia {
@@ -103,6 +112,7 @@ impl DxgiCapture {
                             width: w,
                             height: h,
                             is_nvidia,
+                            matches_device,
                         });
                     }
                     output_idx += 1;
