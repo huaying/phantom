@@ -354,6 +354,10 @@ fn create_service_session(
     {
         let ipc = session_mgr.ipc.as_ref().unwrap();
 
+        // Request keyframe from agent — triggers DXGI capture reset so the
+        // agent produces a frame even on a static desktop.
+        let _ = ipc.request_keyframe();
+
         // Wait for first encoded frame from agent to get resolution
         let mut attempts = 0;
         svc_log("Waiting for first encoded frame from agent...");
