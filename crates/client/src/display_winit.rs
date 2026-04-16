@@ -45,6 +45,14 @@ impl WinitDisplay {
         self.buffer[..len].copy_from_slice(&rgb32[..len]);
     }
 
+    pub fn server_width(&self) -> u32 {
+        self.server_width
+    }
+
+    pub fn server_height(&self) -> u32 {
+        self.server_height
+    }
+
     /// Apply decoded lossless tiles to the framebuffer.
     pub fn update_tiles(&mut self, tiles: &[DecodedTile]) {
         let bpp = 4;

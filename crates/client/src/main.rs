@@ -829,6 +829,32 @@ impl ApplicationHandler for App {
                     }));
                 }
             }
+            WindowEvent::Resized(size) => {
+                // Adaptive resolution: send window size to server (like web client).
+                // Use 1.3x scale so small windows still get usable resolution.
+                let scale = 1.3;
+                let tw = (size.width as f64 * scale) as u32;
+                let th = (size.height as f64 * scale) as u32;
+                // Round to closest standard resolution capped at 1920x1080
+                let resolutions: &[(u32, u32)] = &[
+                    (1024, 768), (1152, 864), (1280, 720), (1280, 800),
+                    (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
+                    (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
+                ];
+                let (w, h) = resolutions
+                    .iter()
+                    .filter(|&&(rw, rh)| rw <= tw && rh <= th)
+                    .last()
+                    .copied()
+                    .unwrap_or((1024, 768));
+                if w != session.display.server_width() || h != session.display.server_height() {
+                    tracing::info!(w, h, "requesting resolution change");
+                    let _ = session.input_tx.send(Message::ResolutionChange {
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
             WindowEvent::DroppedFile(path) => {
                 tracing::info!(path = %path.display(), "file dropped on window");
                 match session.file_xfer.initiate_send(&path) {

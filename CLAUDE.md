@@ -251,10 +251,20 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 - **Cmd+R stuck keys on macOS**: Meta key is blocked but 'r' keydown is sent, page refreshes before keyup. Fix: skip ALL keys when `e.meta_key()` is true. Also release modifiers on `beforeunload` and `blur`.
 - **ABR spiral on high-latency links**: previous ABR decreased bitrate whenever RTT >100ms (fixed latency). Fix: track baseline RTT (minimum observed), only decrease when RTT rises >50% above baseline (actual congestion).
 - **Scroll direction**: browser `deltaY` already reflects client OS direction (macOS natural scroll). Do NOT negate. winit (native) has opposite convention from enigo — DO negate there.
+- **DXGI recreate must drop old duplication first**: `IDXGIOutputDuplication` only one per output. Must set `self.duplication = None` before `DuplicateOutput()`. Using `mem::zeroed()` creates null COM pointer → crash on Drop.
+- **DXGI recreate must reuse same adapter+output**: Re-enumerating adapters in `recreate()` picks wrong output (different from initial). Store adapter+output_idx and reuse.
+- **force_keyframe must NOT reset DXGI on periodic timer**: `capture.reset()` every 2s causes pipeline crash loop. Only reset on IPC keyframe request (new session). Periodic timer just sets `force_idr` flag.
+- **Keyframe request must come BEFORE wait-for-frame loop**: `create_service_session` waits 2s for first frame. On static desktop, no frames exist. Must `request_keyframe()` (triggers DXGI reset) before the wait loop.
+- **VDD on headless GPU VMs**: Data center GPUs (L40, A40) in TCC mode have no display. VDD creates virtual display. Must switch to WDDM (`nvidia-smi -fdm 0`) for VDD to render on GPU.
+- **DO NOT disable Basic Display Adapter**: Causes Windows boot failure. Even with NVIDIA WDDM, Windows needs Basic Display during early boot. DXGI targets VDD by device name instead.
+- **IPC dead thread detection**: `is_connected()` must check `JoinHandle::is_finished()`. Raw `connected` bool stays true after IO threads die.
+- **OpenH264 SIMD**: Must use `phantom_core::color::bgra_to_yuv420` (AVX2 SIMD), NOT `pixel_f32()` callback. Per-pixel f32 = ~300ms/frame at 1080p. SIMD = ~10ms.
+- **Toast JS eval + Windows paths**: Backslashes in `C:\Users\...` break JS eval. Must escape `\\` before `\'` and `\"`.
+- **Service mode clipboard/paste**: Session 0 has no clipboard access. Paste: `MSG_PASTE_TEXT` IPC → agent `enigo.text()`. Clipboard sync: agent polls arboard → `MSG_CLIPBOARD_SYNC` IPC → `ClipboardSync` to client.
 
 ---
 
-## Implemented Features (48)
+## Implemented Features (55)
 
 | # | Feature |
 |---|---------|
@@ -306,6 +316,13 @@ DXGI→NVENC (zero-copy):     30-47 fps (limited by 52Hz refresh rate)
 | 46 | **Scroll redesign** (Sunshine-style pixel accumulation, client-native direction, no magic multipliers) |
 | 47 | **ABR baseline RTT** (track minimum RTT, only decrease on congestion not fixed latency, min 1500kbps) |
 | 48 | **Native client UI** (borderless fullscreen, macOS transparent title bar, F11/Esc toggle) |
+| 49 | **Virtual Display Driver (VDD)** auto-install (`--install` downloads MiketheTech VDD + nefcon, configures for NVIDIA GPU) |
+| 50 | **TCC→WDDM auto-switch** (`--install` detects NVIDIA GPU mode, switches to WDDM if needed) |
+| 51 | **Adaptive resolution** (web client sends viewport size, agent ChangeDisplaySettingsEx on VDD, 1.3x scale, debounce 300ms) |
+| 52 | **DXGI VDD device targeting** (capture from VDD by device name like DCV/Parsec, not highest-res) |
+| 53 | **Clipboard paste in service mode** (PasteText → MSG_PASTE_TEXT IPC → agent enigo.text()) |
+| 54 | **Clipboard sync in service mode** (agent arboard polling → MSG_CLIPBOARD_SYNC IPC → ClipboardSync to client) |
+| 55 | **File transfer toast + path** (FileSaved protocol message, batch progress, actual saved path with dedup suffix) |
 
 ---
 
