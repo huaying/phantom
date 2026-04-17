@@ -315,12 +315,15 @@ impl App {
             self.last_session_token.clear();
         }
 
-        // Create window
+        // Create window — default to windowed (with decorations so the user
+        // can move/resize). F11 toggles fullscreen, Esc exits fullscreen.
+        // Opening fullscreen by default was annoying on reconnect because
+        // every disconnect destroyed the window and re-opened it fullscreen.
         let win_size = display_winit::fit_window_size(width, height);
+        #[allow(unused_mut)]
         let mut attrs = WindowAttributes::default()
             .with_title("Phantom")
-            .with_inner_size(win_size)
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+            .with_inner_size(win_size);
 
         // macOS: transparent title bar with traffic lights, content extends behind it
         #[cfg(target_os = "macos")]
@@ -330,11 +333,6 @@ impl App {
                 .with_titlebar_transparent(true)
                 .with_title_hidden(true)
                 .with_fullsize_content_view(true);
-        }
-        // Other platforms: no title bar
-        #[cfg(not(target_os = "macos"))]
-        {
-            attrs = attrs.with_decorations(false);
         }
 
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
