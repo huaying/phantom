@@ -59,6 +59,28 @@ chmod +x phantom-server-linux-x86_64
 ./phantom-server-linux-x86_64 --transport web --no-encrypt
 ```
 
+### Auto-start on boot
+
+After installing the binary, register Phantom as a system service so it
+starts automatically on boot and survives logout:
+
+**Windows** (creates a Windows Service, runs in Session 0 so clients can
+connect before anyone logs in; also installs the MTT Virtual Display
+Driver so headless GPU servers have something to capture):
+```powershell
+# Must run in an elevated PowerShell
+phantom-server.exe --install
+# → sc query PhantomServer  (verify)
+# → phantom-server.exe --uninstall  (to remove)
+```
+
+**Linux** (creates a systemd user unit at `~/.config/systemd/user/`):
+```bash
+phantom-server --install
+# → systemctl --user status phantom-server  (verify)
+# → phantom-server --uninstall
+```
+
 ### Docker
 
 ```bash
@@ -149,7 +171,7 @@ Native Client                        Server                         Web Client (
 --no-encrypt                 Disable encryption
 --stun <server|auto>         STUN NAT discovery (use "auto" for Google STUN)
 --public-addr <ip:port>      Override public address (skip STUN)
---install / --uninstall      Auto-start (Windows: schtasks, Linux: systemd)
+--install / --uninstall      Auto-start (Windows: Service + VDD, Linux: systemd user)
 ```
 
 ### Client Options
