@@ -184,6 +184,10 @@ mod platform {
 
     fn wait_connect(handle: HANDLE, name: &str, timeout: Duration) -> Result<bool> {
         let start = Instant::now();
+        // ConnectNamedPipe is blocking (no OVERLAPPED), so every branch below
+        // returns — the `loop {}` is kept as a style bookmark for a future
+        // async version that would actually retry.
+        #[allow(clippy::never_loop)]
         loop {
             if start.elapsed() > timeout {
                 tracing::warn!("IPC: {name} connection timed out");
@@ -496,6 +500,7 @@ mod platform {
         }
 
         /// Send an input event to the agent for injection.
+        #[allow(dead_code)]
         pub fn send_input(&self, event: InputEvent) -> Result<()> {
             if let Some(ref tx) = self.input_tx {
                 tx.send(event).context("IPC input channel closed")?;
@@ -523,6 +528,7 @@ mod platform {
         }
 
         /// Request the agent to change display resolution.
+        #[allow(dead_code)]
         pub fn request_resolution_change(&self, width: u32, height: u32) {
             if self.connected {
                 *self
@@ -538,6 +544,7 @@ mod platform {
         }
 
         /// Send paste text to agent for injection.
+        #[allow(dead_code)]
         pub fn send_paste(&self, text: &str) {
             if self.connected {
                 *self.paste_text.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
@@ -559,11 +566,11 @@ mod platform {
             }
             // Check if IO threads are still alive — a dead thread means
             // the pipe broke and this IPC is no longer usable.
-            let read_dead = self._read_thread.as_ref().map_or(true, |h| h.is_finished());
+            let read_dead = self._read_thread.as_ref().is_none_or(|h| h.is_finished());
             let write_dead = self
                 ._write_thread
                 .as_ref()
-                .map_or(true, |h| h.is_finished());
+                .is_none_or(|h| h.is_finished());
             if read_dead || write_dead {
                 tracing::warn!(
                     read_dead,

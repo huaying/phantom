@@ -715,9 +715,24 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
     recv_tx: mpsc::Sender<Vec<u8>>,
 ) {
     loop {
-        while let Ok(data) = send_rx.try_recv() {
-            if ws.send(tungstenite::Message::Binary(data)).is_err() {
-                return;
+        // Drain pending outgoing messages. If the sender end was dropped
+        // (session ended, replaced, cancelled by watcher, etc.), exit so
+        // the TCP stream drops, the client's onclose fires, and the web
+        // client can auto-reconnect. Without this, the io loop idle-loops
+        // on ws.read() forever and the client sees a hung connection.
+        loop {
+            match send_rx.try_recv() {
+                Ok(data) => {
+                    if ws.send(tungstenite::Message::Binary(data)).is_err() {
+                        return;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return;
+                }
             }
         }
         match ws.read() {

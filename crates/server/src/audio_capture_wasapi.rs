@@ -325,8 +325,8 @@ fn convert_channels(pcm: &[i16], from_channels: usize, to_channels: usize) -> Ve
             for ch in 0..to_channels.min(from_channels) {
                 out.push(pcm[offset + ch]);
             }
-            for _ in from_channels..to_channels {
-                out.push(0);
+            if to_channels > from_channels {
+                out.resize(out.len() + (to_channels - from_channels), 0);
             }
         }
     }

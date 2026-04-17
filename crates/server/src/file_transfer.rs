@@ -85,6 +85,7 @@ mod dirs_impl {
                 ) -> i32;
                 fn WTSFreeMemory(pMemory: *mut std::ffi::c_void);
             }
+            #[allow(non_upper_case_globals)]
             const WTSUserName: i32 = 5;
 
             let session_id = WTSGetActiveConsoleSessionId();

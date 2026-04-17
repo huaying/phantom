@@ -137,7 +137,7 @@ impl FrameCapture for GdiCapture {
 
             let hbm = CreateCompatibleBitmap(hdc_screen, self.width as i32, self.height as i32);
             if hbm.is_invalid() {
-                DeleteDC(hdc_mem);
+                let _ = DeleteDC(hdc_mem);
                 ReleaseDC(hwnd, hdc_screen);
                 anyhow::bail!("CreateCompatibleBitmap failed");
             }
@@ -159,8 +159,8 @@ impl FrameCapture for GdiCapture {
 
             if result.is_err() {
                 SelectObject(hdc_mem, old_bm);
-                DeleteObject(hbm);
-                DeleteDC(hdc_mem);
+                let _ = DeleteObject(hbm);
+                let _ = DeleteDC(hdc_mem);
                 ReleaseDC(hwnd, hdc_screen);
                 anyhow::bail!("BitBlt failed");
             }
@@ -177,7 +177,7 @@ impl FrameCapture for GdiCapture {
                     biHeight: -(self.height as i32), // top-down
                     biPlanes: 1,
                     biBitCount: 32,
-                    biCompression: BI_RGB.0 as u32,
+                    biCompression: BI_RGB.0,
                     biSizeImage: 0,
                     biXPelsPerMeter: 0,
                     biYPelsPerMeter: 0,
@@ -199,8 +199,8 @@ impl FrameCapture for GdiCapture {
 
             // Cleanup GDI resources
             SelectObject(hdc_mem, old_bm);
-            DeleteObject(hbm);
-            DeleteDC(hdc_mem);
+            let _ = DeleteObject(hbm);
+            let _ = DeleteDC(hdc_mem);
             ReleaseDC(hwnd, hdc_screen);
 
             if lines == 0 {

@@ -446,7 +446,7 @@ fn create_service_session(
             });
 
         // Resolution change callback — forwards to agent via IPC
-        let resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>> = {
+        let resolution_change_fn: Option<crate::session::ResolutionChangeFn> = {
             let ipc_ref = session_mgr.ipc.as_ref();
             ipc_ref.map(|ipc| {
                 let res_arc = Arc::clone(&ipc.resolution_change_arc());
@@ -457,7 +457,7 @@ fn create_service_session(
         };
 
         // Paste callback — forwards to agent via IPC
-        let paste_fn: Option<Box<dyn Fn(&str) + Send>> = {
+        let paste_fn: Option<crate::session::PasteFn> = {
             let ipc_ref = session_mgr.ipc.as_ref();
             ipc_ref.map(|ipc| {
                 let paste_arc = Arc::clone(&ipc.paste_arc());
@@ -486,7 +486,7 @@ fn create_service_session(
             width,
             height,
         );
-        return Ok(result);
+        Ok(result)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -760,6 +760,7 @@ fn get_active_console_session_id() -> u32 {
 /// Launch the phantom agent process in a specific user session.
 /// Get the username associated with a Windows session ID.
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn get_session_username(session_id: u32) -> Option<String> {
     let output = std::process::Command::new("query")
         .args(["session"])
@@ -961,6 +962,7 @@ fn setup_nvidia_gpu() -> anyhow::Result<bool> {
 }
 
 /// Disable the Microsoft Basic Display Adapter so Windows uses only the NVIDIA GPU.
+#[allow(dead_code)]
 fn disable_basic_display_adapter() {
     println!("  Disabling Microsoft Basic Display Adapter...");
     let _ = std::process::Command::new("powershell")

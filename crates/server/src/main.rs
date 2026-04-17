@@ -10,6 +10,11 @@
 //! as a fallback within the agent when DXGI is unavailable (e.g. lock screen).
 //! Use `--install` to register the service, `--uninstall` to remove it.
 
+// Windows FFI stubs (DISPLAY_DEVICEW, DEVMODEW) have no public struct-init
+// syntax because of embedded unions and private fields; `default()` + field
+// assignment is the conventional idiom and is unavoidable.
+#![allow(clippy::field_reassign_with_default)]
+
 #[cfg(feature = "audio")]
 mod audio_capture;
 #[cfg(target_os = "windows")]
@@ -976,9 +981,7 @@ fn install_autostart() -> Result<()> {
     let exe_str = exe.to_string_lossy();
 
     #[cfg(target_os = "windows")]
-    {
-        return service_win::install_service();
-    }
+    return service_win::install_service();
 
     #[cfg(target_os = "linux")]
     {
@@ -1001,23 +1004,19 @@ fn install_autostart() -> Result<()> {
         println!("Installed: systemd user service");
         println!("  Status: systemctl --user status phantom-server");
         println!("  Remove: phantom-server --uninstall");
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         println!("Auto-start not yet supported on this OS. Run phantom-server manually.");
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn uninstall_autostart() -> Result<()> {
-    #[allow(unused_imports)]
-    use anyhow::Context;
     #[cfg(target_os = "windows")]
-    {
-        return service_win::uninstall_service();
-    }
+    return service_win::uninstall_service();
 
     #[cfg(target_os = "linux")]
     {
@@ -1028,14 +1027,14 @@ fn uninstall_autostart() -> Result<()> {
             .join(".config/systemd/user/phantom-server.service");
         let _ = std::fs::remove_file(&path);
         println!("Removed: systemd user service");
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         println!("Auto-start not supported on this OS.");
+        Ok(())
     }
-
-    Ok(())
 }
 
 // ── Agent mode (Windows only) ───────────────────────────────────────────────
@@ -1047,7 +1046,6 @@ fn uninstall_autostart() -> Result<()> {
 fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     // Agent has no console (spawned by the service). Set up tracing to write
     // to a log file in the system temp directory instead of stdout.
@@ -1761,7 +1759,7 @@ fn run_agent_loop(
             match gpu.capture_and_encode() {
                 Ok(Some(encoded)) => {
                     frame_count += 1;
-                    if frame_count <= 3 || frame_count % 300 == 0 {
+                    if frame_count <= 3 || frame_count.is_multiple_of(300) {
                         tracing::info!(
                             frame = frame_count,
                             width,
@@ -1800,7 +1798,7 @@ fn run_agent_loop(
                 Ok(Some(frame)) => match enc.encode_frame(&frame) {
                     Ok(encoded) => {
                         frame_count += 1;
-                        if frame_count <= 3 || frame_count % 300 == 0 {
+                        if frame_count <= 3 || frame_count.is_multiple_of(300) {
                             tracing::info!(
                                 frame = frame_count,
                                 width,
@@ -1838,7 +1836,7 @@ fn run_agent_loop(
                 Ok(Some(frame)) => match enc.encode_frame(&frame) {
                     Ok(encoded) => {
                         frame_count += 1;
-                        if frame_count <= 3 || frame_count % 300 == 0 {
+                        if frame_count <= 3 || frame_count.is_multiple_of(300) {
                             tracing::info!(
                                 frame = frame_count,
                                 width,
