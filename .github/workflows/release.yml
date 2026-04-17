@@ -74,6 +74,14 @@ jobs:
         if: contains(matrix.target, 'apple-darwin')
         run: brew install nasm cmake
 
+      # Opus's bundled CMakeLists.txt calls cmake_minimum_required below 3.5,
+      # which CMake 4.x (installed on macos-latest) rejects. Env var tells
+      # CMake to accept the old policies. Applies globally to all cmake-crate
+      # invocations. No harm on Linux/Windows runners.
+      - name: Set CMake policy fallback
+        run: echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> $GITHUB_ENV
+        shell: bash
+
       # Linux aarch64: cross-compilation toolchain
       - name: Install Linux cross-compile dependencies (aarch64)
         if: matrix.cross
