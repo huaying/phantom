@@ -18,6 +18,7 @@ pub struct DxgiCapture {
     pub width: u32,
     pub height: u32,
     frame_acquired: bool,
+    #[allow(dead_code)]
     target_device: Option<String>,
 }
 
@@ -88,8 +89,8 @@ impl DxgiCapture {
                     );
 
                     // Match by device name (e.g. \\.\DISPLAY10 = VDD)
-                    let matches_device = target_device.map_or(false, |td| device_name == td);
-                    let best_matches_device = best.as_ref().map_or(false, |b| b.matches_device);
+                    let matches_device = target_device.is_some_and(|td| device_name == td);
+                    let best_matches_device = best.as_ref().is_some_and(|b| b.matches_device);
 
                     // Scoring: device name match > NVIDIA highest res > any highest res
                     let dominated = best.as_ref().is_some_and(|b| {

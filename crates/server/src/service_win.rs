@@ -604,7 +604,7 @@ impl SessionManager {
             ));
 
             // Check IPC health — if IO threads died, clean up so we relaunch.
-            let ipc_alive = self.ipc.as_ref().map_or(false, |ipc| ipc.is_connected());
+            let ipc_alive = self.ipc.as_ref().is_some_and(|ipc| ipc.is_connected());
             if self.ipc.is_some() && !ipc_alive {
                 svc_log("IPC IO threads dead — cleaning up for relaunch");
                 if let Some(mut ipc) = self.ipc.take() {
