@@ -1,20 +1,30 @@
 //! Modern CCD (Connecting and Configuring Displays) API wrappers.
 //!
-//! Used to make the VDD the primary display and optionally detach all other
-//! displays so windows are forced onto it. Required because the legacy
-//! `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` API returns `DISP_CHANGE_FAILED`
-//! on Windows 11 24H2+ with IDD-based virtual displays (VDD issue #471).
+//! Makes the VDD the **primary** display via `QueryDisplayConfig` +
+//! `SetDisplayConfig` (with `SDC_VIRTUAL_MODE_AWARE` — required for IDD drivers).
+//! Required because the legacy `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` API
+//! returns `DISP_CHANGE_FAILED` on Windows 11 24H2+ with IDD-based virtual
+//! displays (VDD issue #471).
 //!
-//! Follows the same pattern as Sunshine's libdisplaydevice:
-//! QueryDisplayConfig + mutate modes + SetDisplayConfig.
+//! # Safety design — NEVER detach physical displays
 //!
-//! Runtime-only (no `SDC_SAVE_TO_DATABASE`): topology reverts on reboot so
-//! a VDD failure can never brick the machine.
+//! Earlier versions cleared `PATH_ACTIVE` on non-VDD paths so VDD was the
+//! ONLY active display. This worked, but when combined with uninstall (which
+//! force-kills the agent, bypassing topology restore, then removes VDD), it
+//! left Windows with "last active topology = {VDD-only}" and no VDD driver on
+//! next boot → boot hang. Two Win10/Win11 VMs got bricked this way.
+//!
+//! Sunshine (`libdisplaydevice`) never detaches physical paths — VDD is added
+//! as an *extension* display, marked primary via source-mode position (0,0).
+//! We follow the same pattern. Uninstall can never brick because physical
+//! displays stay active throughout.
+//!
+//! Runtime-only (no `SDC_SAVE_TO_DATABASE`) — reboot reverts to defaults.
 #![cfg(target_os = "windows")]
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::Devices::Display::*;
-use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 
 /// Flag inside `DISPLAYCONFIG_PATH_INFO.flags`. Not exposed by windows-rs 0.58.
 const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
@@ -91,10 +101,18 @@ pub fn find_vdd_path_idx(topo: &Topology, vdd_gdi_name: &str) -> Option<usize> {
     None
 }
 
-/// Check if VDD is already the only active display at (0,0). Used as a
-/// fast-path skip — if nothing changed, don't pay the SetDisplayConfig cost
-/// (~100-200ms on Win10 where NVIDIA can come back via legacy API calls).
-pub fn is_vdd_already_exclusive(vdd_gdi_name: &str) -> bool {
+/// Extract the source-mode index from a path's bitfield. In virtual-mode-aware
+/// mode the `sourceInfo.Anonymous` field is `{cloneGroupId:16, sourceModeInfoIdx:16}`.
+fn source_mode_idx(path: &DISPLAYCONFIG_PATH_INFO) -> usize {
+    unsafe {
+        let bf = path.sourceInfo.Anonymous.modeInfoIdx;
+        ((bf >> 16) & 0xFFFF) as usize
+    }
+}
+
+/// Fast-path: is VDD already the primary (at (0,0))? Skips the ~100-200ms
+/// SetDisplayConfig call when no change is needed.
+pub fn is_vdd_primary(vdd_gdi_name: &str) -> bool {
     let topo = match query_active_config() {
         Ok(t) => t,
         Err(_) => return false,
@@ -103,92 +121,51 @@ pub fn is_vdd_already_exclusive(vdd_gdi_name: &str) -> bool {
         Some(i) => i,
         None => return false,
     };
-    // Exactly one active path (VDD).
-    let active_count = topo
-        .paths
-        .iter()
-        .filter(|p| (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
-        .count();
-    if active_count != 1 {
+    let src_idx = source_mode_idx(&topo.paths[vdd_idx]);
+    if src_idx >= topo.modes.len()
+        || topo.modes[src_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+    {
         return false;
     }
-    // VDD's source mode at (0,0)?
     unsafe {
-        let bf = topo.paths[vdd_idx].sourceInfo.Anonymous.modeInfoIdx;
-        let src_idx = ((bf >> 16) & 0xFFFF) as usize;
-        if src_idx >= topo.modes.len()
-            || topo.modes[src_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
-        {
-            return false;
-        }
         let p = topo.modes[src_idx].Anonymous.sourceMode.position;
         p.x == 0 && p.y == 0
     }
 }
 
-/// Make the VDD the ONLY active display (detaches all others at runtime).
+/// Make VDD the primary display by shifting all source-mode positions so VDD
+/// lands at (0,0). Physical displays stay active — they just move to positive
+/// coordinates (Windows treats the monitor at (0,0) as primary).
 ///
-/// Tries three strategies in order (each saved original, so we can restore):
-///   1. Shift all source positions so VDD → (0,0). Others stay active but
-///      placed relative to VDD. New windows should open on VDD as primary.
-///   2. (future) Clear PATH_ACTIVE on non-VDD paths to make VDD exclusive.
-///
-/// Changes are runtime-only — reboot reverts to default topology.
-pub fn set_vdd_exclusive(vdd_gdi_name: &str) -> Result<Topology> {
+/// Returns the original topology so the caller can restore it on shutdown.
+pub fn set_vdd_primary(vdd_gdi_name: &str) -> Result<Topology> {
     let current = query_active_config()?;
     let vdd_idx = find_vdd_path_idx(&current, vdd_gdi_name)
         .with_context(|| format!("VDD path not found: {vdd_gdi_name}"))?;
 
-    // Log current topology for debugging
-    crate::service_win::svc_log(&format!(
-        "CCD: current topology {} paths, {} modes, vdd_idx={vdd_idx}",
-        current.paths.len(),
-        current.modes.len()
-    ));
-    for (i, m) in current.modes.iter().enumerate() {
-        unsafe {
-            let ty = m.infoType.0;
-            if ty == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 {
-                let src = m.Anonymous.sourceMode;
-                crate::service_win::svc_log(&format!(
-                    "CCD: mode[{i}] SOURCE {}x{} pos=({},{})",
-                    src.width, src.height, src.position.x, src.position.y
-                ));
-            } else if ty == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET.0 {
-                crate::service_win::svc_log(&format!("CCD: mode[{i}] TARGET"));
-            }
-        }
-    }
-
-    // --- Strategy 1: position-only shift so VDD lands at (0,0) ---
-    // Find VDD's current source mode position to compute the shift.
-    //
-    // In virtual-mode-aware mode the sourceInfo.Anonymous field is a bitfield
-    // `{cloneGroupId: 16, sourceModeInfoIdx: 16}`. Reading `modeInfoIdx` as u32
-    // gives us the whole 32 bits — need to extract the upper 16 bits to get
-    // the actual mode index.
+    // Find VDD's source mode position — that's the shift vector.
+    let src_idx = source_mode_idx(&current.paths[vdd_idx]);
     let (shift_x, shift_y) = unsafe {
-        let bf = current.paths[vdd_idx].sourceInfo.Anonymous.modeInfoIdx;
-        let src_idx = ((bf >> 16) & 0xFFFF) as usize;
-        crate::service_win::svc_log(&format!(
-            "CCD: vdd bitfield=0x{bf:X} sourceModeInfoIdx={src_idx}"
-        ));
         if src_idx < current.modes.len()
             && current.modes[src_idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
         {
             let p = current.modes[src_idx].Anonymous.sourceMode.position;
             (p.x, p.y)
         } else {
-            (0, 0)
+            bail!("VDD source mode not found at idx {src_idx}");
         }
     };
-    crate::service_win::svc_log(&format!("CCD: shift=(-{shift_x},-{shift_y})"));
+    if shift_x == 0 && shift_y == 0 {
+        // Already primary — no-op.
+        crate::service_win::svc_log(&format!(
+            "CCD: VDD {vdd_gdi_name} already at (0,0), skipping"
+        ));
+        return Ok(current);
+    }
 
-    let mut paths = current.paths.clone();
+    let paths = current.paths.clone();
     let mut modes = current.modes.clone();
     // Shift every source mode by (-shift_x, -shift_y) so VDD lands at (0,0).
-    // (Harmless for paths we're about to deactivate; those modes just get
-    //  ignored by Windows.)
     for m in modes.iter_mut() {
         unsafe {
             if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
@@ -197,25 +174,16 @@ pub fn set_vdd_exclusive(vdd_gdi_name: &str) -> Result<Topology> {
             }
         }
     }
-    // Deactivate all non-VDD paths so VDD is the ONLY active display.
-    // This prevents Windows from moving primary back to NVIDIA when the user
-    // logs in (user display config is otherwise restored from registry).
-    let mut detached = 0;
-    for (i, path) in paths.iter_mut().enumerate() {
-        if i != vdd_idx && (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0 {
-            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
-            detached += 1;
-        }
-    }
     crate::service_win::svc_log(&format!(
-        "CCD: detaching {detached} non-VDD paths, shifting VDD to (0,0)"
+        "CCD: shifting all sources by ({},{}); VDD → (0,0); physical paths STAY ACTIVE",
+        -shift_x, -shift_y
     ));
 
-    apply(&paths, &modes).context("SetDisplayConfig (exclusive)")?;
+    apply(&paths, &modes).context("SetDisplayConfig (set_vdd_primary)")?;
     Ok(current)
 }
 
-/// Apply a previously saved topology. Used to restore default when stopping.
+/// Apply a previously saved topology. Used to restore on graceful shutdown.
 pub fn restore(topo: &Topology) -> Result<()> {
     apply(&topo.paths, &topo.modes).context("SetDisplayConfig (restore)")
 }
@@ -225,50 +193,23 @@ fn apply(
     modes: &[DISPLAYCONFIG_MODE_INFO],
 ) -> Result<()> {
     unsafe {
-        // Try a progression of flag combos. Starting strictest (matching
-        // Sunshine) down to more permissive. No SDC_SAVE_TO_DATABASE — stay
-        // runtime-only so reboot reverts.
-        let attempts: [(SET_DISPLAY_CONFIG_FLAGS, &str); 4] = [
-            (
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE,
-                "supplied|virtual",
-            ),
-            (
+        // No SDC_SAVE_TO_DATABASE — stay runtime-only so reboot reverts.
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;
+        let r = SetDisplayConfig(Some(paths), Some(modes), flags);
+        if r != ERROR_SUCCESS.0 as i32 {
+            // Retry with SDC_ALLOW_CHANGES as a permissive fallback.
+            let r2 = SetDisplayConfig(
+                Some(paths),
+                Some(modes),
                 SDC_APPLY
                     | SDC_USE_SUPPLIED_DISPLAY_CONFIG
                     | SDC_ALLOW_CHANGES
                     | SDC_VIRTUAL_MODE_AWARE,
-                "supplied|virtual|allow",
-            ),
-            (
-                SDC_APPLY
-                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                    | SDC_ALLOW_CHANGES
-                    | SDC_ALLOW_PATH_ORDER_CHANGES
-                    | SDC_VIRTUAL_MODE_AWARE,
-                "supplied|virtual|allow|path-order",
-            ),
-            (
-                SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE,
-                "VALIDATE-only",
-            ),
-        ];
-        let mut last_err: i32 = 0;
-        for (flags, label) in attempts {
-            let r = SetDisplayConfig(Some(paths), Some(modes), flags);
-            crate::service_win::svc_log(&format!(
-                "SetDisplayConfig [{label}] = {r} (0=success, 87=bad-param, 5=access-denied, 31=gen-failure)"
-            ));
-            if r == ERROR_SUCCESS.0 as i32 {
-                return Ok(());
+            );
+            if r2 != ERROR_SUCCESS.0 as i32 {
+                bail!("SetDisplayConfig failed: primary={r} fallback={r2}");
             }
-            last_err = r;
         }
-        bail!("SetDisplayConfig: all flag combos failed, last err={last_err}")
+        Ok(())
     }
-}
-
-#[allow(dead_code)]
-fn _unused_luid() -> LUID {
-    LUID::default()
 }

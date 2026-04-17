@@ -1296,7 +1296,7 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
 /// Idempotent — calling on an already-primary VDD is a no-op.
 /// Deprecated — the legacy `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` path.
 /// Windows 11 24H2+ returns `DISP_CHANGE_FAILED` for IDD drivers. Kept around
-/// but unused; real work is in `display_ccd::set_vdd_exclusive`.
+/// but unused; real work is in `display_ccd::set_vdd_primary`.
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 fn set_vdd_primary_legacy(vdd_device: &str) -> bool {
@@ -1458,10 +1458,10 @@ fn run_agent_loop(
     let mut saved_topology: Option<display_ccd::Topology> = None;
     if let Some(ref dev) = vdd_device {
         tracing::info!(device = %dev, "Will capture from VDD");
-        match display_ccd::set_vdd_exclusive(dev) {
+        match display_ccd::set_vdd_primary(dev) {
             Ok(topo) => {
                 crate::service_win::svc_log(&format!(
-                    "agent: set_vdd_exclusive({dev}) OK — saved {} paths, {} modes",
+                    "agent: set_vdd_primary({dev}) OK — saved {} paths, {} modes",
                     topo.paths.len(),
                     topo.modes.len()
                 ));
@@ -1469,7 +1469,7 @@ fn run_agent_loop(
             }
             Err(e) => {
                 crate::service_win::svc_log(&format!(
-                    "agent: set_vdd_exclusive({dev}) failed: {e:#}"
+                    "agent: set_vdd_primary({dev}) failed: {e:#}"
                 ));
             }
         }
@@ -1653,8 +1653,8 @@ fn run_agent_loop(
                     // exclusive state actually got broken — the query is ~10ms,
                     // SetDisplayConfig is ~100-200ms.
                     if let Some(ref dev) = vdd_device {
-                        if !display_ccd::is_vdd_already_exclusive(dev) {
-                            match display_ccd::set_vdd_exclusive(dev) {
+                        if !display_ccd::is_vdd_primary(dev) {
+                            match display_ccd::set_vdd_primary(dev) {
                                 Ok(_) => crate::service_win::svc_log(
                                     "agent: re-applied CCD after resize (was broken)",
                                 ),
@@ -1685,8 +1685,8 @@ fn run_agent_loop(
             // exclusive only if state got broken — saves ~150ms per session
             // start on the common case.
             if let Some(ref dev) = vdd_device {
-                if !display_ccd::is_vdd_already_exclusive(dev) {
-                    let _ = display_ccd::set_vdd_exclusive(dev);
+                if !display_ccd::is_vdd_primary(dev) {
+                    let _ = display_ccd::set_vdd_primary(dev);
                 }
             }
             if let Some(ref mut gpu) = gpu_pipeline {
