@@ -11,14 +11,10 @@ if (!(Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-# Get latest release tag
-Write-Host "Fetching latest release..." -ForegroundColor Cyan
-$release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
-$version = $release.tag_name
-Write-Host "Latest version: $version" -ForegroundColor Green
-
-# Download binaries
-$baseUrl = "https://github.com/$repo/releases/download/$version"
+# Download binaries via `/releases/latest/download/NAME` redirect.
+# This avoids the GitHub API rate limit (60 unauthenticated req/hr/IP)
+# that `/repos/:owner/:repo/releases/latest` imposes.
+$baseUrl = "https://github.com/$repo/releases/latest/download"
 
 $files = @("phantom-server-windows-x86_64.exe", "phantom-client-windows-x86_64.exe")
 foreach ($file in $files) {
@@ -44,7 +40,7 @@ if ($userPath -notlike "*$installDir*") {
 }
 
 Write-Host ""
-Write-Host "Done! Phantom $version installed to $installDir" -ForegroundColor Green
+Write-Host "Done! Phantom (latest) installed to $installDir" -ForegroundColor Green
 Write-Host ""
 Write-Host "Quick start:" -ForegroundColor Cyan
 Write-Host "  phantom-server.exe"
