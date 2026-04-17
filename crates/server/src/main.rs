@@ -1534,12 +1534,36 @@ fn run_agent_loop(
     // when capturing from a secondary display (e.g. VDD).
     let mut display_x: i32 = 0;
     let mut display_y: i32 = 0;
+    // Track input desktop name (e.g. "Default" vs "Winlogon") so we can reset
+    // the DXGI duplication when Windows switches desktops on lock / unlock /
+    // UAC prompts. Duplication objects are scoped to the desktop they were
+    // created on and keep returning stale frames from the now-hidden desktop.
+    let mut last_desktop_name: Option<String> = None;
 
     tracing::info!("Starting agent loop");
 
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
         let loop_start = Instant::now();
         capture_gdi::switch_to_input_desktop();
+        // Detect desktop switch (Winlogon ↔ Default): if changed, force reset
+        // of all capture pipelines so the new duplication targets the right
+        // desktop. Without this, after lock→unlock the client keeps seeing
+        // the login screen until the user manually reconnects.
+        let cur_desktop = capture_gdi::current_input_desktop_name();
+        if cur_desktop != last_desktop_name {
+            if last_desktop_name.is_some() {
+                crate::service_win::svc_log(&format!(
+                    "Input desktop changed: {:?} → {:?} — resetting capture",
+                    last_desktop_name, cur_desktop
+                ));
+                gpu_pipeline = None;
+                scrap_capture = None;
+                gdi_capture = None;
+                cpu_encoder = None;
+                last_init_attempt = Instant::now() - Duration::from_secs(10);
+            }
+            last_desktop_name = cur_desktop;
+        }
 
         // Try to init/reinit capture pipeline (best available)
         if gpu_pipeline.is_none()

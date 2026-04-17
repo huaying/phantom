@@ -19,7 +19,8 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
@@ -48,6 +49,38 @@ pub fn switch_to_input_desktop() -> bool {
         let ok = SetThreadDesktop(hdesk).is_ok();
         let _ = CloseDesktop(hdesk);
         ok
+    }
+}
+
+/// Get the name of the currently active input desktop (e.g., "Default",
+/// "Winlogon", "Screen-saver"). Used to detect desktop transitions
+/// (lock/unlock/UAC prompts) so the agent can reset DXGI duplication —
+/// duplication objects are scoped to the desktop they were created on and
+/// keep returning stale frames from the wrong desktop after a switch.
+pub fn current_input_desktop_name() -> Option<String> {
+    unsafe {
+        let hdesk = OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
+        )
+        .ok()?;
+        let mut buf = [0u16; 256];
+        let mut needed: u32 = 0;
+        let ok = GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(hdesk.0),
+            UOI_NAME,
+            Some(buf.as_mut_ptr() as *mut _),
+            (buf.len() * 2) as u32,
+            Some(&mut needed),
+        )
+        .is_ok();
+        let _ = CloseDesktop(hdesk);
+        if !ok {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..end]))
     }
 }
 
