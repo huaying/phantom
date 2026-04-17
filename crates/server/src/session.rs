@@ -770,11 +770,10 @@ impl SessionRunner {
             let elapsed = self.stats_time.elapsed().as_secs_f64();
             let fps = self.stats_frames as f64 / elapsed;
             let bw_bps = (self.stats_bytes as f64 / elapsed) as u64;
-            let avg_encode_us = if self.stats_frames > 0 {
-                self.stats_encode_us / self.stats_frames
-            } else {
-                0
-            };
+            let avg_encode_us = self
+                .stats_encode_us
+                .checked_div(self.stats_frames)
+                .unwrap_or(0);
             let rtt_str = match self.rtt_us {
                 Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
                 None => "n/a".to_string(),
