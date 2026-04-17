@@ -280,6 +280,38 @@ fn run_server_loop(
             })?;
     }
 
+    // Session-change watcher thread. The main loop can be stuck inside
+    // `create_service_session()` relaying frames for a connected client —
+    // during that time it can't poll for session drift. When the user signs
+    // out, the agent's session becomes invalid and stops producing frames,
+    // but the client stays connected (socket OK) so the relay loop doesn't
+    // exit. This thread breaks the standoff: every 500ms it checks the
+    // active console session ID; if it changed, it trips the `cancel` flag
+    // so the current service session exits, then main loop picks up drift
+    // on next iteration and relaunches the agent in the new session.
+    {
+        let cancel = Arc::clone(&cancel);
+        let shutdown = Arc::clone(&shutdown);
+        let session_changed = Arc::clone(&session_changed);
+        std::thread::Builder::new()
+            .name("svc-session-watch".into())
+            .spawn(move || {
+                let mut last_seen = get_active_console_session_id();
+                while !shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let cur = get_active_console_session_id();
+                    if cur != 0 && cur != 0xFFFFFFFF && cur != last_seen {
+                        svc_log(&format!(
+                            "Watcher: session ID changed {last_seen} -> {cur}, cancelling current session"
+                        ));
+                        session_changed.store(true, Ordering::Relaxed);
+                        cancel.store(true, Ordering::Relaxed);
+                        last_seen = cur;
+                    }
+                }
+            })?;
+    }
+
     while !shutdown.load(Ordering::Relaxed) {
         // Check for session changes (driven by SCM SESSION_CHANGE events).
         // Also poll every iteration because SCM events are not 100% reliable:
