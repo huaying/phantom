@@ -51,4 +51,6 @@ features = [
     "DragEvent", "DataTransfer", "FileList", "File",
     # Web Crypto API (SHA-256 for file transfer)
     "Crypto", "SubtleCrypto",
+    # Tab visibility (re-send resize when user switches back to Phantom tab)
+    "VisibilityState",
 ]

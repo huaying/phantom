@@ -2005,6 +2005,24 @@ fn setup_input(
             window.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
         cb.forget();
     }
+
+    // Tab becomes visible → re-check viewport. While the tab was hidden the
+    // browser throttles setTimeout (can delay our debounced resize by many
+    // seconds or drop it entirely), so if the user resized the window in a
+    // different tab we might not have sent the update. Force a check now.
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+            let document = web_sys::window().unwrap().document().unwrap();
+            if document.visibility_state() == web_sys::VisibilityState::Visible {
+                send_resolution_change(&s);
+            }
+        });
+        let document = web_sys::window().unwrap().document().unwrap();
+        let _ = document
+            .add_event_listener_with_callback("visibilitychange", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
 }
 
 fn send_input(state: &AppState, event: InputEvent) {
