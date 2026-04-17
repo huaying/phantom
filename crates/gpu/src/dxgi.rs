@@ -88,8 +88,7 @@ impl DxgiCapture {
                     );
 
                     // Match by device name (e.g. \\.\DISPLAY10 = VDD)
-                    let matches_device = target_device
-                        .map_or(false, |td| device_name == td);
+                    let matches_device = target_device.map_or(false, |td| device_name == td);
                     let best_matches_device = best.as_ref().map_or(false, |b| b.matches_device);
 
                     // Scoring: device name match > NVIDIA highest res > any highest res

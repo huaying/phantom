@@ -268,7 +268,7 @@ impl VideoToolboxDecoder {
 
     /// Initialize the VideoToolbox session once we have SPS/PPS.
     fn init_session(&mut self) -> Result<()> {
-        if self.session != ptr::null_mut() {
+        if !self.session.is_null() {
             return Ok(()); // already initialized
         }
         if self.sps.is_empty() || self.pps.is_empty() {
@@ -299,8 +299,10 @@ impl VideoToolboxDecoder {
                 let new_h = dims.height as usize;
                 if new_w != self.width || new_h != self.height {
                     tracing::info!(
-                        old_w = self.width, old_h = self.height,
-                        new_w, new_h,
+                        old_w = self.width,
+                        old_h = self.height,
+                        new_w,
+                        new_h,
                         "VideoToolbox: resolution changed from SPS"
                     );
                     self.width = new_w;

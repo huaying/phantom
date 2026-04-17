@@ -645,7 +645,8 @@ impl ApplicationHandler for App {
                         }
                         Message::FileSaved { path, .. } => {
                             tracing::info!(path, "file saved on server");
-                            title_toast = Some((format!("Phantom — Saved: {path}"), Instant::now()));
+                            title_toast =
+                                Some((format!("Phantom — Saved: {path}"), Instant::now()));
                         }
                         _ => {}
                     }
@@ -671,14 +672,22 @@ impl ApplicationHandler for App {
                         let tw = (rw as f64 * 1.3) as u32;
                         let th = (rh as f64 * 1.3) as u32;
                         let resolutions: &[(u32, u32)] = &[
-                            (1024, 768), (1152, 864), (1280, 720), (1280, 800),
-                            (1280, 960), (1280, 1024), (1366, 768), (1440, 900),
-                            (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
+                            (1024, 768),
+                            (1152, 864),
+                            (1280, 720),
+                            (1280, 800),
+                            (1280, 960),
+                            (1280, 1024),
+                            (1366, 768),
+                            (1440, 900),
+                            (1600, 900),
+                            (1600, 1200),
+                            (1680, 1050),
+                            (1920, 1080),
                         ];
                         let (w, h) = resolutions
                             .iter()
-                            .filter(|&&(rw, rh)| rw <= tw && rh <= th)
-                            .last()
+                            .rfind(|&&(rw, rh)| rw <= tw && rh <= th)
                             .copied()
                             .unwrap_or((1024, 768));
                         // Don't go below 1024x768 — very small VDD resolutions cause
@@ -841,7 +850,7 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                if let Some(mut input) =
+                if let Some(input) =
                     input_capture::key_event(&key_event.physical_key, key_event.state)
                 {
                     // macOS: remap Cmd+key → Ctrl+key (same as web client).
@@ -921,15 +930,20 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(_) => {
                 // Debounced resolution change — use logical pixels (macOS retina = 2x physical)
-                let logical = session.display.window.inner_size().to_logical::<u32>(
-                    session.display.window.scale_factor(),
-                );
+                let logical = session
+                    .display
+                    .window
+                    .inner_size()
+                    .to_logical::<u32>(session.display.window.scale_factor());
                 session.pending_resize = Some((logical.width, logical.height, Instant::now()));
             }
             WindowEvent::DroppedFile(path) => {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy();
                 tracing::info!(path = %path.display(), "file dropped on window");
-                session.display.window.set_title(&format!("Phantom — Uploading: {filename}"));
+                session
+                    .display
+                    .window
+                    .set_title(&format!("Phantom — Uploading: {filename}"));
                 match session.file_xfer.initiate_send(&path) {
                     Ok((_transfer_id, offer_msg)) => {
                         let _ = session.input_tx.send(offer_msg);

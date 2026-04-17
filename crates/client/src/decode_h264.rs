@@ -25,6 +25,7 @@ impl OpenH264Decoder {
     }
 
     /// Current decoded resolution (may change after decode_frame if server changed resolution).
+    #[allow(dead_code)]
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
     }

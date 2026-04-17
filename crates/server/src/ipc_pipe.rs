@@ -65,7 +65,7 @@ mod platform {
     const MSG_FORCE_KEYFRAME: u8 = 0x05;
     const MSG_RESOLUTION_CHANGE: u8 = 0x06;
     const MSG_PASTE_TEXT: u8 = 0x07;
-    const MSG_CLIPBOARD_SYNC: u8 = 0x08;  // agent → service (clipboard changed)
+    const MSG_CLIPBOARD_SYNC: u8 = 0x08; // agent → service (clipboard changed)
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -391,10 +391,8 @@ mod platform {
                             }
 
                             // Check resolution change request
-                            if let Some((w, h)) = res_change
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .take()
+                            if let Some((w, h)) =
+                                res_change.lock().unwrap_or_else(|e| e.into_inner()).take()
                             {
                                 let payload = [
                                     w.to_le_bytes()[0],
@@ -406,9 +404,9 @@ mod platform {
                                     h.to_le_bytes()[2],
                                     h.to_le_bytes()[3],
                                 ];
-                                if let Err(e) = unsafe {
-                                    send_message(handle, MSG_RESOLUTION_CHANGE, &payload)
-                                } {
+                                if let Err(e) =
+                                    unsafe { send_message(handle, MSG_RESOLUTION_CHANGE, &payload) }
+                                {
                                     if !shutdown2.load(Ordering::Relaxed) {
                                         tracing::warn!("IPC resolution change write error: {e}");
                                     }
@@ -417,15 +415,13 @@ mod platform {
                             }
 
                             // Check paste text request
-                            if let Some(text) = paste_text
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .take()
+                            if let Some(text) =
+                                paste_text.lock().unwrap_or_else(|e| e.into_inner()).take()
                             {
                                 let payload = text.into_bytes();
-                                if let Err(e) = unsafe {
-                                    send_message(handle, MSG_PASTE_TEXT, &payload)
-                                } {
+                                if let Err(e) =
+                                    unsafe { send_message(handle, MSG_PASTE_TEXT, &payload) }
+                                {
                                     if !shutdown2.load(Ordering::Relaxed) {
                                         tracing::warn!("IPC paste write error: {e}");
                                     }
@@ -529,8 +525,10 @@ mod platform {
         /// Request the agent to change display resolution.
         pub fn request_resolution_change(&self, width: u32, height: u32) {
             if self.connected {
-                *self.resolution_change.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((width, height));
+                *self
+                    .resolution_change
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((width, height));
             }
         }
 
@@ -542,8 +540,7 @@ mod platform {
         /// Send paste text to agent for injection.
         pub fn send_paste(&self, text: &str) {
             if self.connected {
-                *self.paste_text.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(text.to_string());
+                *self.paste_text.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
             }
         }
 
@@ -562,10 +559,7 @@ mod platform {
             }
             // Check if IO threads are still alive — a dead thread means
             // the pipe broke and this IPC is no longer usable.
-            let read_dead = self
-                ._read_thread
-                .as_ref()
-                .map_or(true, |h| h.is_finished());
+            let read_dead = self._read_thread.as_ref().map_or(true, |h| h.is_finished());
             let write_dead = self
                 ._write_thread
                 .as_ref()
@@ -700,8 +694,7 @@ mod platform {
                                     payload[4], payload[5], payload[6], payload[7],
                                 ]);
                                 tracing::info!(w, h, "IPC: resolution change request");
-                                *read_res.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some((w, h));
+                                *read_res.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
                             }
                             Ok((MSG_HEARTBEAT, _)) => {}
                             Ok((t, _)) => tracing::debug!("IPC down: unexpected 0x{t:02x}"),

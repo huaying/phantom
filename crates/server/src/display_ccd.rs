@@ -188,10 +188,7 @@ pub fn restore(topo: &Topology) -> Result<()> {
     apply(&topo.paths, &topo.modes).context("SetDisplayConfig (restore)")
 }
 
-fn apply(
-    paths: &[DISPLAYCONFIG_PATH_INFO],
-    modes: &[DISPLAYCONFIG_MODE_INFO],
-) -> Result<()> {
+fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> Result<()> {
     unsafe {
         // No SDC_SAVE_TO_DATABASE — stay runtime-only so reboot reverts.
         let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;

@@ -14,11 +14,11 @@
 mod audio_capture;
 #[cfg(target_os = "windows")]
 mod capture_gdi;
-#[cfg(target_os = "windows")]
-mod display_ccd;
 #[cfg(feature = "wayland")]
 mod capture_pipewire;
 mod capture_scrap;
+#[cfg(target_os = "windows")]
+mod display_ccd;
 mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
@@ -248,6 +248,8 @@ fn main() -> Result<()> {
 
     // Hardware probe: resolve "auto" encoder and capture
     let gpu_probe = phantom_gpu::probe::probe();
+    // `mut` used only on linux/windows fallback paths
+    #[allow(unused_mut)]
     let mut encoder_name = if args.encoder == "auto" {
         gpu_probe.best_encoder().to_string()
     } else {
@@ -1142,12 +1144,17 @@ fn get_display_origin(target_width: u32, target_height: u32, display_index: usiz
             .iter()
             .filter(|(_, _, w, h)| *w == target_width && *h == target_height)
             .collect();
-        if let Some(&&(x, y, _, _)) = matching.get(display_index.min(matching.len().saturating_sub(1)))
+        if let Some(&&(x, y, _, _)) =
+            matching.get(display_index.min(matching.len().saturating_sub(1)))
         {
             tracing::info!(x, y, target_width, target_height, "Display origin found");
             (x, y)
         } else {
-            tracing::warn!("No monitor matching {}x{}, using (0,0)", target_width, target_height);
+            tracing::warn!(
+                "No monitor matching {}x{}, using (0,0)",
+                target_width,
+                target_height
+            );
             (0, 0)
         }
     }
@@ -1244,7 +1251,10 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
         };
 
         // Get current settings
-        let device_name_w: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let device_name_w: Vec<u16> = device_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let pcwstr = windows::core::PCWSTR(device_name_w.as_ptr());
         let mut dm = DEVMODEW::default();
         dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
@@ -1270,15 +1280,15 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
         if result == DISP_CHANGE_SUCCESSFUL {
             // Apply the change
             let _ = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
-            tracing::info!(width, height, device = device_name, "Display resolution changed");
-            true
-        } else {
-            tracing::warn!(
-                ?result,
+            tracing::info!(
                 width,
                 height,
-                "ChangeDisplaySettingsExW failed"
+                device = device_name,
+                "Display resolution changed"
             );
+            true
+        } else {
+            tracing::warn!(?result, width, height, "ChangeDisplaySettingsExW failed");
             false
         }
     }
@@ -1379,8 +1389,10 @@ fn set_vdd_primary_legacy(vdd_device: &str) -> bool {
         }
 
         // Step 3: queue VDD at (0,0) as primary.
-        let vdd_w_str: Vec<u16> =
-            vdd_device.encode_utf16().chain(std::iter::once(0)).collect();
+        let vdd_w_str: Vec<u16> = vdd_device
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let vdd_pc = windows::core::PCWSTR(vdd_w_str.as_ptr());
         let mut dm = DEVMODEW::default();
         dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
@@ -1432,8 +1444,8 @@ fn run_agent_loop(
     use std::time::{Duration, Instant};
 
     use phantom_core::capture::FrameCapture;
-    use phantom_core::input::InputEvent;
     use phantom_core::encode::FrameEncoder;
+    use phantom_core::input::InputEvent;
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
@@ -1496,9 +1508,7 @@ fn run_agent_loop(
             if let Some(topo) = self.0.take() {
                 match display_ccd::restore(&topo) {
                     Ok(()) => crate::service_win::svc_log("agent: topology restored"),
-                    Err(e) => {
-                        crate::service_win::svc_log(&format!("agent: restore failed: {e:#}"))
-                    }
+                    Err(e) => crate::service_win::svc_log(&format!("agent: restore failed: {e:#}")),
                 }
             }
         }
@@ -1857,7 +1867,11 @@ fn run_agent_loop(
             capture_gdi::switch_to_input_desktop();
             // Offset mouse coordinates to the captured display's position
             // on the virtual desktop (needed for secondary displays like VDD).
-            if let InputEvent::MouseMove { ref mut x, ref mut y } = event {
+            if let InputEvent::MouseMove {
+                ref mut x,
+                ref mut y,
+            } = event
+            {
                 *x += display_x;
                 *y += display_y;
             }

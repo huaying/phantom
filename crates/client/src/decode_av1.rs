@@ -3,15 +3,15 @@
 use anyhow::{Context, Result};
 use phantom_core::encode::FrameDecoder;
 
+#[allow(dead_code)]
 pub struct Dav1dDecoder {
     decoder: dav1d::Decoder,
-    #[allow(dead_code)]
     width: u32,
-    #[allow(dead_code)]
     height: u32,
 }
 
 impl Dav1dDecoder {
+    #[allow(dead_code)]
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let settings = dav1d::Settings::new();
         let decoder =

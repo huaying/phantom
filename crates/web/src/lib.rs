@@ -148,6 +148,7 @@ struct AppState {
 
 /// Snapshot of the most recent Stats message from the server.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct StatsSnapshot {
     rtt_ms: f64,
     fps: f32,
@@ -688,7 +689,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         Message::FileSaved { path, .. } => {
             console::log_1(&format!("File saved: {path}").into());
             let filename = path.rsplit(['\\', '/']).next().unwrap_or(&path);
-            let dir = path.rsplitn(2, ['\\', '/']).nth(1).unwrap_or("");
+            let dir = path.rsplit_once(['\\', '/']).map(|x| x.0).unwrap_or("");
             let escaped_path = path.replace('\\', "\\\\").replace('\'', "\\'");
             let escaped_dir = dir.replace('\\', "\\\\").replace('\'', "\\'");
             let escaped_name = filename.replace('\\', "\\\\").replace('\'', "\\'");
@@ -826,7 +827,11 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
         // Detect resolution change from decoded frame — update canvas + mapping
         if fw > 0 && fh > 0 && (fw != st.server_width || fh != st.server_height) {
             console::log_1(
-                &format!("Resolution changed: {}x{} → {fw}x{fh}", st.server_width, st.server_height).into(),
+                &format!(
+                    "Resolution changed: {}x{} → {fw}x{fh}",
+                    st.server_width, st.server_height
+                )
+                .into(),
             );
             st.server_width = fw;
             st.server_height = fh;
@@ -1646,8 +1651,8 @@ fn setup_input(
             // Browser deltaY already reflects the client OS settings (macOS natural
             // scroll, etc.). Positive = scroll down, which maps to enigo ScrollDown.
             let mut acc = scroll_accum.borrow_mut();
-            acc.0 += e.delta_x() as f64;
-            acc.1 += e.delta_y() as f64;
+            acc.0 += e.delta_x();
+            acc.1 += e.delta_y();
             drop(acc);
 
             // Schedule flush on next rAF (one flush per frame, ~60Hz)
@@ -2001,8 +2006,7 @@ fn setup_input(
             *timeout_id2.borrow_mut() = Some(id);
         });
         let window = web_sys::window().unwrap();
-        let _ =
-            window.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
@@ -2083,7 +2087,10 @@ fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
         return; // Already at this resolution
     }
     console::log_1(&format!("Requesting resolution: {w}x{h} (viewport {vw}x{vh})").into());
-    let msg = Message::ResolutionChange { width: w, height: h };
+    let msg = Message::ResolutionChange {
+        width: w,
+        height: h,
+    };
     send_message(&st, &msg);
 }
 
@@ -2105,7 +2112,10 @@ fn send_message(state: &AppState, msg: &Message) {
 /// Show a toast notification. If `id` is provided, replaces existing toast with same id.
 /// Auto-dismisses after `duration_ms` (0 = persistent until replaced).
 fn show_toast_with_id(msg: &str, id: &str, duration_ms: u32) {
-    let escaped_msg = msg.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"");
+    let escaped_msg = msg
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"");
     let escaped_id = id.replace('\\', "\\\\").replace('\'', "\\'");
     let js = format!(
         r#"(function(){{
@@ -2128,6 +2138,7 @@ fn show_toast_with_id(msg: &str, id: &str, duration_ms: u32) {
     let _ = js_sys::eval(&js);
 }
 
+#[allow(dead_code)]
 fn show_toast(msg: &str) {
     show_toast_with_id(msg, "default", 3000);
 }

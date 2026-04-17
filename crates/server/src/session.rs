@@ -30,6 +30,9 @@ pub trait InputForwarder: Send {
     fn forward_input(&self, event: &InputEvent) -> Result<()>;
 }
 
+pub type ResolutionChangeFn = Box<dyn Fn(u32, u32) + Send>;
+pub type PasteFn = Box<dyn Fn(&str) + Send>;
+
 // ── Inbound events from the network receive thread ──────────────────────────
 
 pub enum InboundEvent {
@@ -64,7 +67,10 @@ pub enum InboundEvent {
         last_sequence: u64,
     },
     /// Client requests display resolution change (adaptive resolution).
-    ResolutionChange { width: u32, height: u32 },
+    ResolutionChange {
+        width: u32,
+        height: u32,
+    },
     Disconnected,
 }
 
@@ -389,11 +395,13 @@ pub struct SessionRunner {
     /// When set, input events are forwarded instead of locally injected.
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
-    pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
+    pub resolution_change_fn: Option<ResolutionChangeFn>,
     /// Optional callback for paste text (service mode → IPC to agent).
-    pub paste_fn: Option<Box<dyn Fn(&str) + Send>>,
+    pub paste_fn: Option<PasteFn>,
     /// Current frame resolution (for detecting changes in IPC mode).
+    #[allow(dead_code)]
     pub current_width: u32,
+    #[allow(dead_code)]
     pub current_height: u32,
 }
 
@@ -615,30 +623,24 @@ impl SessionRunner {
                 Ok(InboundEvent::FileDone {
                     transfer_id,
                     sha256,
-                }) => {
-                    match self.file_transfer.on_file_done(transfer_id, &sha256) {
-                        Ok(Some(ref path)) => {
-                            #[cfg(target_os = "windows")]
-                            crate::service_win::svc_log(&format!(
-                                "FileSaved: {path}"
-                            ));
-                            let _ = self.sender.send_msg(&Message::FileSaved {
-                                transfer_id,
-                                path: path.clone(),
-                            });
-                        }
-                        Ok(None) => {
-                            #[cfg(target_os = "windows")]
-                            crate::service_win::svc_log("FileDone: no path");
-                        }
-                        Err(e) => {
-                            #[cfg(target_os = "windows")]
-                            crate::service_win::svc_log(&format!(
-                                "FileDone error: {e}"
-                            ));
-                        }
+                }) => match self.file_transfer.on_file_done(transfer_id, &sha256) {
+                    Ok(Some(ref path)) => {
+                        #[cfg(target_os = "windows")]
+                        crate::service_win::svc_log(&format!("FileSaved: {path}"));
+                        let _ = self.sender.send_msg(&Message::FileSaved {
+                            transfer_id,
+                            path: path.clone(),
+                        });
                     }
-                }
+                    Ok(None) => {
+                        #[cfg(target_os = "windows")]
+                        crate::service_win::svc_log("FileDone: no path");
+                    }
+                    Err(_e) => {
+                        #[cfg(target_os = "windows")]
+                        crate::service_win::svc_log(&format!("FileDone error: {_e}"));
+                    }
+                },
                 Ok(InboundEvent::Resume {
                     session_token,
                     last_sequence,
@@ -905,9 +907,9 @@ pub struct SessionConfig<'a> {
     /// Receiver for audio-only WebSocket connections (independent from video).
     pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
-    pub resolution_change_fn: Option<Box<dyn Fn(u32, u32) + Send>>,
+    pub resolution_change_fn: Option<ResolutionChangeFn>,
     /// Optional callback for paste text (service mode → IPC to agent).
-    pub paste_fn: Option<Box<dyn Fn(&str) + Send>>,
+    pub paste_fn: Option<PasteFn>,
 }
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────

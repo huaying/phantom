@@ -41,7 +41,9 @@ mod dirs_impl {
             }
         }
         // Linux/macOS: $HOME/Downloads
-        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Downloads"))
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Downloads"))
     }
 
     #[cfg(target_os = "windows")]

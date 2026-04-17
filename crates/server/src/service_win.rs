@@ -56,7 +56,8 @@ const SERVICE_DESCRIPTION: &str =
 const VDD_HARDWARE_ID: &str = r"Root\MttVDD";
 const VDD_CLASS_GUID: &str = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
 const VDD_DRIVER_URL: &str = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip";
-const NEFCON_URL: &str = "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip";
+const NEFCON_URL: &str =
+    "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip";
 
 /// Entry point when invoked by the Windows Service Control Manager.
 /// Call this from main() when `--service` flag is passed.
@@ -413,8 +414,7 @@ fn create_service_session(
             ipc_ref.map(|ipc| {
                 let paste_arc = Arc::clone(&ipc.paste_arc());
                 Box::new(move |text: &str| {
-                    *paste_arc.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(text.to_string());
+                    *paste_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
                 }) as Box<dyn Fn(&str) + Send>
             })
         };
@@ -752,9 +752,8 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken,
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-        PROCESS_INFORMATION, STARTUPINFOW,
+        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
     };
 
     unsafe {
@@ -1034,8 +1033,7 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     for name in ["MttVDD.dll", "MttVDD.inf", "mttvdd.cat"] {
         let src = extracted.join(name);
         let dst = vdd_dir.join(name);
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!("copy {name} to vdd dir"))?;
+        std::fs::copy(&src, &dst).with_context(|| format!("copy {name} to vdd dir"))?;
     }
 
     // Write settings to the path VDD reads from (fixed location).
@@ -1201,7 +1199,7 @@ pub fn install_service() -> anyhow::Result<()> {
             "reset=",
             "86400",
             "actions=",
-            "\"\"",  // No actions — don't auto-restart
+            "\"\"", // No actions — don't auto-restart
         ])
         .status();
 
