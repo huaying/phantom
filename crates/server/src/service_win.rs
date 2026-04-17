@@ -282,15 +282,31 @@ fn run_server_loop(
 
     while !shutdown.load(Ordering::Relaxed) {
         // Check for session changes (driven by SCM SESSION_CHANGE events).
-        // Also poll when agent/IPC are not ready — like Sunshine, we poll every
-        // iteration (~100ms) until an agent is connected. This handles:
-        // - Boot race: service starts before winlogon creates Session 1
-        // - Missed SESSION_CHANGE events
-        // - Agent crash recovery
+        // Also poll every iteration because SCM events are not 100% reliable:
+        // - User-switch ("Switch user") may not fire CONSOLE_DISCONNECT reliably
+        // - Event may fire before WTSGetActiveConsoleSessionId reflects new state
+        // - Agent may be alive + IPC connected but in a now-Disconnected session
+        //   (pipe stays open across sessions, so ipc_alive is a lie here)
+        //
+        // So check three conditions that require update():
+        //  1. Explicit SCM event fired
+        //  2. Missing agent/IPC (first-launch, crash, or we killed it)
+        //  3. Active console session ID changed since last update
+        let active_session = get_active_console_session_id();
+        let session_drift = active_session != 0
+            && active_session != 0xFFFFFFFF
+            && active_session != session_mgr.current_session_id;
         if session_changed.swap(false, Ordering::Relaxed)
             || session_mgr.agent.is_none()
             || session_mgr.ipc().is_none()
+            || session_drift
         {
+            if session_drift {
+                svc_log(&format!(
+                    "Session drift detected: active={active_session} current={}",
+                    session_mgr.current_session_id
+                ));
+            }
             session_mgr.update();
         }
         // Also check if agent died unexpectedly
