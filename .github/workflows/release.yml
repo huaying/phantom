@@ -68,6 +68,12 @@ jobs:
             nasm cmake \
             libpulse-dev libasound2-dev
 
+      # macOS: nasm (OpenH264 SIMD asm) + cmake (opus static build)
+      # macos-latest runners have cmake pre-installed but NOT nasm.
+      - name: Install macOS dependencies
+        if: contains(matrix.target, 'apple-darwin')
+        run: brew install nasm cmake
+
       # Linux aarch64: cross-compilation toolchain
       - name: Install Linux cross-compile dependencies (aarch64)
         if: matrix.cross
