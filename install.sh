@@ -58,9 +58,9 @@ if [ "$OS" = "linux" ]; then
             PKGS="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0"
         fi
         if [ "$INSTALL_CLIENT" = true ]; then
-            # Client: winit needs xcb libs + softbuffer renders via xcb,
-            # alsa for audio output.
-            PKGS="$PKGS libxcb1 libxcb-shm0 libasound2"
+            # Client: winit needs xcb + xcb-randr (multi-monitor), softbuffer
+            # renders via xcb-shm, alsa for audio output.
+            PKGS="$PKGS libxcb1 libxcb-shm0 libxcb-randr0 libasound2"
         fi
         if [ -n "$PKGS" ]; then
             sudo apt-get update -qq
