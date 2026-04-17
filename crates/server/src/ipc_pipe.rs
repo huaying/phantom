@@ -567,10 +567,7 @@ mod platform {
             // Check if IO threads are still alive — a dead thread means
             // the pipe broke and this IPC is no longer usable.
             let read_dead = self._read_thread.as_ref().is_none_or(|h| h.is_finished());
-            let write_dead = self
-                ._write_thread
-                .as_ref()
-                .is_none_or(|h| h.is_finished());
+            let write_dead = self._write_thread.as_ref().is_none_or(|h| h.is_finished());
             if read_dead || write_dead {
                 tracing::warn!(
                     read_dead,
