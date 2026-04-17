@@ -1549,7 +1549,10 @@ fn run_agent_loop(
                     width = gpu.width;
                     height = gpu.height;
                     gpu.force_keyframe();
-                    tracing::info!(width, height, "Tier 1: DXGI→NVENC ready");
+                    crate::service_win::svc_log(&format!(
+                        "Tier 1: DXGI→NVENC ready {}x{}",
+                        width, height
+                    ));
                     gpu_pipeline = Some(gpu);
                     scrap_capture = None;
                     gdi_capture = None;
@@ -1557,7 +1560,7 @@ fn run_agent_loop(
                     capture_mode = "dxgi_nvenc";
                 }
                 Err(e) => {
-                    tracing::warn!("DXGI→NVENC unavailable: {e:#}");
+                    crate::service_win::svc_log(&format!("Tier 1 DXGI→NVENC unavailable: {e:#}"));
 
                     // Tier 2: ScrapCapture (DXGI + CPU readback) — picks highest-res display (VDD)
                     let scrap_result = {
@@ -1588,11 +1591,10 @@ fn run_agent_loop(
                             match encode_h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
                                 Ok(mut enc) => {
                                     enc.force_keyframe();
-                                    tracing::info!(
-                                        width,
-                                        height,
-                                        "Tier 2: ScrapCapture+OpenH264 (DXGI CPU path)"
-                                    );
+                                    crate::service_win::svc_log(&format!(
+                                        "Tier 2: ScrapCapture+OpenH264 {}x{} (CPU path)",
+                                        width, height
+                                    ));
                                     scrap_capture = Some(scrap);
                                     cpu_encoder = Some(Box::new(enc));
                                     capture_mode = "scrap_h264";
@@ -1646,6 +1648,17 @@ fn run_agent_loop(
                     new_h,
                     "Resolution change requested"
                 );
+                // CRITICAL ORDER: drop capture pipelines BEFORE changing display
+                // mode. Otherwise the old pipeline captures the brief black
+                // transition the desktop goes through during mode switch and
+                // sends those black frames to the client — that's the "black
+                // flash" users see. With pipeline dropped first, no frames are
+                // sent during the transition and client keeps the last frame.
+                gpu_pipeline = None;
+                scrap_capture = None;
+                gdi_capture = None;
+                cpu_encoder = None;
+
                 if change_display_resolution(new_w, new_h) {
                     // change_display_resolution uses legacy ChangeDisplaySettingsExW
                     // with CDS_UPDATEREGISTRY, which can re-activate detached paths
@@ -1664,11 +1677,6 @@ fn run_agent_loop(
                             }
                         }
                     }
-                    // Force reinit of all capture pipelines at the new resolution
-                    gpu_pipeline = None;
-                    scrap_capture = None;
-                    gdi_capture = None;
-                    cpu_encoder = None;
                     last_init_attempt = Instant::now() - Duration::from_secs(10);
                     // Brief pause for Windows to settle. 200ms is enough for
                     // DXGI/GDI to reflect the new mode; 500ms was overly safe.
