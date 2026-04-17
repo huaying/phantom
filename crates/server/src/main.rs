@@ -14,6 +14,8 @@
 mod audio_capture;
 #[cfg(target_os = "windows")]
 mod capture_gdi;
+#[cfg(target_os = "windows")]
+mod display_ccd;
 #[cfg(feature = "wayland")]
 mod capture_pipewire;
 mod capture_scrap;
@@ -134,6 +136,12 @@ type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // rustls 0.23 requires explicit CryptoProvider install before any TLS use.
+    // Without this, `ServerConnection::new()` fails silently and TCP connections
+    // get reset during TLS handshake. Must run before service/agent dispatch
+    // because the service path also creates TLS connections.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // ── Windows: agent/service modes need early detection before tracing init ──
     #[cfg(target_os = "windows")]
@@ -1276,6 +1284,140 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
     }
 }
 
+/// Make the MTT VDD the primary display so all windows open on it.
+///
+/// On VMs where another display (e.g. NVIDIA L40 with a CLB2770 EDID emulator,
+/// or DCV's IDD with a connected client) is primary, new windows open there
+/// and our VDD stays empty → Phantom captures a black screen. Setting VDD
+/// primary forces new windows onto VDD; existing windows can be moved by user.
+///
+/// Same approach as Sunshine: position VDD at (0,0) and set CDS_SET_PRIMARY.
+/// Windows automatically repositions other displays to negative coordinates.
+/// Idempotent — calling on an already-primary VDD is a no-op.
+/// Deprecated — the legacy `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` path.
+/// Windows 11 24H2+ returns `DISP_CHANGE_FAILED` for IDD drivers. Kept around
+/// but unused; real work is in `display_ccd::set_vdd_exclusive`.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+fn set_vdd_primary_legacy(vdd_device: &str) -> bool {
+    use windows::Win32::Graphics::Gdi::*;
+
+    unsafe {
+        // Step 1: enumerate all active displays. Get VDD's current width to know
+        // where to place other displays.
+        let mut vdd_w: u32 = 0;
+        let mut others: Vec<(String, i32, i32, u32, u32)> = Vec::new();
+        let mut idx = 0u32;
+        loop {
+            let mut dd = DISPLAY_DEVICEW::default();
+            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
+                break;
+            }
+            idx += 1;
+            // Only attached (active) displays matter
+            // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1
+            if (dd.StateFlags & 0x1) == 0 {
+                continue;
+            }
+            let name = String::from_utf16_lossy(
+                &dd.DeviceName[..dd.DeviceName.iter().position(|&c| c == 0).unwrap_or(32)],
+            );
+            let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut dm = DEVMODEW::default();
+            dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            if !EnumDisplaySettingsW(
+                windows::core::PCWSTR(name_w.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut dm,
+            )
+            .as_bool()
+            {
+                continue;
+            }
+            let x = dm.Anonymous1.Anonymous2.dmPosition.x;
+            let y = dm.Anonymous1.Anonymous2.dmPosition.y;
+            if name == vdd_device {
+                vdd_w = dm.dmPelsWidth;
+            } else {
+                others.push((name, x, y, dm.dmPelsWidth, dm.dmPelsHeight));
+            }
+        }
+        if vdd_w == 0 {
+            crate::service_win::svc_log(&format!(
+                "set_vdd_primary: VDD {vdd_device} not found among attached displays"
+            ));
+            return false;
+        }
+
+        // Step 2: queue moves for all non-VDD displays. Place them sequentially
+        // to the right of VDD: first at x=vdd_w, next at vdd_w+w1, etc.
+        let mut x_offset = vdd_w as i32;
+        for (name, ox, oy, w, h) in &others {
+            let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let pc = windows::core::PCWSTR(name_w.as_ptr());
+            let mut dm = DEVMODEW::default();
+            dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            if !EnumDisplaySettingsW(pc, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+                continue;
+            }
+            dm.Anonymous1.Anonymous2.dmPosition.x = x_offset;
+            dm.Anonymous1.Anonymous2.dmPosition.y = 0;
+            dm.dmFields = DM_POSITION;
+            let r = ChangeDisplaySettingsExW(
+                pc,
+                Some(&dm),
+                None,
+                CDS_UPDATEREGISTRY | CDS_NORESET,
+                None,
+            );
+            crate::service_win::svc_log(&format!(
+                "set_vdd_primary: queue move {name} ({ox},{oy})->({x_offset},0) size={w}x{h} = {}",
+                r.0
+            ));
+            x_offset += *w as i32;
+        }
+
+        // Step 3: queue VDD at (0,0) as primary.
+        let vdd_w_str: Vec<u16> =
+            vdd_device.encode_utf16().chain(std::iter::once(0)).collect();
+        let vdd_pc = windows::core::PCWSTR(vdd_w_str.as_ptr());
+        let mut dm = DEVMODEW::default();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if !EnumDisplaySettingsW(vdd_pc, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            crate::service_win::svc_log(&format!(
+                "set_vdd_primary({vdd_device}): EnumDisplaySettingsW failed"
+            ));
+            return false;
+        }
+        dm.Anonymous1.Anonymous2.dmPosition.x = 0;
+        dm.Anonymous1.Anonymous2.dmPosition.y = 0;
+        dm.dmFields = DM_POSITION;
+        let r = ChangeDisplaySettingsExW(
+            vdd_pc,
+            Some(&dm),
+            None,
+            CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET,
+            None,
+        );
+        crate::service_win::svc_log(&format!(
+            "set_vdd_primary({vdd_device}): queue primary = {}",
+            r.0
+        ));
+        if r != DISP_CHANGE_SUCCESSFUL {
+            return false;
+        }
+
+        // Step 4: apply all queued changes atomically.
+        let apply = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
+        crate::service_win::svc_log(&format!(
+            "set_vdd_primary({vdd_device}): apply = {}",
+            apply.0
+        ));
+        apply == DISP_CHANGE_SUCCESSFUL
+    }
+}
+
 /// Agent capture+encode loop following RustDesk/Sunshine pattern:
 /// - Calls OpenInputDesktop + SetThreadDesktop before capture (follows desktop switches)
 /// - On DXGI error: reinit pipeline (don't crash)
@@ -1300,14 +1442,68 @@ fn run_agent_loop(
     let mut last_clipboard = String::new();
     let mut clipboard_poll = Instant::now();
 
+    // Attach to input desktop BEFORE calling SetDisplayConfig. CCD API returns
+    // ERROR_ACCESS_DENIED if the calling thread isn't attached to an interactive
+    // desktop. Same reason capture calls need this.
+    capture_gdi::switch_to_input_desktop();
+
     // Find VDD device name (e.g. \\.\DISPLAY10) — always capture from VDD.
     // Same approach as DCV/Parsec: target our own virtual display by device name.
     let vdd_device = find_vdd_device_name();
+    crate::service_win::svc_log(&format!("agent: vdd_device = {:?}", vdd_device));
+
+    // Make VDD the ONLY active display (modern CCD API). Runtime-only so
+    // reboot reverts to default if anything goes wrong. Save the original
+    // topology so we can restore it on graceful shutdown.
+    let mut saved_topology: Option<display_ccd::Topology> = None;
     if let Some(ref dev) = vdd_device {
         tracing::info!(device = %dev, "Will capture from VDD");
+        match display_ccd::set_vdd_exclusive(dev) {
+            Ok(topo) => {
+                crate::service_win::svc_log(&format!(
+                    "agent: set_vdd_exclusive({dev}) OK — saved {} paths, {} modes",
+                    topo.paths.len(),
+                    topo.modes.len()
+                ));
+                saved_topology = Some(topo);
+            }
+            Err(e) => {
+                crate::service_win::svc_log(&format!(
+                    "agent: set_vdd_exclusive({dev}) failed: {e:#}"
+                ));
+            }
+        }
     } else {
         tracing::info!("No VDD found — will capture from best available display");
     }
+    // Log displays after topology change so we can verify
+    if let Ok(displays) = capture_scrap::ScrapCapture::list_displays() {
+        for d in &displays {
+            crate::service_win::svc_log(&format!(
+                "agent: display[{}] {}x{} primary={}",
+                d.index, d.width, d.height, d.is_primary
+            ));
+        }
+    }
+
+    // Guard to restore topology on graceful shutdown. Drop-based restore so it
+    // fires even if the agent loop panics. If the process is killed outright
+    // (SIGKILL / TerminateProcess), reboot still restores since we didn't
+    // save to the display database.
+    struct TopologyGuard(Option<display_ccd::Topology>);
+    impl Drop for TopologyGuard {
+        fn drop(&mut self) {
+            if let Some(topo) = self.0.take() {
+                match display_ccd::restore(&topo) {
+                    Ok(()) => crate::service_win::svc_log("agent: topology restored"),
+                    Err(e) => {
+                        crate::service_win::svc_log(&format!("agent: restore failed: {e:#}"))
+                    }
+                }
+            }
+        }
+    }
+    let _topology_guard = TopologyGuard(saved_topology);
 
     // Capture tiers (best to worst):
     // 1. DXGI(VDD)→NVENC zero-copy (GPU capture + GPU encode, ~4ms)
@@ -1451,14 +1647,32 @@ fn run_agent_loop(
                     "Resolution change requested"
                 );
                 if change_display_resolution(new_w, new_h) {
+                    // change_display_resolution uses legacy ChangeDisplaySettingsExW
+                    // with CDS_UPDATEREGISTRY, which can re-activate detached paths
+                    // (NVIDIA comes back as primary). Only re-apply CCD if the
+                    // exclusive state actually got broken — the query is ~10ms,
+                    // SetDisplayConfig is ~100-200ms.
+                    if let Some(ref dev) = vdd_device {
+                        if !display_ccd::is_vdd_already_exclusive(dev) {
+                            match display_ccd::set_vdd_exclusive(dev) {
+                                Ok(_) => crate::service_win::svc_log(
+                                    "agent: re-applied CCD after resize (was broken)",
+                                ),
+                                Err(e) => crate::service_win::svc_log(&format!(
+                                    "agent: re-apply CCD failed after resize: {e:#}"
+                                )),
+                            }
+                        }
+                    }
                     // Force reinit of all capture pipelines at the new resolution
                     gpu_pipeline = None;
                     scrap_capture = None;
                     gdi_capture = None;
                     cpu_encoder = None;
                     last_init_attempt = Instant::now() - Duration::from_secs(10);
-                    // Give Windows a moment to apply the resolution change
-                    std::thread::sleep(Duration::from_millis(500));
+                    // Brief pause for Windows to settle. 200ms is enough for
+                    // DXGI/GDI to reflect the new mode; 500ms was overly safe.
+                    std::thread::sleep(Duration::from_millis(200));
                 }
             }
         }
@@ -1467,6 +1681,14 @@ fn run_agent_loop(
         // Uses capture reset to force DXGI to return a frame on static desktop.
         if ipc.take_keyframe_request() {
             tracing::info!("Agent: received keyframe request from service");
+            // Keyframe request fires on new client session. Re-apply CCD
+            // exclusive only if state got broken — saves ~150ms per session
+            // start on the common case.
+            if let Some(ref dev) = vdd_device {
+                if !display_ccd::is_vdd_already_exclusive(dev) {
+                    let _ = display_ccd::set_vdd_exclusive(dev);
+                }
+            }
             if let Some(ref mut gpu) = gpu_pipeline {
                 gpu.force_keyframe_with_capture_reset();
             }

@@ -213,7 +213,12 @@ fn make_tls_acceptor() -> Result<Arc<rustls::ServerConfig>> {
         (cert_der, key_der)
     };
 
-    let config = rustls::ServerConfig::builder()
+    // Pass provider explicitly. rustls 0.23 ServerConfig::builder() panics if
+    // no default provider is installed, even if the `ring` feature is enabled.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("rustls protocol versions: {e}"))?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
     Ok(Arc::new(config))
@@ -324,7 +329,14 @@ impl WebServerTransport {
                             let _guard = guard; // held until this thread exits
                             let conn = match rustls::ServerConnection::new(tls) {
                                 Ok(c) => c,
-                                Err(_) => return,
+                                Err(e) => {
+                                    tracing::warn!("ServerConnection::new failed: {e}");
+                                    #[cfg(target_os = "windows")]
+                                    crate::service_win::svc_log(&format!(
+                                        "ServerConnection::new failed: {e}"
+                                    ));
+                                    return;
+                                }
                             };
                             let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
 
@@ -390,7 +402,14 @@ impl WebServerTransport {
                             let _guard = guard;
                             let conn = match rustls::ServerConnection::new(tls) {
                                 Ok(c) => c,
-                                Err(_) => return,
+                                Err(e) => {
+                                    tracing::warn!("ServerConnection::new failed: {e}");
+                                    #[cfg(target_os = "windows")]
+                                    crate::service_win::svc_log(&format!(
+                                        "ServerConnection::new failed: {e}"
+                                    ));
+                                    return;
+                                }
                             };
                             let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
 
