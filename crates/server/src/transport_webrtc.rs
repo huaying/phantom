@@ -567,4 +567,28 @@ impl MessageReceiver for WebRtcReceiver {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    fn recv_msg_within(&mut self, timeout: Duration) -> Result<Option<Message>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.input_rx.try_recv() {
+                Ok(d) => return bincode::deserialize(&d).context("deserialize").map(Some),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("input channel closed");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match self.control_rx.try_recv() {
+                Ok(d) => return bincode::deserialize(&d).context("deserialize").map(Some),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("control channel closed");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }

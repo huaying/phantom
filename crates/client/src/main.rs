@@ -130,6 +130,7 @@ fn main() -> Result<()> {
         send_file: args.send_file,
         send_file_initiated: false,
         last_session_token: Vec::new(),
+        client_id: rand::random(),
     };
 
     event_loop
@@ -198,6 +199,59 @@ struct App {
     send_file_initiated: bool,
     /// Saved session token from previous connection for reconnect.
     last_session_token: Vec<u8>,
+    /// Stable per-process client id. Server uses this to distinguish an
+    /// auto-reconnect of the same client (same id → accepted) from a
+    /// genuinely new client (different id → takes over); repeated
+    /// reconnect attempts with the same id after being kicked get
+    /// rejected so this process can't thrash a newer client.
+    client_id: [u8; 16],
+}
+
+/// Standard VDD resolutions. Must be kept in sync with the web client's
+/// STANDARD_RESOLUTIONS (crates/web/src/lib.rs) and vdd_settings.xml on the
+/// server side — any value here that isn't in vdd_settings.xml won't apply.
+const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
+    (1024, 768),
+    (1152, 864),
+    (1280, 720),
+    (1280, 800),
+    (1280, 960),
+    (1280, 1024),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1600, 1200),
+    (1680, 1050),
+    (1920, 1080),
+];
+
+/// Pick the resolution the client will converge to after the window opens.
+/// Matches the post-open debounced-resize formula in the event loop
+/// (`window_size * 1.3` then closest standard), so the server lands at the
+/// final size on the FIRST frame — no open-at-wrong-res flicker and no
+/// post-Hello ResolutionChange round-trip.
+///
+///   target = (monitor * 0.8)  // window size fit_window_size will pick
+///          * 1.3               // same server-upscale the debounce uses
+///          = monitor * 1.04
+///
+/// Returns (0, 0) if scrap can't read the primary monitor — server treats
+/// that as "no hint, keep current VDD res".
+fn preferred_server_resolution() -> (u32, u32) {
+    let Some((screen_w, screen_h)) =
+        scrap::Display::primary().ok().map(|d| (d.width() as u32, d.height() as u32))
+    else {
+        return (0, 0);
+    };
+    let tw = (screen_w as f32 * 0.8 * 1.3) as u32;
+    let th = (screen_h as f32 * 0.8 * 1.3) as u32;
+    let mut best = (0u32, 0u32);
+    for &(w, h) in STANDARD_RESOLUTIONS {
+        if w <= tw && h <= th {
+            best = (w, h);
+        }
+    }
+    best
 }
 
 impl App {
@@ -259,6 +313,22 @@ impl App {
                 return;
             }
         };
+
+        // Send ClientHello as the very first message so the server's doorbell
+        // can tell auto-reconnect attempts apart from fresh clients, and so
+        // the server can pre-size the VDD to match this client's primary
+        // monitor BEFORE sending Hello (no open-at-wrong-res flicker, and no
+        // post-Hello ResolutionChange that kicks an already-connected browser
+        // tab into its own reconnect loop).
+        let (preferred_width, preferred_height) = preferred_server_resolution();
+        if let Err(e) = sender.send_msg(&Message::ClientHello {
+            client_id: self.client_id,
+            preferred_width,
+            preferred_height,
+        }) {
+            tracing::warn!("failed to send ClientHello: {e}");
+            return;
+        }
 
         // Read Hello and check protocol version
         let (width, height, server_audio, video_codec, new_session_token) =

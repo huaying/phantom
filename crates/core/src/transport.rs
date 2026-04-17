@@ -1,5 +1,6 @@
 use crate::protocol::Message;
 use anyhow::Result;
+use std::time::Duration;
 
 /// A bidirectional connection that can send/receive protocol messages.
 pub trait Connection: Send {
@@ -15,6 +16,14 @@ pub trait MessageSender: Send {
 /// Receive-only half of a split connection.
 pub trait MessageReceiver: Send {
     fn recv_msg(&mut self) -> Result<Message>;
+
+    /// Best-effort timed read. Returns `Ok(None)` on timeout, `Ok(Some(msg))`
+    /// on success, `Err` on transport-level failure. Default implementation
+    /// is a plain blocking `recv_msg()` — the `timeout` hint is ignored; use
+    /// this for transports that expose a native timeout (e.g. mpsc-backed).
+    fn recv_msg_within(&mut self, _timeout: Duration) -> Result<Option<Message>> {
+        self.recv_msg().map(Some)
+    }
 }
 
 /// Server-side transport: listens and accepts connections.

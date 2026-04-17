@@ -88,7 +88,36 @@ pub struct PlainReceiver {
 
 impl MessageReceiver for PlainReceiver {
     fn recv_msg(&mut self) -> Result<Message> {
+        self.stream.set_read_timeout(None).ok();
         protocol::read_message(&mut self.stream)
+    }
+
+    fn recv_msg_within(&mut self, timeout: std::time::Duration) -> Result<Option<Message>> {
+        self.stream.set_read_timeout(Some(timeout)).ok();
+        let r = protocol::read_message(&mut self.stream);
+        self.stream.set_read_timeout(None).ok();
+        match r {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                // Distinguish WouldBlock/TimedOut from real errors. The
+                // underlying error comes from read() on the TcpStream so
+                // check its chain for the io::ErrorKind.
+                let is_timeout = e
+                    .chain()
+                    .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                    .any(|io_e| {
+                        matches!(
+                            io_e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )
+                    });
+                if is_timeout {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 

@@ -771,4 +771,14 @@ impl MessageReceiver for WsReceiver {
         let data = self.rx.recv().context("ws closed")?;
         bincode::deserialize(&data).context("deserialize")
     }
+
+    fn recv_msg_within(&mut self, timeout: std::time::Duration) -> Result<Option<Message>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(data) => bincode::deserialize(&data)
+                .context("deserialize")
+                .map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("ws closed")),
+        }
+    }
 }

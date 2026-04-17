@@ -2546,6 +2546,7 @@ dependencies = [
  "phantom-core",
  "phantom-gpu",
  "quinn",
+ "rand 0.8.5",
  "rustls",
  "scrap",
  "softbuffer",

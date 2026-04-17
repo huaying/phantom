@@ -158,6 +158,14 @@ fn run_server_loop(
     use std::sync::mpsc;
 
     type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
+    // After the doorbell has pulled ClientHello off the wire, it attaches
+    // any resolution hint (Some((w, h)) when client's viewport suggests a
+    // specific VDD size; None for legacy / unhinted clients).
+    type PendingSession = (
+        Box<dyn MessageSender>,
+        Box<dyn MessageReceiver>,
+        Option<(u32, u32)>,
+    );
 
     let listen_addr = "0.0.0.0:9900";
     let base_port: u16 = 9900;
@@ -252,24 +260,114 @@ fn run_server_loop(
     );
 
     // Main loop: accept connections and run sessions
-    let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
+    let pending: Arc<std::sync::Mutex<Option<PendingSession>>> =
         Arc::new(std::sync::Mutex::new(None));
     // cancel: shared with Stop handler (passed from run_service)
     let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
+    // Client-identity tracking for thrash prevention.
+    //  - `current_client_id`: the id of whoever owns the active session (if any)
+    //  - `ghost_ids`: ids we've recently kicked; auto-reconnect attempts
+    //    from these ids get rejected immediately so they can't steal back
+    //    the session from the new legitimate owner.
+    // Using a small VecDeque capped at 16 entries — plenty for the "N
+    // forgotten browser tabs" scenario, and we don't want this to grow
+    // unbounded.
+    let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(16)));
+    const GHOST_MAX: usize = 16;
 
     // Doorbell thread
     {
         let conn_rx = Arc::clone(&conn_rx);
         let pending = Arc::clone(&pending);
         let cancel = Arc::clone(&cancel);
+        let current_client_id = Arc::clone(&current_client_id);
+        let ghost_ids = Arc::clone(&ghost_ids);
         std::thread::Builder::new()
             .name("svc-doorbell".into())
             .spawn(move || loop {
                 let pair = { conn_rx.lock().unwrap().recv() };
                 match pair {
-                    Ok(conn) => {
+                    Ok((sender, mut receiver)) => {
+                        // Expect ClientHello as the first message. Clients
+                        // built after we added client-id tracking always send
+                        // one; legacy clients don't, and we grant them a
+                        // 500ms grace window before treating them as "no id".
+                        let (id, resolution_hint): (Option<[u8; 16]>, Option<(u32, u32)>) =
+                            match receiver.recv_msg_within(Duration::from_millis(500)) {
+                                Ok(Some(phantom_core::protocol::Message::ClientHello {
+                                    client_id,
+                                    preferred_width,
+                                    preferred_height,
+                                })) => {
+                                    let hint =
+                                        if preferred_width > 0 && preferred_height > 0 {
+                                            Some((preferred_width, preferred_height))
+                                        } else {
+                                            None
+                                        };
+                                    (Some(client_id), hint)
+                                }
+                                _ => (None, None),
+                            };
+
+                        // Decision logic: look up id against current/ghost sets.
+                        let mut cur = current_client_id.lock().unwrap();
+                        let mut ghosts = ghost_ids.lock().unwrap();
+                        let accept = match id {
+                            Some(id) if ghosts.iter().any(|g| g == &id) => {
+                                tracing::info!(
+                                    "Doorbell: rejecting ghost client (already kicked)"
+                                );
+                                false
+                            }
+                            Some(id) if *cur == Some(id) => {
+                                // Same client reconnecting — allow (probably a
+                                // transient network blip); no ghost shuffle.
+                                true
+                            }
+                            Some(id) => {
+                                // A genuinely new client takes over. Demote
+                                // the old one to ghost so its auto-reconnect
+                                // loop won't thrash us.
+                                if let Some(old) = cur.take() {
+                                    ghosts.push_back(old);
+                                    while ghosts.len() > GHOST_MAX {
+                                        ghosts.pop_front();
+                                    }
+                                }
+                                *cur = Some(id);
+                                true
+                            }
+                            None => {
+                                // Legacy / unidentified — treat as new but
+                                // don't track (no id to remember).
+                                if let Some(old) = cur.take() {
+                                    ghosts.push_back(old);
+                                    while ghosts.len() > GHOST_MAX {
+                                        ghosts.pop_front();
+                                    }
+                                }
+                                true
+                            }
+                        };
+                        drop(cur);
+                        drop(ghosts);
+
+                        if !accept {
+                            // Drop sender+receiver → transport IO thread
+                            // sees EOF → closes socket → client sees
+                            // onclose → auto-reconnect (will be rejected
+                            // again until page reload gives it a new id).
+                            drop(sender);
+                            drop(receiver);
+                            continue;
+                        }
+
                         let had_existing = pending.lock().unwrap().is_some();
-                        *pending.lock().unwrap() = Some(conn);
+                        *pending.lock().unwrap() = Some((sender, receiver, resolution_hint));
                         if had_existing {
                             tracing::info!("New client arrived, replacing queued connection");
                         }
@@ -346,13 +444,19 @@ fn run_server_loop(
 
         // Check for pending connection
         let conn = pending.lock().unwrap().take();
-        if let Some((sender, receiver)) = conn {
+        if let Some((sender, receiver, resolution_hint)) = conn {
             cancel.store(false, Ordering::Relaxed);
             let session_cancel = Arc::clone(&cancel);
 
             // In service mode, relay agent frames via IPC (DXGI/GDI from user session).
             // If agent is not connected yet, reject the client.
-            match create_service_session(&mut session_mgr, sender, receiver, session_cancel) {
+            match create_service_session(
+                &mut session_mgr,
+                sender,
+                receiver,
+                session_cancel,
+                resolution_hint,
+            ) {
                 Ok(result) => {
                     tracing::info!("Service session ended: {}", result.error);
                 }
@@ -382,6 +486,7 @@ fn create_service_session(
     sender: Box<dyn phantom_core::transport::MessageSender>,
     receiver: Box<dyn phantom_core::transport::MessageReceiver>,
     cancel: Arc<AtomicBool>,
+    resolution_hint: Option<(u32, u32)>,
 ) -> anyhow::Result<crate::session::SessionResult> {
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
@@ -403,15 +508,42 @@ fn create_service_session(
     {
         let ipc = session_mgr.ipc.as_ref().unwrap();
 
+        // If the client hinted a preferred resolution, apply it now so the
+        // first frame we wait for below is already at that size. The agent's
+        // capture loop polls the resolution arc each iteration; when it sees
+        // a change it drops the pipeline, reinits at the new mode, and
+        // resumes producing frames. We then discard any stale frames still
+        // in the IPC pipe that don't match the hint.
+        if let Some((hw, hh)) = resolution_hint {
+            *ipc.resolution_change_arc()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((hw, hh));
+            svc_log(&format!(
+                "create_service_session: resolution hint {hw}x{hh} applied"
+            ));
+        }
+
         // Request keyframe from agent — triggers DXGI capture reset so the
         // agent produces a frame even on a static desktop.
         let _ = ipc.request_keyframe();
 
-        // Wait for first encoded frame from agent to get resolution
+        // Wait for first encoded frame from agent to get resolution. When a
+        // hint is set, skip any frames that don't match — those were captured
+        // before the agent applied the mode switch and would cause a visible
+        // resize on the client.
         let mut attempts = 0;
         svc_log("Waiting for first encoded frame from agent...");
-        let (width, height) = loop {
-            if let Some(ef) = ipc.recv_encoded_frames().into_iter().next() {
+        let (width, height) = 'wait: loop {
+            for ef in ipc.recv_encoded_frames() {
+                if let Some((hw, hh)) = resolution_hint {
+                    if ef.width != hw || ef.height != hh {
+                        svc_log(&format!(
+                            "Discarding stale frame {}x{} (waiting for {}x{})",
+                            ef.width, ef.height, hw, hh
+                        ));
+                        continue;
+                    }
+                }
                 svc_log(&format!(
                     "Got frame: {}x{} {} bytes kf={}",
                     ef.width,
@@ -426,15 +558,19 @@ fn create_service_session(
                     keyframe = ef.encoded.is_keyframe,
                     "Got encoded frame from agent"
                 );
-                break (ef.width, ef.height);
+                break 'wait (ef.width, ef.height);
             }
             attempts += 1;
             if attempts % 10 == 0 {
                 tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
             }
-            if attempts > 100 {
-                svc_log("No frames after 2s — agent not producing frames");
-                anyhow::bail!("agent connected but not producing frames after 2s");
+            // With a resolution hint, the agent needs ~500ms to apply the
+            // mode switch before producing a matching frame. Give it up to
+            // 5s (was 2s) so the VDD reinit can finish on slower GPUs.
+            let cap = if resolution_hint.is_some() { 250 } else { 100 };
+            if attempts > cap {
+                svc_log("No matching frames from agent within timeout");
+                anyhow::bail!("agent connected but not producing frames in time");
             }
             std::thread::sleep(Duration::from_millis(20));
         };

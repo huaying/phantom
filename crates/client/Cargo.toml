@@ -7,6 +7,7 @@ edition = "2021"
 phantom-core = { path = "../core" }
 phantom-gpu = { path = "../gpu", features = ["nvdec"] }
 anyhow = "1"
+rand = "0.8"
 bincode = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

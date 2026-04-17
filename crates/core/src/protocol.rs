@@ -148,6 +148,27 @@ pub enum Message {
         /// Server-side encode time per frame in microseconds (average).
         encode_us: u64,
     },
+
+    /// Client → Server: identity introduction sent as the FIRST message on
+    /// every connection (including auto-reconnect). `client_id` is generated
+    /// once per client process / browser-tab lifetime and stays stable across
+    /// auto-reconnects (in-memory only — page reload or native process
+    /// restart yields a fresh id).
+    ///
+    /// Server uses this to distinguish legitimate reconnect / new client
+    /// from a ghost retry (a client we already kicked whose auto-reconnect
+    /// loop is thrashing the active session). Ghost ids are held in a
+    /// bounded set and rejected; fresh ids take over normally.
+    ClientHello {
+        client_id: [u8; 16],
+        /// Preferred initial resolution derived from the client's viewport.
+        /// Zero = no hint (keep current VDD res). When non-zero, server
+        /// applies this BEFORE sending Hello so the first rendered frame is
+        /// already at the right size — avoids the "open → flash old res →
+        /// resize" flicker the user sees on every new tab.
+        preferred_width: u32,
+        preferred_height: u32,
+    },
 }
 
 fn default_protocol_version_1() -> u32 {

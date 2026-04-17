@@ -144,6 +144,22 @@ struct AppState {
     audio_ctx: Option<web_sys::AudioContext>,
     /// Timestamp counter for audio chunks (in microseconds).
     audio_timestamp_us: i64,
+    /// Stable per-tab client id. Server uses this to distinguish an
+    /// auto-reconnect (same id → accepted) from a fresh client (different
+    /// id → takes over). Page reload yields a new id because we keep it
+    /// only in memory, not sessionStorage.
+    client_id: [u8; 16],
+}
+
+/// Generate a random 16-byte client id via Web Crypto.
+fn gen_client_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    if let Some(window) = web_sys::window() {
+        if let Ok(crypto) = window.crypto() {
+            let _ = crypto.get_random_values_with_u8_array(&mut id);
+        }
+    }
+    id
 }
 
 /// Snapshot of the most recent Stats message from the server.
@@ -210,6 +226,7 @@ pub fn main() {
         audio_decoder: None,
         audio_ctx: None,
         audio_timestamp_us: 0,
+        client_id: gen_client_id(),
     }));
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
@@ -287,6 +304,28 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
             }
         });
         control_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    // When input DC opens → send ClientHello immediately so the doorbell
+    // can match this connection against the current/ghost sets and pre-size
+    // the VDD before the session spins up.
+    {
+        let s = state.clone();
+        let dc = input_dc.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let id = s.borrow().client_id;
+            let (pw, ph) = preferred_viewport();
+            let msg = Message::ClientHello {
+                client_id: id,
+                preferred_width: pw,
+                preferred_height: ph,
+            };
+            if let Ok(bytes) = bincode::serialize(&msg) {
+                let _ = dc.send_with_u8_array(&bytes);
+            }
+        });
+        input_dc.set_onopen(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
     }
 
@@ -423,10 +462,25 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
         cb.forget();
     }
 
-    // onopen — reset retry delay
+    // onopen — send ClientHello as the first message so the server's
+    // doorbell can tell this tab apart from ghost auto-reconnects, and so
+    // the server can pre-size the VDD to match this tab's viewport BEFORE
+    // sending Hello (avoids the open-flash-resize flicker).
     {
-        let cb = Closure::<dyn FnMut()>::new(|| {
+        let s = state.clone();
+        let ws_clone = ws.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
             console::log_1(&"WebSocket connected!".into());
+            let id = s.borrow().client_id;
+            let (pw, ph) = preferred_viewport();
+            let msg = Message::ClientHello {
+                client_id: id,
+                preferred_width: pw,
+                preferred_height: ph,
+            };
+            if let Ok(bytes) = bincode::serialize(&msg) {
+                let _ = ws_clone.send_with_u8_array(&bytes);
+            }
         });
         ws.set_onopen(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
@@ -2070,6 +2124,23 @@ fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
         }
     }
     best
+}
+
+/// Compute the preferred initial resolution from the current browser viewport.
+/// Sent in ClientHello so the server can pre-size the VDD before Hello,
+/// avoiding the "open → flash old res → resize" flicker on every new tab.
+/// Returns (0, 0) if the viewport can't be read (shouldn't happen in a browser).
+fn preferred_viewport() -> (u32, u32) {
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return (0, 0),
+    };
+    let vw = window.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+    let vh = window.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+    if vw == 0 || vh == 0 {
+        return (0, 0);
+    }
+    closest_resolution(vw, vh)
 }
 
 /// Send a ResolutionChange message matching the browser viewport size.
