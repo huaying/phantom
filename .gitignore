@@ -1,2 +1,13 @@
 /target
 core.*
+
+# OS metadata
+.DS_Store
+*.swp
+
+# Local Claude state (per-machine)
+/.claude/scheduled_tasks.lock
+/.claude/settings.local.json
+
+# Test logs
+*.log
