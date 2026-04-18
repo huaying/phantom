@@ -138,6 +138,49 @@ if [ "$INSTALL_CLIENT" = true ]; then
     download_and_install "phantom-client"
 fi
 
+# --- Linux server: configure /dev/uinput for keyboard injection ---
+# Server uses /dev/uinput to create a virtual keyboard (bypasses the
+# X11 XKB remap path that scrambles keys on GDM 42, and also works on
+# Wayland + lock screens where XTest can't reach). Needs:
+#   1. udev rule giving the `input` group rw on /dev/uinput
+#   2. invoking user in the `input` group
+# Without this the server still runs but falls back to enigo/XTest,
+# with a loud warning in logs and the known GDM-42 scramble bug
+# lurking.
+if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
+    echo ""
+    echo "Configuring /dev/uinput for keyboard injection..."
+    UDEV_RULE_PATH="/etc/udev/rules.d/99-phantom-uinput.rules"
+    UDEV_RULE_CONTENT='KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"'
+
+    # Only write if missing or different (idempotent re-install)
+    if [ ! -f "$UDEV_RULE_PATH" ] || ! grep -qxF "$UDEV_RULE_CONTENT" "$UDEV_RULE_PATH" 2>/dev/null; then
+        echo "$UDEV_RULE_CONTENT" | sudo tee "$UDEV_RULE_PATH" > /dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger /dev/uinput 2>/dev/null || true
+        echo "  Wrote $UDEV_RULE_PATH"
+    else
+        echo "  udev rule already in place"
+    fi
+
+    # Add invoking user to input group. SUDO_USER preferred when
+    # install.sh is piped through sudo; fall back to $USER.
+    TARGET_USER="${SUDO_USER:-$USER}"
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        if id -nG "$TARGET_USER" 2>/dev/null | grep -qw input; then
+            echo "  User $TARGET_USER already in 'input' group"
+        else
+            sudo usermod -a -G input "$TARGET_USER"
+            echo "  Added $TARGET_USER to 'input' group"
+            echo ""
+            echo "⚠️  Log out and back in for the 'input' group to take effect,"
+            echo "   or run 'newgrp input' in your current shell before starting"
+            echo "   phantom-server. Otherwise keyboard injection falls back to"
+            echo "   XTest (login screen typing may be unreliable on Ubuntu 22)."
+        fi
+    fi
+fi
+
 # --- Post-install hints ---
 echo ""
 echo "Done!"
