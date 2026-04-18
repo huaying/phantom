@@ -1236,8 +1236,48 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
         ])
         .status();
 
-    // Remove any existing VDD device nodes (prevents duplicates from repeated installs).
+    // Remove ALL existing VDD device nodes before installing a fresh one.
+    // The previous code ran `nefconw --remove-device-node` exactly once,
+    // which only removes the first matching device. Any extra instances
+    // left over from a partial/failed previous install stayed, and the
+    // new `nefconw install` below added another on top — so repeated
+    // uninstall→install cycles accumulated duplicate Virtual Display
+    // Driver entries in Win32_VideoController. Now we enumerate via
+    // pnputil and remove every one before installing.
     println!("  Removing old VDD device nodes...");
+    let enum_out = std::process::Command::new("pnputil")
+        .args(["/enum-devices", "/connected"])
+        .output();
+    let mut removed = 0usize;
+    if let Ok(out) = enum_out {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // pnputil groups fields per device. "Instance ID: ROOT\MTTVDD\..."
+        // identifies VDD devices; there's one line per device, and the
+        // preceding Instance ID line is what `pnputil /remove-device`
+        // wants.
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(id) = t.strip_prefix("Instance ID:") {
+                let id = id.trim();
+                if id.to_ascii_uppercase().contains("MTTVDD") {
+                    let r = std::process::Command::new("pnputil")
+                        .args(["/remove-device", id])
+                        .status();
+                    match r {
+                        Ok(s) if s.success() => removed += 1,
+                        Ok(s) => println!(
+                            "  Warning: pnputil /remove-device {id} exit code {:?}",
+                            s.code()
+                        ),
+                        Err(e) => println!("  Warning: pnputil spawn failed: {e}"),
+                    }
+                }
+            }
+        }
+    }
+    // Belt-and-suspenders: also call nefconw's by-hardware-id flavour in
+    // case pnputil missed anything (different Windows builds surface
+    // the instance list differently).
     let _ = std::process::Command::new(&nefconw_dst)
         .args([
             "--remove-device-node",
@@ -1247,6 +1287,9 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
             VDD_CLASS_GUID,
         ])
         .status();
+    if removed > 0 {
+        println!("  Removed {removed} existing VDD device node(s).");
+    }
 
     // Install driver using nefcon (devcon-compatible syntax: install <inf> <hwid>).
     // This creates exactly one device node + installs the driver.
