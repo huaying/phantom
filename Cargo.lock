@@ -2635,7 +2635,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-bench"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "openh264",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-client"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-gpu"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "phantom-core",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-web"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bincode",
  "js-sys",
