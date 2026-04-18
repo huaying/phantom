@@ -2135,8 +2135,16 @@ fn preferred_viewport() -> (u32, u32) {
         Some(w) => w,
         None => return (0, 0),
     };
-    let vw = window.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
-    let vh = window.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+    let vw = window
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as u32;
+    let vh = window
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as u32;
     if vw == 0 || vh == 0 {
         return (0, 0);
     }

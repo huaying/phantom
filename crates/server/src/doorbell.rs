@@ -167,7 +167,7 @@ mod tests {
         let mut ghosts = VecDeque::new();
         decide(Some(id(1)), &mut current, &mut ghosts); // A connects
         decide(Some(id(2)), &mut current, &mut ghosts); // B takes over
-        // A's WS reconnect attempt with same id → rejected
+                                                        // A's WS reconnect attempt with same id → rejected
         assert_eq!(
             decide(Some(id(1)), &mut current, &mut ghosts),
             DoorbellDecision::Reject

@@ -275,9 +275,9 @@ fn run_server_loop(
     let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-            crate::doorbell::GHOST_MAX,
-        )));
+        Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(crate::doorbell::GHOST_MAX),
+        ));
 
     // Doorbell thread
     {
@@ -303,12 +303,11 @@ fn run_server_loop(
                                     preferred_width,
                                     preferred_height,
                                 })) => {
-                                    let hint =
-                                        if preferred_width > 0 && preferred_height > 0 {
-                                            Some((preferred_width, preferred_height))
-                                        } else {
-                                            None
-                                        };
+                                    let hint = if preferred_width > 0 && preferred_height > 0 {
+                                        Some((preferred_width, preferred_height))
+                                    } else {
+                                        None
+                                    };
                                     (Some(client_id), hint)
                                 }
                                 _ => (None, None),
@@ -322,9 +321,7 @@ fn run_server_loop(
                         drop(ghosts);
 
                         if matches!(decision, crate::doorbell::DoorbellDecision::Reject) {
-                            tracing::info!(
-                                "Doorbell: rejecting ghost client (already kicked)"
-                            );
+                            tracing::info!("Doorbell: rejecting ghost client (already kicked)");
                             // Drop sender+receiver → transport IO thread
                             // sees EOF → closes socket → client sees
                             // onclose → auto-reconnect (will be rejected

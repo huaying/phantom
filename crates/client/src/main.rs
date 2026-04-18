@@ -238,8 +238,9 @@ const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
 /// Returns (0, 0) if scrap can't read the primary monitor — server treats
 /// that as "no hint, keep current VDD res".
 fn preferred_server_resolution() -> (u32, u32) {
-    let Some((screen_w, screen_h)) =
-        scrap::Display::primary().ok().map(|d| (d.width() as u32, d.height() as u32))
+    let Some((screen_w, screen_h)) = scrap::Display::primary()
+        .ok()
+        .map(|d| (d.width() as u32, d.height() as u32))
     else {
         return (0, 0);
     };

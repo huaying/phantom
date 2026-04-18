@@ -160,11 +160,7 @@ struct LogGuards {
 
 /// Initialise tracing with stdout output and (optionally) a rotating file
 /// sink. Falls back to stdout-only if the file path can't be opened.
-fn init_tracing(
-    log_file: &Option<std::path::PathBuf>,
-    rotate: &str,
-    keep: usize,
-) -> LogGuards {
+fn init_tracing(log_file: &Option<std::path::PathBuf>, rotate: &str, keep: usize) -> LogGuards {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -695,9 +691,9 @@ fn main() -> Result<()> {
     let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-            doorbell::GHOST_MAX,
-        )));
+        Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(doorbell::GHOST_MAX),
+        ));
 
     {
         let conn_rx = Arc::clone(&conn_rx);
@@ -715,15 +711,14 @@ fn main() -> Result<()> {
                         // (pre-feature) don't send one — they get a None id and
                         // are accepted unconditionally (no tracking). New
                         // clients always send one within the first message.
-                        let id: Option<[u8; 16]> = match receiver
-                            .recv_msg_within(Duration::from_millis(500))
-                        {
-                            Ok(Some(phantom_core::protocol::Message::ClientHello {
-                                client_id,
-                                ..
-                            })) => Some(client_id),
-                            _ => None,
-                        };
+                        let id: Option<[u8; 16]> =
+                            match receiver.recv_msg_within(Duration::from_millis(500)) {
+                                Ok(Some(phantom_core::protocol::Message::ClientHello {
+                                    client_id,
+                                    ..
+                                })) => Some(client_id),
+                                _ => None,
+                            };
 
                         let mut cur = current_client_id.lock().unwrap();
                         let mut ghosts = ghost_ids.lock().unwrap();
@@ -732,9 +727,7 @@ fn main() -> Result<()> {
                         drop(ghosts);
 
                         if matches!(decision, doorbell::DoorbellDecision::Reject) {
-                            tracing::info!(
-                                "Doorbell: rejecting ghost client (already kicked)"
-                            );
+                            tracing::info!("Doorbell: rejecting ghost client (already kicked)");
                             drop(sender);
                             drop(receiver);
                             continue;
