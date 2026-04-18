@@ -419,7 +419,34 @@ impl App {
         let _decoder_name = &self.args_decoder;
         let decoder: Box<dyn phantom_core::encode::FrameDecoder> = {
             #[cfg(target_os = "macos")]
-            if _decoder_name == "auto" || _decoder_name == "videotoolbox" {
+            if video_codec == phantom_core::encode::VideoCodec::Av1 {
+                // VideoToolbox on macOS only handles H.264 in our codebase —
+                // server-side AV1 (e.g. L40 GPU auto-selects AV1) must go
+                // through dav1d. Without this branch, the client picked
+                // VideoToolbox regardless of server codec and every frame
+                // failed with "SPS/PPS not yet available" (an H.264-shaped
+                // error against AV1 bytes).
+                #[cfg(feature = "av1")]
+                {
+                    match decode_av1::Dav1dDecoder::new(width, height) {
+                        Ok(d) => {
+                            tracing::info!("using Dav1dDecoder (macOS software AV1)");
+                            Box::new(d)
+                        }
+                        Err(e) => {
+                            tracing::error!("AV1 decoder init failed: {e}");
+                            return;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "av1"))]
+                {
+                    tracing::error!(
+                        "Server sent AV1 but client built without 'av1' feature (needs libdav1d)"
+                    );
+                    return;
+                }
+            } else if _decoder_name == "auto" || _decoder_name == "videotoolbox" {
                 match decode_videotoolbox::VideoToolboxDecoder::new(width, height) {
                     Ok(d) => {
                         tracing::info!("using VideoToolbox hardware decoder");
