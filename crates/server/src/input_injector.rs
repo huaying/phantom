@@ -106,9 +106,7 @@ impl InputInjector {
                         Err(e) => {
                             // Device died unexpectedly (e.g. module unloaded).
                             // Drop to enigo path for this call and future ones.
-                            tracing::warn!(
-                                "uinput inject failed: {e:#}; dropping uinput backend"
-                            );
+                            tracing::warn!("uinput inject failed: {e:#}; dropping uinput backend");
                             self.uinput = None;
                         }
                     }

@@ -63,7 +63,10 @@ struct Args {
     #[arg(long, default_value = "auto")]
     encoder: String,
 
-    /// Video codec: auto (default, uses AV1 if GPU supports it), h264, av1.
+    /// Video codec: auto (default — H.264 for broad client compat), h264, av1.
+    /// AV1 is opt-in only: hardware AV1 decode isn't ubiquitous on clients
+    /// yet; software fallback can cause laggy native typing and web tab
+    /// OOM crashes. See docs/features.md "AV1 (opt-in, work in progress)".
     #[arg(long, default_value = "auto")]
     codec: String,
 
@@ -365,19 +368,40 @@ fn main() -> Result<()> {
         capture_name = "scrap".to_string();
     }
 
+    // Default codec selection intentionally picks H.264 even when the
+    // GPU can do AV1. Reason: AV1 support on the client side is the
+    // weak link — software dav1d on a mid-range Mac / Intel Chrome can
+    // cost 20-40 ms per 1080p frame, which shows up as typing lag on
+    // the native client and as outright browser-tab OOM crashes on the
+    // web client (observed on U22 L40). H.264 decodes on every
+    // platform we ship with hardware acceleration (VideoToolbox on
+    // macOS, NVDEC on Linux/Windows, WebCodecs H.264 everywhere).
+    //
+    // AV1 is kept as an explicit opt-in (`--codec av1`) while we:
+    //   (a) teach ClientHello to advertise supported decoders
+    //   (b) let the server pick the codec intersection
+    // Until (a) + (b) land, defaulting to AV1 is a regression for the
+    // majority of clients even when the server supports it.
     let video_codec = match args.codec.as_str() {
         "auto" => {
-            let codec_name = gpu_probe.best_codec();
-            tracing::info!(codec = codec_name, "auto-detected video codec");
-            match codec_name {
-                "av1" => VideoCodec::Av1,
-                _ => VideoCodec::H264,
-            }
+            tracing::info!(
+                "codec=auto → H.264 (AV1 is opt-in via --codec av1; client decode support still rolling out)"
+            );
+            VideoCodec::H264
         }
         "h264" | "H264" | "h.264" => VideoCodec::H264,
         "av1" | "AV1" => {
             if encoder_name != "nvenc" {
                 anyhow::bail!("AV1 codec requires --encoder nvenc (OpenH264 only supports H.264)");
+            }
+            // Non-fatal probe: warn if the GPU isn't reporting AV1 but
+            // let it through — the NVENC init will surface the real
+            // error in a consistent format if it really can't.
+            if gpu_probe.best_codec() != "av1" {
+                tracing::warn!(
+                    "AV1 requested but GPU probe did not confirm AV1 support; \
+                     continuing anyway — NVENC will error out cleanly if unsupported"
+                );
             }
             VideoCodec::Av1
         }

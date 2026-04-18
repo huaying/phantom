@@ -16,9 +16,34 @@ deployment. New features in 0.4.0 are flagged at the bottom.
 | 22 | NVFBC→NVENC zero-copy pipeline (capture+encode ~4ms at 1080p on A40) |
 | 23 | Windows support (DXGI capture, OpenH264/NVENC, enigo input) |
 | 27 | DXGI→NVENC zero-copy (`--capture dxgi --encoder nvenc`, D3D11 texture, no CPU copy) |
-| 35 | AV1 encoder (NVENC hardware AV1, Ada Lovelace+, `--codec av1`) |
+| 35 | AV1 encoder (NVENC hardware AV1, Ada Lovelace+, **opt-in** via `--codec av1` — in progress, see below) |
 | 36 | AV1 decoder (dav1d software + NVDEC hardware, WebCodecs for web) |
 | 37 | NVDEC hardware decode (client-side H.264 + AV1, runtime dlopen, feature-gated) |
+
+### AV1 (opt-in, work in progress)
+
+AV1 encoding works on the server side for any GPU that supports it
+(Ada Lovelace / RTX 40-series NVENC and newer). It's **not** the default
+because client-side decode support is uneven and the failure mode is
+bad:
+
+| Client | AV1 decode |
+|---|---|
+| Native (phantom-client) on any platform | software dav1d, ~20-40ms/frame at 1080p on a mid-range laptop → noticeable typing lag |
+| Web (WebCodecs) on Safari M3+, Chrome on Intel 11th-gen+ / AMD RDNA3+ | hardware, fast |
+| Web on older Mac / older Intel | software, ~30-50% tab CPU at 1080p30, tab OOM crashes observed under sustained use |
+| Web on Firefox, Safari pre-17.2 | not supported |
+
+Until the server can negotiate codec with the client (TODO: add
+`supported_codecs` to ClientHello so server picks the intersection),
+`auto` always picks H.264 so every client platform works out of the
+box with hardware decode. Pass `--codec av1` on a server where you
+control the clients and know they have AV1 hardware decoders.
+
+The underlying encode/decode paths are already wired (tests pass on
+A40/L40 servers, M-series Macs, Ada Lovelace clients) — the only
+reason AV1 is opt-in is that rolling it as default would regress the
+typical user. Codec negotiation is the next step.
 | 28 | VideoToolbox hardware decode (macOS native client, 2-2.5x faster at 4K) |
 | 29 | 4K support (bilinear downscale, aspect-ratio letterbox, coordinate mapping) |
 | 33 | AVX2 SIMD color conversion (BGRA→NV12 2.8x, YUV→RGB32 3.4x faster, runtime-detected) |
