@@ -598,18 +598,86 @@ fn main() -> Result<()> {
     // Active session token for reconnect validation (future: pre-Hello resume)
     let mut _active_session_token: Vec<u8> = Vec::new();
 
+    // Client-id session affinity (mirrors service_win.rs doorbell). Without
+    // this, a forgotten browser tab whose WebSocket auto-reconnects every
+    // few seconds keeps stealing the session from the real user. With it,
+    // the kicked id sits in a bounded ghost set and gets rejected on retry.
+    // Resolution-hint pre-flight is omitted on Linux/non-service since
+    // there's no VDD to resize — the X server runs at whatever res it
+    // already started at.
+    let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(16)));
+    const GHOST_MAX: usize = 16;
+
     {
         let conn_rx = Arc::clone(&conn_rx);
         let pending = Arc::clone(&pending);
         let cancel = Arc::clone(&cancel);
+        let current_client_id = Arc::clone(&current_client_id);
+        let ghost_ids = Arc::clone(&ghost_ids);
         std::thread::Builder::new()
             .name("doorbell".into())
             .spawn(move || loop {
                 let pair = { conn_rx.lock().unwrap().recv() };
                 match pair {
-                    Ok(conn) => {
+                    Ok((sender, mut receiver)) => {
+                        // Read ClientHello with a short timeout. Legacy clients
+                        // (pre-feature) don't send one — they get a None id and
+                        // are accepted unconditionally (no tracking). New
+                        // clients always send one within the first message.
+                        let id: Option<[u8; 16]> = match receiver
+                            .recv_msg_within(Duration::from_millis(500))
+                        {
+                            Ok(Some(phantom_core::protocol::Message::ClientHello {
+                                client_id,
+                                ..
+                            })) => Some(client_id),
+                            _ => None,
+                        };
+
+                        let mut cur = current_client_id.lock().unwrap();
+                        let mut ghosts = ghost_ids.lock().unwrap();
+                        let accept = match id {
+                            Some(id) if ghosts.iter().any(|g| g == &id) => {
+                                tracing::info!(
+                                    "Doorbell: rejecting ghost client (already kicked)"
+                                );
+                                false
+                            }
+                            Some(id) if *cur == Some(id) => true,
+                            Some(id) => {
+                                if let Some(old) = cur.take() {
+                                    ghosts.push_back(old);
+                                    while ghosts.len() > GHOST_MAX {
+                                        ghosts.pop_front();
+                                    }
+                                }
+                                *cur = Some(id);
+                                true
+                            }
+                            None => {
+                                if let Some(old) = cur.take() {
+                                    ghosts.push_back(old);
+                                    while ghosts.len() > GHOST_MAX {
+                                        ghosts.pop_front();
+                                    }
+                                }
+                                true
+                            }
+                        };
+                        drop(cur);
+                        drop(ghosts);
+
+                        if !accept {
+                            drop(sender);
+                            drop(receiver);
+                            continue;
+                        }
+
                         // Replace any previously queued (but not yet consumed) connection
-                        *pending.lock().unwrap() = Some(conn);
+                        *pending.lock().unwrap() = Some((sender, receiver));
                         cancel.store(true, Ordering::Relaxed);
                     }
                     Err(_) => break,
