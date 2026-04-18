@@ -171,7 +171,7 @@ fn run_server_loop(
     let base_port: u16 = 9900;
 
     // Start TCP listener
-    let tcp_listener = transport::tcp::TcpServerTransport::bind(listen_addr)?;
+    let tcp_listener = tcp::TcpServerTransport::bind(listen_addr)?;
     let (conn_tx, conn_rx) = mpsc::channel::<ConnectionPair>();
 
     let tx = conn_tx.clone();
@@ -220,7 +220,7 @@ fn run_server_loop(
             }
         }
     });
-    let ws_transport = transport::ws::WebServerTransport::start(
+    let ws_transport = ws::WebServerTransport::start(
         base_port + 1,
         base_port + 2,
         base_port + 3,
