@@ -24,8 +24,8 @@
 //! revisiting later for Wayland mouse support.
 
 use anyhow::{anyhow, Context, Result};
-use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
-use evdev::{AttributeSet, EventType, InputEvent as EvdevEvent, Key};
+use evdev::uinput::VirtualDevice;
+use evdev::{AttributeSet, EventType, InputEvent as EvdevEvent, KeyCode as Key};
 use phantom_core::input::KeyCode;
 
 pub struct UinputKeyboard {
@@ -41,7 +41,7 @@ impl UinputKeyboard {
             keys.insert(*k);
         }
 
-        let device = VirtualDeviceBuilder::new()
+        let device = VirtualDevice::builder()
             .context("open /dev/uinput (need udev rule or root)")?
             .name("Phantom Virtual Keyboard")
             .with_keys(&keys)
@@ -60,7 +60,7 @@ impl UinputKeyboard {
         // EV_KEY: value 1 = press, 0 = release, 2 = auto-repeat
         // (we never send 2 — OS handles key repeat itself).
         let value = if pressed { 1 } else { 0 };
-        let ev = EvdevEvent::new(EventType::KEY, evdev_key.code(), value);
+        let ev = EvdevEvent::new(EventType::KEY.0, evdev_key.code(), value);
         self.device
             .emit(&[ev])
             .context("emit evdev key event")?;
