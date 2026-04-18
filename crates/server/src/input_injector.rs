@@ -74,6 +74,7 @@ impl InputInjector {
                     } else {
                         Direction::Release
                     };
+                    tracing::trace!(?key, ?enigo_key, ?dir, "key inject");
                     self.enigo
                         .key(enigo_key, dir)
                         .map_err(|e| anyhow::anyhow!("key: {e}"))?;
