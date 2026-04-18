@@ -220,12 +220,8 @@ fn run_server_loop(
             }
         }
     });
-    let ws_transport = ws::WebServerTransport::start(
-        base_port + 1,
-        base_port + 2,
-        base_port + 3,
-        auth_secret,
-    )?;
+    let ws_transport =
+        ws::WebServerTransport::start(base_port + 1, base_port + 2, base_port + 3, auth_secret)?;
     let tx = conn_tx.clone();
     std::thread::Builder::new()
         .name("svc-web-accept".into())
@@ -1407,9 +1403,7 @@ pub fn uninstall_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     if let Ok(out) = verify {
         let text = String::from_utf8_lossy(&out.stdout);
         if text.to_ascii_lowercase().contains("mttvdd") {
-            println!(
-                "  Warning: pnputil still lists an MttVDD device — reboot may be needed."
-            );
+            println!("  Warning: pnputil still lists an MttVDD device — reboot may be needed.");
         } else {
             println!("  VDD fully removed.");
         }

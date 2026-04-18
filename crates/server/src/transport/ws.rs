@@ -799,9 +799,7 @@ impl MessageSender for WsSender {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                Err(anyhow::anyhow!("ws closed"))
-            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(anyhow::anyhow!("ws closed")),
         }
     }
 }
