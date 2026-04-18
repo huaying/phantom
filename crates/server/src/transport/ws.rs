@@ -674,11 +674,15 @@ fn spawn_ws_connection(
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("WebSocket client connected via HTTPS port");
-    let (send_tx, send_rx) = mpsc::channel();
+    let (send_tx, send_rx) = mpsc::sync_channel(WS_SEND_QUEUE_DEPTH);
     let (recv_tx, recv_rx) = mpsc::channel();
     std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let _ = ws_tx.send(WsConnection {
-        data_sender: WsSender { tx: send_tx },
+        data_sender: WsSender {
+            tx: send_tx,
+            dropped,
+        },
         data_receiver: WsReceiver { rx: recv_rx },
     });
 }
@@ -694,10 +698,14 @@ fn spawn_audio_ws_connection(
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("audio WebSocket connected");
-    let (send_tx, send_rx) = mpsc::channel();
+    let (send_tx, send_rx) = mpsc::sync_channel(WS_SEND_QUEUE_DEPTH);
     let (recv_tx, _recv_rx) = mpsc::channel();
     std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
-    let _ = audio_ws_tx.send(WsSender { tx: send_tx });
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _ = audio_ws_tx.send(WsSender {
+        tx: send_tx,
+        dropped,
+    });
 }
 
 #[cfg(feature = "webrtc")]
@@ -751,15 +759,50 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
     }
 }
 
+/// Bound on the WebSocket send queue. ~1.5s at 30fps video, ~1s at
+/// 20ms audio. Sized to absorb normal jitter (TCP scheduling, brief
+/// network hiccups) but small enough that a stalled receiver — the
+/// classic case being a laptop that sleeps with the tab open — won't
+/// accumulate hours of frames that all replay at line rate when the
+/// client wakes back up.
+const WS_SEND_QUEUE_DEPTH: usize = 50;
+
 pub struct WsSender {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Counts payloads we couldn't push because the IO loop was too far
+    /// behind (client TCP receive buffer full → IO loop blocked on write
+    /// → channel full). Logged occasionally; never panics.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
+
+impl WsSender {
+    /// How many outgoing messages have been dropped since this sender was
+    /// created (current process lifetime).
+    #[allow(dead_code)]
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 impl MessageSender for WsSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         let payload = bincode::serialize(msg).context("serialize")?;
-        self.tx
-            .send(payload)
-            .map_err(|_| anyhow::anyhow!("ws closed"))
+        match self.tx.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                // IO loop is far behind — client's TCP receive side is
+                // stalled (laptop asleep, network frozen). Drop this
+                // message so the queue doesn't grow without bound;
+                // periodic keyframe + ABR will recover the stream once
+                // the client catches up.
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(anyhow::anyhow!("ws closed"))
+            }
+        }
     }
 }
 
