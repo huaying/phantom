@@ -198,6 +198,13 @@ impl WinitDisplay {
             );
         }
 
+        // macOS: fade the top strip to black so the traffic-light buttons
+        // (which sit on top of the video because the title bar is
+        // transparent+fullsize_content_view) have a readable backdrop
+        // regardless of what colour the remote desktop is showing.
+        #[cfg(target_os = "macos")]
+        draw_top_gradient(&mut sb, dst_w as usize, dst_h as usize);
+
         sb.present().map_err(|e| anyhow::anyhow!("present: {e}"))?;
         Ok(())
     }
@@ -280,6 +287,29 @@ const CURSOR_BITMAP: [u8; CURSOR_W * CURSOR_H] = [
     2,0,0,0,0,0,2,1,2,0,0,0,
     0,0,0,0,0,0,0,2,0,0,0,0,
 ];
+
+/// Darken the top ~50px of the framebuffer with a vertical gradient: full
+/// black at y=0 fading to the original pixel at y=GRAD_H. Gives the macOS
+/// traffic lights a legible backdrop over any remote-desktop content.
+#[cfg(target_os = "macos")]
+fn draw_top_gradient(buffer: &mut [u32], buf_w: usize, buf_h: usize) {
+    const GRAD_H: usize = 50;
+    let h = GRAD_H.min(buf_h);
+    for y in 0..h {
+        // Scale factor for the original pixel: 0 (fully black) at y=0,
+        // 1 (untouched) at y=h.
+        let alpha = y as f32 / h as f32;
+        let row = y * buf_w;
+        for x in 0..buf_w {
+            let idx = row + x;
+            let p = buffer[idx];
+            let r = (((p >> 16) & 0xff) as f32 * alpha) as u32;
+            let g = (((p >> 8) & 0xff) as f32 * alpha) as u32;
+            let b = ((p & 0xff) as f32 * alpha) as u32;
+            buffer[idx] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
 
 /// Bilinear interpolation of four pixels.
 fn bilinear(p00: u32, p10: u32, p01: u32, p11: u32, fx: f64, fy: f64) -> u32 {
