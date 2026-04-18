@@ -18,6 +18,8 @@ bincode = "1"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
 scrap = "0.5"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }

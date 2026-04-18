@@ -24,6 +24,7 @@ mod capture_pipewire;
 mod capture_scrap;
 #[cfg(target_os = "windows")]
 mod display_ccd;
+mod doorbell;
 mod encode_h264;
 mod encode_zstd;
 mod file_transfer;
@@ -135,6 +136,102 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     service: bool,
+
+    /// Write log output to this file (in addition to stdout). Used together
+    /// with `--log-rotate`. When unset, logs go only to stdout.
+    #[arg(long)]
+    log_file: Option<std::path::PathBuf>,
+
+    /// Rotation cadence for `--log-file` (daily, hourly, or never).
+    #[arg(long, default_value = "daily")]
+    log_rotate: String,
+
+    /// How many rotated files to keep. Older files are deleted.
+    #[arg(long, default_value_t = 7)]
+    log_keep: usize,
+}
+
+/// Hold-onto guards returned by tracing-appender so the background flush
+/// thread sticks around for the process lifetime. Dropping this aborts the
+/// flush thread and you'll lose buffered log lines.
+struct LogGuards {
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+/// Initialise tracing with stdout output and (optionally) a rotating file
+/// sink. Falls back to stdout-only if the file path can't be opened.
+fn init_tracing(
+    log_file: &Option<std::path::PathBuf>,
+    rotate: &str,
+    keep: usize,
+) -> LogGuards {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("phantom=info".parse().unwrap());
+
+    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+
+    let (file_layer, _file_guard) = match log_file {
+        Some(path) => {
+            // Split path into dir + file prefix for tracing-appender.
+            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            let file_name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "phantom.log".into());
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!(
+                    "warning: cannot create log directory {}: {e} — falling back to stdout-only",
+                    dir.display()
+                );
+                (None, None)
+            } else {
+                let rotation = match rotate {
+                    "hourly" => tracing_appender::rolling::Rotation::HOURLY,
+                    "never" => tracing_appender::rolling::Rotation::NEVER,
+                    _ => tracing_appender::rolling::Rotation::DAILY,
+                };
+                let appender = tracing_appender::rolling::Builder::new()
+                    .rotation(rotation)
+                    .filename_prefix(&file_name)
+                    .max_log_files(keep)
+                    .build(dir)
+                    .map_err(|e| {
+                        eprintln!("warning: cannot init log file {}: {e}", path.display())
+                    });
+                match appender {
+                    Ok(appender) => {
+                        let (nb, guard) = tracing_appender::non_blocking(appender);
+                        let layer = tracing_subscriber::fmt::layer()
+                            .with_writer(nb)
+                            .with_ansi(false);
+                        (Some(layer), Some(guard))
+                    }
+                    Err(_) => (None, None),
+                }
+            }
+        }
+        None => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+
+    if log_file.is_some() && _file_guard.is_some() {
+        tracing::info!(
+            path = %log_file.as_ref().unwrap().display(),
+            rotate,
+            keep,
+            "log file enabled"
+        );
+    }
+
+    LogGuards { _file_guard }
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
@@ -154,12 +251,7 @@ fn main() -> Result<()> {
         if args.service {
             // Service mode: tracing will be set up by the service itself.
             // Initialize console tracing for the SCM dispatcher.
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::from_default_env()
-                        .add_directive("phantom=info".parse().unwrap()),
-                )
-                .init();
+            let _guards = init_tracing(&args.log_file, &args.log_rotate, args.log_keep);
             tracing::info!("Entering Windows Service dispatcher mode");
             return service_win::run_as_service()
                 .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"));
@@ -172,13 +264,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── Normal console mode: tracing to stdout ─────────────────────────────
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("phantom=info".parse().unwrap()),
-        )
-        .init();
+    // ── Normal console mode: tracing to stdout (+optional file) ────────────
+    let _log_guards = init_tracing(&args.log_file, &args.log_rotate, args.log_keep);
 
     // ── Graceful shutdown signal (Ctrl+C / SIGTERM) ─────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -608,8 +695,9 @@ fn main() -> Result<()> {
     let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(16)));
-    const GHOST_MAX: usize = 16;
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            doorbell::GHOST_MAX,
+        )));
 
     {
         let conn_rx = Arc::clone(&conn_rx);
@@ -639,38 +727,14 @@ fn main() -> Result<()> {
 
                         let mut cur = current_client_id.lock().unwrap();
                         let mut ghosts = ghost_ids.lock().unwrap();
-                        let accept = match id {
-                            Some(id) if ghosts.iter().any(|g| g == &id) => {
-                                tracing::info!(
-                                    "Doorbell: rejecting ghost client (already kicked)"
-                                );
-                                false
-                            }
-                            Some(id) if *cur == Some(id) => true,
-                            Some(id) => {
-                                if let Some(old) = cur.take() {
-                                    ghosts.push_back(old);
-                                    while ghosts.len() > GHOST_MAX {
-                                        ghosts.pop_front();
-                                    }
-                                }
-                                *cur = Some(id);
-                                true
-                            }
-                            None => {
-                                if let Some(old) = cur.take() {
-                                    ghosts.push_back(old);
-                                    while ghosts.len() > GHOST_MAX {
-                                        ghosts.pop_front();
-                                    }
-                                }
-                                true
-                            }
-                        };
+                        let decision = doorbell::decide(id, &mut cur, &mut ghosts);
                         drop(cur);
                         drop(ghosts);
 
-                        if !accept {
+                        if matches!(decision, doorbell::DoorbellDecision::Reject) {
+                            tracing::info!(
+                                "Doorbell: rejecting ghost client (already kicked)"
+                            );
                             drop(sender);
                             drop(receiver);
                             continue;
@@ -772,7 +836,8 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             _active_session_token = result.session_token.clone();
-            tracing::info!("session ended: {}", result.error);
+            // session end is already logged by make_session_result with
+            // structured fields (session_id, reason).
         }
         #[cfg(target_os = "windows")]
         let result = if let Some(ref mut gw) = gpu_win {
@@ -845,7 +910,8 @@ fn main() -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             _active_session_token = result.session_token.clone();
-            tracing::info!("session ended: {}", result.error);
+            // session end is already logged by make_session_result with
+            // structured fields (session_id, reason).
         }
 
         // Post-session cleanup

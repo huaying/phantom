@@ -354,7 +354,41 @@ impl AdaptiveBitrate {
 
 // ── SessionRunner: shared session plumbing ──────────────────────────────────
 
+/// Why a session ended. Returned via SessionResult so the accept loop can
+/// log it without re-parsing the anyhow::Error string and so future code
+/// can branch on the reason (e.g. only force-keyframe on transient errors).
+#[derive(Debug, Clone)]
+pub enum SessionEndReason {
+    /// Server cancelled this session because a new client took over via the
+    /// doorbell. Expected during session replacement, not an error.
+    Cancelled,
+    /// Client closed cleanly (TCP EOF / WS close / peer hangup).
+    PeerClosed,
+    /// Client sent an explicit Disconnect message.
+    ClientDisconnect(String),
+    /// Network IO error during send/receive.
+    NetworkError(String),
+    /// Capture / encode pipeline failure.
+    PipelineError(String),
+}
+
+impl std::fmt::Display for SessionEndReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "cancelled (replaced by new client)"),
+            Self::PeerClosed => write!(f, "peer closed"),
+            Self::ClientDisconnect(r) => write!(f, "client disconnect: {r}"),
+            Self::NetworkError(e) => write!(f, "network error: {e}"),
+            Self::PipelineError(e) => write!(f, "pipeline error: {e}"),
+        }
+    }
+}
+
 pub struct SessionRunner {
+    /// Short random hex string identifying this session in logs. Generated
+    /// on construction; remains stable for the session lifetime so log
+    /// lines can be correlated when sessions overlap or churn.
+    pub session_id: String,
     pub sender: Box<dyn MessageSender>,
     /// Separate audio sender (independent WebSocket). Falls back to main sender.
     pub audio_sender: Option<Box<dyn MessageSender>>,
@@ -377,8 +411,17 @@ pub struct SessionRunner {
     pub ping_sent_at: Option<Instant>,
     /// Smoothed round-trip time (exponential moving average).
     pub rtt_us: Option<u64>,
+    /// Smoothed RTT jitter — EMA of |Δ RTT| sample-to-sample. Reflects how
+    /// much the round-trip time bounces around, which is what audio
+    /// jitter buffers actually have to absorb. RTT alone can be high but
+    /// stable (long but predictable) or low but noisy (short trips with
+    /// scheduler jitter); the latter is much harder on audio.
+    pub jitter_us: Option<u64>,
     /// Accumulated encode time for stats period.
     pub stats_encode_us: u64,
+    /// Audio drops since last stats log (snapshotted from AudioCapture
+    /// counter, not directly observed in this struct).
+    pub last_audio_drop_count: u64,
     /// Set to true by the accept loop when a new client connects.
     /// The session loop checks this and exits cleanly.
     pub cancel: Arc<AtomicBool>,
@@ -439,7 +482,13 @@ impl SessionRunner {
         #[cfg(not(feature = "audio"))]
         let has_audio = false;
 
+        // 8-char random hex (32 bits of entropy — collisions vanishingly
+        // unlikely for the dozens-of-sessions scale we're at, and short
+        // enough to keep log lines readable).
+        let session_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
+
         let mut runner = Self {
+            session_id,
             sender,
             audio_sender: None,
             audio_ws_rx: None,
@@ -458,7 +507,9 @@ impl SessionRunner {
             last_keyframe_time: Instant::now() - Duration::from_secs(10),
             ping_sent_at: None,
             rtt_us: None,
+            jitter_us: None,
             stats_encode_us: 0,
+            last_audio_drop_count: 0,
             cancel,
             #[cfg(feature = "audio")]
             audio_rx,
@@ -485,7 +536,12 @@ impl SessionRunner {
         if is_resume {
             // Resume: send ResumeOk instead of Hello, same session token
             runner.sender.send_msg(&Message::ResumeOk)?;
-            tracing::info!(width, height, "session resumed");
+            tracing::info!(
+                session_id = %runner.session_id,
+                width,
+                height,
+                "session resumed"
+            );
             // Force keyframe on first frame (reset last_keyframe_time to epoch)
             runner.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
         } else {
@@ -498,7 +554,13 @@ impl SessionRunner {
                 video_codec,
                 session_token: session_token.clone(),
             })?;
-            tracing::info!(width, height, audio = has_audio, "session started");
+            tracing::info!(
+                session_id = %runner.session_id,
+                width,
+                height,
+                audio = has_audio,
+                "session started"
+            );
         }
 
         runner.session_token = session_token;
@@ -578,11 +640,21 @@ impl SessionRunner {
                 Ok(InboundEvent::Pong) => {
                     if let Some(sent_at) = self.ping_sent_at.take() {
                         let rtt = sent_at.elapsed().as_micros() as u64;
-                        // Exponential moving average (α = 0.2)
-                        self.rtt_us = Some(match self.rtt_us {
+                        // RTT EMA (α = 0.2)
+                        let prev_rtt = self.rtt_us;
+                        self.rtt_us = Some(match prev_rtt {
                             Some(prev) => (prev * 4 + rtt) / 5,
                             None => rtt,
                         });
+                        // Jitter EMA — measure |Δ RTT| sample-to-sample so
+                        // we can tell apart "slow but stable" from "noisy".
+                        if let Some(prev) = prev_rtt {
+                            let delta = rtt.abs_diff(prev);
+                            self.jitter_us = Some(match self.jitter_us {
+                                Some(jp) => (jp * 4 + delta) / 5,
+                                None => delta,
+                            });
+                        }
                     }
                 }
                 Ok(InboundEvent::FileOffer {
@@ -778,11 +850,35 @@ impl SessionRunner {
                 Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
                 None => "n/a".to_string(),
             };
+            let jitter_str = match self.jitter_us {
+                Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
+                None => "n/a".to_string(),
+            };
+
+            // Snapshot audio drops since last stats interval. The capture
+            // thread holds the canonical counter; we just diff.
+            #[cfg(feature = "audio")]
+            let audio_drops = {
+                let total = self
+                    ._audio_capture
+                    .as_ref()
+                    .map(|c| c.dropped_count())
+                    .unwrap_or(0);
+                let delta = total.saturating_sub(self.last_audio_drop_count);
+                self.last_audio_drop_count = total;
+                delta
+            };
+            #[cfg(not(feature = "audio"))]
+            let audio_drops: u64 = 0;
+
             tracing::info!(
+                session_id = %self.session_id,
                 fps = format_args!("{:.1}", fps),
                 bw = format_args!("{:.1} KB/s", bw_bps as f64 / 1024.0),
                 rtt = %rtt_str,
+                jitter = %jitter_str,
                 encode_ms = format_args!("{:.1}", avg_encode_us as f64 / 1000.0),
+                audio_drops_5s = audio_drops,
                 "{label}"
             );
 
@@ -885,10 +981,169 @@ impl SessionRunner {
 
 /// Configuration for starting a session, avoids long parameter lists.
 /// Result of a session run — carries the session token for reconnect.
+#[allow(dead_code)]
 pub struct SessionResult {
     pub session_token: Vec<u8>,
     /// The error that ended the session (disconnect, cancel, IO error).
+    /// Kept for backward-compat with existing call sites; new code should
+    /// prefer `reason` for branching since the error message is not stable.
     pub error: anyhow::Error,
+    /// Structured reason for the session ending. `None` for legacy paths
+    /// (e.g. early-init failures before SessionRunner exists).
+    pub reason: Option<SessionEndReason>,
+    /// Session id assigned by SessionRunner. Empty when the session failed
+    /// before SessionRunner was constructed.
+    pub session_id: String,
+}
+
+/// Build a SessionResult from the inner loop's outcome. Common to all
+/// pipelines (cpu / gpu / ipc / wayland) so they all log the same shape.
+pub fn make_session_result(
+    inner: Result<Vec<u8>>,
+    session_id: String,
+    cancelled: bool,
+) -> SessionResult {
+    match inner {
+        Ok(token) => {
+            let reason = if cancelled {
+                SessionEndReason::Cancelled
+            } else {
+                SessionEndReason::PeerClosed
+            };
+            tracing::info!(
+                session_id = %session_id,
+                reason = %reason,
+                "session ended"
+            );
+            SessionResult {
+                session_id,
+                session_token: token,
+                error: anyhow::anyhow!("{reason}"),
+                reason: Some(reason),
+            }
+        }
+        Err(e) => {
+            let reason = classify_session_error(&e, cancelled);
+            tracing::info!(
+                session_id = %session_id,
+                reason = %reason,
+                "session ended"
+            );
+            SessionResult {
+                session_id,
+                session_token: vec![],
+                error: e,
+                reason: Some(reason),
+            }
+        }
+    }
+}
+
+/// Map an anyhow::Error from the session loop into a structured reason.
+/// `cancelled` overrides everything: if the doorbell flipped the cancel
+/// flag, that's the real cause regardless of the surface error.
+pub fn classify_session_error(err: &anyhow::Error, cancelled: bool) -> SessionEndReason {
+    if cancelled {
+        return SessionEndReason::Cancelled;
+    }
+    // Walk the error chain looking for an io::Error so we can distinguish
+    // "EOF / peer closed" from real network failures.
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => SessionEndReason::PeerClosed,
+                _ => SessionEndReason::NetworkError(format!("{}", io_err)),
+            };
+        }
+    }
+    let msg = format!("{err:#}");
+    if msg.contains("client requested disconnect") || msg.contains("client disconnect") {
+        SessionEndReason::ClientDisconnect(msg)
+    } else if msg.contains("capture") || msg.contains("encode") || msg.contains("pipeline") {
+        SessionEndReason::PipelineError(msg)
+    } else {
+        SessionEndReason::NetworkError(msg)
+    }
+}
+
+#[cfg(test)]
+mod end_reason_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_flag_overrides_any_error() {
+        // Even if the surface error looks like a network failure, a flipped
+        // cancel flag means the session was replaced by a new client and
+        // we shouldn't claim the network broke.
+        let err = anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset by peer"
+        ));
+        match classify_session_error(&err, true) {
+            SessionEndReason::Cancelled => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unexpected_eof_classified_as_peer_closed() {
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        match classify_session_error(&err, false) {
+            SessionEndReason::PeerClosed => {}
+            other => panic!("expected PeerClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broken_pipe_classified_as_peer_closed() {
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        match classify_session_error(&err, false) {
+            SessionEndReason::PeerClosed => {}
+            other => panic!("expected PeerClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_io_kind_classified_as_network_error() {
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        match classify_session_error(&err, false) {
+            SessionEndReason::NetworkError(_) => {}
+            other => panic!("expected NetworkError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_keyword_classified_as_pipeline_error() {
+        let err = anyhow::anyhow!("encode failed: nvenc out of memory");
+        match classify_session_error(&err, false) {
+            SessionEndReason::PipelineError(_) => {}
+            other => panic!("expected PipelineError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_disconnect_keyword_classified_as_client_disconnect() {
+        let err = anyhow::anyhow!("client disconnect: user clicked X");
+        match classify_session_error(&err, false) {
+            SessionEndReason::ClientDisconnect(_) => {}
+            other => panic!("expected ClientDisconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_io_error_in_chain_is_found() {
+        // Real session errors come back as `anyhow::Error` wrapping an
+        // io::Error several layers deep. Make sure we walk the chain.
+        let inner = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let err: anyhow::Error = anyhow::Error::new(inner).context("send_msg failed");
+        match classify_session_error(&err, false) {
+            SessionEndReason::PeerClosed => {}
+            other => panic!("expected PeerClosed via chain walk, got {other:?}"),
+        }
+    }
 }
 
 pub struct SessionConfig<'a> {
@@ -921,17 +1176,10 @@ pub fn run_session_cpu(
     differ: &mut TileDiffer,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
-    let result = run_session_cpu_inner(capture, video_encoder, differ, cfg);
-    match result {
-        Ok(token) => SessionResult {
-            session_token: token,
-            error: anyhow::anyhow!("session ended cleanly"),
-        },
-        Err(e) => SessionResult {
-            session_token: vec![],
-            error: e,
-        },
-    }
+    let cancel = Arc::clone(&cfg.cancel);
+    let mut session_id = String::new();
+    let result = run_session_cpu_inner(capture, video_encoder, differ, cfg, &mut session_id);
+    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
 fn run_session_cpu_inner(
@@ -939,6 +1187,7 @@ fn run_session_cpu_inner(
     video_encoder: &mut dyn FrameEncoder,
     differ: &mut TileDiffer,
     cfg: SessionConfig<'_>,
+    session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
     differ.reset();
     let _ = capture.reset();
@@ -954,6 +1203,7 @@ fn run_session_cpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.paste_fn = cfg.paste_fn;
@@ -1053,17 +1303,10 @@ pub fn run_session_ipc(
     initial_width: u32,
     initial_height: u32,
 ) -> SessionResult {
-    let result = run_session_ipc_inner(ipc, cfg, initial_width, initial_height);
-    match result {
-        Ok(token) => SessionResult {
-            session_token: token,
-            error: anyhow::anyhow!("session ended cleanly"),
-        },
-        Err(e) => SessionResult {
-            session_token: vec![],
-            error: e,
-        },
-    }
+    let cancel = Arc::clone(&cfg.cancel);
+    let mut session_id = String::new();
+    let result = run_session_ipc_inner(ipc, cfg, initial_width, initial_height, &mut session_id);
+    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
 #[cfg(target_os = "windows")]
@@ -1072,6 +1315,7 @@ fn run_session_ipc_inner(
     cfg: SessionConfig<'_>,
     initial_width: u32,
     initial_height: u32,
+    session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
     let mut runner = SessionRunner::new(
         cfg.sender,
@@ -1083,6 +1327,7 @@ fn run_session_ipc_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.paste_fn = cfg.paste_fn;
@@ -1137,17 +1382,10 @@ pub fn run_session_gpu(
     encoder: &mut phantom_gpu::nvenc::NvencEncoder,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
-    let result = run_session_gpu_inner(capture, encoder, cfg);
-    match result {
-        Ok(token) => SessionResult {
-            session_token: token,
-            error: anyhow::anyhow!("session ended cleanly"),
-        },
-        Err(e) => SessionResult {
-            session_token: vec![],
-            error: e,
-        },
-    }
+    let cancel = Arc::clone(&cfg.cancel);
+    let mut session_id = String::new();
+    let result = run_session_gpu_inner(capture, encoder, cfg, &mut session_id);
+    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
 #[cfg(target_os = "linux")]
@@ -1155,6 +1393,7 @@ fn run_session_gpu_inner(
     capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
     encoder: &mut phantom_gpu::nvenc::NvencEncoder,
     cfg: SessionConfig<'_>,
+    session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
     use phantom_core::encode::FrameEncoder;
 
@@ -1170,6 +1409,7 @@ fn run_session_gpu_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.paste_fn = cfg.paste_fn;
@@ -1239,23 +1479,17 @@ pub fn run_session_dxgi(
     pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
-    let result = run_session_dxgi_inner(pipeline, cfg);
-    match result {
-        Ok(token) => SessionResult {
-            session_token: token,
-            error: anyhow::anyhow!("session ended cleanly"),
-        },
-        Err(e) => SessionResult {
-            session_token: vec![],
-            error: e,
-        },
-    }
+    let cancel = Arc::clone(&cfg.cancel);
+    let mut session_id = String::new();
+    let result = run_session_dxgi_inner(pipeline, cfg, &mut session_id);
+    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
 #[cfg(target_os = "windows")]
 fn run_session_dxgi_inner(
     pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
     cfg: SessionConfig<'_>,
+    session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
     pipeline.force_keyframe();
     let (width, height) = (pipeline.width, pipeline.height);
@@ -1269,6 +1503,7 @@ fn run_session_dxgi_inner(
         cfg.video_codec,
         cfg.is_resume,
     )?;
+    *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
     runner.resolution_change_fn = cfg.resolution_change_fn;
     runner.paste_fn = cfg.paste_fn;

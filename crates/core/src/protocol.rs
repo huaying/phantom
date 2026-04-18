@@ -460,6 +460,60 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_client_hello_with_resolution_hint() {
+        let id = [
+            0x42, 0xde, 0xad, 0xbe, 0xef, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+            0xa0, 0xb0,
+        ];
+        let msg = Message::ClientHello {
+            client_id: id,
+            preferred_width: 1920,
+            preferred_height: 1080,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::ClientHello {
+                client_id,
+                preferred_width,
+                preferred_height,
+            } => {
+                assert_eq!(client_id, id);
+                assert_eq!(preferred_width, 1920);
+                assert_eq!(preferred_height, 1080);
+            }
+            _ => panic!("expected ClientHello"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_client_hello_with_no_hint() {
+        // 0/0 is the "no hint" sentinel. The doorbell on the server side
+        // must accept this exactly as well-formed and treat it as legacy.
+        let id = [0u8; 16];
+        let msg = Message::ClientHello {
+            client_id: id,
+            preferred_width: 0,
+            preferred_height: 0,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::ClientHello {
+                preferred_width,
+                preferred_height,
+                ..
+            } => {
+                assert_eq!(preferred_width, 0);
+                assert_eq!(preferred_height, 0);
+            }
+            _ => panic!("expected ClientHello"),
+        }
+    }
+
+    #[test]
     fn lenient_reader_skips_unknown() {
         // Construct a framed payload with an invalid enum variant index.
         // bincode uses u32 for enum variant, so variant 0xFFFFFFFF should not exist.

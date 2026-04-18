@@ -275,8 +275,9 @@ fn run_server_loop(
     let current_client_id: Arc<std::sync::Mutex<Option<[u8; 16]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ghost_ids: Arc<std::sync::Mutex<std::collections::VecDeque<[u8; 16]>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(16)));
-    const GHOST_MAX: usize = 16;
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            crate::doorbell::GHOST_MAX,
+        )));
 
     // Doorbell thread
     {
@@ -313,50 +314,17 @@ fn run_server_loop(
                                 _ => (None, None),
                             };
 
-                        // Decision logic: look up id against current/ghost sets.
+                        // Decision logic shared with main.rs (see doorbell module).
                         let mut cur = current_client_id.lock().unwrap();
                         let mut ghosts = ghost_ids.lock().unwrap();
-                        let accept = match id {
-                            Some(id) if ghosts.iter().any(|g| g == &id) => {
-                                tracing::info!(
-                                    "Doorbell: rejecting ghost client (already kicked)"
-                                );
-                                false
-                            }
-                            Some(id) if *cur == Some(id) => {
-                                // Same client reconnecting — allow (probably a
-                                // transient network blip); no ghost shuffle.
-                                true
-                            }
-                            Some(id) => {
-                                // A genuinely new client takes over. Demote
-                                // the old one to ghost so its auto-reconnect
-                                // loop won't thrash us.
-                                if let Some(old) = cur.take() {
-                                    ghosts.push_back(old);
-                                    while ghosts.len() > GHOST_MAX {
-                                        ghosts.pop_front();
-                                    }
-                                }
-                                *cur = Some(id);
-                                true
-                            }
-                            None => {
-                                // Legacy / unidentified — treat as new but
-                                // don't track (no id to remember).
-                                if let Some(old) = cur.take() {
-                                    ghosts.push_back(old);
-                                    while ghosts.len() > GHOST_MAX {
-                                        ghosts.pop_front();
-                                    }
-                                }
-                                true
-                            }
-                        };
+                        let decision = crate::doorbell::decide(id, &mut cur, &mut ghosts);
                         drop(cur);
                         drop(ghosts);
 
-                        if !accept {
+                        if matches!(decision, crate::doorbell::DoorbellDecision::Reject) {
+                            tracing::info!(
+                                "Doorbell: rejecting ghost client (already kicked)"
+                            );
                             // Drop sender+receiver → transport IO thread
                             // sees EOF → closes socket → client sees
                             // onclose → auto-reconnect (will be rejected
@@ -458,7 +426,9 @@ fn run_server_loop(
                 resolution_hint,
             ) {
                 Ok(result) => {
-                    tracing::info!("Service session ended: {}", result.error);
+                    // session end already logged by make_session_result;
+                    // result.session_id / result.reason available if needed.
+                    let _ = result;
                 }
                 Err(e) => {
                     tracing::error!("Service session failed: {e}");

@@ -6,9 +6,9 @@
 //! The audio thread runs independently from the video session loop and sends
 //! encoded Opus frames through an mpsc channel.
 
-use super::AudioChunk;
+use super::{AudioChunk, AudioDropCounter};
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -17,6 +17,14 @@ use tracing::{info, warn};
 pub struct AudioCapture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dropped: AudioDropCounter,
+}
+
+impl AudioCapture {
+    /// Number of audio chunks dropped because the consuming channel was full.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl AudioCapture {
@@ -74,6 +82,8 @@ impl AudioCapture {
         let (tx, rx) = mpsc::sync_channel::<AudioChunk>(50); // ~1s buffer at 20ms/frame
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        let dropped = AudioDropCounter::new(AtomicU64::new(0));
+        let dropped_clone = Arc::clone(&dropped);
 
         let thread = std::thread::Builder::new()
             .name("audio-capture".into())
@@ -110,7 +120,10 @@ impl AudioCapture {
                                 channels,
                             };
                             if tx.try_send(chunk).is_err() {
-                                // Receiver dropped or buffer full — skip frame
+                                // Receiver full or disconnected — frame
+                                // dropped on the floor. Counted so the
+                                // session can surface it in stats.
+                                dropped_clone.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
@@ -127,6 +140,7 @@ impl AudioCapture {
             AudioCapture {
                 stop,
                 thread: Some(thread),
+                dropped,
             },
             rx,
         ))

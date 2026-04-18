@@ -11,6 +11,13 @@ pub struct AudioChunk {
     pub channels: u8,
 }
 
+/// Counter of dropped audio chunks (capture-side `try_send` failures —
+/// receiver was full or already disconnected). Cloned into both the
+/// AudioCapture instance and the capture thread so the SessionRunner can
+/// poll it for stats.
+#[allow(dead_code)] // unused on macOS / no-audio builds
+pub type AudioDropCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
 #[cfg(target_os = "linux")]
 #[path = "audio_capture_pulse.rs"]
 mod platform;
@@ -30,6 +37,11 @@ pub struct AudioCapture;
 impl AudioCapture {
     pub fn start() -> anyhow::Result<(Self, std::sync::mpsc::Receiver<AudioChunk>)> {
         anyhow::bail!("audio capture not supported on this platform")
+    }
+
+    /// Number of audio chunks dropped (always 0 on unsupported platforms).
+    pub fn dropped_count(&self) -> u64 {
+        0
     }
 }
 

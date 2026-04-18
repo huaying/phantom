@@ -6,9 +6,9 @@
 //!
 //! Uses the official `windows` crate for COM/WASAPI APIs.
 
-use super::AudioChunk;
+use super::{AudioChunk, AudioDropCounter};
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -26,6 +26,14 @@ use windows::Win32::System::Com::{
 pub struct AudioCapture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dropped: AudioDropCounter,
+}
+
+impl AudioCapture {
+    /// Number of audio chunks dropped because the consuming channel was full.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl AudioCapture {
@@ -38,11 +46,15 @@ impl AudioCapture {
         let (tx, rx) = mpsc::sync_channel::<AudioChunk>(50); // ~1s buffer at 20ms/frame
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        let dropped = AudioDropCounter::new(AtomicU64::new(0));
+        let dropped_clone = Arc::clone(&dropped);
 
         let thread = std::thread::Builder::new()
             .name("audio-capture".into())
             .spawn(move || {
-                if let Err(e) = wasapi_capture_loop(tx, stop_clone, sample_rate, channels) {
+                if let Err(e) =
+                    wasapi_capture_loop(tx, stop_clone, dropped_clone, sample_rate, channels)
+                {
                     warn!("WASAPI capture thread exited with error: {e}");
                 }
                 info!("audio capture thread stopped");
@@ -58,6 +70,7 @@ impl AudioCapture {
             AudioCapture {
                 stop,
                 thread: Some(thread),
+                dropped,
             },
             rx,
         ))
@@ -77,6 +90,7 @@ impl Drop for AudioCapture {
 fn wasapi_capture_loop(
     tx: mpsc::SyncSender<AudioChunk>,
     stop: Arc<AtomicBool>,
+    dropped: AudioDropCounter,
     target_sample_rate: u32,
     target_channels: u8,
 ) -> Result<()> {
@@ -250,7 +264,9 @@ fn wasapi_capture_loop(
                                 channels: target_channels,
                             };
                             if tx.try_send(chunk).is_err() {
-                                // Receiver dropped or buffer full — skip frame
+                                // Receiver full or disconnected — counted
+                                // so the session can surface drops in stats.
+                                dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
