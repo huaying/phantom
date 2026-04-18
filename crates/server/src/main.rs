@@ -24,6 +24,8 @@ mod doorbell;
 mod encode;
 mod file_transfer;
 mod input_injector;
+#[cfg(target_os = "linux")]
+mod input_uinput;
 mod ipc_pipe;
 #[cfg(target_os = "windows")]
 mod service_win;

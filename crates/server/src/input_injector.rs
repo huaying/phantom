@@ -2,10 +2,16 @@ use anyhow::Result;
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 
-/// Injects input events into the OS via enigo.
-/// macOS: requires Accessibility permission.
+/// Injects input events into the OS. Mouse + scroll always go through
+/// enigo. Key events go through uinput when available (Linux only) —
+/// uinput bypasses X11's XKB remap path that causes the GDM 42 password
+/// field "scrambled keys" bug, and also works on Wayland and lock
+/// screens where XTest fails. Falls back to enigo for keys if uinput
+/// init fails (unprivileged run without udev rule).
 pub struct InputInjector {
     enigo: Enigo,
+    #[cfg(target_os = "linux")]
+    uinput: Option<crate::input_uinput::UinputKeyboard>,
 }
 
 impl InputInjector {
@@ -18,8 +24,32 @@ impl InputInjector {
             let _ = enigo.key(key, Direction::Release);
         }
 
+        // Try uinput for keyboard on Linux. Non-fatal if it fails — we
+        // keep running with enigo/XTest but log loudly so the operator
+        // knows the GDM-42 / Wayland / lock-screen scenarios won't work
+        // reliably until permissions are fixed.
+        #[cfg(target_os = "linux")]
+        let uinput = match crate::input_uinput::UinputKeyboard::new() {
+            Ok(u) => {
+                tracing::info!("InputInjector: keyboard via uinput");
+                Some(u)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "uinput keyboard unavailable, falling back to XTest: {e:#}. \
+                     Run install.sh to add a udev rule + the 'input' group so \
+                     login-screen typing works reliably."
+                );
+                None
+            }
+        };
+
         tracing::info!("InputInjector initialized");
-        Ok(Self { enigo })
+        Ok(Self {
+            enigo,
+            #[cfg(target_os = "linux")]
+            uinput,
+        })
     }
 
     /// Type out a string (for paste operations).
@@ -68,13 +98,28 @@ impl InputInjector {
                 }
             }
             InputEvent::Key { key, pressed } => {
+                #[cfg(target_os = "linux")]
+                if let Some(ref mut u) = self.uinput {
+                    tracing::trace!(?key, pressed, "key inject (uinput)");
+                    match u.inject_key(*key, *pressed) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            // Device died unexpectedly (e.g. module unloaded).
+                            // Drop to enigo path for this call and future ones.
+                            tracing::warn!(
+                                "uinput inject failed: {e:#}; dropping uinput backend"
+                            );
+                            self.uinput = None;
+                        }
+                    }
+                }
                 if let Some(enigo_key) = keycode_to_enigo(*key) {
                     let dir = if *pressed {
                         Direction::Press
                     } else {
                         Direction::Release
                     };
-                    tracing::trace!(?key, ?enigo_key, ?dir, "key inject");
+                    tracing::trace!(?key, ?enigo_key, ?dir, "key inject (enigo)");
                     self.enigo
                         .key(enigo_key, dir)
                         .map_err(|e| anyhow::anyhow!("key: {e}"))?;

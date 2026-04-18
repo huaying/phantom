@@ -44,10 +44,12 @@ ctrlc = "3"
 pipewire = { version = "0.8", optional = true }
 dbus = { version = "0.9", optional = true }
 
-# Linux: PulseAudio capture for audio feature
+# Linux: PulseAudio capture for audio feature, uinput for keyboard injection
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = { version = "2", optional = true }
 libpulse-simple-binding = { version = "2", optional = true }
+# uinput virtual keyboard (bypasses XKB/XTest — Wayland + GDM login work)
+evdev = "0.13"
 
 # Windows: WASAPI capture for audio feature + Windows Service + Session management
 [target.'cfg(target_os = "windows")'.dependencies]
