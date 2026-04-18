@@ -1277,9 +1277,12 @@ pub fn uninstall_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     let vdd_dir = install_dir.join("vdd");
     let nefconw = vdd_dir.join("nefconw.exe");
 
+    // Step 1: remove the device node via nefconw (if available).
+    // Previously this swallowed the exit code and always claimed success;
+    // we now at least log whether nefconw thought it worked.
     if nefconw.exists() {
-        println!("  Removing Virtual Display Driver...");
-        let _ = std::process::Command::new(&nefconw)
+        println!("  Removing Virtual Display Driver device node...");
+        match std::process::Command::new(&nefconw)
             .args([
                 "--remove-device-node",
                 "--hardware-id",
@@ -1287,10 +1290,89 @@ pub fn uninstall_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
                 "--class-guid",
                 VDD_CLASS_GUID,
             ])
-            .status();
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                println!(
+                    "  Warning: nefconw --remove-device-node exit code {:?}",
+                    s.code()
+                );
+            }
+            Err(e) => {
+                println!("  Warning: nefconw failed to spawn: {e}");
+            }
+        }
     }
 
-    // Clean up files
+    // Step 2: remove the driver package from the Windows driver store.
+    // `nefconw --remove-device-node` only removes the device node — the .inf
+    // stays in the driver store, so pnputil sees it and the next install
+    // pulls from cache. Use pnputil to enumerate and delete any oem*.inf
+    // that mentions our hardware id.
+    println!("  Removing VDD driver package from driver store...");
+    let enum_output = std::process::Command::new("pnputil")
+        .args(["/enum-drivers"])
+        .output();
+    if let Ok(out) = enum_output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut published_names: Vec<String> = Vec::new();
+        let mut cur_name: Option<String> = None;
+        // pnputil output is "Published Name: oem42.inf" blocks separated by
+        // an "Original Name" / "Provider Name" / etc. We walk line-by-line:
+        // remember the most recent Published Name; on a line containing
+        // "MttVDD" (in either "Original Name" or "Hardware ID" subsection
+        // after running /enum-drivers) associate it with that name.
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("Published Name:") {
+                cur_name = Some(rest.trim().to_string());
+            } else if t.to_ascii_lowercase().contains("mttvdd") {
+                if let Some(ref n) = cur_name {
+                    if !published_names.contains(n) {
+                        published_names.push(n.clone());
+                    }
+                }
+            }
+        }
+        for name in &published_names {
+            println!("  Deleting driver package {name}...");
+            let r = std::process::Command::new("pnputil")
+                .args(["/delete-driver", name, "/uninstall", "/force"])
+                .status();
+            match r {
+                Ok(s) if s.success() => {}
+                Ok(s) => println!(
+                    "  Warning: pnputil /delete-driver {name} exit code {:?}",
+                    s.code()
+                ),
+                Err(e) => println!("  Warning: pnputil spawn failed: {e}"),
+            }
+        }
+        if published_names.is_empty() {
+            println!("  (no MttVDD driver packages found in store)");
+        }
+    } else {
+        println!("  Warning: pnputil /enum-drivers failed to run");
+    }
+
+    // Step 3: verify no MttVDD device is left. Purely diagnostic — users
+    // see this and know whether to reboot / retry / ignore.
+    let verify = std::process::Command::new("pnputil")
+        .args(["/enum-devices"])
+        .output();
+    if let Ok(out) = verify {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.to_ascii_lowercase().contains("mttvdd") {
+            println!(
+                "  Warning: pnputil still lists an MttVDD device — reboot may be needed."
+            );
+        } else {
+            println!("  VDD fully removed.");
+        }
+    }
+
+    // Step 4: clean up our own install files + config dir.
     let _ = std::fs::remove_dir_all(&vdd_dir);
     let _ = std::fs::remove_dir_all(r"C:\VirtualDisplayDriver");
 
