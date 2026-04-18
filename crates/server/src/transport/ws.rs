@@ -225,12 +225,12 @@ fn make_tls_acceptor() -> Result<Arc<rustls::ServerConfig>> {
 }
 
 /// Embedded static files for the web client.
-const INDEX_HTML: &str = include_str!("../web/index.html");
+const INDEX_HTML: &str = include_str!("../../web/index.html");
 
 #[cfg(feature = "web-client")]
-const WASM_JS: &[u8] = include_bytes!("../../web/pkg/phantom_web.js");
+const WASM_JS: &[u8] = include_bytes!("../../../web/pkg/phantom_web.js");
 #[cfg(feature = "web-client")]
-const WASM_BIN: &[u8] = include_bytes!("../../web/pkg/phantom_web_bg.wasm");
+const WASM_BIN: &[u8] = include_bytes!("../../../web/pkg/phantom_web_bg.wasm");
 
 #[cfg(not(feature = "web-client"))]
 const WASM_JS: &[u8] =
@@ -242,8 +242,8 @@ const WASM_BIN: &[u8] = b"";
 
 #[cfg(feature = "webrtc")]
 type SessionPair = (
-    super::transport_webrtc::WebRtcSender,
-    super::transport_webrtc::WebRtcReceiver,
+    super::transport::webrtc::WebRtcSender,
+    super::transport::webrtc::WebRtcReceiver,
 );
 
 #[allow(dead_code)]
@@ -295,7 +295,7 @@ impl WebServerTransport {
             let (notify_tx, rtc_notify) = mpsc::channel::<()>();
 
             std::thread::spawn(move || {
-                super::transport_webrtc::run_loop(candidate_addr, rtc_rx, rtc_session2, notify_tx);
+                super::transport::webrtc::run_loop(candidate_addr, rtc_rx, rtc_session2, notify_tx);
             });
 
             // HTTPS server thread (serves static files + POST /rtc + WSS upgrade)

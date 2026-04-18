@@ -5,7 +5,7 @@
 //! `SessionRunner` to avoid duplicating the ~80% of session code that is
 //! transport/input/clipboard plumbing.
 
-use crate::encode_zstd::ZstdEncoder;
+use crate::encode::zstd::ZstdEncoder;
 use crate::input_injector::InputInjector;
 use anyhow::Result;
 use phantom_core::clipboard::ClipboardTracker;
@@ -393,7 +393,7 @@ pub struct SessionRunner {
     /// Separate audio sender (independent WebSocket). Falls back to main sender.
     pub audio_sender: Option<Box<dyn MessageSender>>,
     /// Receiver for audio WS connections (set from main.rs).
-    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
+    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport::ws::WsSender>>,
     pub event_rx: mpsc::Receiver<InboundEvent>,
     pub injector: Option<InputInjector>,
     pub clipboard: ClipboardTracker,
@@ -427,9 +427,9 @@ pub struct SessionRunner {
     pub cancel: Arc<AtomicBool>,
     /// Audio capture thread + receiver (None if audio feature disabled or init failed).
     #[cfg(feature = "audio")]
-    pub audio_rx: Option<mpsc::Receiver<crate::audio_capture::AudioChunk>>,
+    pub audio_rx: Option<mpsc::Receiver<crate::audio::AudioChunk>>,
     #[cfg(feature = "audio")]
-    pub _audio_capture: Option<crate::audio_capture::AudioCapture>,
+    pub _audio_capture: Option<crate::audio::AudioCapture>,
     /// File transfer handler.
     pub file_transfer: crate::file_transfer::ServerFileTransfer,
     /// Session token for reconnect validation.
@@ -469,7 +469,7 @@ impl SessionRunner {
 
         // Start audio capture (best-effort: don't fail session if audio unavailable)
         #[cfg(feature = "audio")]
-        let (audio_capture, audio_rx) = match crate::audio_capture::AudioCapture::start() {
+        let (audio_capture, audio_rx) = match crate::audio::AudioCapture::start() {
             Ok((capture, rx)) => (Some(capture), Some(rx)),
             Err(e) => {
                 tracing::warn!("audio capture unavailable: {e}");
@@ -1159,7 +1159,7 @@ pub struct SessionConfig<'a> {
     /// Optional input forwarder for service mode (IPC to agent).
     pub input_forwarder: Option<Box<dyn InputForwarder>>,
     /// Receiver for audio-only WebSocket connections (independent from video).
-    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport_ws::WsSender>>,
+    pub audio_ws_rx: Option<mpsc::Receiver<crate::transport::ws::WsSender>>,
     /// Optional callback for resolution change (service mode → IPC to agent).
     pub resolution_change_fn: Option<ResolutionChangeFn>,
     /// Optional callback for paste text (service mode → IPC to agent).

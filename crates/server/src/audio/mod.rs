@@ -1,8 +1,8 @@
 //! Cross-platform audio capture → Opus encoding.
 //!
 //! Dispatches to the platform-specific backend:
-//! - **Linux**: PulseAudio monitor source (`audio_capture_pulse`)
-//! - **Windows**: WASAPI loopback capture (`audio_capture_wasapi`)
+//! - **Linux**: PulseAudio monitor source (`pulse`)
+//! - **Windows**: WASAPI loopback capture (`wasapi`)
 
 /// Encoded audio chunk ready to be sent as an AudioFrame message.
 pub struct AudioChunk {
@@ -19,15 +19,14 @@ pub struct AudioChunk {
 pub type AudioDropCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
 #[cfg(target_os = "linux")]
-#[path = "audio_capture_pulse.rs"]
-mod platform;
-
+mod pulse;
 #[cfg(target_os = "windows")]
-#[path = "audio_capture_wasapi.rs"]
-mod platform;
+mod wasapi;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub use platform::AudioCapture;
+#[cfg(target_os = "linux")]
+pub use pulse::AudioCapture;
+#[cfg(target_os = "windows")]
+pub use wasapi::AudioCapture;
 
 /// Stub for unsupported platforms (macOS etc.)
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

@@ -16,28 +16,19 @@
 #![allow(clippy::field_reassign_with_default)]
 
 #[cfg(feature = "audio")]
-mod audio_capture;
-#[cfg(target_os = "windows")]
-mod capture_gdi;
-#[cfg(feature = "wayland")]
-mod capture_pipewire;
-mod capture_scrap;
+mod audio;
+mod capture;
 #[cfg(target_os = "windows")]
 mod display_ccd;
 mod doorbell;
-mod encode_h264;
-mod encode_zstd;
+mod encode;
 mod file_transfer;
 mod input_injector;
 mod ipc_pipe;
 #[cfg(target_os = "windows")]
 mod service_win;
 mod session;
-mod transport_quic;
-mod transport_tcp;
-#[cfg(feature = "webrtc")]
-mod transport_webrtc;
-mod transport_ws;
+mod transport;
 
 use anyhow::Result;
 use clap::Parser;
@@ -288,7 +279,7 @@ fn main() -> Result<()> {
     }
 
     if args.list_displays {
-        match capture_scrap::ScrapCapture::list_displays() {
+        match capture::scrap::ScrapCapture::list_displays() {
             Ok(displays) => {
                 if displays.is_empty() {
                     println!("No displays found.");
@@ -491,7 +482,7 @@ fn main() -> Result<()> {
     let transports: Vec<&str> = args.transport.split(',').map(|s| s.trim()).collect();
     let (conn_tx, conn_rx) = mpsc::channel::<ConnectionPair>();
     // Audio WS receiver, shared across sessions. Set by "web" transport.
-    type AudioWsRxShared = Arc<std::sync::Mutex<Option<mpsc::Receiver<transport_ws::WsSender>>>>;
+    type AudioWsRxShared = Arc<std::sync::Mutex<Option<mpsc::Receiver<transport::ws::WsSender>>>>;
     let mut audio_ws_rx_shared: Option<AudioWsRxShared> = None;
 
     let base_port: u16 = args
@@ -526,7 +517,7 @@ fn main() -> Result<()> {
         match *transport {
             "tcp" => {
                 let tcp_addr = format!("{listen_host}:{base_port}");
-                let tcp_listener = transport_tcp::TcpServerTransport::bind(&tcp_addr)?;
+                let tcp_listener = transport::tcp::TcpServerTransport::bind(&tcp_addr)?;
                 let tx = conn_tx.clone();
                 let enc_key = encryption_key;
                 std::thread::Builder::new()
@@ -573,7 +564,7 @@ fn main() -> Result<()> {
                 } else {
                     base_port
                 };
-                let mut ws_transport = transport_ws::WebServerTransport::start(
+                let mut ws_transport = transport::ws::WebServerTransport::start(
                     web_port,
                     web_port + 1,
                     web_port + 2,
@@ -612,7 +603,7 @@ fn main() -> Result<()> {
             }
             "quic" => {
                 let quic_addr = format!("{listen_host}:{base_port}");
-                let quic_listener = transport_quic::QuicServerTransport::bind(&quic_addr)?;
+                let quic_listener = transport::quic::QuicServerTransport::bind(&quic_addr)?;
                 let tx = conn_tx.clone();
                 std::thread::Builder::new()
                     .name("quic-accept".into())
@@ -1042,7 +1033,7 @@ fn create_capture(
 ) -> Result<Box<dyn phantom_core::capture::FrameCapture>> {
     match name {
         "scrap" => {
-            let cap = capture_scrap::ScrapCapture::with_display(display_index)?;
+            let cap = capture::scrap::ScrapCapture::with_display(display_index)?;
             Ok(Box::new(cap))
         }
         #[cfg(feature = "wayland")]
@@ -1052,7 +1043,7 @@ fn create_capture(
                     "PipeWire capture: --display is ignored (portal handles display selection)"
                 );
             }
-            let cap = capture_pipewire::PipeWireCapture::new()?;
+            let cap = capture::pipewire::PipeWireCapture::new()?;
             Ok(Box::new(cap))
         }
         other => {
@@ -1079,7 +1070,7 @@ fn create_encoder(
             if codec == VideoCodec::Av1 {
                 anyhow::bail!("OpenH264 does not support AV1. Use --encoder nvenc for AV1.");
             }
-            let enc = encode_h264::OpenH264Encoder::new(width, height, fps, bitrate_kbps)?;
+            let enc = encode::h264::OpenH264Encoder::new(width, height, fps, bitrate_kbps)?;
             Ok(Box::new(enc))
         }
         "nvenc" => {
@@ -1582,7 +1573,7 @@ fn run_agent_loop(
     // Attach to input desktop BEFORE calling SetDisplayConfig. CCD API returns
     // ERROR_ACCESS_DENIED if the calling thread isn't attached to an interactive
     // desktop. Same reason capture calls need this.
-    capture_gdi::switch_to_input_desktop();
+    capture::gdi::switch_to_input_desktop();
 
     // Find VDD device name (e.g. \\.\DISPLAY10) — always capture from VDD.
     // Same approach as DCV/Parsec: target our own virtual display by device name.
@@ -1614,7 +1605,7 @@ fn run_agent_loop(
         tracing::info!("No VDD found — will capture from best available display");
     }
     // Log displays after topology change so we can verify
-    if let Ok(displays) = capture_scrap::ScrapCapture::list_displays() {
+    if let Ok(displays) = capture::scrap::ScrapCapture::list_displays() {
         for d in &displays {
             crate::service_win::svc_log(&format!(
                 "agent: display[{}] {}x{} primary={}",
@@ -1645,8 +1636,8 @@ fn run_agent_loop(
     // 2. DXGI(VDD)→CPU encode     (any platform with VDD)
     // 3. GDI→CPU encode            (lock screen fallback)
     let mut gpu_pipeline: Option<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> = None;
-    let mut scrap_capture: Option<capture_scrap::ScrapCapture> = None;
-    let mut gdi_capture: Option<capture_gdi::GdiCapture> = None;
+    let mut scrap_capture: Option<capture::scrap::ScrapCapture> = None;
+    let mut gdi_capture: Option<capture::gdi::GdiCapture> = None;
     let mut cpu_encoder: Option<Box<dyn FrameEncoder>> = None;
 
     let mut frame_count = 0u64;
@@ -1669,12 +1660,12 @@ fn run_agent_loop(
 
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
         let loop_start = Instant::now();
-        capture_gdi::switch_to_input_desktop();
+        capture::gdi::switch_to_input_desktop();
         // Detect desktop switch (Winlogon ↔ Default): if changed, force reset
         // of all capture pipelines so the new duplication targets the right
         // desktop. Without this, after lock→unlock the client keeps seeing
         // the login screen until the user manually reconnects.
-        let cur_desktop = capture_gdi::current_input_desktop_name();
+        let cur_desktop = capture::gdi::current_input_desktop_name();
         if cur_desktop != last_desktop_name {
             if last_desktop_name.is_some() {
                 crate::service_win::svc_log(&format!(
@@ -1725,7 +1716,7 @@ fn run_agent_loop(
                     let scrap_result = {
                         // Enumerate displays, pick the highest-res one
                         let displays =
-                            capture_scrap::ScrapCapture::list_displays().unwrap_or_default();
+                            capture::scrap::ScrapCapture::list_displays().unwrap_or_default();
                         let best_idx = displays
                             .iter()
                             .max_by_key(|d| (d.width as u64) * (d.height as u64))
@@ -1736,7 +1727,7 @@ fn run_agent_loop(
                             displays = ?displays.iter().map(|d| format!("{}:{}x{}", d.index, d.width, d.height)).collect::<Vec<_>>(),
                             "ScrapCapture display selection"
                         );
-                        capture_scrap::ScrapCapture::with_display(best_idx)
+                        capture::scrap::ScrapCapture::with_display(best_idx)
                     };
                     match scrap_result {
                         Ok(scrap) => {
@@ -1747,7 +1738,7 @@ fn run_agent_loop(
                             let (dx, dy) = get_display_origin(w, h, 0);
                             display_x = dx;
                             display_y = dy;
-                            match encode_h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
+                            match encode::h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
                                 Ok(mut enc) => {
                                     enc.force_keyframe();
                                     crate::service_win::svc_log(&format!(
@@ -1765,12 +1756,12 @@ fn run_agent_loop(
                             tracing::debug!("ScrapCapture unavailable: {e}");
 
                             // Tier 3: GDI + OpenH264 (lock screen fallback)
-                            match capture_gdi::GdiCapture::new() {
+                            match capture::gdi::GdiCapture::new() {
                                 Ok(gdi) => {
                                     let (w, h) = gdi.resolution();
                                     width = w;
                                     height = h;
-                                    match encode_h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
+                                    match encode::h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
                                         Ok(mut enc) => {
                                             enc.force_keyframe();
                                             tracing::info!(
@@ -2013,7 +2004,7 @@ fn run_agent_loop(
             tracing::info!(count = inputs.len(), "agent received input events");
         }
         for mut event in inputs {
-            capture_gdi::switch_to_input_desktop();
+            capture::gdi::switch_to_input_desktop();
             // Offset mouse coordinates to the captured display's position
             // on the virtual desktop (needed for secondary displays like VDD).
             if let InputEvent::MouseMove {
