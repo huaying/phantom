@@ -1511,13 +1511,24 @@ pub fn uninstall_service() -> anyhow::Result<()> {
     // Wait for graceful stop (Bug 1 fix: Stop handler now cancels active session)
     std::thread::sleep(Duration::from_secs(5));
 
-    // Force kill fallback — if sc stop didn't work, kill the process directly
+    // Force kill fallback — if sc stop didn't work, kill the process directly.
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/FI", &format!("SERVICES eq {SERVICE_NAME}")])
         .status();
-    // Also kill any agent processes
+    // Also kill any agent processes — but NEVER the current process.
+    // The uninstall binary runs as phantom-server.exe itself, so an
+    // unconditional `taskkill /IM phantom-server.exe` would suicide
+    // before reaching `sc delete` / `uninstall_vdd` below. Exclude our
+    // own PID via a second filter.
+    let my_pid = std::process::id();
     let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "phantom-server.exe"])
+        .args([
+            "/F",
+            "/FI",
+            "IMAGENAME eq phantom-server.exe",
+            "/FI",
+            &format!("PID ne {my_pid}"),
+        ])
         .status();
 
     std::thread::sleep(Duration::from_secs(2));
