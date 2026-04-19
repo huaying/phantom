@@ -1,48 +1,10 @@
 # Phantom — Architecture
 
-A high-performance, open-source remote desktop built in Rust. Target:
-Parsec-class latency (~20-50ms), single binary deployment, browser +
-native access.
+A high-performance, open-source remote desktop built in Rust. Low
+latency, single binary deployment, browser + native access.
 
 ~18,000 lines Rust (across 6 crates), MIT license. Runs on Linux +
 Windows; native client also runs on macOS.
-
-## Competitive Position
-
-```
-                    Latency     Text Quality    Deploy        Web Client  Open Source
-Parsec              15-30ms     lossy(blurry)   simple        ❌          ❌
-NICE DCV            30-60ms     pixel-perfect   medium        ✅(limited) ❌
-KasmVNC             80-150ms    pixel-perfect   Docker        ✅          ✅
-Neko                80-150ms    lossy(blurry)   Docker        ✅          ✅
-Selkies (Google)    70-120ms    lossy(blurry)   complex       ✅          ✅
-RustDesk            50-100ms    lossy(blurry)   simple        ✅(beta)    ✅
-Phantom             20-50ms     lossy(H.264)    single binary ✅          ✅
-```
-
-### Five unique advantages
-1. **DataChannel + WebCodecs** — same approach as Parsec/Zoom, bypasses
-   jitter buffer (30-80ms saved)
-2. **WSS fallback on same port** — WebSocket + WebCodecs as reliable
-   fallback (validated by Helix at scale)
-3. **Single binary** — web client embedded, no Docker/GStreamer/coturn
-4. **Rust + WASM code sharing** — one codebase for server + web client
-5. **~17K lines** — vs KasmVNC 200K+, Neko 15K+, RustDesk 150K
-
-### Lessons from competitors
-- **Parsec** (BorgGames/streaming-client): DataChannel reliable+ordered for
-  video, MSE decode. Only other production DataChannel video impl.
-- **Zoom**: unreliable DataChannel for video, WASM decode. Validated at
-  massive scale.
-- **Neko/Selkies**: WebRTC Media Track (RTP), not DataChannel. Browser
-  handles decode. Simpler but 30-80ms jitter buffer.
-- **Helix**: killed WebRTC entirely, WebSocket + WebCodecs. Reports
-  20-30ms lower latency than their WebRTC setup.
-- **Sunshine**: no web client. Custom UDP + RTP + Reed-Solomon FEC for
-  native Moonlight clients.
-- **NICE DCV**: QUIC transport (we have it), GPU sharing (future)
-- **KasmVNC**: per-rectangle quality tracking, multi-encoder mixing, DLP
-- **RustDesk**: NAT traversal, P2P, file transfer
 
 ## Architecture decisions
 
@@ -52,9 +14,9 @@ Sunshine and Parsec don't use GStreamer either. Our pipeline is 3 steps,
 not 20 elements with buffer copies.
 
 ### WebRTC DataChannel, not Media Track
-Media Track adds 30-80ms jitter buffer (designed for video calls).
-DataChannel delivers raw bytes instantly → WebCodecs GPU decode → Canvas.
-Measured: 20-50ms vs 80-150ms.
+Media Track adds a jitter buffer (designed for video calls) which adds
+tens of ms. DataChannel delivers raw bytes instantly → WebCodecs GPU
+decode → Canvas.
 
 ### WebRTC, not WebTransport
 WebTransport requires HTTPS + certificates. Self-signed ≤14 days in Chrome.
@@ -79,11 +41,11 @@ phantom was ignoring this return value. Fix: backpressure via
 `set_buffered_amount_low_threshold()` + `Event::ChannelBufferedAmountLow`
 to pause/resume writes, with per-channel pending queues.
 
-### Always H.264 full frames (tile mode disabled)
-Tile-based rendering (zstd per-tile) was disabled — caused visual tearing
-when mixed with H.264 over high latency. Now every frame change triggers a
-full H.264 encode. TileDiffer still detects change to skip encode on
-static frames.
+### Full-frame H.264/AV1 encoding with tile-based change detection
+Every dirty frame triggers a full encode; TileDiffer skips the encode
+entirely when no tile has changed. Zstd per-tile refresh was removed
+in 0.4.4 — it only ran on CPU capture, never on the GPU path most
+users actually run.
 
 ### Periodic keyframes (2s interval)
 Server forces IDR keyframe every 2 seconds. Recovers from:
@@ -98,7 +60,7 @@ Server forces IDR keyframe every 2 seconds. Recovers from:
   param): POST /rtc signaling, str0m 0.18, reliable+ordered. Needs
   chunking for messages >16KB (SCTP limitation). Only needed for future
   NAT traversal.
-- **Native**: raw QUIC (no browser overhead, 15-30ms target)
+- **Native**: raw QUIC (no browser overhead)
 - All produce same `Box<dyn MessageSender/Receiver>` → same session loop
 
 ## Key implementation details
