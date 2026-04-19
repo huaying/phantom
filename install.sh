@@ -9,146 +9,167 @@ set -e
 
 REPO="huaying/phantom"
 INSTALL_DIR="/usr/local/bin"
+BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
-# --- Detect OS and Arch ---
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
+# ===========================================================================
+# Generic helpers
+# ===========================================================================
 
-case "$OS" in
-    linux)  OS="linux" ;;
-    darwin) OS="macos" ;;
-    *) echo "Unsupported OS: $OS"; exit 1 ;;
-esac
+have_cmd() {
+    command -v "$1" > /dev/null 2>&1
+}
 
-case "$ARCH" in
-    x86_64|amd64)  ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
-    *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
+detect_os_arch() {
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m)
 
-echo "Detected: ${OS}/${ARCH}"
-
-# --- Determine what to install ---
-INSTALL_SERVER=false
-INSTALL_CLIENT=false
-AUTOLOGIN=false
-GOT_ROLE=false
-
-for arg in "$@"; do
-    case "$arg" in
-        server) INSTALL_SERVER=true; GOT_ROLE=true ;;
-        client) INSTALL_CLIENT=true; GOT_ROLE=true ;;
-        both)   INSTALL_SERVER=true; INSTALL_CLIENT=true; GOT_ROLE=true ;;
-        --autologin) AUTOLOGIN=true ;;
-        *) echo "Unknown argument: $arg"; echo "Usage: $0 [server|client|both] [--autologin]"; exit 1 ;;
-    esac
-done
-
-if [ "$GOT_ROLE" = false ]; then
-    # Default: server on Linux, client on macOS
     case "$OS" in
-        linux) INSTALL_SERVER=true ;;
-        macos) INSTALL_CLIENT=true ;;
+        linux)  OS="linux" ;;
+        darwin) OS="macos" ;;
+        *) echo "Unsupported OS: $OS"; exit 1 ;;
     esac
-fi
 
-if [ "$AUTOLOGIN" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
-    echo "--autologin only applies to Linux server installs; ignoring"
+    case "$ARCH" in
+        x86_64|amd64)  ARCH="x86_64" ;;
+        aarch64|arm64) ARCH="aarch64" ;;
+        *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
+
+    echo "Detected: ${OS}/${ARCH}"
+}
+
+parse_args() {
+    INSTALL_SERVER=false
+    INSTALL_CLIENT=false
     AUTOLOGIN=false
-fi
+    GOT_ROLE=false
 
-# --- Install Linux runtime dependencies ---
-if [ "$OS" = "linux" ]; then
+    for _arg in "$@"; do
+        case "$_arg" in
+            server) INSTALL_SERVER=true; GOT_ROLE=true ;;
+            client) INSTALL_CLIENT=true; GOT_ROLE=true ;;
+            both)   INSTALL_SERVER=true; INSTALL_CLIENT=true; GOT_ROLE=true ;;
+            --autologin) AUTOLOGIN=true ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin]"; exit 1 ;;
+        esac
+    done
+}
+
+apply_defaults() {
+    if [ "$GOT_ROLE" = false ]; then
+        # Default: server on Linux, client on macOS
+        case "$OS" in
+            linux) INSTALL_SERVER=true ;;
+            macos) INSTALL_CLIENT=true ;;
+        esac
+    fi
+
+    if [ "$AUTOLOGIN" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
+        echo "--autologin only applies to Linux server installs; ignoring"
+        AUTOLOGIN=false
+    fi
+}
+
+# Resolve the invoking non-root user. SUDO_USER is set when install.sh
+# is piped through sudo; fall back to $USER.
+get_target_user() {
+    TARGET_USER="${SUDO_USER:-$USER}"
+}
+
+download_and_install() {
+    _name="$1"
+    _url="${BASE_URL}/${_name}-${OS}-${ARCH}"
+
+    echo "Downloading ${_name}..."
+    if have_cmd curl; then
+        curl -fsSL "$_url" -o "/tmp/${_name}"
+    elif have_cmd wget; then
+        wget -qO "/tmp/${_name}" "$_url"
+    else
+        echo "Error: curl or wget required"; exit 1
+    fi
+
+    chmod +x "/tmp/${_name}"
+
+    # Install — use sudo if needed
+    if [ -w "$INSTALL_DIR" ]; then
+        mv "/tmp/${_name}" "${INSTALL_DIR}/${_name}"
+    else
+        echo "Installing to ${INSTALL_DIR} (requires sudo)..."
+        sudo mv "/tmp/${_name}" "${INSTALL_DIR}/${_name}"
+    fi
+
+    echo "Installed: ${INSTALL_DIR}/${_name}"
+}
+
+# ===========================================================================
+# Linux: runtime package install
+# ===========================================================================
+
+linux_install_deps() {
     echo "Installing runtime dependencies..."
 
-    if command -v apt-get > /dev/null 2>&1; then
-        # Debian / Ubuntu
-        PKGS=""
-        if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0"
-        fi
-        if [ "$INSTALL_CLIENT" = true ]; then
-            # Client: winit needs xcb + xcb-randr (multi-monitor), softbuffer
-            # renders via xcb-shm, alsa for audio output.
-            PKGS="$PKGS libxcb1 libxcb-shm0 libxcb-randr0 libasound2"
-        fi
-        if [ -n "$PKGS" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends $PKGS || true
-        fi
-
-    elif command -v dnf > /dev/null 2>&1; then
-        # Fedora / RHEL
-        PKGS=""
-        if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="libxcb libxdo libXtst pulseaudio-libs"
-        fi
-        if [ "$INSTALL_CLIENT" = true ]; then
-            PKGS="$PKGS libxcb alsa-lib"
-        fi
-        if [ -n "$PKGS" ]; then
-            sudo dnf install -y $PKGS || true
-        fi
-
-    elif command -v pacman > /dev/null 2>&1; then
-        # Arch Linux
-        PKGS=""
-        if [ "$INSTALL_SERVER" = true ]; then
-            PKGS="libxcb xdotool libxtst libpulse"
-        fi
-        if [ "$INSTALL_CLIENT" = true ]; then
-            PKGS="$PKGS libxcb alsa-lib"
-        fi
-        if [ -n "$PKGS" ]; then
-            sudo pacman -S --needed --noconfirm $PKGS || true
-        fi
-
+    if have_cmd apt-get; then
+        linux_install_deps_apt
+    elif have_cmd dnf; then
+        linux_install_deps_dnf
+    elif have_cmd pacman; then
+        linux_install_deps_pacman
     else
         echo "Warning: could not detect package manager. You may need to install runtime libraries manually."
         echo "  Server: libxcb, libxdo, libpulse"
         echo "  Client: libasound (ALSA)"
     fi
-fi
-
-# --- Get latest release URL ---
-BASE_URL="https://github.com/${REPO}/releases/latest/download"
-
-download_and_install() {
-    name="$1"
-    url="${BASE_URL}/${name}-${OS}-${ARCH}"
-
-    echo "Downloading ${name}..."
-    if command -v curl > /dev/null 2>&1; then
-        curl -fsSL "$url" -o "/tmp/${name}"
-    elif command -v wget > /dev/null 2>&1; then
-        wget -qO "/tmp/${name}" "$url"
-    else
-        echo "Error: curl or wget required"; exit 1
-    fi
-
-    chmod +x "/tmp/${name}"
-
-    # Install — use sudo if needed
-    if [ -w "$INSTALL_DIR" ]; then
-        mv "/tmp/${name}" "${INSTALL_DIR}/${name}"
-    else
-        echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "/tmp/${name}" "${INSTALL_DIR}/${name}"
-    fi
-
-    echo "Installed: ${INSTALL_DIR}/${name}"
 }
 
-# --- Install ---
-if [ "$INSTALL_SERVER" = true ]; then
-    download_and_install "phantom-server"
-fi
+linux_install_deps_apt() {
+    # Debian / Ubuntu
+    _pkgs=""
+    if [ "$INSTALL_SERVER" = true ]; then
+        _pkgs="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0"
+    fi
+    if [ "$INSTALL_CLIENT" = true ]; then
+        # Client: winit needs xcb + xcb-randr (multi-monitor), softbuffer
+        # renders via xcb-shm, alsa for audio output.
+        _pkgs="$_pkgs libxcb1 libxcb-shm0 libxcb-randr0 libasound2"
+    fi
+    if [ -n "$_pkgs" ]; then
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends $_pkgs || true
+    fi
+}
 
-if [ "$INSTALL_CLIENT" = true ]; then
-    download_and_install "phantom-client"
-fi
+linux_install_deps_dnf() {
+    # Fedora / RHEL
+    _pkgs=""
+    if [ "$INSTALL_SERVER" = true ]; then
+        _pkgs="libxcb libxdo libXtst pulseaudio-libs"
+    fi
+    if [ "$INSTALL_CLIENT" = true ]; then
+        _pkgs="$_pkgs libxcb alsa-lib"
+    fi
+    if [ -n "$_pkgs" ]; then
+        sudo dnf install -y $_pkgs || true
+    fi
+}
 
-# --- Linux server: configure /dev/uinput for keyboard injection ---
+linux_install_deps_pacman() {
+    # Arch Linux
+    _pkgs=""
+    if [ "$INSTALL_SERVER" = true ]; then
+        _pkgs="libxcb xdotool libxtst libpulse"
+    fi
+    if [ "$INSTALL_CLIENT" = true ]; then
+        _pkgs="$_pkgs libxcb alsa-lib"
+    fi
+    if [ -n "$_pkgs" ]; then
+        sudo pacman -S --needed --noconfirm $_pkgs || true
+    fi
+}
+
+# ===========================================================================
+# Linux server: /dev/uinput for keyboard injection
+# ===========================================================================
 # Server uses /dev/uinput to create a virtual keyboard (bypasses the
 # X11 XKB remap path that scrambles keys on GDM 42, and also works on
 # Wayland + lock screens where XTest can't reach). Needs:
@@ -157,25 +178,25 @@ fi
 # Without this the server still runs but falls back to enigo/XTest,
 # with a loud warning in logs and the known GDM-42 scramble bug
 # lurking.
-if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
+
+linux_configure_uinput() {
     echo ""
     echo "Configuring /dev/uinput for keyboard injection..."
-    UDEV_RULE_PATH="/etc/udev/rules.d/99-phantom-uinput.rules"
-    UDEV_RULE_CONTENT='KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"'
+    _udev_rule_path="/etc/udev/rules.d/99-phantom-uinput.rules"
+    _udev_rule_content='KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"'
 
     # Only write if missing or different (idempotent re-install)
-    if [ ! -f "$UDEV_RULE_PATH" ] || ! grep -qxF "$UDEV_RULE_CONTENT" "$UDEV_RULE_PATH" 2>/dev/null; then
-        echo "$UDEV_RULE_CONTENT" | sudo tee "$UDEV_RULE_PATH" > /dev/null
+    if [ ! -f "$_udev_rule_path" ] || ! grep -qxF "$_udev_rule_content" "$_udev_rule_path" 2>/dev/null; then
+        echo "$_udev_rule_content" | sudo tee "$_udev_rule_path" > /dev/null
         sudo udevadm control --reload-rules
         sudo udevadm trigger /dev/uinput 2>/dev/null || true
-        echo "  Wrote $UDEV_RULE_PATH"
+        echo "  Wrote $_udev_rule_path"
     else
         echo "  udev rule already in place"
     fi
 
     # Add invoking user to input group. SUDO_USER preferred when
     # install.sh is piped through sudo; fall back to $USER.
-    TARGET_USER="${SUDO_USER:-$USER}"
     if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
         if id -nG "$TARGET_USER" 2>/dev/null | grep -qw input; then
             echo "  User $TARGET_USER already in 'input' group"
@@ -189,18 +210,20 @@ if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
             echo "   XTest (login screen typing may be unreliable on Ubuntu 22)."
         fi
     fi
-fi
+}
 
-# --- Linux server --autologin: configure GDM autologin + disable screen lock
+# ===========================================================================
+# Linux server --autologin: GDM autologin + disable screen lock
 # + auto-unlock keyring. Target use case is remote VMs where the phantom
 # session needs to survive user sign out (Windows-style service feel).
 # Without autologin, the X session dies on sign out and phantom-server can't
 # reattach. See docs/pitfalls.md for the full rationale.
-if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ] && [ "$AUTOLOGIN" = true ]; then
+# ===========================================================================
+
+linux_configure_autologin() {
     echo ""
     echo "Configuring auto-login (per --autologin)..."
 
-    TARGET_USER="${SUDO_USER:-$USER}"
     if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
         echo "  ERROR: cannot determine non-root user for autologin. Re-run as a regular user via sudo."
         exit 1
@@ -211,6 +234,20 @@ if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ] && [ "$AUTOLOGIN" = true 
         exit 1
     fi
 
+    linux_autologin_gdm
+    linux_autologin_disable_screenlock
+    linux_autologin_reset_keyring
+    linux_autologin_install_keyring_unlock
+    linux_autologin_install_phantom_autostart
+    linux_autologin_install_watchdog
+
+    echo ""
+    echo "⚠️  Autologin takes effect on next reboot. Security note: the console"
+    echo "   will no longer require a password, and the keyring will be stored"
+    echo "   unencrypted. This is intended for dedicated remote-access VMs."
+}
+
+linux_autologin_gdm() {
     # 1. GDM autologin (Ubuntu 22/24 default DM)
     if [ -f /etc/gdm3/custom.conf ]; then
         # Back up original once so we can revert cleanly later
@@ -244,7 +281,9 @@ EOF
     else
         echo "  WARN: /etc/gdm3/custom.conf not found. Only GDM is supported here — configure autologin manually for your DM."
     fi
+}
 
+linux_autologin_disable_screenlock() {
     # 2. Disable GNOME screen lock + idle (system-wide dconf override so it
     #    applies before the user ever logs in and picks it up on every boot).
     sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
@@ -264,7 +303,9 @@ idle-delay=uint32 0
 EOF
     sudo dconf update 2>/dev/null || true
     echo "  Disabled GNOME screen lock + idle timeout"
+}
 
+linux_autologin_reset_keyring() {
     # 3. Clear any pre-existing keyring. The login keyring is encrypted with
     #    the user's password — under autologin, PAM never captures that
     #    password so the keyring can't be unlocked and Chrome/etc. pop up a
@@ -276,13 +317,15 @@ EOF
         sudo rm -rf "$USER_HOME/.local/share/keyrings"
         echo "  Cleared existing keyring (fresh empty one created on next login)"
     fi
+}
 
+linux_autologin_install_keyring_unlock() {
     # 4. Autostart hook: every session start, hand gnome-keyring-daemon an
     #    empty password via stdin. If no keyring exists, it creates one with
     #    no password → stays unlocked forever, no popup.
-    AUTOSTART_DIR="$USER_HOME/.config/autostart"
-    sudo -u "$TARGET_USER" mkdir -p "$AUTOSTART_DIR"
-    sudo -u "$TARGET_USER" tee "$AUTOSTART_DIR/phantom-keyring-unlock.desktop" > /dev/null <<'EOF'
+    _autostart_dir="$USER_HOME/.config/autostart"
+    sudo -u "$TARGET_USER" mkdir -p "$_autostart_dir"
+    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-keyring-unlock.desktop" > /dev/null <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Phantom Unlock Keyring
@@ -293,7 +336,9 @@ X-GNOME-Autostart-Phase=Initialization
 NoDisplay=true
 EOF
     echo "  Installed keyring auto-unlock autostart entry"
+}
 
+linux_autologin_install_phantom_autostart() {
     # 5. phantom-server autostart. GDM assigns a fresh DISPLAY number to
     #    each new session (sign out + TimedLogin fire = :0 → :1 → :2 ...),
     #    so a daemon pinned to DISPLAY=:0 breaks after the first sign-out.
@@ -307,7 +352,8 @@ EOF
     # gnome-session exits) and keep ports 9900/9901 bound. The new
     # session's autostart would then bind-fail silently. Wrapper kills
     # stale instances first, then launches fresh on the current DISPLAY.
-    sudo -u "$TARGET_USER" tee "$AUTOSTART_DIR/phantom-server.desktop" > /dev/null <<'EOF'
+    _autostart_dir="$USER_HOME/.config/autostart"
+    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-server.desktop" > /dev/null <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Phantom Server
@@ -317,7 +363,9 @@ X-GNOME-Autostart-enabled=true
 NoDisplay=true
 EOF
     echo "  Installed phantom-server autostart entry (edit ~/.config/autostart/phantom-server.desktop to change flags)"
+}
 
+linux_autologin_install_watchdog() {
     # 6. Watchdog timer. GDM 42 on Ubuntu 22.04 has a regression where
     #    TimedLogin doesn't fire reliably after sign-out — the greeter
     #    just sits there forever. Our workaround: poll every 30s, and if
@@ -359,27 +407,60 @@ EOF
     sudo systemctl daemon-reload
     sudo systemctl enable --now phantom-autologin-watchdog.timer > /dev/null 2>&1
     echo "  Installed autologin watchdog timer (workaround for GDM 42 TimedLogin regression)"
+}
 
-    echo ""
-    echo "⚠️  Autologin takes effect on next reboot. Security note: the console"
-    echo "   will no longer require a password, and the keyring will be stored"
-    echo "   unencrypted. This is intended for dedicated remote-access VMs."
-fi
+# ===========================================================================
+# Post-install hints
+# ===========================================================================
 
-# --- Post-install hints ---
-echo ""
-echo "Done!"
-if [ "$INSTALL_SERVER" = true ]; then
+print_post_install_hints() {
     echo ""
-    echo "Start server:"
-    echo "  phantom-server"
-    echo "  # TCP:9900 (native client) + Web:9901 (browser: https://localhost:9901)"
-    echo ""
-    echo "With GPU (NVIDIA):"
-    echo "  DISPLAY=:0 phantom-server --capture nvfbc --encoder nvenc"
-fi
-if [ "$INSTALL_CLIENT" = true ]; then
-    echo ""
-    echo "Connect to server:"
-    echo "  phantom-client -c <server-ip>:9900"
-fi
+    echo "Done!"
+    if [ "$INSTALL_SERVER" = true ]; then
+        echo ""
+        echo "Start server:"
+        echo "  phantom-server"
+        echo "  # TCP:9900 (native client) + Web:9901 (browser: https://localhost:9901)"
+        echo ""
+        echo "With GPU (NVIDIA):"
+        echo "  DISPLAY=:0 phantom-server --capture nvfbc --encoder nvenc"
+    fi
+    if [ "$INSTALL_CLIENT" = true ]; then
+        echo ""
+        echo "Connect to server:"
+        echo "  phantom-client -c <server-ip>:9900"
+    fi
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+main() {
+    detect_os_arch
+    parse_args "$@"
+    apply_defaults
+    get_target_user
+
+    if [ "$OS" = "linux" ]; then
+        linux_install_deps
+    fi
+
+    if [ "$INSTALL_SERVER" = true ]; then
+        download_and_install "phantom-server"
+    fi
+    if [ "$INSTALL_CLIENT" = true ]; then
+        download_and_install "phantom-client"
+    fi
+
+    if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
+        linux_configure_uinput
+        if [ "$AUTOLOGIN" = true ]; then
+            linux_configure_autologin
+        fi
+    fi
+
+    print_post_install_hints
+}
+
+main "$@"
