@@ -1120,31 +1120,28 @@ pub struct SessionConfig<'a> {
 
 // ── Session entry points (one per pipeline) ─────────────────────────────────
 
-/// CPU session: scrap capture + openh264/nvenc encode + tile differ + lossless.
-#[allow(clippy::too_many_arguments)]
-pub fn run_session_cpu(
-    capture: &mut dyn phantom_core::capture::FrameCapture,
-    video_encoder: &mut dyn FrameEncoder,
-    differ: &mut TileDiffer,
+/// Common session loop for any pipeline (CPU, GPU NVFBC, DXGI, etc.).
+/// Handles the parts of a session that don't vary by capture/encode backend:
+/// input pumping, clipboard, audio draining, stats, keepalive, frame pacing,
+/// adaptive bitrate.
+pub fn run_session(
+    pipeline: &mut dyn crate::pipeline::Pipeline,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
     let cancel = Arc::clone(&cfg.cancel);
     let mut session_id = String::new();
-    let result = run_session_cpu_inner(capture, video_encoder, differ, cfg, &mut session_id);
+    let result = run_session_inner(pipeline, cfg, &mut session_id);
     make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
-fn run_session_cpu_inner(
-    capture: &mut dyn phantom_core::capture::FrameCapture,
-    video_encoder: &mut dyn FrameEncoder,
-    differ: &mut TileDiffer,
+fn run_session_inner(
+    pipeline: &mut dyn crate::pipeline::Pipeline,
     cfg: SessionConfig<'_>,
     session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
-    differ.reset();
-    let _ = capture.reset();
+    pipeline.prepare()?;
+    let (width, height) = pipeline.dimensions();
 
-    let (width, height) = capture.resolution();
     let mut runner = SessionRunner::new(
         cfg.sender,
         cfg.receiver,
@@ -1161,23 +1158,20 @@ fn run_session_cpu_inner(
     runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
-    // Send file if requested via --send-file
     if let Some(path) = cfg.send_file {
         if let Err(e) = runner.send_file(path) {
             tracing::error!("failed to initiate file send: {e}");
         }
     }
 
-    // Nudge the screen for DXGI (Windows) — harmless on Linux.
+    // Nudge the screen — harmless for CPU capture, matters for DXGI on Windows.
     if let Some(ref mut inj) = runner.injector {
         let _ = inj.inject(&InputEvent::MouseMove { x: 0, y: 0 });
         let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
     }
 
-    let mut congestion = CongestionTracker::new(cfg.frame_interval);
-    let mut abr = AdaptiveBitrate::new(video_encoder.bitrate_kbps().max(5000));
-    let mut sent_first_frame = false;
-    let mut sent_first_frame_encoded = false;
+    let mut abr = AdaptiveBitrate::new(pipeline.bitrate_kbps().max(5000));
+    let log_label = pipeline.log_label();
 
     loop {
         runner.check_cancelled()?;
@@ -1185,51 +1179,74 @@ fn run_session_cpu_inner(
 
         runner.pump_events()?;
         runner.poll_clipboard()?;
-
-        // Drain audio FIRST — tiny packets (~100 bytes), must not be blocked by video
+        // Audio FIRST — tiny packets (~100 bytes), must not be blocked by video.
         runner.drain_audio()?;
 
-        // Capture
-        let frame = match capture.capture()? {
-            Some(f) => f,
+        let ctx = crate::pipeline::TickCtx {
+            had_input: runner.take_had_input(),
+            needs_keyframe: runner.needs_keyframe(),
+        };
+
+        match pipeline.tick(ctx)? {
+            Some(result) => {
+                runner.record_encode_time(result.encode_duration);
+                runner.send_video_frame(result.encoded, pipeline.congestion_mut())?;
+            }
             None => {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
-        };
-
-        let had_input = runner.take_had_input();
-        let changed = !sent_first_frame || had_input || differ.has_changes(&frame);
-
-        if changed {
-            sent_first_frame = true;
-            let dirty_tiles = differ.diff(&frame);
-
-            if congestion.should_skip_frame() {
-                continue;
-            }
-
-            if !dirty_tiles.is_empty() {
-                if runner.needs_keyframe() || !sent_first_frame_encoded {
-                    video_encoder.force_keyframe();
-                }
-                let enc_start = Instant::now();
-                let encoded = video_encoder.encode_frame(&frame)?;
-                runner.record_encode_time(enc_start.elapsed());
-                if encoded.is_keyframe && !sent_first_frame_encoded {
-                    tracing::info!(size = encoded.data.len(), "first keyframe sent");
-                }
-                sent_first_frame_encoded = true;
-                runner.send_video_frame(encoded, Some(&mut congestion))?;
-            }
         }
 
         runner.drain_file_transfers()?;
-        runner.adapt_bitrate(&mut abr, &congestion, video_encoder);
-        runner.log_stats("stats");
+
+        // ABR: snapshot skip_ratio before calling set_bitrate_kbps (both borrow pipeline).
+        let skip_ratio = pipeline
+            .congestion_mut()
+            .map(|c| c.skip_ratio)
+            .unwrap_or(0);
+        if let Some(new_kbps) = abr.evaluate(runner.rtt_us, skip_ratio) {
+            match pipeline.set_bitrate_kbps(new_kbps) {
+                Ok(()) => abr.apply(new_kbps),
+                Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
+            }
+        }
+
+        runner.log_stats(log_label);
         runner.keepalive_tick()?;
         runner.frame_pace(loop_start)?;
     }
+}
+
+/// CPU session: scrap capture + openh264/nvenc encode + tile differ.
+/// Thin wrapper that constructs a `CpuPipeline` and dispatches to `run_session`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_cpu(
+    capture: &mut dyn phantom_core::capture::FrameCapture,
+    video_encoder: &mut dyn FrameEncoder,
+    differ: &mut TileDiffer,
+    cfg: SessionConfig<'_>,
+) -> SessionResult {
+    let frame_interval = cfg.frame_interval;
+    let mut pipeline = match crate::pipeline::CpuPipeline::new(
+        capture,
+        video_encoder,
+        differ,
+        frame_interval,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return SessionResult {
+                session_token: Vec::new(),
+                error: e,
+                reason: Some(SessionEndReason::PipelineError(
+                    "CpuPipeline::new failed".into(),
+                )),
+                session_id: String::new(),
+            };
+        }
+    };
+    run_session(&mut pipeline, cfg)
 }
 
 /// IPC forwarding session: receives pre-encoded H.264 from agent, forwards to client.

@@ -30,9 +30,21 @@ use phantom_core::transport::{MessageReceiver, MessageSender};
 use phantom_server::session::{run_session_cpu, SessionConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Global serial lock for this test file. Rust runs `#[test]` functions on a
+/// thread pool by default; several of the real components SessionRunner::new
+/// constructs (notably `arboard` on macOS, which talks to NSPasteboard) are
+/// not thread-safe and will segfault under concurrent use. Each test
+/// acquires this lock at the top so we effectively run serially.
+fn test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -163,8 +175,6 @@ impl MockSender {
 
 impl MessageSender for MockSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
-        // Cloning Message is cheap for small variants; VideoFrame has Box so
-        // this is still a single pointer copy for the payload.
         self.out.lock().unwrap().push(clone_message(msg));
         Ok(())
     }
@@ -325,6 +335,21 @@ impl Harness {
             .map(clone_message)
             .collect()
     }
+
+    /// Block until the session has finished its Hello handshake (first message
+    /// in the outbox), or until `deadline` elapses. Returns true if ready.
+    /// Needed because SessionRunner::new on macOS takes 300-500ms to
+    /// initialize audio capture, which would otherwise race short tests.
+    fn wait_for_ready(&self, deadline: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if !self.sent.lock().unwrap().is_empty() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
 }
 
 fn count_variants<F: Fn(&Message) -> bool>(msgs: &[Message], pred: F) -> usize {
@@ -335,12 +360,15 @@ fn count_variants<F: Fn(&Message) -> bool>(msgs: &[Message], pred: F) -> usize {
 
 #[test]
 fn hello_is_first_message() {
+    let _lock = test_lock();
     let (h, _fill) = Harness::start(320, 240, 5);
-    thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.wait_for_ready(Duration::from_secs(3)),
+        "session never sent Hello within 3s"
+    );
     let msgs = h.sent();
     h.stop();
 
-    assert!(!msgs.is_empty(), "expected at least one message");
     match &msgs[0] {
         Message::Hello {
             width,
@@ -358,10 +386,12 @@ fn hello_is_first_message() {
 
 #[test]
 fn emits_video_frames_for_changing_capture() {
+    let _lock = test_lock();
+    let (h, fill) = Harness::start(64, 64, 300);
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
     // Change the fill byte every 20ms so TileDiffer thinks each frame is dirty.
-    let (h, fill) = Harness::start(64, 64, 100);
     let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(300) {
+    while start.elapsed() < Duration::from_millis(500) {
         {
             let mut f = fill.lock().unwrap();
             *f = f.wrapping_add(1);
@@ -381,9 +411,11 @@ fn emits_video_frames_for_changing_capture() {
 
 #[test]
 fn first_encoded_frame_is_a_keyframe() {
+    let _lock = test_lock();
     // Even with a static capture, the session should force a keyframe on the
     // first encode so the client can start decoding.
     let (h, _fill) = Harness::start(64, 64, 10);
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
     thread::sleep(Duration::from_millis(300));
     let keyframes = *h.keyframe_count.lock().unwrap();
     h.stop();
@@ -393,11 +425,13 @@ fn first_encoded_frame_is_a_keyframe() {
 
 #[test]
 fn static_screen_still_emits_one_frame() {
+    let _lock = test_lock();
     // Fill never changes → TileDiffer reports no dirty tiles after frame 1.
     // But the session sends at least one VideoFrame (the first one, which is
     // always sent regardless of diff).
     let (h, _fill) = Harness::start(64, 64, 50);
-    thread::sleep(Duration::from_millis(200));
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
+    thread::sleep(Duration::from_millis(300));
     let msgs = h.sent();
     h.stop();
 
@@ -410,8 +444,9 @@ fn static_screen_still_emits_one_frame() {
 
 #[test]
 fn cancel_ends_session_cleanly() {
+    let _lock = test_lock();
     let (h, _fill) = Harness::start(64, 64, 1000);
-    thread::sleep(Duration::from_millis(100));
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
     let start = Instant::now();
     h.stop();
     // Session should wake and exit within the next loop iteration (~33ms).
@@ -424,12 +459,13 @@ fn cancel_ends_session_cleanly() {
 
 #[test]
 fn input_channel_does_not_block_session() {
+    let _lock = test_lock();
     // Sanity check: spamming input events at the session doesn't deadlock or
     // crash it. We aren't asserting per-event side effects here (injector is
     // real, not mocked — the actual inject call is a no-op when there's no
     // display); just that the session keeps running and producing frames.
-    let (h, fill) = Harness::start(64, 64, 200);
-    thread::sleep(Duration::from_millis(50));
+    let (h, fill) = Harness::start(64, 64, 300);
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
     for _ in 0..20 {
         let _ = h.input_tx.send(Message::Input(InputEvent::Key {
             key: KeyCode::A,
@@ -442,7 +478,7 @@ fn input_channel_does_not_block_session() {
         thread::sleep(Duration::from_millis(10));
     }
     let msgs_before = h.sent().len();
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(100));
     let msgs_after = h.sent().len();
     h.stop();
 
@@ -455,9 +491,11 @@ fn input_channel_does_not_block_session() {
 
 #[test]
 fn bitrate_remains_sensible_under_idle() {
+    let _lock = test_lock();
     // No stress → adaptive bitrate should stay at its starting value (5000 kbps
     // per MockEncoder::new). We just check it didn't blow up to 0 or overflow.
     let (h, _fill) = Harness::start(64, 64, 30);
+    assert!(h.wait_for_ready(Duration::from_secs(3)), "session not ready");
     thread::sleep(Duration::from_millis(300));
     let final_kbps = *h.bitrate.lock().unwrap();
     h.stop();

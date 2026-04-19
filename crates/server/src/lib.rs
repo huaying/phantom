@@ -24,6 +24,7 @@ pub mod input_injector;
 #[cfg(target_os = "linux")]
 pub mod input_uinput;
 pub mod ipc_pipe;
+pub mod pipeline;
 #[cfg(target_os = "windows")]
 pub mod service_win;
 pub mod session;
