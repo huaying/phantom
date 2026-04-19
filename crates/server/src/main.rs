@@ -18,11 +18,17 @@
 // Modules live in lib.rs so integration tests can reach them. Re-alias here
 // so the binary's internal `crate::session::...` paths still resolve.
 use phantom_server::capture;
+#[cfg(target_os = "windows")]
+use phantom_server::display_ccd;
 use phantom_server::doorbell;
 use phantom_server::encode;
+#[cfg(target_os = "windows")]
+use phantom_server::input_injector;
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)]
 use phantom_server::input_uinput;
+#[cfg(target_os = "windows")]
+use phantom_server::ipc_pipe;
 #[cfg(target_os = "windows")]
 use phantom_server::service_win;
 use phantom_server::session;
