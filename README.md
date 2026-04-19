@@ -4,29 +4,18 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 
 ## Features
 
-- **H.264 / AV1 streaming** with periodic keyframes and dirty-tile gating (skip encode when nothing changed)
-- **GPU acceleration** — NVENC encoding (H.264 + AV1) + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
-- **Audio forwarding** — PulseAudio (Linux) / WASAPI (Windows) → Opus 48kHz stereo → client playback (native + web)
-- **Adaptive bitrate** — RTT-based, automatic quality adjustment with hysteresis
-- **File transfer** — bidirectional, chunked streaming with SHA-256 integrity verification
-- **Multi-monitor** — `--display N` to select monitor, `--list-displays` to enumerate
-- **Hardware auto-detect** — `--encoder auto` probes GPU and picks best encoder/capture
-- **Multi-transport** — `--transport tcp,web` serves TCP and HTTPS/WebSocket simultaneously
-- **Web client via WebSocket** — connect from any browser, zero install, WebCodecs H.264/AV1 decode + Opus audio
-- **Native client** — winit + softbuffer with local cursor rendering, OpenH264/dav1d/NVDEC decode
-- **QUIC/UDP transport** — for native client, no head-of-line blocking
-- **Encrypted by default** — ChaCha20-Poly1305 (TCP) or TLS (QUIC) or DTLS (WebRTC)
-- **Clipboard sync** — bidirectional, with Ctrl+V paste injection
-- **Session replacement** — new client seamlessly takes over active session
-- **Graceful shutdown** — Ctrl+C / SIGTERM clean exit
-- **Auto-reconnect** — exponential backoff (native client)
-- **HTTP keep-alive + connection pool** — reuses TLS connections, bounded thread pool (16 max)
-- **SIMD color conversion** — AVX2-accelerated BGRA↔YUV + NV12↔RGB (2.8–3.4x faster than scalar)
-- **Connection quality stats** — RTT, FPS, bandwidth, encode time reported to client every 5s (web overlay)
-- **NVDEC hardware decode** — client-side NVIDIA GPU decode (H.264 + AV1)
-- **Wayland capture** — PipeWire + XDG Desktop Portal (compile-tested)
-- **WAN tested** — verified under simulated latency (0–300ms RTT), jitter, and session replacement
-- **Windows + Linux** — DXGI (Windows) / X11 (Linux) capture, auto-start support
+- **H.264 / AV1 streaming** — OpenH264 CPU + NVENC GPU (NVIDIA), periodic keyframes, dirty-tile gating
+- **Zero-copy GPU pipelines** — DXGI→NVENC on Windows, NVFBC→NVENC on Linux
+- **Web client** — zero-install browser access via WSS + WebCodecs; native client via TCP / QUIC
+- **Audio forwarding** — PulseAudio / WASAPI → Opus 48kHz stereo
+- **Adaptive bitrate** — RTT-based with hysteresis
+- **Encrypted by default** — ChaCha20-Poly1305 (TCP) / TLS (QUIC) / DTLS (WebRTC)
+- **Clipboard sync + file transfer** — bidirectional, Ctrl+V paste injection, SHA-256 verified
+- **Session replacement + auto-reconnect** — new client takes over seamlessly, native client reconnects with backoff
+- **Multi-monitor, multi-transport** — `--display N`, `--transport tcp,web,quic`
+
+See [docs/features.md](docs/features.md) for the full capability matrix and
+[docs/architecture.md](docs/architecture.md) for design rationale.
 
 ## Installation
 
@@ -44,221 +33,163 @@ irm https://raw.githubusercontent.com/huaying/phantom/main/install.ps1 | iex
 
 ### Download pre-built binaries
 
-Grab the latest binaries from [GitHub Releases](https://github.com/huaying/phantom/releases):
+From [GitHub Releases](https://github.com/huaying/phantom/releases):
 
 | Platform | Server | Client |
 |----------|--------|--------|
 | Linux x86_64 | `phantom-server-linux-x86_64` | `phantom-client-linux-x86_64` |
 | Windows x86_64 | `phantom-server-windows-x86_64.exe` | `phantom-client-windows-x86_64.exe` |
-| macOS ARM | — | `phantom-client-macos-aarch64` |
-| macOS x86_64 | — | `phantom-client-macos-x86_64` |
-
-```bash
-# Example: download and run on Linux
-chmod +x phantom-server-linux-x86_64
-./phantom-server-linux-x86_64 --transport web --no-encrypt
-```
+| macOS ARM / x86_64 | — | `phantom-client-macos-{aarch64,x86_64}` |
 
 ### Auto-start on boot
 
-After installing the binary, register Phantom as a system service so it
-starts automatically on boot and survives logout:
-
-**Windows** (creates a Windows Service, runs in Session 0 so clients can
-connect before anyone logs in; also installs the MTT Virtual Display
-Driver so headless GPU servers have something to capture):
+**Windows** (Windows Service + MTT Virtual Display Driver; run in elevated PowerShell):
 ```powershell
-# Must run in an elevated PowerShell
-phantom-server.exe --install
-# → sc query PhantomServer  (verify)
-# → phantom-server.exe --uninstall  (to remove)
+phantom-server.exe --install      # register service + install VDD
+phantom-server.exe --install-vdd  # re-run just the VDD step if it failed
+phantom-server.exe --uninstall    # remove everything
 ```
 
-**Linux** (creates a systemd user unit at `~/.config/systemd/user/`):
+**Linux** (systemd user unit):
 ```bash
 phantom-server --install
-# → systemctl --user status phantom-server  (verify)
-# → phantom-server --uninstall
+phantom-server --uninstall
+```
+
+For Linux VMs where you want phantom to survive sign-out (auto-relogin via
+GDM, no keyring popup, watchdog that kicks GDM if stuck at greeter):
+```bash
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s server --autologin
 ```
 
 ### Docker
 
 ```bash
-docker run --rm -p 9900:9900 ghcr.io/huaying/phantom:latest
-# → open https://127.0.0.1:9900
-```
-
-Or build locally:
-
-```bash
 docker build -t phantom .
 docker run --rm -p 9900:9900 -e PHANTOM_HOST=127.0.0.1 phantom server-web
+# → open https://127.0.0.1:9900
 ```
-
-### Build from source
-
-See [Building](#building) below.
 
 ## Quick Start
 
-### Web Client (recommended)
-
 ```bash
-# Server with web access
-cargo run --release -p phantom-server -- --transport web --no-encrypt
+# Web access (default, https://<server-ip>:9900 in Chrome/Edge)
+phantom-server --transport web --no-encrypt
 
-# Open in browser (Chrome/Edge)
-# → https://<server-ip>:9900
-```
+# GPU acceleration (NVIDIA)
+phantom-server --transport web --no-encrypt --capture nvfbc --encoder nvenc   # Linux
+phantom-server.exe --transport web --no-encrypt --capture dxgi --encoder nvenc --fps 60   # Windows
 
-### GPU-Accelerated (Windows with NVIDIA GPU)
-
-```bash
-# DXGI→NVENC zero-copy (30-47fps at 1080p)
-cargo run --release -p phantom-server -- --transport web --no-encrypt --capture dxgi --encoder nvenc --fps 60
-```
-
-### Native Client
-
-```bash
-# Server
-cargo run --release -p phantom-server
-# → prints: --key <hex>
-
-# Client
-cargo run --release -p phantom-client -- -c <server-ip>:9900 --key <hex>
-```
-
-### Docker (test environment with XFCE desktop)
-
-```bash
-docker build -t phantom .
-docker run --rm -p 9900:9900 -e PHANTOM_HOST=127.0.0.1 phantom server-web
-# → open https://127.0.0.1:9900
+# Native client
+phantom-server                                # prints --key <hex>
+phantom-client -c <server-ip>:9900 --key <hex>
 ```
 
 ## Architecture
 
 ```
-Native Client                        Server                         Web Client (Browser)
-┌──────────────┐   QUIC/TCP   ┌──────────────────┐    WSS        ┌──────────────┐
-│ OpenH264/    │◄════════════╗│ Screen Capture    │╗══(TCP/TLS)═►│ WASM client  │
-│ dav1d/NVDEC  │             ║│ H.264/AV1 Encode  │║             │ WebCodecs    │
-│ winit render │             ║│ (OpenH264/NVENC)  │║             │ Canvas       │
-│ Local cursor │             ║│ Adaptive Bitrate  │║             │ Opus Audio   │
-│ Audio (cpal) │             ║│ Audio Capture     │║             │ Stats HUD    │
-│              │═════════════╝│ enigo inject      │╝═════════════│              │
-│ Input capture│──────────────│                    │──────────────│ Keyboard/    │
-│              │              │                    │              │ Mouse events │
-└──────────────┘              └──────────────────┘              └──────────────┘
+ Native Client            Server                   Web Client (Browser)
+┌──────────────┐   QUIC  ┌─────────────────┐  WSS  ┌──────────────┐
+│ OpenH264/    │◄───────►│ Screen Capture  │◄─────►│ WASM client  │
+│ dav1d/NVDEC  │   TCP   │ H.264/AV1       │       │ WebCodecs    │
+│ winit render │         │ (OpenH264/NVENC)│       │ Canvas       │
+│ cpal audio   │         │ Adaptive Bitrate│       │ Opus audio   │
+│              │         │ Audio Capture   │       │              │
+│ Input        │────────►│ enigo/uinput    │◄──────│ Input        │
+└──────────────┘         └─────────────────┘       └──────────────┘
 ```
 
-## Server Options
+## CLI
+
+### Server
 
 ```
---listen <addr>              Listen address (default: 0.0.0.0:9900)
---transport <transports>     Comma-separated: tcp, web, quic (default: tcp,web)
---fps <n>                    Target FPS (default: 30)
---bitrate <kbps>             H.264 bitrate (default: 5000)
---encoder <auto|openh264|nvenc>  Video encoder (default: auto)
---codec <auto|h264|av1>          Video codec (default: auto, AV1 if GPU supports it)
---capture <auto|scrap|nvfbc|pipewire>  Screen capture (default: auto)
---display <n>                Display index to capture (default: 0)
---list-displays              List available displays and exit
---send-file <path>           Send a file to the first connected client
---key <hex>                  Encryption key (auto-generated if omitted)
---no-encrypt                 Disable encryption
---stun <server|auto>         STUN NAT discovery (use "auto" for Google STUN)
---public-addr <ip:port>      Override public address (skip STUN)
---install / --uninstall      Auto-start (Windows: Service + VDD, Linux: systemd user)
+--listen <addr>                        Listen address (default: 0.0.0.0:9900)
+--transport <tcp,web,quic>             Comma-separated transports (default: tcp,web)
+--fps <n>                              Target FPS (default: 30)
+--bitrate <kbps>                       Initial bitrate (default: 5000)
+--encoder <auto|openh264|nvenc>        Video encoder (default: auto)
+--codec <auto|h264|av1>                Video codec (default: auto → H.264; AV1 opt-in)
+--capture <auto|scrap|nvfbc|pipewire|dxgi>
+                                       Screen capture (default: auto)
+--display <n>                          Display index (0 = primary)
+--list-displays                        Enumerate and exit
+--send-file <path>                     Push a file to the first client
+--key <hex> / --no-encrypt             Encryption key / disable
+--stun <server|auto>                   NAT discovery (prints a connection code)
+--public-addr <ip:port>                Override public address (skip STUN)
+--install / --uninstall                Register / remove auto-start
+--install-vdd                          (Windows) re-run just the VDD install step
+--auth-secret <hex>                    HMAC-SHA256 secret for JWT auth (WebSocket)
+--log-file <path> / --log-rotate / --log-keep
+                                       File logging with rotation
 ```
 
-### Client Options
+### Client
 
 ```
---connect <addr>             Server address (default: 127.0.0.1:9900)
---transport <tcp|quic>       Transport protocol (default: tcp)
---decoder <auto|openh264|videotoolbox>  Video decoder (default: auto — tries NVDEC, then dav1d/OpenH264)
---send-file <path>           Send a file to the server after connecting
---key <hex>                  Encryption key (from server output)
---no-encrypt                 Disable encryption
+--connect <addr>                       Server address
+--transport <tcp|quic>                 Transport (default: tcp)
+--decoder <auto|openh264|dav1d|nvdec|videotoolbox>
+                                       Video decoder (default: auto)
+--send-file <path>                     Push a file to the server on connect
+--key <hex> / --no-encrypt             Encryption key / disable
 ```
 
 ## Performance
 
-| Configuration | FPS (1080p) | Notes |
-|--------------|-------------|-------|
-| OpenH264 CPU (scrap) | 6-8 | Any machine, fallback |
-| NVENC GPU (scrap) | 17-18 | NVIDIA GPU, CPU capture |
-| DXGI→NVENC zero-copy | 30-47 | Windows + NVIDIA, all GPU |
+Rough numbers at 1080p; see `cargo run --release -p phantom-bench` on your hardware.
+
+| Configuration | FPS | Notes |
+|---|---|---|
+| OpenH264 CPU (scrap) | 6–8 | Any machine, fallback |
+| NVENC GPU (scrap) | 17–18 | NVIDIA + CPU capture |
+| DXGI→NVENC zero-copy | 30–47 | Windows + NVIDIA |
 | NVFBC→NVENC zero-copy | ~60+ | Linux + NVIDIA (X11) |
 
-### SIMD Color Conversion (AVX2)
+### SIMD color conversion (AVX2 on x86_64, scalar fallback elsewhere)
 
-| Operation | Scalar (1080p) | AVX2 SIMD | Speedup |
-|-----------|---------------|-----------|---------|
-| BGRA→NV12 (encode) | 5.1ms | 1.8ms | **2.8x** |
-| YUV→RGB32 (decode) | 8.5ms | 2.5ms | **3.4x** |
-| NV12→RGB32 (NVDEC decode) | ~15ms | ~4ms | **~3.5x** |
-
-Runtime-detected: AVX2 on x86_64, automatic scalar fallback on other architectures.
+| Operation | Scalar (1080p) | AVX2 | Speedup |
+|---|---|---|---|
+| BGRA→NV12 | 5.1ms | 1.8ms | 2.8× |
+| YUV→RGB32 | 8.5ms | 2.5ms | 3.4× |
+| NV12→RGB32 | ~15ms | ~4ms | ~3.5× |
 
 ## Building
 
 ```bash
-# Prerequisites
+# Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Linux build dependencies
-sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev nasm libpulse-dev libopus-dev
+# Linux build deps
+sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+    libxdo-dev nasm libpulse-dev libopus-dev
 
-# Build (includes audio by default)
-cargo build --release
-
-# Build with WebRTC support (adds str0m dependency)
-cargo build --release --features webrtc
-
-# Build WASM web client (pre-built pkg checked into repo)
+# WASM web client first (server embeds the bundle via include_bytes!)
 wasm-pack build crates/web --target web --no-typescript
 
-# Run tests (104 tests: unit, integration, E2E, WAN simulation)
-cargo test
+# Workspace
+cargo build --release
+cargo build --release --features webrtc   # +WebRTC DataChannel
+cargo test                                 # 129 tests
+cargo clippy --workspace -- -D warnings
 ```
 
-## Project Structure
+## Project layout
 
 ```
 phantom/
 ├── crates/
-│   ├── core/      Traits, protocol, frame, input, clipboard, file transfer, SIMD color, crypto
-│   ├── server/    Capture, encode, input inject, file transfer, TCP/QUIC/WSS transports
-│   ├── client/    Decode, winit display, input capture, file transfer, reconnect
-│   ├── web/       WASM client (WebCodecs, Canvas, WebSocket/WebRTC)
-│   ├── gpu/       NVENC, NVDEC (feature-gated), NVFBC (Linux), DXGI capture (Windows), CUDA, hardware probe
-│   └── bench/     Encoder benchmark (OpenH264 vs NVENC)
-├── Dockerfile     XFCE desktop test environment
-├── CLAUDE.md      Developer guide
-└── DESIGN.md      Design document
+│   ├── core/     Traits, protocol, frame, input, clipboard, file transfer, SIMD color, crypto
+│   ├── server/   Capture, encode, input inject, file transfer, TCP/QUIC/WSS transports
+│   ├── client/   Decode, winit display, input capture, reconnect
+│   ├── web/      WASM client (WebCodecs, Canvas, WebSocket/WebRTC)
+│   ├── gpu/      NVENC / NVDEC / NVFBC / DXGI capture (feature-gated)
+│   └── bench/    Encoder benchmark
+├── docs/         Architecture, features, file-map, pitfalls
+├── CLAUDE.md     AI assistant guide
+└── DESIGN.md     Design pointer
 ```
-
-## Roadmap
-
-See [CLAUDE.md](CLAUDE.md) for the full roadmap. Key next steps:
-
-- ~~Audio forwarding~~ ✅ PulseAudio (Linux) + WASAPI (Windows) → Opus → client playback
-- ~~Hardware probe~~ ✅ Auto-detect best encoder/capture at startup
-- ~~SIMD color conversion~~ ✅ AVX2-accelerated BGRA↔YUV (2.8–3.4x speedup)
-- ~~Multi-monitor~~ ✅ `--display N` and `--list-displays`
-- ~~File transfer~~ ✅ Bidirectional, chunked, SHA-256 verified
-- ~~Session replacement~~ ✅ Seamless client takeover
-- ~~Graceful shutdown~~ ✅ Clean Ctrl+C / SIGTERM handling
-- ~~Wayland capture~~ ✅ PipeWire + XDG Desktop Portal (compile-tested)
-- ~~Hardware decode~~ ✅ NVDEC (Linux), VideoToolbox (macOS), dav1d (AV1 software) client-side
-- ~~AV1 encoder~~ ✅ NVENC hardware AV1 encode (Ada Lovelace+), dav1d/NVDEC decode
-- **QUIC unreliable datagrams** — lower latency for WAN
-- **VAAPI/AMF GPU encoding** — AMD/Intel GPU encode support
-- ~~**NAT discovery (STUN)**~~ ✅ `--stun auto` discovers public IP, prints connection code
-- **NAT relay (TURN)** — for symmetric NAT / firewall bypass without port forwarding
 
 ## License
 
