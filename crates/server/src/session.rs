@@ -1201,10 +1201,7 @@ fn run_session_inner(
         runner.drain_file_transfers()?;
 
         // ABR: snapshot skip_ratio before calling set_bitrate_kbps (both borrow pipeline).
-        let skip_ratio = pipeline
-            .congestion_mut()
-            .map(|c| c.skip_ratio)
-            .unwrap_or(0);
+        let skip_ratio = pipeline.congestion_mut().map(|c| c.skip_ratio).unwrap_or(0);
         if let Some(new_kbps) = abr.evaluate(runner.rtt_us, skip_ratio) {
             match pipeline.set_bitrate_kbps(new_kbps) {
                 Ok(()) => abr.apply(new_kbps),
@@ -1228,24 +1225,20 @@ pub fn run_session_cpu(
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
     let frame_interval = cfg.frame_interval;
-    let mut pipeline = match crate::pipeline::CpuPipeline::new(
-        capture,
-        video_encoder,
-        differ,
-        frame_interval,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return SessionResult {
-                session_token: Vec::new(),
-                error: e,
-                reason: Some(SessionEndReason::PipelineError(
-                    "CpuPipeline::new failed".into(),
-                )),
-                session_id: String::new(),
-            };
-        }
-    };
+    let mut pipeline =
+        match crate::pipeline::CpuPipeline::new(capture, video_encoder, differ, frame_interval) {
+            Ok(p) => p,
+            Err(e) => {
+                return SessionResult {
+                    session_token: Vec::new(),
+                    error: e,
+                    reason: Some(SessionEndReason::PipelineError(
+                        "CpuPipeline::new failed".into(),
+                    )),
+                    session_id: String::new(),
+                };
+            }
+        };
     run_session(&mut pipeline, cfg)
 }
 

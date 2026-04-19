@@ -123,8 +123,7 @@ impl<'a> Pipeline for CpuPipeline<'a> {
             None => return Ok(None),
         };
 
-        let changed =
-            !self.sent_first_frame || ctx.had_input || self.differ.has_changes(&frame);
+        let changed = !self.sent_first_frame || ctx.had_input || self.differ.has_changes(&frame);
         if !changed {
             return Ok(None);
         }

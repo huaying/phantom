@@ -515,9 +515,7 @@ impl MessageSender for WebRtcSender {
         let payload = bincode::serialize(msg).context("serialize")?;
         match msg {
             // Video data (including Hello) → video DC (reliable + ordered)
-            Message::Hello { .. }
-            | Message::VideoFrame { .. }
-            | Message::AudioFrame { .. } => {
+            Message::Hello { .. } | Message::VideoFrame { .. } | Message::AudioFrame { .. } => {
                 self.video_tx
                     .try_send(payload)
                     .map_err(|e| match e {

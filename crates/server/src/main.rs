@@ -23,9 +23,9 @@ use phantom_server::encode;
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)]
 use phantom_server::input_uinput;
-use phantom_server::session;
 #[cfg(target_os = "windows")]
 use phantom_server::service_win;
+use phantom_server::session;
 use phantom_server::transport;
 
 use anyhow::Result;
@@ -315,7 +315,10 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     if args.install_vdd {
         let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
-        println!("Re-installing Virtual Display Driver at {}", install_dir.display());
+        println!(
+            "Re-installing Virtual Display Driver at {}",
+            install_dir.display()
+        );
         return service_win::install_vdd(&install_dir);
     }
 

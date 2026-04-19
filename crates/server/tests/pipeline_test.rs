@@ -220,4 +220,3 @@ fn diff_detects_single_pixel_change() {
     let dirty = differ.diff(&frame2);
     assert_eq!(dirty.len(), 1);
 }
-
