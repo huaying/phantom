@@ -56,8 +56,6 @@ crates/server/src/                Capture → encode → ship pixels
   encode/                         CPU encoders (GPU encoders live in phantom-gpu)
     mod.rs                          re-exports
     h264.rs                         OpenH264Encoder (impl FrameEncoder, CPU baseline)
-    zstd.rs                         ZstdEncoder (impl Encoder, lossless tiles —
-                                    used by lossless refinement path; see TODO #24)
 
   transport/                      All implement MessageSender/Receiver
     mod.rs                          re-exports

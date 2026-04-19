@@ -5,12 +5,10 @@
 //! `SessionRunner` to avoid duplicating the ~80% of session code that is
 //! transport/input/clipboard plumbing.
 
-use crate::encode::zstd::ZstdEncoder;
 use crate::input_injector::InputInjector;
 use anyhow::Result;
 use phantom_core::clipboard::ClipboardTracker;
-use phantom_core::encode::{EncodedFrame, Encoder, FrameEncoder};
-use phantom_core::frame::Frame;
+use phantom_core::encode::{EncodedFrame, FrameEncoder};
 use phantom_core::input::InputEvent;
 #[cfg(feature = "audio")]
 use phantom_core::protocol::AudioCodec;
@@ -160,34 +158,6 @@ pub fn spawn_receive_thread(
         })
         .expect("spawn receive thread");
     rx
-}
-
-// ── Quality state (lossless refinement after idle period) ───────────────────
-
-pub struct QualityState {
-    last_motion: Instant,
-    lossless_sent: bool,
-    delay: Duration,
-}
-
-impl QualityState {
-    pub fn new(delay: Duration) -> Self {
-        Self {
-            last_motion: Instant::now(),
-            lossless_sent: false,
-            delay,
-        }
-    }
-    pub fn on_motion(&mut self) {
-        self.last_motion = Instant::now();
-        self.lossless_sent = false;
-    }
-    pub fn should_send_lossless(&self) -> bool {
-        !self.lossless_sent && self.last_motion.elapsed() >= self.delay
-    }
-    pub fn mark_lossless_sent(&mut self) {
-        self.lossless_sent = true;
-    }
 }
 
 // ── Congestion tracker ──────────────────────────────────────────────────────
@@ -786,23 +756,6 @@ impl SessionRunner {
         Ok(())
     }
 
-    /// Send a full-frame lossless (zstd) tile update for quality refinement.
-    pub fn send_lossless_update(
-        &mut self,
-        zstd_encoder: &mut ZstdEncoder,
-        frame: &Frame,
-    ) -> Result<()> {
-        let mut fresh = TileDiffer::new();
-        let all_tiles = fresh.diff(frame);
-        let encoded = zstd_encoder.encode_tiles(&all_tiles)?;
-        self.sequence += 1;
-        self.sender.send_msg(&Message::TileUpdate {
-            sequence: self.sequence,
-            tiles: Box::new(encoded),
-        })?;
-        Ok(())
-    }
-
     /// Send keepalive ping (~1s interval). Returns `Err` if connection lost.
     pub fn keepalive_tick(&mut self) -> Result<()> {
         if self.keepalive_time.elapsed() >= Duration::from_secs(1) {
@@ -1150,7 +1103,6 @@ pub struct SessionConfig<'a> {
     pub sender: Box<dyn MessageSender>,
     pub receiver: Box<dyn MessageReceiver>,
     pub frame_interval: Duration,
-    pub quality_delay: Duration,
     pub cancel: Arc<AtomicBool>,
     pub send_file: Option<&'a std::path::Path>,
     pub video_codec: phantom_core::encode::VideoCodec,
@@ -1222,11 +1174,8 @@ fn run_session_cpu_inner(
         let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
     }
 
-    let mut zstd_encoder = ZstdEncoder::new(3);
-    let mut quality = QualityState::new(cfg.quality_delay);
     let mut congestion = CongestionTracker::new(cfg.frame_interval);
     let mut abr = AdaptiveBitrate::new(video_encoder.bitrate_kbps().max(5000));
-    let mut last_frame: Option<Frame> = None;
     let mut sent_first_frame = false;
     let mut sent_first_frame_encoded = false;
 
@@ -1244,12 +1193,6 @@ fn run_session_cpu_inner(
         let frame = match capture.capture()? {
             Some(f) => f,
             None => {
-                if quality.should_send_lossless() {
-                    if let Some(ref f) = last_frame {
-                        runner.send_lossless_update(&mut zstd_encoder, f)?;
-                        quality.mark_lossless_sent();
-                    }
-                }
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -1261,10 +1204,8 @@ fn run_session_cpu_inner(
         if changed {
             sent_first_frame = true;
             let dirty_tiles = differ.diff(&frame);
-            quality.on_motion();
 
             if congestion.should_skip_frame() {
-                last_frame = Some(frame);
                 continue;
             }
 
@@ -1281,8 +1222,6 @@ fn run_session_cpu_inner(
                 sent_first_frame_encoded = true;
                 runner.send_video_frame(encoded, Some(&mut congestion))?;
             }
-
-            last_frame = Some(frame);
         }
 
         runner.drain_file_transfers()?;
@@ -1583,31 +1522,6 @@ fn hide_remote_cursor() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quality_state_initial_motion() {
-        let qs = QualityState::new(Duration::from_secs(2));
-        // Just created — should not send lossless yet (delay not elapsed)
-        assert!(!qs.should_send_lossless());
-    }
-
-    #[test]
-    fn quality_state_sends_lossless_after_idle() {
-        let mut qs = QualityState::new(Duration::from_millis(10));
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(qs.should_send_lossless());
-        qs.mark_lossless_sent();
-        assert!(!qs.should_send_lossless());
-    }
-
-    #[test]
-    fn quality_state_resets_on_motion() {
-        let mut qs = QualityState::new(Duration::from_millis(10));
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(qs.should_send_lossless());
-        qs.on_motion();
-        assert!(!qs.should_send_lossless());
-    }
 
     #[test]
     fn congestion_no_skip_initially() {

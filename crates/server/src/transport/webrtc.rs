@@ -517,7 +517,6 @@ impl MessageSender for WebRtcSender {
             // Video data (including Hello) → video DC (reliable + ordered)
             Message::Hello { .. }
             | Message::VideoFrame { .. }
-            | Message::TileUpdate { .. }
             | Message::AudioFrame { .. } => {
                 self.video_tx
                     .try_send(payload)

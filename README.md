@@ -4,7 +4,7 @@ A high-performance, open-source remote desktop built in Rust. Low latency, brows
 
 ## Features
 
-- **H.264 / AV1 streaming** with periodic keyframes and lossless refinement after 2s idle
+- **H.264 / AV1 streaming** with periodic keyframes and dirty-tile gating (skip encode when nothing changed)
 - **GPU acceleration** — NVENC encoding (H.264 + AV1) + DXGI zero-copy capture (Windows), NVFBC→NVENC (Linux)
 - **Audio forwarding** — PulseAudio (Linux) / WASAPI (Windows) → Opus 48kHz stereo → client playback (native + web)
 - **Adaptive bitrate** — RTT-based, automatic quality adjustment with hysteresis
@@ -160,7 +160,6 @@ Native Client                        Server                         Web Client (
 --transport <transports>     Comma-separated: tcp, web, quic (default: tcp,web)
 --fps <n>                    Target FPS (default: 30)
 --bitrate <kbps>             H.264 bitrate (default: 5000)
---quality-delay-ms <ms>      Lossless update delay (default: 2000)
 --encoder <auto|openh264|nvenc>  Video encoder (default: auto)
 --codec <auto|h264|av1>          Video codec (default: auto, AV1 if GPU supports it)
 --capture <auto|scrap|nvfbc|pipewire>  Screen capture (default: auto)

@@ -5,17 +5,15 @@
 //! and renders to an HTML5 canvas. Sends keyboard/mouse input back to
 //! the server and supports clipboard paste.
 
-use phantom_core::encode::{TileEncoding, VideoCodec};
+use phantom_core::encode::VideoCodec;
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 use phantom_core::protocol::Message;
-use phantom_core::tile::TILE_SIZE;
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    console, CanvasRenderingContext2d, HtmlCanvasElement, KeyboardEvent, MessageEvent, MouseEvent,
-    WebSocket, WheelEvent,
+    console, HtmlCanvasElement, KeyboardEvent, MessageEvent, MouseEvent, WebSocket, WheelEvent,
 };
 
 // -- WebCodecs bindings (not in web-sys yet) --
@@ -121,7 +119,6 @@ impl ChunkAssembler {
 }
 
 struct AppState {
-    ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
     decoder: Option<JsVideoDecoder>,
     server_width: u32,
@@ -130,9 +127,6 @@ struct AppState {
     got_keyframe: bool,
     video_assembler: ChunkAssembler,
     control_assembler: ChunkAssembler,
-    /// Highest sequence number from a fully rendered VideoFrame.
-    /// TileUpdates with sequence <= this are stale and should be skipped.
-    last_video_sequence: u64,
     /// For sending input — either DataChannel or WebSocket
     send_dc: Option<web_sys::RtcDataChannel>,
     send_ws: Option<WebSocket>,
@@ -202,15 +196,7 @@ pub fn main() {
         .unwrap()
         .dyn_into()
         .unwrap();
-    let ctx: CanvasRenderingContext2d = canvas
-        .get_context("2d")
-        .unwrap()
-        .unwrap()
-        .dyn_into()
-        .unwrap();
-
     let state = Rc::new(RefCell::new(AppState {
-        ctx,
         canvas: canvas.clone(),
         decoder: None,
         server_width: 0,
@@ -219,7 +205,6 @@ pub fn main() {
         got_keyframe: false,
         video_assembler: ChunkAssembler::new(),
         control_assembler: ChunkAssembler::new(),
-        last_video_sequence: 0,
         send_dc: None,
         send_ws: None,
         last_stats: None,
@@ -597,7 +582,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             // Send viewport size so server can match resolution (adaptive, like DCV)
             send_resolution_change(state);
         }
-        Message::VideoFrame { sequence, frame } => {
+        Message::VideoFrame { sequence: _, frame } => {
             if frame.data.is_empty() {
                 return;
             }
@@ -645,7 +630,6 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 s.got_keyframe = true;
             }
             s.frame_count += 1;
-            s.last_video_sequence = sequence;
             let fc = s.frame_count;
             if let Some(ref decoder) = s.decoder {
                 // If tab was backgrounded, decoder may be stale. Reset on keyframe.
@@ -672,53 +656,6 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
                 decoder.decode(&chunk);
-            }
-        }
-        Message::TileUpdate { sequence, tiles } => {
-            let s = state.borrow();
-            // Skip tile updates that are older than the last full video frame,
-            // since the video frame already contains the complete screen state.
-            if sequence <= s.last_video_sequence {
-                return;
-            }
-            for tile in tiles.iter() {
-                let bgra = match tile.encoding {
-                    TileEncoding::Zstd => {
-                        let mut dec = match ruzstd::StreamingDecoder::new(tile.data.as_slice()) {
-                            Ok(d) => d,
-                            Err(_) => continue,
-                        };
-                        let mut out = Vec::new();
-                        if std::io::Read::read_to_end(&mut dec, &mut out).is_err() {
-                            continue;
-                        }
-                        out
-                    }
-                    TileEncoding::Raw => tile.data.clone(),
-                    _ => continue,
-                };
-                let tw = tile.pixel_width as usize;
-                let th = tile.pixel_height as usize;
-                if bgra.len() < tw * th * 4 {
-                    continue;
-                }
-                let mut rgba = vec![0u8; tw * th * 4];
-                for i in 0..tw * th {
-                    rgba[i * 4] = bgra[i * 4 + 2];
-                    rgba[i * 4 + 1] = bgra[i * 4 + 1];
-                    rgba[i * 4 + 2] = bgra[i * 4];
-                    rgba[i * 4 + 3] = 255;
-                }
-                let clamped = wasm_bindgen::Clamped(&rgba[..]);
-                if let Ok(img) = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
-                    clamped, tw as u32, th as u32,
-                ) {
-                    let _ = s.ctx.put_image_data(
-                        &img,
-                        (tile.tile_x * TILE_SIZE) as f64,
-                        (tile.tile_y * TILE_SIZE) as f64,
-                    );
-                }
             }
         }
         Message::ClipboardSync(text) => {

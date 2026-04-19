@@ -1,8 +1,7 @@
 # Phantom — Design
 
 A high-performance, open-source remote desktop built in Rust. Target:
-Parsec-class latency with pixel-perfect text quality, single binary
-deployment, browser + native access.
+Parsec-class latency, single binary deployment, browser + native access.
 
 The detailed design — encoding pipeline, transport choices, GPU zero-copy
 paths, the rationale for every architectural decision — has moved to:

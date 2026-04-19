@@ -52,8 +52,6 @@ struct Args {
     fps: u32,
     #[arg(short, long, default_value_t = 5000)]
     bitrate: u32,
-    #[arg(long, default_value_t = 2000)]
-    quality_delay_ms: u64,
     #[arg(short, long)]
     key: Option<String>,
     #[arg(long)]
@@ -94,6 +92,14 @@ struct Args {
     /// Remove auto-start registration.
     #[arg(long)]
     uninstall: bool,
+
+    /// (Windows only) Re-run just the Virtual Display Driver install step
+    /// against `C:\Program Files\Phantom`. Use this when --install's VDD step
+    /// failed on a transient network blip — avoids a full uninstall/install
+    /// cycle. No-op on non-Windows.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    install_vdd: bool,
 
     /// Send a file to the first client that connects.
     #[arg(long)]
@@ -310,8 +316,14 @@ fn main() -> Result<()> {
         return uninstall_autostart();
     }
 
+    #[cfg(target_os = "windows")]
+    if args.install_vdd {
+        let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
+        println!("Re-installing Virtual Display Driver at {}", install_dir.display());
+        return service_win::install_vdd(&install_dir);
+    }
+
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
-    let quality_delay = Duration::from_millis(args.quality_delay_ms);
 
     let encryption_key: Option<[u8; 32]> = if args.no_encrypt {
         tracing::warn!("encryption DISABLED");
@@ -807,7 +819,6 @@ fn main() -> Result<()> {
                     sender,
                     receiver,
                     frame_interval,
-                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
@@ -829,7 +840,6 @@ fn main() -> Result<()> {
                     sender,
                     receiver,
                     frame_interval,
-                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
@@ -857,7 +867,6 @@ fn main() -> Result<()> {
                     sender,
                     receiver,
                     frame_interval,
-                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
@@ -879,7 +888,6 @@ fn main() -> Result<()> {
                     sender,
                     receiver,
                     frame_interval,
-                    quality_delay,
                     cancel: session_cancel,
                     send_file: send_file_path.as_deref(),
                     video_codec,
@@ -902,7 +910,6 @@ fn main() -> Result<()> {
                 sender,
                 receiver,
                 frame_interval,
-                quality_delay,
                 cancel: session_cancel,
                 send_file: send_file_path.as_deref(),
                 video_codec,

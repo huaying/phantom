@@ -1,11 +1,11 @@
 # Phantom — Architecture
 
 A high-performance, open-source remote desktop built in Rust. Target:
-Parsec-class latency (~20-50ms) with DCV-class quality (pixel-perfect text),
-single binary deployment, browser + native access.
+Parsec-class latency (~20-50ms), single binary deployment, browser +
+native access.
 
-~18,000 lines Rust (across 6 crates), 134 tests, MIT license. Runs on
-Linux + Windows; native client also runs on macOS.
+~18,000 lines Rust (across 6 crates), MIT license. Runs on Linux +
+Windows; native client also runs on macOS.
 
 ## Competitive Position
 
@@ -17,7 +17,7 @@ KasmVNC             80-150ms    pixel-perfect   Docker        ✅          ✅
 Neko                80-150ms    lossy(blurry)   Docker        ✅          ✅
 Selkies (Google)    70-120ms    lossy(blurry)   complex       ✅          ✅
 RustDesk            50-100ms    lossy(blurry)   simple        ✅(beta)    ✅
-Phantom (target)    20-50ms     pixel-perfect   single binary ✅          ✅
+Phantom             20-50ms     lossy(H.264)    single binary ✅          ✅
 ```
 
 ### Five unique advantages

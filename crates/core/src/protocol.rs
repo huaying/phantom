@@ -1,14 +1,16 @@
-use crate::encode::{EncodedFrame, EncodedTile};
+use crate::encode::EncodedFrame;
 use crate::frame::PixelFormat;
 use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Minimum protocol version we can interoperate with.
-/// Versions below this are rejected at handshake.
-pub const MIN_PROTOCOL_VERSION: u32 = 2;
+/// Versions below this are rejected at handshake. Bumped to 6 in 0.4.4:
+/// the zstd lossless TileUpdate message was removed, so any client that
+/// expects it would desync on an idle refresh attempt.
+pub const MIN_PROTOCOL_VERSION: u32 = 6;
 
 /// Audio codec identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,12 +45,6 @@ pub enum Message {
     VideoFrame {
         sequence: u64,
         frame: Box<EncodedFrame>,
-    },
-
-    /// Server → Client: tile-based lossless update (quality refinement when static).
-    TileUpdate {
-        sequence: u64,
-        tiles: Box<Vec<EncodedTile>>,
     },
 
     /// Client → Server: input event.

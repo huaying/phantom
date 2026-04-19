@@ -572,7 +572,6 @@ fn create_service_session(
                 sender,
                 receiver,
                 frame_interval,
-                quality_delay: Duration::from_millis(2000),
                 cancel,
                 send_file: None,
                 video_codec: phantom_core::encode::VideoCodec::H264,
@@ -1117,6 +1116,9 @@ fn vdd_settings_xml() -> String {
 }
 
 /// Download a file using PowerShell (no extra Rust deps needed).
+/// Retries up to 3 times with 2s sleep between attempts — first-install on
+/// Win11 has occasionally hit a transient TLS / SAS-redirect blip where an
+/// immediate manual retry of the exact same URL succeeds.
 fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
     let status = std::process::Command::new("powershell")
@@ -1126,7 +1128,17 @@ fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
             &format!(
                 "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
                  $ProgressPreference = 'SilentlyContinue'; \
-                 Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
+                 $ErrorActionPreference = 'Stop'; \
+                 for ($i = 1; $i -le 3; $i++) {{ \
+                   try {{ \
+                     Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; \
+                     exit 0 \
+                   }} catch {{ \
+                     Write-Host \"download attempt $i failed: $_\"; \
+                     if ($i -lt 3) {{ Start-Sleep -Seconds 2 }} \
+                   }} \
+                 }}; \
+                 exit 1",
                 url,
                 dest.display()
             ),
@@ -1134,7 +1146,7 @@ fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
         .status()
         .context("powershell download")?;
     if !status.success() {
-        anyhow::bail!("download failed: {url}");
+        anyhow::bail!("download failed after 3 attempts: {url}");
     }
     Ok(())
 }

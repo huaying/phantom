@@ -8,7 +8,7 @@ deployment. New features in 0.4.0 are flagged at the bottom.
 | # | Feature |
 |---|---------|
 | 1 | H.264 encoding (OpenH264 CPU, `--encoder` plugin architecture) |
-| 2 | H.264 full frames + lossless refinement after 2s idle (tile path disabled — caused tearing) |
+| 2 | Dirty-tile gating — skip encode entirely when no region of the frame changed |
 | 3 | Periodic keyframe (2s interval, recovers from loss / decoder errors) |
 | 19 | Encoder plugin architecture (`--encoder` flag, `Box<dyn FrameEncoder>`) |
 | 20 | NVENC GPU encoding (`--encoder nvenc`, runtime dlopen, no build-time CUDA dep) |

@@ -1,53 +1,10 @@
 use phantom_core::color::yuv420_to_rgb32;
-use phantom_core::decode::{DecodedTile, Decoder};
-use phantom_core::encode::{EncodedFrame, EncodedTile, Encoder, TileEncoding, VideoCodec};
+use phantom_core::encode::{EncodedFrame, VideoCodec};
 use phantom_core::frame::{Frame, PixelFormat};
 use phantom_core::protocol::{self, Message};
-use phantom_core::tile::{DirtyTile, TileDiffer};
+use phantom_core::tile::TileDiffer;
 use std::io::Cursor;
 use std::time::Instant;
-
-struct ZstdEncoder(i32);
-impl Encoder for ZstdEncoder {
-    fn encode_tiles(&mut self, tiles: &[DirtyTile]) -> anyhow::Result<Vec<EncodedTile>> {
-        let mut out = Vec::with_capacity(tiles.len());
-        for tile in tiles {
-            let compressed = zstd::encode_all(tile.data.as_slice(), self.0)?;
-            let (data, encoding) = if compressed.len() < tile.data.len() {
-                (compressed, TileEncoding::Zstd)
-            } else {
-                (tile.data.clone(), TileEncoding::Raw)
-            };
-            out.push(EncodedTile {
-                tile_x: tile.tile_x,
-                tile_y: tile.tile_y,
-                pixel_width: tile.pixel_width,
-                pixel_height: tile.pixel_height,
-                encoding,
-                data,
-            });
-        }
-        Ok(out)
-    }
-}
-
-struct ZstdDecoder;
-impl Decoder for ZstdDecoder {
-    fn decode_tile(&mut self, tile: &EncodedTile) -> anyhow::Result<DecodedTile> {
-        let data = match tile.encoding {
-            TileEncoding::Zstd => zstd::decode_all(tile.data.as_slice())?,
-            TileEncoding::Raw => tile.data.clone(),
-            _ => panic!("unsupported encoding"),
-        };
-        Ok(DecodedTile {
-            tile_x: tile.tile_x,
-            tile_y: tile.tile_y,
-            pixel_width: tile.pixel_width,
-            pixel_height: tile.pixel_height,
-            data,
-        })
-    }
-}
 
 fn make_frame(width: u32, height: u32, fill: u8) -> Frame {
     Frame {
@@ -56,40 +13,6 @@ fn make_frame(width: u32, height: u32, fill: u8) -> Frame {
         format: PixelFormat::Bgra8,
         data: vec![fill; (width * height * 4) as usize],
         timestamp: Instant::now(),
-    }
-}
-
-#[test]
-fn tile_pipeline_roundtrip() {
-    let mut differ = TileDiffer::new();
-    let mut encoder = ZstdEncoder(3);
-    let mut decoder = ZstdDecoder;
-
-    let frame = make_frame(128, 128, 0xAB);
-    let dirty = differ.diff(&frame);
-    assert_eq!(dirty.len(), 4);
-
-    let encoded = encoder.encode_tiles(&dirty).unwrap();
-    let msg = Message::TileUpdate {
-        sequence: 1,
-        tiles: Box::new(encoded),
-    };
-
-    let mut buf = Vec::new();
-    protocol::write_message(&mut buf, &msg).unwrap();
-    let mut cursor = Cursor::new(&buf);
-    let msg_back = protocol::read_message(&mut cursor).unwrap();
-
-    match msg_back {
-        Message::TileUpdate { sequence, tiles } => {
-            assert_eq!(sequence, 1);
-            assert_eq!(tiles.len(), 4);
-            for tile in tiles.iter() {
-                let decoded = decoder.decode_tile(tile).unwrap();
-                assert!(decoded.data.iter().all(|&b| b == 0xAB));
-            }
-        }
-        _ => panic!("expected TileUpdate"),
     }
 }
 
@@ -264,10 +187,6 @@ fn protocol_message_roundtrip() {
         },
         Message::Ping,
         Message::Pong,
-        Message::TileUpdate {
-            sequence: 42,
-            tiles: Box::new(vec![]),
-        },
         Message::VideoFrame {
             sequence: 1,
             frame: Box::new(EncodedFrame {
@@ -302,20 +221,3 @@ fn diff_detects_single_pixel_change() {
     assert_eq!(dirty.len(), 1);
 }
 
-#[test]
-fn compression_ratio_solid_color() {
-    let mut encoder = ZstdEncoder(3);
-    let tile = DirtyTile {
-        tile_x: 0,
-        tile_y: 0,
-        pixel_width: 64,
-        pixel_height: 64,
-        data: vec![0x42; 64 * 64 * 4],
-    };
-    let encoded = encoder.encode_tiles(&[tile]).unwrap();
-    let ratio = (64 * 64 * 4) as f64 / encoded[0].data.len() as f64;
-    assert!(
-        ratio > 100.0,
-        "solid color should compress >100x, got {ratio:.1}x"
-    );
-}

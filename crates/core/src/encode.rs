@@ -1,33 +1,6 @@
 use crate::frame::Frame;
-use crate::tile::DirtyTile;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-
-// -- Tile-level encoding (lossless, for quality updates) --
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TileEncoding {
-    Raw,
-    Zstd,
-    H264,
-    Av1,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncodedTile {
-    pub tile_x: u32,
-    pub tile_y: u32,
-    pub pixel_width: u32,
-    pub pixel_height: u32,
-    pub encoding: TileEncoding,
-    pub data: Vec<u8>,
-}
-
-pub trait Encoder: Send {
-    fn encode_tiles(&mut self, tiles: &[DirtyTile]) -> Result<Vec<EncodedTile>>;
-}
-
-// -- Frame-level encoding (lossy, for motion) --
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
@@ -53,7 +26,6 @@ pub trait FrameEncoder: Send {
     /// Dynamically update the target bitrate (kbps).
     /// Returns Ok(()) if the encoder supports it, Err if not.
     fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
-        // Default: not supported
         anyhow::bail!("runtime bitrate change not supported by this encoder")
     }
 

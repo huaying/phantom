@@ -12,7 +12,6 @@ mod decode_av1;
 mod decode_h264;
 #[cfg(target_os = "macos")]
 mod decode_videotoolbox;
-mod decode_zstd;
 mod display_winit;
 mod file_transfer;
 mod input_capture;
@@ -23,7 +22,6 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
-use phantom_core::decode::Decoder;
 use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
@@ -150,7 +148,6 @@ struct Session {
     /// The video codec the server uses.
     #[allow(dead_code)]
     server_codec: phantom_core::encode::VideoCodec,
-    tile_decoder: decode_zstd::ZstdDecoder,
     frame_rx: mpsc::Receiver<Message>,
     input_tx: mpsc::Sender<Message>,
     connected: Arc<AtomicBool>,
@@ -573,7 +570,6 @@ impl App {
             display,
             decoder,
             server_codec: video_codec,
-            tile_decoder: decode_zstd::ZstdDecoder::new(),
             frame_rx,
             input_tx,
             connected,
@@ -641,7 +637,6 @@ impl ApplicationHandler for App {
                 // Process received frames — decode every VideoFrame to maintain
                 // decoder state, but only render the last decoded result.
                 let mut last_decoded = None;
-                let mut last_tiles = None;
                 let mut clipboard_msgs = Vec::new();
                 let mut title_toast: Option<(String, Instant)> = None;
                 while let Ok(msg) = session.frame_rx.try_recv() {
@@ -671,7 +666,6 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
-                        Message::TileUpdate { .. } => last_tiles = Some(msg),
                         Message::ClipboardSync(t) => clipboard_msgs.push(t),
                         Message::AudioFrame { data, .. } => {
                             if let Some(ref audio_tx) = session.audio_tx {
@@ -821,16 +815,6 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                if let Some(Message::TileUpdate { tiles, .. }) = last_tiles {
-                    let mut decoded = Vec::with_capacity(tiles.len());
-                    for tile in tiles.iter() {
-                        if let Ok(dt) = session.tile_decoder.decode_tile(tile) {
-                            decoded.push(dt);
-                        }
-                    }
-                    session.display.update_tiles(&decoded);
-                }
-
                 // Flush accumulated scroll (once per frame, like Parsec)
                 if session.scroll_accum.0 != 0.0 || session.scroll_accum.1 != 0.0 {
                     let _ = session

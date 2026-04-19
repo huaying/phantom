@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-use phantom_core::decode::DecodedTile;
-use phantom_core::tile::TILE_SIZE;
 use softbuffer::Surface;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -71,44 +69,6 @@ impl WinitDisplay {
         self.server_width = width;
         self.server_height = height;
         self.buffer = vec![0u32; (width * height) as usize];
-    }
-
-    /// Apply decoded lossless tiles to the framebuffer.
-    pub fn update_tiles(&mut self, tiles: &[DecodedTile]) {
-        let bpp = 4;
-        let w = self.server_width as usize;
-
-        for tile in tiles {
-            let base_x = (tile.tile_x * TILE_SIZE) as usize;
-            let base_y = (tile.tile_y * TILE_SIZE) as usize;
-            let tw = tile.pixel_width as usize;
-            let th = tile.pixel_height as usize;
-
-            if base_x >= w || base_y >= self.server_height as usize {
-                continue;
-            }
-            let expected_data = tw * th * bpp;
-            if tile.data.len() < expected_data {
-                continue;
-            }
-
-            for row in 0..th {
-                let dst_y = base_y + row;
-                if dst_y >= self.server_height as usize {
-                    break;
-                }
-                let src_offset = row * tw * bpp;
-                let dst_offset = dst_y * w + base_x;
-                let copy_w = tw.min(w.saturating_sub(base_x));
-
-                for col in 0..copy_w {
-                    let si = src_offset + col * bpp;
-                    self.buffer[dst_offset + col] = ((tile.data[si + 2] as u32) << 16)
-                        | ((tile.data[si + 1] as u32) << 8)
-                        | (tile.data[si] as u32);
-                }
-            }
-        }
     }
 
     /// Draw local cursor and present framebuffer to screen.

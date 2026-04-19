@@ -3,4 +3,3 @@
 //! without forcing CUDA on every build.
 
 pub mod h264;
-pub mod zstd;

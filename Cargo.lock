@@ -2635,7 +2635,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantom-bench"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "openh264",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-client"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2668,12 +2668,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winit",
- "zstd",
 ]
 
 [[package]]
 name = "phantom-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2686,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-gpu"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "phantom-core",
@@ -2696,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-server"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2732,17 +2731,15 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "windows-service",
- "zstd",
 ]
 
 [[package]]
 name = "phantom-web"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bincode",
  "js-sys",
  "phantom-core",
- "ruzstd",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -3345,15 +3342,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "ruzstd"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "safe_arch"
@@ -4202,16 +4190,6 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
-]
-
-[[package]]
-name = "twox-hash"
-version = "1.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
-dependencies = [
- "cfg-if 1.0.4",
- "static_assertions",
 ]
 
 [[package]]
@@ -5286,34 +5264,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
-dependencies = [
- "cc",
- "pkg-config",
-]
 
 [[package]]
 name = "zune-core"
