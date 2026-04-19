@@ -15,22 +15,18 @@
 // assignment is the conventional idiom and is unavoidable.
 #![allow(clippy::field_reassign_with_default)]
 
-#[cfg(feature = "audio")]
-mod audio;
-mod capture;
-#[cfg(target_os = "windows")]
-mod display_ccd;
-mod doorbell;
-mod encode;
-mod file_transfer;
-mod input_injector;
+// Modules live in lib.rs so integration tests can reach them. Re-alias here
+// so the binary's internal `crate::session::...` paths still resolve.
+use phantom_server::capture;
+use phantom_server::doorbell;
+use phantom_server::encode;
 #[cfg(target_os = "linux")]
-mod input_uinput;
-mod ipc_pipe;
+#[allow(unused_imports)]
+use phantom_server::input_uinput;
+use phantom_server::session;
 #[cfg(target_os = "windows")]
-mod service_win;
-mod session;
-mod transport;
+use phantom_server::service_win;
+use phantom_server::transport;
 
 use anyhow::Result;
 use clap::Parser;
