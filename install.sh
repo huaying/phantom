@@ -284,8 +284,16 @@ EOF
 }
 
 linux_autologin_disable_screenlock() {
-    # 2. Disable GNOME screen lock + idle (system-wide dconf override so it
-    #    applies before the user ever logs in and picks it up on every boot).
+    # 2. Disable GNOME screen lock + idle + user switching (system-wide dconf
+    #    override so it applies before the user ever logs in and picks it up
+    #    on every boot).
+    #
+    #    disable-user-switching: blocks the "Switch User" menu item. Without
+    #    this, clicking Switch User leaves the original user's X session
+    #    locked + backgrounded on its VT while GDM spawns a greeter on a new
+    #    VT. phantom stays pinned to DISPLAY=:0 (the backgrounded session)
+    #    and keeps streaming a black screen; autologin can't recover because
+    #    the original session isn't technically dead.
     sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
     if [ ! -f /etc/dconf/profile/user ]; then
         sudo tee /etc/dconf/profile/user > /dev/null <<EOF
@@ -300,9 +308,12 @@ idle-activation-enabled=false
 
 [org/gnome/desktop/session]
 idle-delay=uint32 0
+
+[org/gnome/desktop/lockdown]
+disable-user-switching=true
 EOF
     sudo dconf update 2>/dev/null || true
-    echo "  Disabled GNOME screen lock + idle timeout"
+    echo "  Disabled GNOME screen lock + idle timeout + user switching"
 }
 
 linux_autologin_reset_keyring() {
