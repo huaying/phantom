@@ -157,7 +157,6 @@ struct Args {
     #[arg(long)]
     auth_secret: Option<String>,
 
-
     /// Run as agent process (launched by service in user session).
     /// Handles DXGI capture + input injection, connects back to service.
     #[cfg(target_os = "windows")]
