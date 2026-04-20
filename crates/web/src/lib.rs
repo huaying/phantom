@@ -125,18 +125,19 @@ struct AppState {
     server_height: u32,
     frame_count: u64,
     got_keyframe: bool,
-    /// Highest server sequence we've received. Used by the
-    /// tab-visibility recovery path: when the tab becomes visible we set
-    /// `stale_until_seq = last_received_seq`, and any VideoFrame with
-    /// sequence <= that is discarded entirely (not decoded, doesn't flip
-    /// got_keyframe). Otherwise the first backlog keyframe would flip
-    /// us back into "decoding" mode and the rest of the backlog would
-    /// fast-forward through.
-    last_received_seq: u64,
-    /// When set, drop every VideoFrame with `sequence <= stale_until_seq`.
-    /// Cleared once the post-RequestKeyframe IDR arrives (sequence higher
-    /// than the cutoff AND `is_keyframe` set).
-    stale_until_seq: Option<u64>,
+    /// Tab-visibility recovery: wall-clock `performance.now()` before which
+    /// we drop every VideoFrame regardless of keyframe status. Set to
+    /// `now + 500ms` on visibilitychange→visible. This is the "swallow
+    /// the TCP backlog" window — backlog frames dispatched by the
+    /// browser in a single microtask burst get tossed, even if some are
+    /// keyframes, because those keyframes are stale snapshots from minutes
+    /// ago and decoding them just fast-forwards through them.
+    drop_frames_until_ms: f64,
+    /// After the initial drop window, we still need to wait for the
+    /// next keyframe before resuming decode (can't decode P-frames
+    /// without a reference). Cleared on the first keyframe seen after
+    /// `drop_frames_until_ms` has passed.
+    drop_until_keyframe: bool,
     video_assembler: ChunkAssembler,
     control_assembler: ChunkAssembler,
     /// For sending input — either DataChannel or WebSocket
@@ -201,7 +202,13 @@ pub fn main() {
         }
     });
     let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
-    console::log_1(&format!("Phantom Web Client starting ({mode} mode)...").into());
+    console::log_1(
+        &format!(
+            "Phantom Web Client v{} starting ({mode} mode)...",
+            env!("CARGO_PKG_VERSION")
+        )
+        .into(),
+    );
 
     let canvas: HtmlCanvasElement = document
         .get_element_by_id("screen")
@@ -215,8 +222,8 @@ pub fn main() {
         server_height: 0,
         frame_count: 0,
         got_keyframe: false,
-        last_received_seq: 0,
-        stale_until_seq: None,
+        drop_frames_until_ms: 0.0,
+        drop_until_keyframe: false,
         video_assembler: ChunkAssembler::new(),
         control_assembler: ChunkAssembler::new(),
         send_dc: None,
@@ -596,18 +603,11 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             // Send viewport size so server can match resolution (adaptive, like DCV)
             send_resolution_change(state);
         }
-        Message::VideoFrame { sequence, frame } => {
+        Message::VideoFrame { sequence: _, frame } => {
             if frame.data.is_empty() {
                 return;
             }
             let mut s = state.borrow_mut();
-
-            // Track highest seq so the visibility-recovery path knows what
-            // "backlog" means. Keep it updated even if we end up skipping
-            // this frame — cutoff on next stall should be up-to-date.
-            if sequence > s.last_received_seq {
-                s.last_received_seq = sequence;
-            }
 
             let is_key = match frame.codec {
                 VideoCodec::H264 => h264_has_idr(&frame.data),
@@ -618,28 +618,29 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             };
 
-            // Tab-visibility recovery: after visibilitychange→visible, drop
-            // every frame with sequence <= cutoff (the last seq we saw
-            // before we went hidden). Without this the first backlog
-            // keyframe flips got_keyframe back on and the subsequent
-            // backlog P-frames fast-forward through. Only a keyframe with
-            // sequence > cutoff (i.e. actually fresher than when we asked
-            // for it via RequestKeyframe) clears the stale flag.
-            if let Some(cutoff) = s.stale_until_seq {
-                if sequence <= cutoff {
-                    return;
-                }
+            // Tab-visibility recovery (phase 1): hard wall-clock drop.
+            // When a backgrounded tab becomes visible, the browser
+            // dispatches the entire kernel TCP backlog of queued messages
+            // in one microtask burst — up to several seconds of stale
+            // frames, including multiple stale keyframes. A sequence- or
+            // keyframe-based filter can't reliably tell "stale backlog
+            // keyframe" from "fresh keyframe we just asked for", so we
+            // just toss everything for 500ms (covers typical burst) and
+            // then wait for the next keyframe.
+            let now_ms = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(0.0);
+            if now_ms < s.drop_frames_until_ms {
+                return;
+            }
+            if s.drop_until_keyframe {
                 if is_key {
                     console::log_1(
-                        &format!(
-                            "visibility recovery: fresh keyframe at seq={sequence} (cutoff {cutoff})"
-                        )
-                        .into(),
+                        &"visibility recovery: fresh keyframe received, resuming".into(),
                     );
-                    s.stale_until_seq = None;
+                    s.drop_until_keyframe = false;
                 } else {
-                    // Past cutoff but not a keyframe — still skip, we need
-                    // a keyframe to resume decoding safely.
                     return;
                 }
             }
@@ -2066,18 +2067,28 @@ fn setup_input(
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
             let document = web_sys::window().unwrap().document().unwrap();
             if document.visibility_state() == web_sys::VisibilityState::Visible {
+                let now_ms = web_sys::window()
+                    .and_then(|w| w.performance())
+                    .map(|p| p.now())
+                    .unwrap_or(0.0);
                 {
                     let mut st = s.borrow_mut();
                     st.got_keyframe = false;
-                    // Drop every frame with sequence ≤ last_received_seq
-                    // until a fresh keyframe (seq > cutoff && is_key)
-                    // arrives. See `stale_until_seq` docs on AppState.
-                    st.stale_until_seq = Some(st.last_received_seq);
+                    // Hard-drop everything for 500ms to swallow the TCP
+                    // backlog burst; then wait for the next keyframe
+                    // before resuming. See docs on AppState for why.
+                    st.drop_frames_until_ms = now_ms + 500.0;
+                    st.drop_until_keyframe = true;
                 }
                 {
                     let st = s.borrow();
                     send_message(&st, &Message::RequestKeyframe);
                 }
+                console::log_1(
+                    &"visibility → visible: dropping 500ms of frames then \
+                     waiting for fresh keyframe"
+                        .into(),
+                );
                 send_resolution_change(&s);
             }
         });
