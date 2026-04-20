@@ -103,6 +103,15 @@ struct Args {
     #[arg(long)]
     install_vdd: bool,
 
+    /// (Windows only) Remove only the Virtual Display Driver and leave the
+    /// phantom-server service alone. Use this when you actually want VDD
+    /// gone — `--uninstall` no longer touches VDD by default because
+    /// removing + reinstalling it on every upgrade was shunting user
+    /// windows off-screen.
+    #[cfg(target_os = "windows")]
+    #[arg(long)]
+    uninstall_vdd: bool,
+
     /// Send a file to the first client that connects.
     #[arg(long)]
     send_file: Option<String>,
@@ -326,6 +335,15 @@ fn main() -> Result<()> {
             install_dir.display()
         );
         return service_win::install_vdd(&install_dir);
+    }
+    #[cfg(target_os = "windows")]
+    if args.uninstall_vdd {
+        let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
+        println!(
+            "Removing Virtual Display Driver at {}",
+            install_dir.display()
+        );
+        return service_win::uninstall_vdd(&install_dir);
     }
 
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);

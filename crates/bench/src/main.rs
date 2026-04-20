@@ -161,10 +161,7 @@ impl OpenH264Bench {
 
 fn component_bench(cuda: Option<&Arc<CudaLib>>, av1_supported: bool) {
     println!("=== Component bench (encoder only, {ROUNDS} rounds + {WARMUP} warmup) ===\n");
-    println!(
-        "{:<8} {:>8} {:<10} Result",
-        "Res", "Bitrate", "Encoder"
-    );
+    println!("{:<8} {:>8} {:<10} Result", "Res", "Bitrate", "Encoder");
     println!("{}", "-".repeat(80));
 
     for &(w, h, label) in RESOLUTIONS {

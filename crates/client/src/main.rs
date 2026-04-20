@@ -54,8 +54,20 @@ struct Args {
     no_encrypt: bool,
     #[arg(long, default_value = "tcp")]
     transport: String,
-    /// Video decoder: auto (default), openh264 (CPU), videotoolbox (macOS GPU).
-    #[arg(long, default_value = "auto")]
+    /// Video decoder hint. Accepted values: auto (default), openh264,
+    /// videotoolbox, dav1d, nvdec.
+    ///
+    /// The hint is honoured fully on macOS (auto / videotoolbox take the
+    /// hardware path; anything else forces OpenH264). On Linux / Windows
+    /// `auto` auto-probes NVDEC → dav1d (AV1 only) → OpenH264, and
+    /// `dav1d` / `nvdec` currently fall through the same probe chain —
+    /// they aren't forced selectors. Passing a value outside the list
+    /// errors here instead of silently falling through like older builds.
+    #[arg(
+        long,
+        default_value = "auto",
+        value_parser = ["auto", "openh264", "videotoolbox", "dav1d", "nvdec"]
+    )]
     decoder: String,
     /// Send a file to the server after connecting.
     #[arg(long)]

@@ -1174,8 +1174,41 @@ fn ps_unzip(zip: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()>
 
 /// Install the Virtual Display Driver for headless GPU servers.
 /// Downloads VDD + nefcon from GitHub, installs driver via nefconw.
+/// Ask pnputil whether any MttVDD device node is currently registered.
+/// Used by `install_vdd` to skip the reinstall on upgrade and by
+/// callers that want to check state without doing any install work.
+pub fn vdd_device_present() -> bool {
+    let out = std::process::Command::new("pnputil")
+        .args(["/enum-devices", "/connected"])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // MttVDD's hardware id is `Root\MttVDD`. Match case-insensitive
+            // on "MttVDD" to cover localized pnputil output.
+            s.to_lowercase().contains("mttvdd")
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Idempotent: if the MttVDD device node is already present, skip the
+    // whole download + nefcon dance. This is the upgrade path — phantom-
+    // server `--uninstall` + `--install` was previously causing VDD to
+    // disappear for a few seconds, which Windows would respond to by
+    // migrating all VDD-hosted windows (browser, IDE, ...) onto the
+    // physical display. Those windows save the new position and end up
+    // off-screen from phantom's capture viewport. Skipping the reinstall
+    // when the driver is already registered avoids the window migration
+    // entirely. For a full wipe run `--uninstall-vdd` explicitly.
+    if vdd_device_present() {
+        println!("  Virtual Display Driver already installed — skipping reinstall");
+        println!("  (use --uninstall-vdd to force full removal)");
+        return Ok(());
+    }
 
     let vdd_dir = install_dir.join("vdd");
     std::fs::create_dir_all(&vdd_dir).context("create vdd dir")?;
@@ -1594,10 +1627,14 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
     }
 
-    // Remove Virtual Display Driver
-    let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
-    if let Err(e) = uninstall_vdd(&install_dir) {
-        println!("  Warning: VDD uninstall failed: {e}");
+    // Intentionally *not* removing the Virtual Display Driver here — we
+    // want `--uninstall` to be safe to run as part of an upgrade. The
+    // previous behaviour (always removing VDD) caused every upgrade to
+    // shuffle user windows onto the physical display while VDD was
+    // briefly absent, leaving those windows off-screen after reinstall.
+    // For a full wipe, operators call `--uninstall-vdd` explicitly.
+    if vdd_device_present() {
+        println!("  (Virtual Display Driver left in place; use --uninstall-vdd to remove it)");
     }
 
     // Clean up schtasks

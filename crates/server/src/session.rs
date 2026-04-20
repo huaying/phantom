@@ -89,77 +89,67 @@ pub fn spawn_receive_thread(
     std::thread::Builder::new()
         .name("session-recv".into())
         .spawn(move || loop {
+            // Send an event and break if the receiver (session loop) is gone
+            // — otherwise we'd keep reading the network and silently
+            // discarding messages until the peer happens to close.
+            macro_rules! send_or_break {
+                ($ev:expr) => {
+                    if tx.send($ev).is_err() {
+                        break;
+                    }
+                };
+            }
             match receiver.recv_msg() {
-                Ok(Message::Input(event)) => {
-                    let _ = tx.send(InboundEvent::Input(event));
-                }
-                Ok(Message::ClipboardSync(text)) => {
-                    let _ = tx.send(InboundEvent::Clipboard(text));
-                }
-                Ok(Message::PasteText(text)) => {
-                    let _ = tx.send(InboundEvent::PasteText(text));
-                }
-                Ok(Message::Pong) => {
-                    let _ = tx.send(InboundEvent::Pong);
-                }
+                Ok(Message::Input(event)) => send_or_break!(InboundEvent::Input(event)),
+                Ok(Message::ClipboardSync(text)) => send_or_break!(InboundEvent::Clipboard(text)),
+                Ok(Message::PasteText(text)) => send_or_break!(InboundEvent::PasteText(text)),
+                Ok(Message::Pong) => send_or_break!(InboundEvent::Pong),
                 Ok(Message::FileOffer {
                     transfer_id,
                     name,
                     size,
-                }) => {
-                    let _ = tx.send(InboundEvent::FileOffer {
-                        transfer_id,
-                        name,
-                        size,
-                    });
-                }
+                }) => send_or_break!(InboundEvent::FileOffer {
+                    transfer_id,
+                    name,
+                    size,
+                }),
                 Ok(Message::FileAccept { transfer_id }) => {
-                    let _ = tx.send(InboundEvent::FileAccept { transfer_id });
+                    send_or_break!(InboundEvent::FileAccept { transfer_id })
                 }
                 Ok(Message::FileCancel {
                     transfer_id,
                     reason,
-                }) => {
-                    let _ = tx.send(InboundEvent::FileCancel {
-                        transfer_id,
-                        reason,
-                    });
-                }
+                }) => send_or_break!(InboundEvent::FileCancel {
+                    transfer_id,
+                    reason,
+                }),
                 Ok(Message::FileChunk {
                     transfer_id,
                     offset,
                     data,
-                }) => {
-                    let _ = tx.send(InboundEvent::FileChunk {
-                        transfer_id,
-                        offset,
-                        data,
-                    });
-                }
+                }) => send_or_break!(InboundEvent::FileChunk {
+                    transfer_id,
+                    offset,
+                    data,
+                }),
                 Ok(Message::FileDone {
                     transfer_id,
                     sha256,
-                }) => {
-                    let _ = tx.send(InboundEvent::FileDone {
-                        transfer_id,
-                        sha256,
-                    });
-                }
+                }) => send_or_break!(InboundEvent::FileDone {
+                    transfer_id,
+                    sha256,
+                }),
                 Ok(Message::Resume {
                     session_token,
                     last_sequence,
-                }) => {
-                    let _ = tx.send(InboundEvent::Resume {
-                        session_token,
-                        last_sequence,
-                    });
-                }
+                }) => send_or_break!(InboundEvent::Resume {
+                    session_token,
+                    last_sequence,
+                }),
                 Ok(Message::ResolutionChange { width, height }) => {
-                    let _ = tx.send(InboundEvent::ResolutionChange { width, height });
+                    send_or_break!(InboundEvent::ResolutionChange { width, height })
                 }
-                Ok(Message::RequestKeyframe) => {
-                    let _ = tx.send(InboundEvent::RequestKeyframe);
-                }
+                Ok(Message::RequestKeyframe) => send_or_break!(InboundEvent::RequestKeyframe),
                 Ok(_) => {}
                 Err(_) => {
                     let _ = tx.send(InboundEvent::Disconnected);
@@ -588,11 +578,18 @@ impl SessionRunner {
             match self.event_rx.try_recv() {
                 Ok(InboundEvent::Input(event)) => {
                     // If we have an input forwarder (e.g. IPC to agent), use it.
-                    // Otherwise inject locally (console mode).
+                    // Otherwise inject locally (console mode). Log failures —
+                    // on Windows Service mode a broken IPC pipe (agent crashed)
+                    // would otherwise silently drop keystrokes forever with
+                    // no signal that input isn't reaching the user session.
                     if let Some(ref fwd) = self.input_forwarder {
-                        let _ = fwd.forward_input(&event);
+                        if let Err(e) = fwd.forward_input(&event) {
+                            tracing::warn!("input forward failed: {e:#}");
+                        }
                     } else if let Some(ref mut inj) = self.injector {
-                        let _ = inj.inject(&event);
+                        if let Err(e) = inj.inject(&event) {
+                            tracing::warn!("input inject failed: {e:#}");
+                        }
                     }
                     self.had_input = true;
                 }
@@ -1300,8 +1297,14 @@ fn run_session_ipc_inner(
     runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
-    // Request keyframe from agent for the new client
-    let _ = ipc.request_keyframe();
+    // Request keyframe from agent for the new client. If the IPC pipe is
+    // dead (agent crashed, service/agent race during startup) there's
+    // nothing to do from here — the service's SessionManager will relaunch
+    // the agent on the next poll — but logging the failure at least makes
+    // "client connected but no frames arriving" diagnosable.
+    if let Err(e) = ipc.request_keyframe() {
+        tracing::warn!("ipc request_keyframe failed: {e:#}");
+    }
 
     loop {
         runner.check_cancelled()?;
