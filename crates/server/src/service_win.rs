@@ -1178,15 +1178,17 @@ fn ps_unzip(zip: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()>
 /// Used by `install_vdd` to skip the reinstall on upgrade and by
 /// callers that want to check state without doing any install work.
 pub fn vdd_device_present() -> bool {
+    // pnputil /enum-devices shows Device Description + Manufacturer but not
+    // the hardware id (Root\MttVDD). The combination "Virtual Display Driver"
+    // + "MikeTheTech" is unique enough to identify MTT VDD without false
+    // positives from other vendors' virtual display drivers.
     let out = std::process::Command::new("pnputil")
         .args(["/enum-devices", "/connected"])
         .output();
     match out {
         Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            // MttVDD's hardware id is `Root\MttVDD`. Match case-insensitive
-            // on "MttVDD" to cover localized pnputil output.
-            s.to_lowercase().contains("mttvdd")
+            let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            s.contains("virtual display driver") && s.contains("mikethetech")
         }
         Err(_) => false,
     }
