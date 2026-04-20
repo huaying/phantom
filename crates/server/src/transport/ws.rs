@@ -92,6 +92,7 @@ fn check_ws_auth(
         Some(token) => match verify_jwt(token, secret) {
             Ok((user, vm_id)) => {
                 tracing::info!(user, vm_id, "authenticated WebSocket");
+                crate::sso::on_jwt_verified(&user);
                 Ok(())
             }
             Err(e) => {

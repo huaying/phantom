@@ -9,6 +9,7 @@ web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
 wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + XDG Portal
+sso = []  # SSO agent: write auth ticket after JWT verified, for pam_phantom / phantom_cp plugins
 
 [dependencies]
 phantom-core = { path = "../core" }

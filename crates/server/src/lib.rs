@@ -28,4 +28,5 @@ pub mod pipeline;
 #[cfg(target_os = "windows")]
 pub mod service_win;
 pub mod session;
+pub mod sso;
 pub mod transport;
