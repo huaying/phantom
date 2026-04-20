@@ -125,6 +125,18 @@ struct AppState {
     server_height: u32,
     frame_count: u64,
     got_keyframe: bool,
+    /// Highest server sequence we've received. Used by the
+    /// tab-visibility recovery path: when the tab becomes visible we set
+    /// `stale_until_seq = last_received_seq`, and any VideoFrame with
+    /// sequence <= that is discarded entirely (not decoded, doesn't flip
+    /// got_keyframe). Otherwise the first backlog keyframe would flip
+    /// us back into "decoding" mode and the rest of the backlog would
+    /// fast-forward through.
+    last_received_seq: u64,
+    /// When set, drop every VideoFrame with `sequence <= stale_until_seq`.
+    /// Cleared once the post-RequestKeyframe IDR arrives (sequence higher
+    /// than the cutoff AND `is_keyframe` set).
+    stale_until_seq: Option<u64>,
     video_assembler: ChunkAssembler,
     control_assembler: ChunkAssembler,
     /// For sending input — either DataChannel or WebSocket
@@ -203,6 +215,8 @@ pub fn main() {
         server_height: 0,
         frame_count: 0,
         got_keyframe: false,
+        last_received_seq: 0,
+        stale_until_seq: None,
         video_assembler: ChunkAssembler::new(),
         control_assembler: ChunkAssembler::new(),
         send_dc: None,
@@ -582,11 +596,18 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             // Send viewport size so server can match resolution (adaptive, like DCV)
             send_resolution_change(state);
         }
-        Message::VideoFrame { sequence: _, frame } => {
+        Message::VideoFrame { sequence, frame } => {
             if frame.data.is_empty() {
                 return;
             }
             let mut s = state.borrow_mut();
+
+            // Track highest seq so the visibility-recovery path knows what
+            // "backlog" means. Keep it updated even if we end up skipping
+            // this frame — cutoff on next stall should be up-to-date.
+            if sequence > s.last_received_seq {
+                s.last_received_seq = sequence;
+            }
 
             let is_key = match frame.codec {
                 VideoCodec::H264 => h264_has_idr(&frame.data),
@@ -596,6 +617,32 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     s.frame_count == 0
                 }
             };
+
+            // Tab-visibility recovery: after visibilitychange→visible, drop
+            // every frame with sequence <= cutoff (the last seq we saw
+            // before we went hidden). Without this the first backlog
+            // keyframe flips got_keyframe back on and the subsequent
+            // backlog P-frames fast-forward through. Only a keyframe with
+            // sequence > cutoff (i.e. actually fresher than when we asked
+            // for it via RequestKeyframe) clears the stale flag.
+            if let Some(cutoff) = s.stale_until_seq {
+                if sequence <= cutoff {
+                    return;
+                }
+                if is_key {
+                    console::log_1(
+                        &format!(
+                            "visibility recovery: fresh keyframe at seq={sequence} (cutoff {cutoff})"
+                        )
+                        .into(),
+                    );
+                    s.stale_until_seq = None;
+                } else {
+                    // Past cutoff but not a keyframe — still skip, we need
+                    // a keyframe to resume decoding safely.
+                    return;
+                }
+            }
             // Log first few frames for debugging
             if s.frame_count < 5 {
                 let hex: String = frame
@@ -2022,6 +2069,10 @@ fn setup_input(
                 {
                     let mut st = s.borrow_mut();
                     st.got_keyframe = false;
+                    // Drop every frame with sequence ≤ last_received_seq
+                    // until a fresh keyframe (seq > cutoff && is_key)
+                    // arrives. See `stale_until_seq` docs on AppState.
+                    st.stale_until_seq = Some(st.last_received_seq);
                 }
                 {
                     let st = s.borrow();
