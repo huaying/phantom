@@ -531,7 +531,7 @@ linux_install_sso() {
 
     echo "  Done. Remember:"
     echo "    1. Build phantom-server with --features sso (cargo build --release -p phantom-server --features sso)"
-    echo "    2. Launch phantom-server with --sso-password-file pointing at the OS password"
+    echo "    2. Launch phantom-server with --auth-secret <hex>"
     echo "    3. Connect with a JWT carrying \"sub\"=<target user>; PAM will pick up the ticket"
 }
 

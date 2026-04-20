@@ -157,12 +157,6 @@ struct Args {
     #[arg(long)]
     auth_secret: Option<String>,
 
-    /// Path to a file containing the OS-level password to pair with each
-    /// JWT `sub` when writing the SSO auth ticket. Requires `--features sso`.
-    /// Paired with the pam_phantom / phantom_cp plugins.
-    #[cfg(feature = "sso")]
-    #[arg(long)]
-    sso_password_file: Option<std::path::PathBuf>,
 
     /// Run as agent process (launched by service in user session).
     /// Handles DXGI capture + input injection, connects back to service.
@@ -598,22 +592,6 @@ fn main() -> Result<()> {
         .map(|x| x.0)
         .unwrap_or("0.0.0.0")
         .to_string();
-
-    // SSO: load the shared password file once at startup (feature-gated)
-    #[cfg(feature = "sso")]
-    {
-        use anyhow::Context;
-        let pw = match &args.sso_password_file {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("read --sso-password-file {}", path.display()))?
-                    .trim_end_matches(['\n', '\r'])
-                    .to_string(),
-            ),
-            None => None,
-        };
-        phantom_server::sso::init(pw);
-    }
 
     // Parse JWT auth secret (hex → bytes)
     let auth_secret: Option<Vec<u8>> = match &args.auth_secret {

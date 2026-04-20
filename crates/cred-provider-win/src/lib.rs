@@ -16,9 +16,9 @@ use windows::Win32::Foundation::{
     E_NOTIMPL, E_POINTER, HANDLE, NTSTATUS, S_FALSE, S_OK,
 };
 use windows::Win32::Graphics::Gdi::HBITMAP;
-use windows::Win32::Security::Authentication::Identity::{
-    KerbInteractiveLogon, KerbWorkstationUnlockLogon, KERB_INTERACTIVE_UNLOCK_LOGON,
-};
+// MSV1_0_S4U_LOGON is not exposed in windows 0.58 — define it manually.
+// https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/ns-ntsecapi-msv1_0_s4u_logon
+use windows::Win32::Foundation::UNICODE_STRING;
 use windows::Win32::System::Com::{CoTaskMemAlloc, IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::Shell::*;
 
@@ -305,13 +305,12 @@ impl ICredentialProviderCredential_Impl for Tile_Impl {
             *pcpgsr = CPGSR_NO_CREDENTIAL_NOT_FINISHED;
         }
 
-        let (domain, user, pass) = match read_creds_from_file() {
+        let (domain, user) = match read_user_from_file() {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
 
-        let cpus = CPUS_STATE.load(Ordering::SeqCst);
-        let (buf, cb, auth_pkg) = pack_kiul(&domain, &user, &pass, cpus)?;
+        let (buf, cb, auth_pkg) = pack_s4u(&domain, &user)?;
 
         unsafe {
             (*pcpcs).ulAuthenticationPackage = auth_pkg;
@@ -337,8 +336,10 @@ fn alloc_wide(s: &str) -> PWSTR {
     }
 }
 
-fn read_creds_from_file() -> std::result::Result<(String, String, String), std::io::Error> {
-    // TTL: reject tickets older than TICKET_MAX_AGE_SECS.
+/// Read + consume the auth ticket. Format: first line is `user` or
+/// `domain\user`. Any trailing `:<password>` after the user is ignored
+/// (legacy Phase-1 format). Returns (domain, user).
+fn read_user_from_file() -> std::result::Result<(String, String), std::io::Error> {
     let meta = std::fs::metadata(AUTH_FILE)?;
     if let Ok(modified) = meta.modified() {
         if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
@@ -354,36 +355,46 @@ fn read_creds_from_file() -> std::result::Result<(String, String, String), std::
 
     let raw = std::fs::read_to_string(AUTH_FILE)?;
     let line = raw.lines().next().unwrap_or("").trim();
-    let (userpart, pass) = line.split_once(':').ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing ':' in auth file")
-    })?;
-    let (domain, user) = match userpart.split_once('\\') {
+    // Tolerate legacy `user:pass` by dropping the pass half.
+    let user_part = line.split_once(':').map(|(u, _)| u).unwrap_or(line);
+    let (domain, user) = match user_part.split_once('\\') {
         Some((d, u)) => (d.to_string(), u.to_string()),
-        None => (String::new(), userpart.to_string()),
+        None => (String::new(), user_part.to_string()),
     };
-    // Single-use: burn the ticket now so a crashed / retried logon can't
-    // re-consume it. If LSA rejects the creds the user will just see the
-    // normal password prompt and phantom-server can re-issue.
+    if user.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty user in ticket",
+        ));
+    }
+    // Single-use: burn the ticket now.
     let _ = std::fs::remove_file(AUTH_FILE);
-    Ok((domain, user, pass.to_string()))
+    Ok((domain, user))
 }
 
-fn pack_kiul(
-    domain: &str,
-    user: &str,
-    pass: &str,
-    cpus: u32,
-) -> Result<(*mut u8, u32, u32)> {
-    let d_w: Vec<u16> = domain.encode_utf16().collect();
+// MSV1_0_S4U_LOGON struct — not in windows-rs 0.58, declared by hand.
+// https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/ns-ntsecapi-msv1_0_s4u_logon
+#[repr(C)]
+struct Msv10S4uLogon {
+    message_type: u32, // MsV1_0S4ULogon = 12
+    flags: u32,
+    user_principal_name: UNICODE_STRING,
+    domain_name: UNICODE_STRING,
+}
+const MSV1_0_S4U_LOGON_TYPE: u32 = 12;
+
+/// Build an `MSV1_0_S4U_LOGON` serialization that LSA (called by LogonUI
+/// with SeTcbPrivilege) will accept as a passwordless logon for a local
+/// account. UNICODE_STRING.Buffer fields are offsets-from-start.
+fn pack_s4u(domain: &str, user: &str) -> Result<(*mut u8, u32, u32)> {
     let u_w: Vec<u16> = user.encode_utf16().collect();
-    let p_w: Vec<u16> = pass.encode_utf16().collect();
+    let d_w: Vec<u16> = domain.encode_utf16().collect();
 
-    let d_bytes = d_w.len() * 2;
     let u_bytes = u_w.len() * 2;
-    let p_bytes = p_w.len() * 2;
+    let d_bytes = d_w.len() * 2;
 
-    let base_size = mem::size_of::<KERB_INTERACTIVE_UNLOCK_LOGON>();
-    let total = base_size + d_bytes + u_bytes + p_bytes;
+    let base_size = mem::size_of::<Msv10S4uLogon>();
+    let total = base_size + u_bytes + d_bytes;
 
     let buf = unsafe { CoTaskMemAlloc(total) as *mut u8 };
     if buf.is_null() {
@@ -393,36 +404,26 @@ fn pack_kiul(
         ptr::write_bytes(buf, 0, total);
     }
 
-    let d_off = base_size;
-    let u_off = d_off + d_bytes;
-    let p_off = u_off + u_bytes;
+    let u_off = base_size;
+    let d_off = u_off + u_bytes;
 
     unsafe {
-        if d_bytes > 0 {
-            ptr::copy_nonoverlapping(d_w.as_ptr() as *const u8, buf.add(d_off), d_bytes);
-        }
         if u_bytes > 0 {
             ptr::copy_nonoverlapping(u_w.as_ptr() as *const u8, buf.add(u_off), u_bytes);
         }
-        if p_bytes > 0 {
-            ptr::copy_nonoverlapping(p_w.as_ptr() as *const u8, buf.add(p_off), p_bytes);
+        if d_bytes > 0 {
+            ptr::copy_nonoverlapping(d_w.as_ptr() as *const u8, buf.add(d_off), d_bytes);
         }
 
-        let kiul = buf as *mut KERB_INTERACTIVE_UNLOCK_LOGON;
-        (*kiul).Logon.MessageType = if cpus == CPUS_UNLOCK_WORKSTATION.0 as u32 {
-            KerbWorkstationUnlockLogon
-        } else {
-            KerbInteractiveLogon
-        };
-        (*kiul).Logon.LogonDomainName.Length = d_bytes as u16;
-        (*kiul).Logon.LogonDomainName.MaximumLength = d_bytes as u16;
-        (*kiul).Logon.LogonDomainName.Buffer = PWSTR(d_off as *mut u16);
-        (*kiul).Logon.UserName.Length = u_bytes as u16;
-        (*kiul).Logon.UserName.MaximumLength = u_bytes as u16;
-        (*kiul).Logon.UserName.Buffer = PWSTR(u_off as *mut u16);
-        (*kiul).Logon.Password.Length = p_bytes as u16;
-        (*kiul).Logon.Password.MaximumLength = p_bytes as u16;
-        (*kiul).Logon.Password.Buffer = PWSTR(p_off as *mut u16);
+        let s4u = buf as *mut Msv10S4uLogon;
+        (*s4u).message_type = MSV1_0_S4U_LOGON_TYPE;
+        (*s4u).flags = 0;
+        (*s4u).user_principal_name.Length = u_bytes as u16;
+        (*s4u).user_principal_name.MaximumLength = u_bytes as u16;
+        (*s4u).user_principal_name.Buffer = PWSTR(u_off as *mut u16);
+        (*s4u).domain_name.Length = d_bytes as u16;
+        (*s4u).domain_name.MaximumLength = d_bytes as u16;
+        (*s4u).domain_name.Buffer = PWSTR(d_off as *mut u16);
     }
 
     let auth_pkg = lookup_auth_package("MICROSOFT_AUTHENTICATION_PACKAGE_V1_0")?;

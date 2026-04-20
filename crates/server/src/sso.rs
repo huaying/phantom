@@ -3,40 +3,24 @@
 //! phantom_cp on Windows) can log the user straight into their desktop
 //! session without a password prompt.
 //!
-//! phantom-server doesn't link the plugin — the file on disk is the only
-//! coupling. See docs/sso-plan.md.
+//! Phase 2 — passwordless: phantom-server writes only the username to the
+//! ticket. On Linux, pam_phantom has always ignored the password field.
+//! On Windows, phantom_cp submits MSV1_0_S4U_LOGON to LSA (LogonUI has
+//! SeTcbPrivilege, which is the precondition for caller-asserted logons).
+//!
+//! See docs/sso-plan.md.
 
-#[cfg(feature = "sso")]
-use std::sync::OnceLock;
-
-#[cfg(feature = "sso")]
-static SSO_PASSWORD: OnceLock<String> = OnceLock::new();
-
-/// Called once at startup from main(). Stores the plaintext password
-/// phantom-server will pair with every JWT `sub`. Phase-1 simplification;
-/// Phase 2 replaces this with per-session passwordless S4U (Windows) /
-/// delegated ticket (Linux).
-#[cfg(feature = "sso")]
-pub fn init(password: Option<String>) {
-    if let Some(p) = password {
-        let _ = SSO_PASSWORD.set(p);
-        tracing::info!("sso: enabled (password loaded)");
-    }
-}
-
-#[cfg(not(feature = "sso"))]
-pub fn init(_password: Option<String>) {}
-
-/// Invoked by the WS auth path once a JWT has been verified. If SSO is
-/// configured, writes the auth file and (on Windows) kicks LogonUI so the
-/// Credential Provider re-enumerates and auto-submits.
+/// Invoked by the WS auth path once a JWT has been verified. Writes the
+/// ticket and (on Windows) kicks LogonUI so the Credential Provider
+/// re-enumerates and auto-submits.
 #[cfg(feature = "sso")]
 pub fn on_jwt_verified(user: &str) {
-    let pw = match SSO_PASSWORD.get() {
-        Some(s) => s,
-        None => return, // --sso-password-file not provided
-    };
-    let line = format!("{user}:{pw}");
+    // Guard: refuse empty / whitespace-only usernames.
+    let user = user.trim();
+    if user.is_empty() {
+        tracing::warn!("sso: empty user, skipping ticket write");
+        return;
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -46,11 +30,10 @@ pub fn on_jwt_verified(user: &str) {
             tracing::warn!("sso: mkdir {dir}: {e}");
             return;
         }
-        if let Err(e) = std::fs::write(path, &line) {
+        if let Err(e) = std::fs::write(path, user) {
             tracing::warn!("sso: write {path}: {e}");
             return;
         }
-        // 0600 is plenty — pam_phantom runs as root (inside PAM stack).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -67,13 +50,11 @@ pub fn on_jwt_verified(user: &str) {
             tracing::warn!("sso: mkdir {dir}: {e}");
             return;
         }
-        if let Err(e) = std::fs::write(path, &line) {
+        if let Err(e) = std::fs::write(path, user) {
             tracing::warn!("sso: write {path}: {e}");
             return;
         }
         tracing::info!(user, "sso: wrote {}, kicking LogonUI", path);
-        // taskkill is a no-op if LogonUI isn't running (nobody at lock screen).
-        // When it IS running, respawn re-enumerates CPs → ours auto-submits.
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/IM", "LogonUI.exe"])
             .output();
@@ -81,7 +62,6 @@ pub fn on_jwt_verified(user: &str) {
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = line;
         let _ = user;
     }
 }
