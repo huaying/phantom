@@ -868,6 +868,7 @@ fn main() -> Result<()> {
         let result = if let Some(ref mut gw) = gpu_win {
             session::run_session_dxgi(
                 gw,
+                args.bitrate,
                 session::SessionConfig {
                     sender,
                     receiver,

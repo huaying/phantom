@@ -1325,176 +1325,34 @@ fn run_session_ipc_inner(
 }
 
 /// Linux GPU zero-copy session: NVFBC grab → NVENC encode → send.
+/// Thin wrapper that constructs an `NvfbcNvencPipeline` and dispatches to
+/// `run_session` — same shape as `run_session_cpu`.
 #[cfg(target_os = "linux")]
 pub fn run_session_gpu(
     capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
     encoder: &mut phantom_gpu::nvenc::NvencEncoder,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
-    let cancel = Arc::clone(&cfg.cancel);
-    let mut session_id = String::new();
-    let result = run_session_gpu_inner(capture, encoder, cfg, &mut session_id);
-    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
+    let mut pipeline = crate::pipeline::NvfbcNvencPipeline::new(capture, encoder);
+    run_session(&mut pipeline, cfg)
 }
 
-#[cfg(target_os = "linux")]
-fn run_session_gpu_inner(
-    capture: &mut phantom_gpu::nvfbc::NvfbcCapture,
-    encoder: &mut phantom_gpu::nvenc::NvencEncoder,
-    cfg: SessionConfig<'_>,
-    session_id_out: &mut String,
-) -> Result<Vec<u8>> {
-    use phantom_core::encode::FrameEncoder;
-
-    encoder.force_keyframe();
-    let (width, height) = encoder.dimensions();
-    let mut runner = SessionRunner::new(
-        cfg.sender,
-        cfg.receiver,
-        width,
-        height,
-        cfg.frame_interval,
-        cfg.cancel,
-        cfg.video_codec,
-        cfg.is_resume,
-    )?;
-    *session_id_out = runner.session_id.clone();
-    runner.input_forwarder = cfg.input_forwarder;
-    runner.resolution_change_fn = cfg.resolution_change_fn;
-    runner.paste_fn = cfg.paste_fn;
-    runner.audio_ws_rx = cfg.audio_ws_rx;
-
-    if let Some(path) = cfg.send_file {
-        if let Err(e) = runner.send_file(path) {
-            tracing::error!("failed to initiate file send: {e}");
-        }
-    }
-
-    let mut no_frame_count: u32 = 0;
-    let mut abr = AdaptiveBitrate::new(encoder.bitrate_kbps().max(5000));
-    // GPU path doesn't use CongestionTracker (no skip), but ABR needs one for the API
-    let congestion = CongestionTracker::new(cfg.frame_interval);
-
-    loop {
-        runner.check_cancelled()?;
-        let loop_start = Instant::now();
-
-        runner.pump_events()?;
-        runner.poll_clipboard()?;
-        runner.drain_audio()?; // audio first, before capture/encode
-
-        // After input, give the screen a moment to update then grab.
-        if runner.had_input {
-            std::thread::sleep(Duration::from_millis(2));
-            runner.had_input = false;
-            no_frame_count = 0;
-        }
-
-        capture.bind_context()?;
-        let gpu_frame = capture.grab_cuda();
-        let _ = capture.release_context();
-
-        match gpu_frame {
-            Ok(Some(f)) => {
-                no_frame_count = 0;
-                let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
-                let enc_start = Instant::now();
-                let encoded = encoder.encode_device_nv12(f.device_ptr, pitch)?;
-                runner.record_encode_time(enc_start.elapsed());
-                runner.send_video_frame(encoded, None)?;
-            }
-            Ok(None) => {
-                no_frame_count += 1;
-                if no_frame_count > 5 {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("GPU grab error: {e}");
-            }
-        }
-
-        runner.drain_file_transfers()?;
-        runner.adapt_bitrate(&mut abr, &congestion, encoder);
-        runner.log_stats("GPU stats");
-        runner.keepalive_tick()?;
-        runner.frame_pace(loop_start)?;
-    }
-}
-
-/// Windows DXGI→NVENC zero-copy session loop.
+/// Windows DXGI→NVENC zero-copy session loop. Thin wrapper that constructs a
+/// `DxgiNvencPipelineAdapter` and dispatches to `run_session` — same shape as
+/// the CPU and NVFBC entry points.
+///
+/// `initial_bitrate_kbps` seeds AdaptiveBitrate's starting value. The inner
+/// fused pipeline doesn't expose a bitrate getter, so the caller has to
+/// pass the value they configured it with.
 #[cfg(target_os = "windows")]
 pub fn run_session_dxgi(
     pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
+    initial_bitrate_kbps: u32,
     cfg: SessionConfig<'_>,
 ) -> SessionResult {
-    let cancel = Arc::clone(&cfg.cancel);
-    let mut session_id = String::new();
-    let result = run_session_dxgi_inner(pipeline, cfg, &mut session_id);
-    make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
-}
-
-#[cfg(target_os = "windows")]
-fn run_session_dxgi_inner(
-    pipeline: &mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
-    cfg: SessionConfig<'_>,
-    session_id_out: &mut String,
-) -> Result<Vec<u8>> {
-    pipeline.force_keyframe();
-    let (width, height) = (pipeline.width, pipeline.height);
-    let mut runner = SessionRunner::new(
-        cfg.sender,
-        cfg.receiver,
-        width,
-        height,
-        cfg.frame_interval,
-        cfg.cancel,
-        cfg.video_codec,
-        cfg.is_resume,
-    )?;
-    *session_id_out = runner.session_id.clone();
-    runner.input_forwarder = cfg.input_forwarder;
-    runner.resolution_change_fn = cfg.resolution_change_fn;
-    runner.paste_fn = cfg.paste_fn;
-    runner.audio_ws_rx = cfg.audio_ws_rx;
-
-    if let Some(path) = cfg.send_file {
-        if let Err(e) = runner.send_file(path) {
-            tracing::error!("failed to initiate file send: {e}");
-        }
-    }
-
-    loop {
-        runner.check_cancelled()?;
-        let loop_start = Instant::now();
-
-        runner.pump_events()?;
-        runner.poll_clipboard()?;
-        runner.drain_audio()?; // audio first, before capture/encode
-
-        // Periodic keyframe
-        if runner.needs_keyframe() {
-            pipeline.force_keyframe();
-        }
-
-        // Capture + encode (zero-copy, all GPU)
-        let enc_start = Instant::now();
-        match pipeline.capture_and_encode()? {
-            Some(encoded) => {
-                runner.record_encode_time(enc_start.elapsed());
-                runner.send_video_frame(encoded, None)?;
-            }
-            None => {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-        }
-
-        runner.drain_file_transfers()?;
-        runner.log_stats("stats (DXGI→NVENC)");
-        runner.keepalive_tick()?;
-        runner.frame_pace(loop_start)?;
-    }
+    let mut adapter =
+        crate::pipeline::DxgiNvencPipelineAdapter::new(pipeline, initial_bitrate_kbps);
+    run_session(&mut adapter, cfg)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

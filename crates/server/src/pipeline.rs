@@ -174,3 +174,179 @@ impl<'a> Pipeline for CpuPipeline<'a> {
         Some(&mut self.congestion)
     }
 }
+
+// ── NvfbcNvencPipeline (Linux GPU zero-copy) ────────────────────────────────
+
+/// NVFBC capture → NVENC encode, zero-copy via a CUDA device pointer. The
+/// frame never reaches CPU memory.
+///
+/// Behavior notes preserved from the pre-refactor `run_session_gpu`:
+/// - No congestion tracker: we don't skip frames mid-encode; the GPU pipeline
+///   is already fast enough that congestion would have to be upstream.
+/// - After an input event, briefly sleep 2ms so the screen has time to
+///   actually update before we grab (grab_cuda is eager — grabs identical
+///   frames back-to-back otherwise).
+/// - `no_frame_count` backoff: after 5 consecutive empty grabs, insert a
+///   2ms sleep to avoid hammering the GPU with no-op calls.
+///
+/// Behavior added by this refactor:
+/// - Honor `ctx.needs_keyframe` inside the loop. The old code only forced a
+///   keyframe once at startup, which meant a client reconnecting mid-stream
+///   couldn't recover decode state until the next session restart. The DXGI
+///   path already did this; bringing NVFBC in line.
+#[cfg(target_os = "linux")]
+pub struct NvfbcNvencPipeline<'a> {
+    capture: &'a mut phantom_gpu::nvfbc::NvfbcCapture,
+    encoder: &'a mut phantom_gpu::nvenc::NvencEncoder,
+    no_frame_count: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> NvfbcNvencPipeline<'a> {
+    pub fn new(
+        capture: &'a mut phantom_gpu::nvfbc::NvfbcCapture,
+        encoder: &'a mut phantom_gpu::nvenc::NvencEncoder,
+    ) -> Self {
+        Self {
+            capture,
+            encoder,
+            no_frame_count: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> Pipeline for NvfbcNvencPipeline<'a> {
+    fn prepare(&mut self) -> Result<()> {
+        self.encoder.force_keyframe();
+        Ok(())
+    }
+
+    fn tick(&mut self, ctx: TickCtx) -> Result<Option<TickResult>> {
+        if ctx.had_input {
+            std::thread::sleep(Duration::from_millis(2));
+            self.no_frame_count = 0;
+        }
+
+        if ctx.needs_keyframe {
+            self.encoder.force_keyframe();
+        }
+
+        self.capture.bind_context()?;
+        let gpu_frame = self.capture.grab_cuda();
+        let _ = self.capture.release_context();
+
+        match gpu_frame {
+            Ok(Some(f)) => {
+                self.no_frame_count = 0;
+                let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
+                let enc_start = Instant::now();
+                let encoded = self.encoder.encode_device_nv12(f.device_ptr, pitch)?;
+                let encode_duration = enc_start.elapsed();
+                Ok(Some(TickResult {
+                    encoded,
+                    encode_duration,
+                }))
+            }
+            Ok(None) => {
+                self.no_frame_count += 1;
+                if self.no_frame_count > 5 {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!("GPU grab error: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        self.encoder.dimensions()
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        use phantom_core::encode::FrameEncoder;
+        self.encoder.bitrate_kbps()
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        use phantom_core::encode::FrameEncoder;
+        self.encoder.set_bitrate_kbps(kbps)
+    }
+
+    fn log_label(&self) -> &'static str {
+        "GPU stats"
+    }
+}
+
+// ── DxgiNvencPipeline adapter (Windows GPU zero-copy) ───────────────────────
+
+/// Thin wrapper around `phantom_gpu::dxgi_nvenc::DxgiNvencPipeline` (the
+/// fused DXGI capture + NVENC encoder struct that lives in the gpu crate)
+/// so it fits behind our Pipeline trait.
+///
+/// Behavior preserved:
+/// - `prepare()` forces the first frame to be a keyframe — matches the
+///   old `run_session_dxgi` which called `pipeline.force_keyframe()` just
+///   before entering the loop.
+/// - Periodic keyframe via `ctx.needs_keyframe` — matches the old code.
+/// - No ABR: the fused pipeline doesn't expose a bitrate setter, so
+///   `set_bitrate_kbps` falls back to the default (Err). The session loop
+///   logs a warning every ~5s and otherwise ignores it; this matches the
+///   old `run_session_dxgi` which simply never called `adapt_bitrate`.
+#[cfg(target_os = "windows")]
+pub struct DxgiNvencPipelineAdapter<'a> {
+    inner: &'a mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
+    /// Snapshot of initial bitrate — the inner struct doesn't expose a
+    /// getter, and AdaptiveBitrate only needs it for the starting value.
+    initial_bitrate_kbps: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> DxgiNvencPipelineAdapter<'a> {
+    pub fn new(
+        inner: &'a mut phantom_gpu::dxgi_nvenc::DxgiNvencPipeline,
+        initial_bitrate_kbps: u32,
+    ) -> Self {
+        Self {
+            inner,
+            initial_bitrate_kbps,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> Pipeline for DxgiNvencPipelineAdapter<'a> {
+    fn prepare(&mut self) -> Result<()> {
+        self.inner.force_keyframe();
+        Ok(())
+    }
+
+    fn tick(&mut self, ctx: TickCtx) -> Result<Option<TickResult>> {
+        if ctx.needs_keyframe {
+            self.inner.force_keyframe();
+        }
+        let enc_start = Instant::now();
+        match self.inner.capture_and_encode()? {
+            Some(encoded) => Ok(Some(TickResult {
+                encoded,
+                encode_duration: enc_start.elapsed(),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.inner.width, self.inner.height)
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.initial_bitrate_kbps
+    }
+
+    fn log_label(&self) -> &'static str {
+        "stats (DXGI→NVENC)"
+    }
+}
