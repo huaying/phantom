@@ -2001,15 +2001,32 @@ fn setup_input(
         cb.forget();
     }
 
-    // Tab becomes visible → re-check viewport. While the tab was hidden the
-    // browser throttles setTimeout (can delay our debounced resize by many
-    // seconds or drop it entirely), so if the user resized the window in a
-    // different tab we might not have sent the update. Force a check now.
+    // Tab becomes visible:
+    // 1. Re-check viewport — browser throttles our debounced resize when
+    //    the tab is hidden, so if the user resized in a different tab we
+    //    might not have sent the update.
+    // 2. Clear got_keyframe and request a fresh keyframe — while the tab
+    //    was hidden, the kernel TCP receive buffer accumulated frames past
+    //    our bounded server-side mpsc (up to ~5MB depending on SO_RCVBUF).
+    //    On focus the browser drains + decodes the burst in ~50ms, which
+    //    the user sees as the video fast-forwarding through the backlog.
+    //    By marking got_keyframe=false we skip all buffered P-frames
+    //    (they'd decode but there's no point rendering stale content),
+    //    and RequestKeyframe asks the server to send a fresh IDR within
+    //    one tick instead of making us wait the full ~2s periodic interval.
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
             let document = web_sys::window().unwrap().document().unwrap();
             if document.visibility_state() == web_sys::VisibilityState::Visible {
+                {
+                    let mut st = s.borrow_mut();
+                    st.got_keyframe = false;
+                }
+                {
+                    let st = s.borrow();
+                    send_message(&st, &Message::RequestKeyframe);
+                }
                 send_resolution_change(&s);
             }
         });

@@ -35,18 +35,27 @@ All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); ses
 
 `--codec auto` → H.264 (default for client compatibility). `--codec av1` opts into AV1 on Ada+ NVENC. Periodic keyframe every 2s; keyframe on client reconnect; keyframe on input burst.
 
-### AV1 status
+### AV1 status — opt-in, known decode problems
 
-AV1 works server-side on Ada Lovelace+ NVENC. Client decode coverage:
+AV1 works server-side on Ada Lovelace+ NVENC (hardware encode ~2.5ms).
+The **client decode side is the weak link**, which is why `--codec auto`
+picks H.264 and AV1 is opt-in via `--codec av1`:
 
-| Client | AV1 |
-|---|---|
-| Browser (WebCodecs) | ✅ Chrome/Edge/Safari recent |
-| Native via dav1d | ✅ (feature `av1` — default on in `client/Cargo.toml`) |
-| Native via NVDEC | ✅ Linux + Windows NVIDIA (feature `nvdec`) |
-| macOS VideoToolbox | ❌ H.264 only |
+- **Web browser OOM crash** — WebCodecs software AV1 decode at 1080p30
+  pushes 30-50% CPU and can OOM the browser tab (reproducible L40 →
+  Safari/Chrome on Mac).
+- **Native client laggy typing** — dav1d software decode ~20-40ms per
+  1080p frame on a mid-range Mac → end-to-end feels like laggy typing.
 
-Defaulted off until codec negotiation in `ClientHello` lands (task #34).
+Hardware AV1 decode fixes both, but coverage is patchy: macOS
+VideoToolbox has no AV1 support on M2 and earlier; NVDEC AV1 needs
+Turing/Ampere/Ada depending on the profile; browser hardware AV1 depends
+on OS + GPU + browser combo.
+
+Until codec negotiation in `ClientHello` (task #34) lets the server
+know what the client can actually decode, AV1 defaults off. Pass
+`--codec av1` on a server where you control the clients and know they
+have hardware AV1 decoders.
 
 ## Decode (client)
 

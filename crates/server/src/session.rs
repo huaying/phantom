@@ -75,6 +75,8 @@ pub enum InboundEvent {
         width: u32,
         height: u32,
     },
+    /// Client asks for a keyframe on the next encode (e.g. tab regained focus).
+    RequestKeyframe,
     Disconnected,
 }
 
@@ -154,6 +156,9 @@ pub fn spawn_receive_thread(
                 }
                 Ok(Message::ResolutionChange { width, height }) => {
                     let _ = tx.send(InboundEvent::ResolutionChange { width, height });
+                }
+                Ok(Message::RequestKeyframe) => {
+                    let _ = tx.send(InboundEvent::RequestKeyframe);
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -710,6 +715,13 @@ impl SessionRunner {
                     if let Some(ref f) = self.resolution_change_fn {
                         f(width, height);
                     }
+                }
+                Ok(InboundEvent::RequestKeyframe) => {
+                    // Force `needs_keyframe()` to return true on the next tick.
+                    // Pipeline::tick honors it via `ctx.needs_keyframe` and
+                    // calls force_keyframe() on the encoder.
+                    self.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+                    tracing::debug!("client requested keyframe");
                 }
                 Ok(InboundEvent::Disconnected) => {
                     anyhow::bail!("client disconnected");

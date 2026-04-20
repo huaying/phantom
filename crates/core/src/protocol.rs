@@ -4,12 +4,17 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Minimum protocol version we can interoperate with.
-/// Versions below this are rejected at handshake. Bumped to 6 in 0.4.4:
-/// the zstd lossless TileUpdate message was removed, so any client that
-/// expects it would desync on an idle refresh attempt.
+/// Versions below this are rejected at handshake.
+///
+/// Kept at 6 in 0.4.8: `RequestKeyframe` (the new v7 addition) is purely
+/// client→server, so a v6 client simply never sends it and waits the
+/// natural 2s for the next periodic keyframe. No break.
+///
+/// Bumped to 6 in 0.4.4 when the zstd lossless `TileUpdate` message was
+/// removed — any client expecting it would desync on an idle refresh.
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 
 /// Audio codec identifier.
@@ -60,6 +65,12 @@ pub enum Message {
     Ping,
     Pong,
 
+    /// Client → Server: request an IDR keyframe on the next encode. Used by
+    /// the web client on tab visibility change so a stale decoder can resync
+    /// without waiting up to 2s for the next periodic keyframe. Added in
+    /// protocol v7 (0.4.8); v6 clients simply never send it.
+    RequestKeyframe,
+
     /// Server → Client: encoded audio chunk.
     AudioFrame {
         codec: AudioCodec,
@@ -88,7 +99,7 @@ pub enum Message {
     /// Server → Client: resume accepted — session continues.
     ResumeOk,
 
-    // ── File transfer (v3) ──────────────────────────────────────────────
+    // ── File transfer ──────────────────────────────────────────────────
     /// Bidirectional: offer to send a file.
     FileOffer {
         transfer_id: u64,
