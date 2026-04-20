@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "pam-phantom"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "pam_phantom"
+crate-type = ["cdylib"]
+
+[dependencies]
+pamsm = { version = "0.5", features = ["libpam"] }

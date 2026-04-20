@@ -1,0 +1,11 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{ccd145e9-71bb-4e91-a604-2ee449adfd54}]
+@="Phantom Credential Provider"
+
+[HKEY_CLASSES_ROOT\CLSID\{ccd145e9-71bb-4e91-a604-2ee449adfd54}]
+@="Phantom Credential Provider"
+
+[HKEY_CLASSES_ROOT\CLSID\{ccd145e9-71bb-4e91-a604-2ee449adfd54}\InprocServer32]
+@="C:\\Windows\\System32\\phantom_cp.dll"
+"ThreadingModel"="Apartment"
