@@ -1,12 +1,12 @@
 //! Pipeline trait — single abstraction over "capture + encode" so the session
-//! loop can dispatch to CPU / NVFBC-NVENC / DXGI-NVENC through one code path.
+//! loop dispatches CPU / NVFBC-NVENC / DXGI-NVENC through one code path.
 //!
-//! See task #23 for the motivating refactor. The three original session
-//! runners in `session.rs` (run_session_cpu / run_session_gpu /
-//! run_session_dxgi) duplicated ~600 lines of congestion, adaptive-bitrate,
+//! Before the task-#23 refactor the three session runners each had their own
+//! inline loop, duplicating ~600 lines of congestion, adaptive-bitrate,
 //! keepalive, input, and stats plumbing. Pipeline pushes the per-backend
 //! differences (tile diff vs zero-copy GPU, different congestion handling,
-//! different keyframe triggers) behind one method.
+//! different keyframe triggers) behind one method, and `session::run_session`
+//! holds all the shared infrastructure.
 
 use crate::session::CongestionTracker;
 use anyhow::Result;

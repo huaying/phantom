@@ -1,87 +1,114 @@
 # Phantom — Architecture
 
-A high-performance, open-source remote desktop built in Rust. Low
-latency, single binary deployment, browser + native access.
+A high-performance, open-source remote desktop built in Rust. Low latency,
+single-binary deployment, browser + native access.
 
-~18,000 lines Rust (across 6 crates), MIT license. Runs on Linux +
+~18,000 lines Rust (across 6 crates), 136 tests, MIT license. Runs on Linux +
 Windows; native client also runs on macOS.
 
-## Architecture decisions
+## Design decisions
 
 ### No GStreamer
+
 Direct function calls (capture → encode → send) = 0ms pipeline overhead.
 Sunshine and Parsec don't use GStreamer either. Our pipeline is 3 steps,
 not 20 elements with buffer copies.
 
 ### WebRTC DataChannel, not Media Track
-Media Track adds a jitter buffer (designed for video calls) which adds
-tens of ms. DataChannel delivers raw bytes instantly → WebCodecs GPU
-decode → Canvas.
+
+Media Track adds a jitter buffer (designed for video calls) which adds tens
+of ms. DataChannel delivers raw bytes instantly → WebCodecs GPU decode →
+Canvas.
 
 ### WebRTC, not WebTransport
+
 WebTransport requires HTTPS + certificates. Self-signed ≤14 days in Chrome.
 Pure IP (most users) doesn't work. WebRTC works with any IP, has built-in
 DTLS + NAT traversal.
 
-### HTTP POST signaling (str0m pattern)
-Browser creates offer → POST /rtc → server returns answer. Single HTTP
-round-trip. No WebSocket signaling needed. Avoids chicken-and-egg (session
-must run before signaling can work).
-
 ### str0m (sans-IO WebRTC)
-Pure Rust, ~15K lines, no tokio for WebRTC path. We provide the UDP
-socket; str0m provides the protocol logic. Official `chat.rs` pattern: one
-socket, one run_loop, demux via `rtc.accepts()`.
 
-**CRITICAL: str0m SCTP cannot deliver messages >16KB reliably.**
-Regardless of reliable/ordered settings, large DataChannel messages
-(e.g. 70KB H.264 keyframe) silently fail. Root cause: str0m's `ch.write()`
-returns `Ok(false)` when the 128KB cross-stream SCTP buffer is full, and
-phantom was ignoring this return value. Fix: backpressure via
+Pure Rust, no tokio for WebRTC path. We provide the UDP socket; str0m
+provides the protocol logic. Official `chat.rs` pattern: one socket, one
+`run_loop`, demux via `rtc.accepts()`.
+
+**CRITICAL: str0m SCTP cannot deliver messages >16KB reliably.** Regardless
+of reliable/ordered settings, large DataChannel messages (e.g. 70KB H.264
+keyframe) silently fail. Root cause: str0m's `ch.write()` returns
+`Ok(false)` when the 128KB cross-stream SCTP buffer is full, and phantom
+was ignoring this return value. Fix: backpressure via
 `set_buffered_amount_low_threshold()` + `Event::ChannelBufferedAmountLow`
 to pause/resume writes, with per-channel pending queues.
 
-### Full-frame H.264/AV1 encoding with tile-based change detection
-Every dirty frame triggers a full encode; TileDiffer skips the encode
-entirely when no tile has changed. Zstd per-tile refresh was removed
-in 0.4.4 — it only ran on CPU capture, never on the GPU path most
-users actually run.
+### Dual web transport: WSS default + WebRTC optional
+
+- **WSS** (default): WebSocket upgrade on the same HTTPS port 9900. No
+  message size limits. Reliable. Validated by Helix at scale.
+- **WebRTC DataChannel** (feature `webrtc`, `?rtc` URL param): POST /rtc
+  signaling, str0m 0.18, reliable+ordered. Needs chunking for messages
+  >16KB (SCTP limitation). Only needed for future NAT traversal.
+- **Native**: raw QUIC (no browser overhead) + raw TCP.
+- All produce same `Box<dyn MessageSender/Receiver>` → same session loop.
+
+## Session architecture
+
+### Pipeline trait (0.4.7 refactor)
+
+Three capture+encode backends — CPU, NVFBC→NVENC, DXGI→NVENC — share one
+session loop via a single trait. See `crates/server/src/pipeline.rs`.
+
+```rust
+pub trait Pipeline {
+    fn tick(&mut self, ctx: TickCtx) -> Result<Option<TickResult>>;
+    fn dimensions(&self) -> (u32, u32);
+    fn bitrate_kbps(&self) -> u32;
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> { /* default: unsupported */ }
+    fn congestion_mut(&mut self) -> Option<&mut CongestionTracker> { None }
+    fn log_label(&self) -> &'static str { "stats" }
+    fn prepare(&mut self) -> Result<()> { Ok(()) }
+}
+```
+
+Each tick the session loop gives the pipeline `had_input` (for GPU paths
+that sleep briefly to let the screen update) and `needs_keyframe` (for the
+periodic 2-second keyframe). Pipeline returns `Some(encoded_frame)` or
+`None` (capture empty / differ saw no change / congestion asked to skip).
+
+Impls:
+- `CpuPipeline` — scrap capture → OpenH264 / NVENC encode, `TileDiffer`
+  gates encode when the screen is unchanged, `CongestionTracker` skips
+  frames under network pressure.
+- `NvfbcNvencPipeline` — NVFBC grab → NVENC encode, CUDA device pointer
+  never reaches CPU memory.
+- `DxgiNvencPipelineAdapter` — thin wrapper around the fused struct in
+  `crates/gpu/src/dxgi_nvenc.rs`.
+
+The session loop (`run_session` in `crates/server/src/session.rs`) does
+input pumping, clipboard, audio drain, keepalive, stats, adaptive
+bitrate, frame pacing, file-transfer drain — all transport- and
+backend-agnostic.
 
 ### Periodic keyframes (2s interval)
-Server forces IDR keyframe every 2 seconds. Recovers from:
-- WebRTC DataChannel packet loss (unreliable mode future)
+
+Server forces IDR every 2 seconds. Recovers from:
+- DataChannel packet loss (unreliable mode future)
 - Client decoder errors
 - Browser tab backgrounding/foregrounding
+- Client reconnect / resume
 
-### Dual web transport: WSS default + WebRTC optional
-- **WSS** (default): WebSocket upgrade on same HTTPS port 9900. No message
-  size limits. Reliable. Validated by Helix as production-viable.
-- **WebRTC DataChannel** (`--features webrtc` build flag, `?rtc` URL
-  param): POST /rtc signaling, str0m 0.18, reliable+ordered. Needs
-  chunking for messages >16KB (SCTP limitation). Only needed for future
-  NAT traversal.
-- **Native**: raw QUIC (no browser overhead)
-- All produce same `Box<dyn MessageSender/Receiver>` → same session loop
+### Session resume + replacement
 
-## Key implementation details
+- **Hello**: server sends resolution, codec, audio flag, opaque
+  `session_token` (32 random bytes).
+- **Resume**: client reconnects with `(session_token, last_sequence)`;
+  server replies `ResumeOk` + forces keyframe, else a fresh `Hello`.
+- **Replacement**: new client with a different `client_id` takes over
+  an active session; old client is sent `Disconnect` and bailed out.
+- **Ghost-set**: a bounded LRU of recently kicked `client_id`s rejects
+  auto-reconnect from the dead client so a forgotten browser tab can't
+  thrash a real user's session. See `crates/server/src/doorbell.rs`.
 
-### WebRTC run_loop (str0m official pattern)
-- One UDP socket for the entire server lifetime (never rebind — this was
-  a hard bug)
-- One `run_loop` thread managing one active client at a time
-- 1ms UDP socket timeout for responsive polling (was 50ms — caused
-  visible lag)
-- `poll_output` after `drain_outgoing` — flush written data immediately
-- New POST /rtc → drain all pending Rtc, keep latest → replace active
-  client immediately
-- Session delivered via `Mutex<Option>` slot (always latest, stale auto-dropped)
-- Bounded `sync_channel(30)` for video with `try_send` (backpressure, no
-  blocking)
-- Chunking: messages >16KB split into chunks before `ch.write()`. Client
-  reassembles.
-
-### Session reconnect (hard-won bugs)
-These bugs took significant debugging. Don't reintroduce them.
+### Session reconnect bugs to not reintroduce
 
 1. **`recv_msg()` infinite spin**: MUST detect
    `mpsc::TryRecvError::Disconnected` and return error. Otherwise the
@@ -90,80 +117,57 @@ These bugs took significant debugging. Don't reintroduce them.
 2. **Hello ordering**: Hello MUST go through video DC (same as
    `VideoFrame`). Control DC may deliver slower → decoder not configured
    when keyframe arrives → "Key frame is required" error.
-3. **UDP socket lifecycle**: Do NOT create one socket per session. One
-   socket for the whole server. str0m run_loop manages it. Old approach
-   (bind/rebind per session) caused port conflicts.
-4. **`force_keyframe` at session start**: New client needs IDR frame.
-   Call `video_encoder.force_keyframe()` + `differ.reset()` at the top of
-   `run_session()`.
-5. **Web client `got_keyframe` guard**: WebCodecs throws if first frame is
-   delta. Client skips all delta frames until first IDR arrives. Handles
-   the race condition where P-frames arrive before keyframe.
+3. **UDP socket lifecycle**: do NOT create one socket per session. One
+   socket for the whole server. str0m run_loop manages it.
+4. **`force_keyframe` at session start**: new client needs an IDR frame.
+   Pipeline impls force one in `prepare()` or on the first encode.
+5. **Web client `got_keyframe` guard**: WebCodecs throws if first frame
+   is delta. Client skips all delta frames until first IDR arrives.
 
-### Session affinity (ghost-set)
-Each client (native or web) generates a 16-byte `client_id` once per
-process / tab lifetime. The doorbell tracks the current owner and a
-bounded LRU set of recently kicked ids. Auto-reconnect attempts from a
-ghost id are rejected so a forgotten browser tab can't thrash a real
-user's session. See `crates/server/src/doorbell.rs`.
+## WebRTC run_loop
 
-### Encoding flow
-```
-capture → TileDiffer (64x64 blocks) → any dirty?
-  if dirty → H.264 full frame (VideoFrame)
-  if static → skip encode (zero CPU)
-  every 2s → force keyframe (IDR)
-```
+- One UDP socket for the entire server lifetime (never rebind).
+- One `run_loop` thread managing one active client at a time.
+- 1ms UDP socket timeout for responsive polling (was 50ms — caused
+  visible lag).
+- `poll_output` after `drain_outgoing` — flush written data immediately.
+- New POST /rtc → drain all pending `Rtc`, keep latest → replace active
+  client immediately.
+- Session delivered via `Mutex<Option>` slot (always latest, stale
+  auto-dropped).
+- Bounded `sync_channel(30)` for video with `try_send` (backpressure, no
+  blocking).
+- Chunking: messages >16KB split into chunks before `ch.write()`. Client
+  reassembles.
 
-TileDiffer detects change. Hidden remote cursor means mouse movement alone
-yields 0 dirty tiles → 0 CPU.
+## GPU pipeline
 
-### Windows service mode (Session 0 + Agent)
-Architecture follows RustDesk/Sunshine pattern:
-- **Service** (Session 0, LocalSystem): manages lifecycle, accepts client
-  connections, forwards encoded frames.
-- **Agent** (user session): launched via `CreateProcessAsUser` with
-  SYSTEM token (not user token — required for Winlogon desktop access on
-  lock screen).
-- **IPC**: two named pipes (`PhantomIPC_up` for frames,
-  `PhantomIPC_down` for input) — Windows synchronous I/O deadlocks if
-  you use a single DUPLEX pipe with concurrent read+write on the same
-  handle.
-- Agent does DXGI→NVENC encoding and sends H.264 bytes over pipe (~50KB,
-  not 8MB raw frames).
-- Service uses `run_session_ipc()` which reuses `SessionRunner` for
-  input/clipboard/keepalive/audio/stats.
-- On lock screen: DXGI fails → agent falls back to GDI capture +
-  OpenH264 → auto-recovers to DXGI on unlock.
-- Agent calls `OpenInputDesktop()` + `SetThreadDesktop()` before capture
-  (follows the active desktop like RustDesk/Sunshine).
-- `--install` / `--uninstall` for service management;
-  `--agent-mode` for agent process.
-
-### Transport abstraction
-`run_session()` takes `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`.
-All transports (TCP, QUIC, WebSocket, WebRTC) implement the same traits.
-Adding a new transport = new file under `crates/server/src/transport/` +
-implement traits + one-line init change.
-
-### GPU pipeline (`crates/gpu/`)
 All NVIDIA libraries loaded at runtime via dlopen — compiles on any
 machine, GPU optional.
 
-**NVENC encoder flow** (CPU input path):
+### Flows
+
+**NVENC with CPU capture** (scrap → NVENC):
 ```
 Frame.data (BGRA CPU) → bgra_to_nv12 (CPU, AVX2 SIMD) → cuMemcpyHtoD →
 NVENC encode (GPU) → H.264 bytes
-~8ms at 1080p (was ~10ms before SIMD)
+~8ms at 1080p
 ```
 
-**NVFBC→NVENC zero-copy flow** (all GPU):
+**NVFBC→NVENC zero-copy** (all GPU, Linux):
 ```
 NVFBC grab → CUdeviceptr (NV12, GPU) → NVENC encode (GPU) → H.264 bytes
 ~4ms at 1080p (capture 0.4ms + encode 3.5ms)
 ```
 
-**CUDA context management** (hard-won lessons):
+**DXGI→NVENC zero-copy** (all GPU, Windows):
+```
+Desktop Duplication → ID3D11Texture2D → NVENC encode → H.264 bytes
+~4-8ms at 1080p
+```
+
+### CUDA context management (hard-won)
+
 - Use `cuDevicePrimaryCtxRetain` — NVFBC internally uses the primary
   context. `cuCtxCreate` creates a separate context that conflicts.
 - NVFBC holds a context lock. Must call `NvFBCReleaseContext` before
@@ -171,7 +175,8 @@ NVFBC grab → CUdeviceptr (NV12, GPU) → NVENC encode (GPU) → H.264 bytes
 - NVENC's `encode_registered()` checks `ctx_get_current()` and only does
   `ctx_push` if needed (avoids double-push deadlock).
 
-**NVFBC struct sizes** (critical):
+### NVFBC struct sizes (critical)
+
 - NVFBC embeds `sizeof` in the version field. Wrong size = buffer
   overflow = silent memory corruption.
 - Verified sizes from nvfbc-sys bindgen: `CreateHandleParams=40`,
@@ -179,22 +184,58 @@ NVFBC grab → CUdeviceptr (NV12, GPU) → NVENC encode (GPU) → H.264 bytes
 - Use opaque byte arrays (not Rust structs with named fields) to
   guarantee correct sizes.
 
-**NVFBC function loading**:
+### NVFBC function loading
+
 - Do NOT use `NvFBCCreateInstance` — it has strict API version checks
   that vary by driver.
 - Instead, dlsym each function directly: `NvFBCCreateHandle`,
   `NvFBCToCudaGrabFrame`, etc.
 
-**Benchmark results** (A40 GPU, 1080p, driver 550):
-```
-OpenH264 (CPU):           47ms  (baseline)
-NVENC (CPU color conv):   10ms  (4.7x faster)
-NVFBC→NVENC (zero-copy):   4ms  (12x faster)
-```
+## Windows Service mode
 
-**Windows benchmark** (L40 GPU, 1080p, driver 537):
-```
-OpenH264 (CPU capture):      6-8 fps
-NVENC (CPU capture+upload):  17-18 fps
-DXGI→NVENC (zero-copy):     30-47 fps (capped by 52Hz refresh rate)
-```
+Architecture follows RustDesk/Sunshine pattern:
+
+- **Service** (Session 0, LocalSystem): manages lifecycle, accepts
+  client connections, forwards encoded frames.
+- **Agent** (user session): launched via `CreateProcessAsUser` with
+  SYSTEM token (not user token — required for Winlogon desktop access
+  on the lock screen).
+- **IPC**: two named pipes — `PhantomIPC_up_{session_id}` for frames,
+  `PhantomIPC_down_{session_id}` for input. Windows synchronous I/O
+  deadlocks if you use a single duplex pipe with concurrent read+write
+  on the same handle.
+- Agent does DXGI→NVENC encoding and sends H.264 bytes over pipe
+  (~50KB, not 8MB raw frames).
+- Service uses `run_session_ipc()` which reuses `SessionRunner` for
+  input/clipboard/keepalive/audio/stats.
+- On lock screen: DXGI fails → agent falls back to GDI capture +
+  OpenH264 → auto-recovers to DXGI on unlock.
+- Agent calls `OpenInputDesktop()` + `SetThreadDesktop()` before
+  capture (follows the active desktop like RustDesk/Sunshine).
+- `--install` / `--uninstall` / `--install-vdd` manage the service +
+  Virtual Display Driver.
+
+## Linux VM autologin mode
+
+`install.sh server --autologin` (for dedicated remote-access Linux VMs):
+
+- GDM `AutomaticLogin` + `TimedLogin` (5s) — session auto-restores after
+  sign-out. GDM 42 (Ubuntu 22) has a known `TimedLogin` regression; a
+  systemd timer watchdog polls every 30s and kicks `gdm3` if no seat0
+  session for the target user.
+- dconf overrides disable screen lock, idle timeout, and the "Switch
+  User" menu entry (Switch User backgrounds the user's X session on a
+  different VT while phantom is pinned to `DISPLAY=:0` → phantom
+  captures a black screen).
+- Clears + re-seeds the keyring; an autostart hook unlocks with empty
+  password so Chrome/Evolution don't pop a keyring dialog.
+- Drops an XDG autostart `.desktop` for phantom-server (with a wrapper
+  that kills any stale instance first, since phantom-server can survive
+  gnome-session exit via PPID-1 re-parenting and hold ports 9900/9901).
+
+## Transport abstraction
+
+`run_session` takes `Box<dyn MessageSender>` + `Box<dyn MessageReceiver>`.
+All transports (TCP, QUIC, WebSocket, WebRTC) implement the same traits.
+Adding a new transport = new file under `crates/server/src/transport/` +
+implement the two traits + one-line init change.

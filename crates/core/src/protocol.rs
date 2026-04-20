@@ -25,9 +25,10 @@ pub enum Message {
         width: u32,
         height: u32,
         format: PixelFormat,
-        /// Protocol version (added in v2). Defaults to 1 if absent (bincode
-        /// will deserialize old Hello payloads where this field is missing
-        /// as the default value).
+        /// Protocol version. Must be ≥ `MIN_PROTOCOL_VERSION` (6 as of
+        /// v0.4.4 — clients sending lower are rejected at handshake).
+        /// `#[serde(default)]` still defaults missing fields to 1 on
+        /// deserialize, but that value fails the min-version check.
         #[serde(default = "default_protocol_version_1")]
         protocol_version: u32,
         /// Whether the server will send AudioFrame messages.

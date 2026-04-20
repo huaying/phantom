@@ -9,8 +9,8 @@ short index of must-knows for AI assistants. Everything detailed lives in
   details (str0m run_loop, Windows service mode, GPU pipeline).
 - **[docs/pitfalls.md](docs/pitfalls.md)** — bugs we've shipped and had to
   track down. Re-read before touching the relevant area.
-- **[docs/features.md](docs/features.md)** — current capability list,
-  including 0.4.0 additions.
+- **[docs/features.md](docs/features.md)** — current capability list +
+  full CLI reference.
 - **[docs/file-map.md](docs/file-map.md)** — module layout per crate.
 
 ## Build commands
@@ -23,7 +23,7 @@ wasm-pack build crates/web --target web --no-typescript
 cargo build --release                                      # workspace
 cargo build --release --features webrtc                    # +WebRTC DataChannel
 cargo build --release -p phantom-server                    # server only
-cargo test --workspace                                     # 134 tests
+cargo test --workspace                                     # 136 tests
 cargo clippy --workspace -- -D warnings                    # zero warnings
 
 # GPU benchmarks (NVIDIA + DISPLAY=...)

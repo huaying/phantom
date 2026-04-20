@@ -1,9 +1,15 @@
 //! Shared session logic: input dispatch, clipboard sync, keepalive, stats,
 //! congestion control, and frame pacing.
 //!
-//! The three capture+encode pipelines (CPU, Linux GPU, Windows DXGI) use
-//! `SessionRunner` to avoid duplicating the ~80% of session code that is
-//! transport/input/clipboard plumbing.
+//! The generic `run_session(&mut dyn Pipeline, cfg)` drives any
+//! `crate::pipeline::Pipeline` impl (CpuPipeline / NvfbcNvencPipeline /
+//! DxgiNvencPipelineAdapter). Per-backend capture+encode details live in
+//! pipeline.rs; everything transport / input / clipboard / audio / stats
+//! related lives here once.
+//!
+//! The three `run_session_{cpu,gpu,dxgi}` functions at the bottom are thin
+//! shims kept so main.rs call sites and service-mode code didn't have to
+//! change during the task #23 refactor.
 
 use crate::input_injector::InputInjector;
 use anyhow::Result;

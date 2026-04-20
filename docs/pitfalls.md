@@ -30,10 +30,10 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **WS disconnect under high bandwidth**: TLS write can exceed read
   timeout → tungstenite interprets as error. Increased timeout from 5ms
   to 50ms.
-- **WS send queue is unbounded** (TODO): a stalled client (laptop sleep)
-  causes the server-side send mpsc to grow forever; on wake the client
-  fast-forwards through the backlog. Mirror the WebRTC `sync_channel(30)
-  + try_send` pattern when fixing.
+- **WS send queue bounded via `sync_channel(30)` + `try_send`**: earlier
+  it was unbounded, which made a stalled client (laptop sleep) grow the
+  server-side mpsc forever; on wake the client fast-forwarded through
+  the backlog. Fixed in 0.4.3; mirrors the WebRTC pattern.
 - **HTTPS required for WebCodecs**: non-localhost HTTP is not a secure
   context. Server uses self-signed TLS (rcgen) for HTTPS.
 - **QUIC ALPN mismatch**: server sets `alpn_protocols = ["phantom"]` but
@@ -103,9 +103,12 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **Client `VideoFrame` decode**: must decode ALL frames sequentially,
   not just the last one. Keyframes get overwritten by empty P-frames in
   the channel buffer when the encoder is fast (GPU).
-- **Tile + H.264 mixed rendering**: caused visual tearing. Removed —
-  always use H.264 full frames. Tile code still in codebase but unused
-  (see `docs/tech-debt.md` and TODO #24).
+- **Tile-based rendering (zstd)**: caused visual tearing when mixed with
+  H.264 over high latency, and only ever ran in CPU capture mode (never
+  on the GPU zero-copy paths). Whole tile path + `TileUpdate` protocol
+  message deleted in 0.4.4. Protocol version bumped to 6 so clients
+  that still expect `TileUpdate` fail fast at handshake instead of
+  silently desyncing.
 - **Chrome hardware WebCodecs black screen**: hardware `VideoDecoder`
   defers output callback when the tab isn't fully focused (after URL
   navigation). Fix: use `prefer-software` for decode (~2-4ms vs ~0.5ms
@@ -119,9 +122,8 @@ you're making touches one of these areas, re-read the relevant entry first.
   channels after browser refresh.
 - **Mutex poison**: use `unwrap_or_else(|e| e.into_inner())` not
   `.unwrap()`.
-- **Bounded channels**: WebRTC video uses `sync_channel(30)` +
-  `try_send` — drops on full, never blocks. (WSS path is currently
-  unbounded; see TODO #22.)
+- **Bounded channels**: WebRTC + WSS video both use `sync_channel(30)` +
+  `try_send` — drops on full, never blocks.
 - **IPC encoded frames must be sequential**: H.264 P-frames depend on
   previous frames. Never drain-to-latest — forward ALL queued frames in
   order.
@@ -157,6 +159,32 @@ you're making touches one of these areas, re-read the relevant entry first.
   whenever RTT >100ms (fixed latency). Fix: track baseline RTT (minimum
   observed), only decrease when RTT rises >50% above baseline (actual
   congestion).
+
+## Autologin mode (Linux VM)
+- **"Switch User" backgrounds the session**: clicking GNOME's Switch
+  User menu entry doesn't terminate horde's X session — it backgrounds
+  it on one VT while spawning a greeter on another. phantom stays
+  pinned to `DISPLAY=:0` (the backgrounded session) and keeps streaming
+  a black screen; autologin can't recover because the session isn't
+  technically dead. Fix: `install.sh --autologin` sets
+  `org.gnome.desktop.lockdown.disable-user-switching=true` so the menu
+  entry is hidden.
+- **GDM 42 TimedLogin regression**: on Ubuntu 22, `TimedLogin` doesn't
+  reliably fire after sign-out; GDM sits at the greeter forever. A
+  systemd watchdog timer polls every 30s and kicks `gdm3` if no
+  `$TARGET_USER seat0` session exists.
+- **phantom-server survives gnome-session exit**: when launched from an
+  XDG autostart `.desktop`, phantom-server can get reparented to init
+  (PPID=1) when gnome-session dies, keeping ports 9900/9901 bound even
+  after the user's session ends. New session's autostart then silently
+  fails to bind. Fix: the autostart `Exec=` wrapper pkills any existing
+  phantom-server before launching its own.
+- **Keyring popup under autologin**: no password captured at login →
+  `pam_gnome_keyring` can't unlock → first app to use secret storage
+  (Chrome, Evolution) pops a dialog. Fix: install.sh clears
+  `~/.local/share/keyrings/` and drops an autostart hook that unlocks
+  with empty password via `gnome-keyring-daemon --unlock <<< ""`.
+  Trade-off: stored secrets are effectively plaintext.
 
 ## Service mode (Windows)
 - **Windows IPC pipe deadlock**: synchronous named pipes only allow ONE

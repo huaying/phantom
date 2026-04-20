@@ -1,147 +1,186 @@
-# Phantom — Implemented Features
+# Phantom — Feature Reference
 
-55 features across capture, encode, transport, audio, input, security, and
-deployment. New features in 0.4.0 are flagged at the bottom.
+Accurate as of v0.4.7. Each entry points at the code that implements it.
 
-## Encode + Capture
+## Transports
 
-| # | Feature |
-|---|---------|
-| 1 | H.264 encoding (OpenH264 CPU, `--encoder` plugin architecture) |
-| 2 | Dirty-tile gating — skip encode entirely when no region of the frame changed |
-| 3 | Periodic keyframe (2s interval, recovers from loss / decoder errors) |
-| 19 | Encoder plugin architecture (`--encoder` flag, `Box<dyn FrameEncoder>`) |
-| 20 | NVENC GPU encoding (`--encoder nvenc`, runtime dlopen, no build-time CUDA dep) |
-| 21 | NVFBC GPU capture (`--capture nvfbc`, zero-copy CUdeviceptr) |
-| 22 | NVFBC→NVENC zero-copy pipeline (capture+encode ~4ms at 1080p on A40) |
-| 23 | Windows support (DXGI capture, OpenH264/NVENC, enigo input) |
-| 27 | DXGI→NVENC zero-copy (`--capture dxgi --encoder nvenc`, D3D11 texture, no CPU copy) |
-| 35 | AV1 encoder (NVENC hardware AV1, Ada Lovelace+, **opt-in** via `--codec av1` — in progress, see below) |
-| 36 | AV1 decoder (dav1d software + NVDEC hardware, WebCodecs for web) |
-| 37 | NVDEC hardware decode (client-side H.264 + AV1, runtime dlopen, feature-gated) |
+| Transport | Default | File | Notes |
+|---|---|---|---|
+| TCP (plain + ChaCha20-Poly1305) | ✅ | `server/src/transport/tcp.rs` | Native client; encryption on unless `--no-encrypt` |
+| WebSocket over HTTPS | ✅ | `server/src/transport/ws.rs` | Browser client, embedded WASM, same port as HTTPS static |
+| QUIC | opt-in `--transport quic` | `server/src/transport/quic.rs` | Native client only; self-signed TLS, no head-of-line blocking |
+| WebRTC DataChannel | feature `webrtc` | `server/src/transport/webrtc.rs` | str0m 0.18; 16KB SCTP limit → chunking; opt-in at build time |
 
-### AV1 (opt-in, work in progress)
+All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); session loop is transport-agnostic.
 
-AV1 encoding works on the server side for any GPU that supports it
-(Ada Lovelace / RTX 40-series NVENC and newer). It's **not** the default
-because client-side decode support is uneven and the failure mode is
-bad:
+## Capture
 
-| Client | AV1 decode |
+| Backend | Flag | Platform | File |
+|---|---|---|---|
+| scrap (GDI / XCB) | `--capture scrap` or default fallback | Linux X11, Windows, macOS | `server/src/capture/scrap.rs` |
+| NVFBC (NVIDIA GPU zero-copy) | `--capture nvfbc` | Linux + NVIDIA | `gpu/src/nvfbc.rs` |
+| DXGI (Desktop Duplication) | used with `--encoder nvenc` on Windows | Windows | `gpu/src/dxgi.rs` + `gpu/src/dxgi_nvenc.rs` |
+| GDI | Service agent fallback | Windows Session 0 / lock screen | `server/src/capture/gdi.rs` |
+| PipeWire + XDG Portal | `--capture pipewire` | Linux Wayland (feature `wayland`) | `server/src/capture/pipewire.rs` |
+
+`--capture auto` probes GPU via `gpu_probe::best_capture()` then falls back to scrap.
+
+## Encoding
+
+| Encoder | Codec | File | Notes |
+|---|---|---|---|
+| OpenH264 CPU | H.264 | `server/src/encode/h264.rs` | Baseline, always available |
+| NVENC | H.264 + AV1 | `gpu/src/nvenc.rs` | Runtime dlopen, no build-time CUDA dep |
+| NVENC fused with DXGI | H.264 + AV1 | `gpu/src/dxgi_nvenc.rs` | Zero-copy D3D11 texture → NVENC |
+
+`--codec auto` → H.264 (default for client compatibility). `--codec av1` opts into AV1 on Ada+ NVENC. Periodic keyframe every 2s; keyframe on client reconnect; keyframe on input burst.
+
+### AV1 status
+
+AV1 works server-side on Ada Lovelace+ NVENC. Client decode coverage:
+
+| Client | AV1 |
 |---|---|
-| Native (phantom-client) on any platform | software dav1d, ~20-40ms/frame at 1080p on a mid-range laptop → noticeable typing lag |
-| Web (WebCodecs) on Safari M3+, Chrome on Intel 11th-gen+ / AMD RDNA3+ | hardware, fast |
-| Web on older Mac / older Intel | software, ~30-50% tab CPU at 1080p30, tab OOM crashes observed under sustained use |
-| Web on Firefox, Safari pre-17.2 | not supported |
+| Browser (WebCodecs) | ✅ Chrome/Edge/Safari recent |
+| Native via dav1d | ✅ (feature `av1` — default on in `client/Cargo.toml`) |
+| Native via NVDEC | ✅ Linux + Windows NVIDIA (feature `nvdec`) |
+| macOS VideoToolbox | ❌ H.264 only |
 
-Until the server can negotiate codec with the client (TODO: add
-`supported_codecs` to ClientHello so server picks the intersection),
-`auto` always picks H.264 so every client platform works out of the
-box with hardware decode. Pass `--codec av1` on a server where you
-control the clients and know they have AV1 hardware decoders.
+Defaulted off until codec negotiation in `ClientHello` lands (task #34).
 
-The underlying encode/decode paths are already wired (tests pass on
-A40/L40 servers, M-series Macs, Ada Lovelace clients) — the only
-reason AV1 is opt-in is that rolling it as default would regress the
-typical user. Codec negotiation is the next step.
-| 28 | VideoToolbox hardware decode (macOS native client, 2-2.5x faster at 4K) |
-| 29 | 4K support (bilinear downscale, aspect-ratio letterbox, coordinate mapping) |
-| 33 | AVX2 SIMD color conversion (BGRA→NV12 2.8x, YUV→RGB32 3.4x faster, runtime-detected) |
+## Decode (client)
 
-## Transport + Networking
+| Decoder | File | Platform |
+|---|---|---|
+| OpenH264 CPU | `client/src/decode_h264.rs` | All |
+| dav1d (AV1) | `client/src/decode_av1.rs` | All (feature `av1`) |
+| NVDEC | `gpu/src/nvdec.rs` | Linux + Windows NVIDIA (feature `nvdec`) |
+| VideoToolbox | `client/src/decode_videotoolbox.rs` | macOS (H.264 only) |
+| WebCodecs | `web/src/lib.rs` | Browser |
 
-| # | Feature |
-|---|---------|
-| 4 | ChaCha20-Poly1305 encryption (TCP) / TLS (QUIC) / DTLS (WebRTC) |
-| 5 | QUIC/UDP transport (quinn) |
-| 6 | TCP transport with optional encryption |
-| 14 | Web client WebRTC (DataChannel + chunking, WebCodecs, Canvas, POST /rtc) |
-| 15 | Web client WSS fallback (`?ws` URL param, same HTTPS port) |
-| 25 | Self-signed HTTPS (rcgen, enables WebCodecs on non-localhost) |
-| 31 | QUIC ALPN fix (client was missing ALPN protocol — QUIC never worked before) |
-| 32 | HTTP keep-alive + connection pool (reuses TLS connections, bounded 16-thread pool) |
-| 38 | Adaptive bitrate (baseline RTT tracking, congestion-based decrease, NVENC reconfigure API) |
-| 39 | Connection quality stats (Stats message every 5s: RTT, FPS, bandwidth, encode_us) |
-| 41 | RTT measurement (Ping/Pong, server EMA α=0.2) |
-| 43 | Forward-compatible protocol (`read_message_lenient`, skips unknown message variants) |
+Probe order: `--decoder auto` picks NVDEC → VideoToolbox → dav1d → OpenH264.
 
-## Session lifecycle
+## Pipeline abstraction (0.4.7)
 
-| # | Feature |
-|---|---------|
-| 9 | Auto-reconnect (exponential backoff) |
-| 12 | Adaptive quality (congestion-based frame skipping) |
-| 38 | Adaptive bitrate (see above) |
-| **0.4.0** | ClientHello session affinity + ghost-set rejection (Linux + Windows service mode) |
-| **0.4.0** | Pre-flight resolution hint (Windows service mode — no open-flicker) |
-| **0.4.0** | Session correlation IDs (8-char hex per session, in every stats line) |
-| **0.4.0** | Structured `SessionEndReason` enum (Cancelled / PeerClosed / NetworkError / etc.) |
+Unified trait in `server/src/pipeline.rs`. Three impls share one session loop via `session::run_session(&mut dyn Pipeline, cfg)`:
 
-## Input + I/O
+| Pipeline | Backing | Platform |
+|---|---|---|
+| `CpuPipeline` | scrap + OpenH264 / NVENC + `TileDiffer` | All |
+| `NvfbcNvencPipeline` | NVFBC → NVENC, CUDA zero-copy | Linux GPU |
+| `DxgiNvencPipelineAdapter` | fused `gpu::dxgi_nvenc::DxgiNvencPipeline` | Windows GPU |
 
-| # | Feature |
-|---|---------|
-| 7 | Clipboard sync (bidirectional, arboard) |
-| 8 | Ctrl+V paste (client intercepts → server `enigo.text()`) |
-| 11 | Window scaling + coordinate mapping |
-| 16 | Hidden remote cursor (mouse move = 0 CPU) |
-| 46 | Scroll redesign (Sunshine-style pixel accumulation, client-native direction) |
-| 53 | Clipboard paste in service mode (`PasteText` → IPC → agent `enigo.text()`) |
-| 54 | Clipboard sync in service mode (agent arboard polling → IPC → `ClipboardSync`) |
-| 55 | File transfer toast + path (`FileSaved` protocol message, batch progress) |
+Session logic (input, clipboard, audio, keepalive, stats, adaptive bitrate, congestion, file transfer, frame pacing) lives once in `run_session`.
 
 ## Audio
 
-| # | Feature |
-|---|---------|
-| 42 | Web audio (Opus decode via WebCodecs `AudioDecoder`, auto-resume on gesture) |
-| (impl.) | Server: PulseAudio monitor (Linux) + WASAPI loopback (Windows) → Opus 48kHz stereo |
-| (impl.) | Client: cpal ring buffer with prime threshold + soft drain + underrun/trim metrics |
-| **0.4.0** | Audio drop counter on the capture side (visible in stats) |
+- **Capture**: PulseAudio monitor (`server/src/audio/pulse.rs`, Linux) / WASAPI loopback (`server/src/audio/wasapi.rs`, Windows). Feature `audio`, default on.
+- **Codec**: Opus 48kHz stereo, 20ms frames (static libopus via `audiopus_sys` feature `static`).
+- **Playback**: Browser via WebCodecs + Web Audio API; native via `cpal`.
+- **Sent audio-first** inside the session loop so video backpressure never blocks the ~100-byte audio packets.
 
-## Security
+## Input
 
-| # | Feature |
-|---|---------|
-| 45 | JWT token auth (`--auth-secret`, HMAC-SHA256, platform signs `{sub, vm_id, exp}`, HTTP 401 on invalid) |
+| Backend | Purpose | File |
+|---|---|---|
+| uinput virtual keyboard | Linux keyboard (bypasses GDM 42 XKB remap scramble, works on Wayland + lock screen) | `server/src/input_uinput.rs` |
+| enigo | Cross-platform keyboard + mouse + scroll fallback | `server/src/input_injector.rs` |
+| IPC forwarder | Windows Service → agent (in user session) | `server/src/ipc_pipe.rs` |
 
-## Native client
+uinput needs a udev rule + `input` group membership — `install.sh` wires both.
 
-| # | Feature |
-|---|---------|
-| 13 | Native client (winit + softbuffer, OS key repeat) |
-| 48 | Native UI: borderless fullscreen, macOS transparent title bar, F11/Esc toggle |
-| **0.4.0** | macOS top-edge gradient backdrop for traffic lights |
-| **0.4.0** | Native client sends preferred resolution on connect (no post-open resize round-trip) |
+## Clipboard
 
-## Deployment
+Bidirectional text sync via `arboard` (server + native client) and Async Clipboard API (browser). Echo suppression via `ClipboardTracker` (`core/src/clipboard.rs`). Ctrl+V paste injection forwards as `PasteText` so the server types the string character-by-character.
 
-| # | Feature |
-|---|---------|
-| 17 | Docker XFCE test environment |
-| 18 | Mock server (test without screen capture) |
-| 24 | Auto-start (Windows: schtasks ONLOGON, Linux: systemd) |
-| 26 | WASM pkg in repo (Windows builds without wasm-pack) |
-| 30 | Cross-platform release pipeline (GitHub Actions: Linux/Windows/macOS/Docker, install.sh, install.ps1) |
-| 44 | Windows Service mode (Session 0 service + agent, IPC pipe, lock screen GDI fallback) |
-| 49 | Virtual Display Driver (VDD) auto-install (`--install` downloads MiketheTech VDD + nefcon) |
-| 50 | TCC→WDDM auto-switch (`--install` detects NVIDIA GPU mode, switches if needed) |
-| 51 | Adaptive resolution (web client viewport → agent `ChangeDisplaySettingsEx`, 1.3x scale, 300ms debounce) |
-| 52 | DXGI VDD device targeting (capture from VDD by device name like DCV/Parsec) |
+## File transfer
 
-## Observability
+Bidirectional, chunked, SHA-256 verified. Server → client via `--send-file <path>`; client → server via `--send-file <path>`. Protocol: `FileOffer` → `FileAccept` → `FileChunk*` → `FileDone` (`core/src/file_transfer.rs`, `server/src/file_transfer.rs`, `client/src/file_transfer.rs`).
 
-| # | Feature |
-|---|---------|
-| 40 | Server stats logging (GPU stats with FPS, RTT, bandwidth, encode time) |
-| **0.4.0** | `--log-file` + `--log-rotate` + `--log-keep` (rotating file appender) |
-| **0.4.0** | Network jitter EMA in stats line |
-| **0.4.0** | Audio drops counted per stats interval |
-| **0.4.0** | 16 new unit tests (doorbell, classify_session_error, ClientHello round-trip) |
+## Session lifecycle
 
-## Testing
+- **Hello**: server sends resolution, codec, audio flag, opaque `session_token`.
+- **Resume**: client reconnects with `(session_token, last_sequence)`; server replies `ResumeOk` + forces keyframe, else a fresh `Hello`.
+- **Replacement**: new client takes over an active session; ghost-set rejects the old client's auto-reconnect attempts.
+- **Disconnect**: server pushes `Message::Disconnect { reason }` on graceful shutdown / Ctrl+C / SIGTERM.
 
-| # | Feature |
-|---|---------|
-| 34 | WAN simulation tests (8 E2E tests: 0–300ms RTT, jitter, encrypted, keepalive, session replacement) |
-| (impl.) | 134 tests across all crates (workspace `cargo test`) |
+Session end reasons are structured (`SessionEndReason`: `Cancelled`, `PeerClosed`, `ClientDisconnect`, `NetworkError`, `PipelineError`) so ops-side log parsing is stable.
+
+## Adaptive bitrate + congestion
+
+- `AdaptiveBitrate` (`server/src/session.rs`): RTT-aware, ×0.7 on high RTT, ×1.2 on stable, clamped to [min, max], hysteresis ≥5s.
+- `CongestionTracker`: counts slow frames; once a threshold is hit, skips 1/N frames to recover; releases when frames land on time.
+- GPU pipelines expose no `CongestionTracker` (can't usefully skip after zero-copy encode). CPU pipeline does.
+
+## Logging
+
+`--log-file <path>` + `--log-rotate <daily|hourly|never>` + `--log-keep <N>`. Stats line every ~5s:
+
+```
+session_id=<8-char hex>  fps=X.X  bw=X.X KB/s  rtt=Xms  jitter=Xms  encode_ms=X.X  audio_drops_5s=N
+```
+
+Structured fields via `tracing`; stdout + file if `--log-file` set.
+
+## Network / deployment
+
+- **STUN**: `--stun auto` (Google public) or `--stun <server>` prints a connection code with discovered public `ip:port`. `--public-addr ip:port` skips STUN if you already know the externally-reachable address.
+- **JWT auth (WSS)**: `--auth-secret <hex>` turns on HMAC-SHA256 JWT verification; browser supplies `?token=<jwt>` on WebSocket URL. No token support on TCP/QUIC.
+
+## Windows Service mode
+
+`--install` / `--uninstall` / `--install-vdd` (`server/src/service_win.rs`):
+
+- Registers `PhantomServer` Windows Service (runs in Session 0, SYSTEM, pre-login)
+- Downloads + installs [MTT Virtual Display Driver](https://github.com/VirtualDrivers) via nefcon (so headless GPU servers have something for DXGI to capture)
+- Service spawns an agent in the active console session via `CreateProcessAsUser`; agent does DXGI capture + enigo injection, service relays frames over two named pipes (`\\.\pipe\PhantomIPC_{up,down}_{session_id}`)
+- `--install-vdd` re-runs just the VDD step if a transient download blip killed the first attempt
+
+## Linux VM autologin mode
+
+`install.sh server --autologin` (`install.sh`):
+
+- GDM `AutomaticLogin` + `TimedLogin` (5s) — session auto-restores after sign-out
+- dconf overrides disable screen lock, idle, and the GNOME "Switch User" menu item (that menu entry backgrounds the session and breaks phantom's DISPLAY binding)
+- Clears + re-seeds keyring with empty password so Chrome/Evolution don't pop a keyring dialog under autologin
+- Drops an XDG autostart `.desktop` for phantom-server (with wrapper that kills any stale instance first, since phantom-server sometimes survives gnome-session exit and blocks port 9900/9901)
+- Installs a systemd timer watchdog that polls every 30s and kicks `gdm3` if no horde seat0 session exists — workaround for GDM 42's `TimedLogin` regression on Ubuntu 22
+
+## CLI reference
+
+### Server (`phantom-server`)
+
+```
+--listen <addr>                        default 0.0.0.0:9900
+--transport <tcp,web,quic>             comma-separated; default tcp,web
+--fps <n>                              default 30
+--bitrate <kbps>                       default 5000; seeds ABR
+--encoder <auto|openh264|nvenc>        default auto
+--codec <auto|h264|av1>                default auto (→ H.264)
+--capture <auto|scrap|nvfbc|pipewire|dxgi>
+                                       default auto
+--display <n>                          display index; --list-displays to enumerate
+--send-file <path>                     push file to first client
+--key <hex> | --no-encrypt             ChaCha20 key / disable
+--stun <server|auto>                   NAT discovery
+--public-addr <ip:port>                override STUN
+--auth-secret <hex>                    HMAC-SHA256 for JWT auth over WSS
+--log-file <path> --log-rotate <daily|hourly|never> --log-keep <n>
+                                       production logging
+Windows only:
+--install / --uninstall / --install-vdd
+--agent-mode / --service / --ipc-session
+                                       internal use
+```
+
+### Client (`phantom-client`)
+
+```
+-c, --connect <addr:port>              default 127.0.0.1:9900
+--transport <tcp|quic>                 default tcp
+--decoder <auto|openh264|dav1d|nvdec|videotoolbox>
+                                       default auto
+--send-file <path>                     push file to server
+--key <hex> | --no-encrypt             must match server
+--token <jwt>                          for WSS JWT auth
+```
