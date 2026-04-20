@@ -1,6 +1,6 @@
 # Phantom — Feature Reference
 
-Accurate as of v0.4.7. Each entry points at the code that implements it.
+Accurate as of v0.4.10. Each entry points at the code that implements it.
 
 ## Transports
 

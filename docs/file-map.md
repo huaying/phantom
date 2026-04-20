@@ -6,7 +6,7 @@ crates/core/src/                  Cross-platform foundation, no cfg gates
   capture.rs                        FrameCapture trait
   encode.rs                         FrameEncoder, FrameDecoder, VideoCodec, EncodedFrame
   transport.rs                      MessageSender / MessageReceiver / Connection traits
-  protocol.rs                       Message enum, PROTOCOL_VERSION=6, bincode framing
+  protocol.rs                       Message enum, PROTOCOL_VERSION=7, bincode framing
   tile.rs                           TileDiffer (64x64 dirty detection, AVX2 fast path)
   frame.rs                          Frame struct, PixelFormat
   input.rs                          InputEvent, KeyCode, MouseButton

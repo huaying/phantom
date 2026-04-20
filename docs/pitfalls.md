@@ -108,7 +108,22 @@ you're making touches one of these areas, re-read the relevant entry first.
   on the GPU zero-copy paths). Whole tile path + `TileUpdate` protocol
   message deleted in 0.4.4. Protocol version bumped to 6 so clients
   that still expect `TileUpdate` fail fast at handshake instead of
-  silently desyncing.
+  silently desyncing. Current protocol is v7 (added `RequestKeyframe`
+  in 0.4.8 for the tab-visibility recovery path below; MIN stayed at 6
+  since old clients simply don't send that message).
+- **Tab-focus fast-forward** (0.4.10 fix, two earlier attempts that
+  didn't work are in the git log for reference): when a browser tab is
+  backgrounded, the kernel TCP receive buffer accumulates encoded
+  video past phantom's bounded server-side mpsc. On focus the browser
+  drains + decodes the burst at wire speed → video appears to
+  fast-forward through a stale backlog. Neither sequence-based nor
+  keyframe-based filtering is reliable because `visibilitychange` and
+  the buffered `onmessage` events interleave differently per browser.
+  Fix: on `visibilitychange → visible`, web client hard-drops every
+  frame for 500ms (covers the burst-dispatch window) then waits for
+  the next keyframe before resuming decode. Sends `RequestKeyframe`
+  at the same time so the server emits a fresh IDR instead of the
+  client having to wait the natural 2s periodic interval.
 - **Chrome hardware WebCodecs black screen**: hardware `VideoDecoder`
   defers output callback when the tab isn't fully focused (after URL
   navigation). Fix: use `prefer-software` for decode (~2-4ms vs ~0.5ms
