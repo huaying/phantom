@@ -1,10 +1,10 @@
 [package]
 name = "phantom-server"
-version = "0.4.12"
+version = "0.5.0"
 edition = "2021"
 
 [features]
-default = ["web-client", "audio"]
+default = ["web-client", "audio", "sso"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
