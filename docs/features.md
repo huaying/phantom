@@ -178,8 +178,14 @@ Windows only:
 ```
 -c, --connect <addr:port>              default 127.0.0.1:9900
 --transport <tcp|quic>                 default tcp
---decoder <auto|openh264|dav1d|nvdec|videotoolbox>
-                                       default auto
+--decoder <auto|openh264|videotoolbox>
+                                       default auto. dav1d / nvdec are not
+                                       explicit flag values — on non-macOS,
+                                       `auto` auto-probes NVDEC first then
+                                       dav1d (if AV1) then OpenH264. On
+                                       macOS, `auto` and `videotoolbox`
+                                       use VideoToolbox; anything else
+                                       falls through to OpenH264.
 --send-file <path>                     push file to server
 --key <hex> | --no-encrypt             must match server
 --token <jwt>                          for WSS JWT auth
