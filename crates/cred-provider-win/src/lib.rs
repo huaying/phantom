@@ -16,9 +16,9 @@ use windows::Win32::Foundation::{
     E_NOTIMPL, E_POINTER, HANDLE, NTSTATUS, S_FALSE, S_OK,
 };
 use windows::Win32::Graphics::Gdi::HBITMAP;
-// MSV1_0_S4U_LOGON is not exposed in windows 0.58 — define it manually.
-// https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/ns-ntsecapi-msv1_0_s4u_logon
-use windows::Win32::Foundation::UNICODE_STRING;
+use windows::Win32::Security::Authentication::Identity::{
+    KerbInteractiveLogon, KerbWorkstationUnlockLogon, KERB_INTERACTIVE_UNLOCK_LOGON,
+};
 use windows::Win32::System::Com::{CoTaskMemAlloc, IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::Shell::*;
 
@@ -310,7 +310,21 @@ impl ICredentialProviderCredential_Impl for Tile_Impl {
             Err(_) => return Ok(()),
         };
 
-        let (buf, cb, auth_pkg) = pack_s4u(&domain, &user)?;
+        // Passwordless via password-rotation: the CP (running as SYSTEM in
+        // LogonUI) generates a random password, resets the account to it,
+        // then submits it via KIUL. User never knows / types a password.
+        // Next login re-rotates. Works because SYSTEM can always reset a
+        // local account's password.
+        let password = match generate_random_password() {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // fall through to default CP
+        };
+        if set_local_user_password(&user, &password).is_err() {
+            return Ok(()); // fall through
+        }
+
+        let cpus = CPUS_STATE.load(Ordering::SeqCst);
+        let (buf, cb, auth_pkg) = pack_kiul(&domain, &user, &password, cpus)?;
 
         unsafe {
             (*pcpcs).ulAuthenticationPackage = auth_pkg;
@@ -372,29 +386,26 @@ fn read_user_from_file() -> std::result::Result<(String, String), std::io::Error
     Ok((domain, user))
 }
 
-// MSV1_0_S4U_LOGON struct — not in windows-rs 0.58, declared by hand.
-// https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/ns-ntsecapi-msv1_0_s4u_logon
-#[repr(C)]
-struct Msv10S4uLogon {
-    message_type: u32, // MsV1_0S4ULogon = 12
-    flags: u32,
-    user_principal_name: UNICODE_STRING,
-    domain_name: UNICODE_STRING,
-}
-const MSV1_0_S4U_LOGON_TYPE: u32 = 12;
-
-/// Build an `MSV1_0_S4U_LOGON` serialization that LSA (called by LogonUI
-/// with SeTcbPrivilege) will accept as a passwordless logon for a local
-/// account. UNICODE_STRING.Buffer fields are offsets-from-start.
-fn pack_s4u(domain: &str, user: &str) -> Result<(*mut u8, u32, u32)> {
-    let u_w: Vec<u16> = user.encode_utf16().collect();
+/// Build `KERB_INTERACTIVE_UNLOCK_LOGON` with UNICODE_STRING.Buffer fields
+/// set as offsets-from-start (LSA dereferences them relative to the
+/// serialization base). Called with a password we just assigned via
+/// NetUserSetInfo so LSA's verification step will succeed.
+fn pack_kiul(
+    domain: &str,
+    user: &str,
+    pass: &str,
+    cpus: u32,
+) -> Result<(*mut u8, u32, u32)> {
     let d_w: Vec<u16> = domain.encode_utf16().collect();
+    let u_w: Vec<u16> = user.encode_utf16().collect();
+    let p_w: Vec<u16> = pass.encode_utf16().collect();
 
-    let u_bytes = u_w.len() * 2;
     let d_bytes = d_w.len() * 2;
+    let u_bytes = u_w.len() * 2;
+    let p_bytes = p_w.len() * 2;
 
-    let base_size = mem::size_of::<Msv10S4uLogon>();
-    let total = base_size + u_bytes + d_bytes;
+    let base_size = mem::size_of::<KERB_INTERACTIVE_UNLOCK_LOGON>();
+    let total = base_size + d_bytes + u_bytes + p_bytes;
 
     let buf = unsafe { CoTaskMemAlloc(total) as *mut u8 };
     if buf.is_null() {
@@ -404,30 +415,126 @@ fn pack_s4u(domain: &str, user: &str) -> Result<(*mut u8, u32, u32)> {
         ptr::write_bytes(buf, 0, total);
     }
 
-    let u_off = base_size;
-    let d_off = u_off + u_bytes;
+    let d_off = base_size;
+    let u_off = d_off + d_bytes;
+    let p_off = u_off + u_bytes;
 
     unsafe {
-        if u_bytes > 0 {
-            ptr::copy_nonoverlapping(u_w.as_ptr() as *const u8, buf.add(u_off), u_bytes);
-        }
         if d_bytes > 0 {
             ptr::copy_nonoverlapping(d_w.as_ptr() as *const u8, buf.add(d_off), d_bytes);
         }
+        if u_bytes > 0 {
+            ptr::copy_nonoverlapping(u_w.as_ptr() as *const u8, buf.add(u_off), u_bytes);
+        }
+        if p_bytes > 0 {
+            ptr::copy_nonoverlapping(p_w.as_ptr() as *const u8, buf.add(p_off), p_bytes);
+        }
 
-        let s4u = buf as *mut Msv10S4uLogon;
-        (*s4u).message_type = MSV1_0_S4U_LOGON_TYPE;
-        (*s4u).flags = 0;
-        (*s4u).user_principal_name.Length = u_bytes as u16;
-        (*s4u).user_principal_name.MaximumLength = u_bytes as u16;
-        (*s4u).user_principal_name.Buffer = PWSTR(u_off as *mut u16);
-        (*s4u).domain_name.Length = d_bytes as u16;
-        (*s4u).domain_name.MaximumLength = d_bytes as u16;
-        (*s4u).domain_name.Buffer = PWSTR(d_off as *mut u16);
+        let kiul = buf as *mut KERB_INTERACTIVE_UNLOCK_LOGON;
+        (*kiul).Logon.MessageType = if cpus == CPUS_UNLOCK_WORKSTATION.0 as u32 {
+            KerbWorkstationUnlockLogon
+        } else {
+            KerbInteractiveLogon
+        };
+        (*kiul).Logon.LogonDomainName.Length = d_bytes as u16;
+        (*kiul).Logon.LogonDomainName.MaximumLength = d_bytes as u16;
+        (*kiul).Logon.LogonDomainName.Buffer = PWSTR(d_off as *mut u16);
+        (*kiul).Logon.UserName.Length = u_bytes as u16;
+        (*kiul).Logon.UserName.MaximumLength = u_bytes as u16;
+        (*kiul).Logon.UserName.Buffer = PWSTR(u_off as *mut u16);
+        (*kiul).Logon.Password.Length = p_bytes as u16;
+        (*kiul).Logon.Password.MaximumLength = p_bytes as u16;
+        (*kiul).Logon.Password.Buffer = PWSTR(p_off as *mut u16);
     }
 
     let auth_pkg = lookup_auth_package("MICROSOFT_AUTHENTICATION_PACKAGE_V1_0")?;
     Ok((buf, total as u32, auth_pkg))
+}
+
+/// Generate a 32-byte random ASCII-printable password using BCryptGenRandom.
+/// Used as the ephemeral local-account password for password-rotation SSO.
+fn generate_random_password() -> Result<String> {
+    use windows::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCRYPT_ALG_HANDLE,
+    };
+    let mut raw = [0u8; 24];
+    unsafe {
+        BCryptGenRandom(
+            BCRYPT_ALG_HANDLE::default(),
+            &mut raw,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+        .ok()?;
+    }
+    // Base64-encode to a 32-char ASCII string — keeps printable, avoids
+    // the complexity of a "meets-password-policy" character-class checker.
+    use base64_simple::B64;
+    Ok(B64::encode(&raw))
+}
+
+mod base64_simple {
+    pub struct B64;
+    impl B64 {
+        pub fn encode(input: &[u8]) -> String {
+            const C: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+            let mut i = 0;
+            while i + 3 <= input.len() {
+                let b0 = input[i];
+                let b1 = input[i + 1];
+                let b2 = input[i + 2];
+                out.push(C[(b0 >> 2) as usize] as char);
+                out.push(C[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+                out.push(C[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+                out.push(C[(b2 & 0b111111) as usize] as char);
+                i += 3;
+            }
+            let rem = input.len() - i;
+            if rem == 1 {
+                let b0 = input[i];
+                out.push(C[(b0 >> 2) as usize] as char);
+                out.push(C[((b0 & 0b11) << 4) as usize] as char);
+                out.push('=');
+                out.push('=');
+            } else if rem == 2 {
+                let b0 = input[i];
+                let b1 = input[i + 1];
+                out.push(C[(b0 >> 2) as usize] as char);
+                out.push(C[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+                out.push(C[((b1 & 0b1111) << 2) as usize] as char);
+                out.push('=');
+            }
+            out
+        }
+    }
+}
+
+/// Reset a local user's password to the given value. SYSTEM (which LogonUI
+/// runs as) can always do this for local accounts — no admin check needed.
+fn set_local_user_password(user: &str, password: &str) -> Result<()> {
+    use windows::Win32::NetworkManagement::NetManagement::{NetUserSetInfo, USER_INFO_1003};
+
+    let user_w: Vec<u16> = user.encode_utf16().chain(Some(0)).collect();
+    let pw_w: Vec<u16> = password.encode_utf16().chain(Some(0)).collect();
+
+    let info = USER_INFO_1003 {
+        usri1003_password: PWSTR(pw_w.as_ptr() as *mut u16),
+    };
+
+    unsafe {
+        let status = NetUserSetInfo(
+            PCWSTR::null(), // servername = null → local
+            PCWSTR(user_w.as_ptr()),
+            1003,
+            &info as *const _ as *const u8,
+            None,
+        );
+        if status != 0 {
+            return Err(windows::core::Error::from_hresult(HRESULT(status as i32)));
+        }
+    }
+    Ok(())
 }
 
 fn lookup_auth_package(name: &str) -> Result<u32> {
