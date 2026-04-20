@@ -465,11 +465,6 @@ print_post_install_hints() {
 linux_install_sso() {
     echo "Installing SSO plugin (per --sso)..."
 
-    if ! have_cmd cargo; then
-        echo "  ERROR: cargo not on PATH. --sso currently builds from source."
-        echo "  Install rustup (https://rustup.rs) and re-run."
-        return 1
-    fi
     if [ ! -d "./crates/pam-phantom" ]; then
         echo "  ERROR: ./crates/pam-phantom not found — run --sso from a phantom source checkout."
         return 1
@@ -485,8 +480,17 @@ linux_install_sso() {
         return 1
     fi
 
-    echo "  Building libpam_phantom.so..."
-    ( cd ./crates/pam-phantom && cargo build --release 2>&1 | tail -4 )
+    # Build as the invoking user — root usually lacks rustup / cargo on PATH,
+    # and anything under ~/.cargo belongs to TARGET_USER anyway.
+    CARGO_BIN="/home/${TARGET_USER}/.cargo/bin/cargo"
+    if [ ! -x "$CARGO_BIN" ] && ! have_cmd cargo; then
+        echo "  ERROR: cargo not found (tried $CARGO_BIN and \$PATH)."
+        echo "  Install rustup (https://rustup.rs) as $TARGET_USER and re-run."
+        return 1
+    fi
+
+    echo "  Building libpam_phantom.so as $TARGET_USER..."
+    sudo -u "$TARGET_USER" bash -c "cd '$(pwd)/crates/pam-phantom' && '${CARGO_BIN}' build --release 2>&1 | tail -4"
     SO="./crates/pam-phantom/target/release/libpam_phantom.so"
     if [ ! -f "$SO" ]; then
         echo "  ERROR: $SO did not build."
