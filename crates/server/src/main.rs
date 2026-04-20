@@ -112,6 +112,30 @@ struct Args {
     #[arg(long)]
     uninstall_vdd: bool,
 
+    /// (Windows only, SSO) Install the Phantom Credential Provider DLL.
+    /// Copies phantom_cp.dll to System32 and registers CLSID so LogonUI
+    /// picks it up. Expects phantom_cp.dll + phantom_cp.reg next to
+    /// phantom-server.exe (or pass --cp-dll / --cp-reg to override).
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    #[arg(long)]
+    install_cp: bool,
+
+    /// (Windows only, SSO) Remove the Phantom Credential Provider.
+    /// Unregisters CLSID and deletes the DLL from System32.
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    #[arg(long)]
+    uninstall_cp: bool,
+
+    /// Override path to phantom_cp.dll for --install-cp.
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    #[arg(long)]
+    cp_dll: Option<std::path::PathBuf>,
+
+    /// Override path to phantom_cp.reg for --install-cp.
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    #[arg(long)]
+    cp_reg: Option<std::path::PathBuf>,
+
     /// Send a file to the first client that connects.
     #[arg(long)]
     send_file: Option<String>,
@@ -351,6 +375,15 @@ fn main() -> Result<()> {
             install_dir.display()
         );
         return service_win::uninstall_vdd(&install_dir);
+    }
+
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    if args.install_cp {
+        return install_credential_provider(args.cp_dll.as_deref(), args.cp_reg.as_deref());
+    }
+    #[cfg(all(target_os = "windows", feature = "sso"))]
+    if args.uninstall_cp {
+        return uninstall_credential_provider();
     }
 
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
@@ -1168,6 +1201,105 @@ fn create_encoder(
         }
         other => anyhow::bail!("unknown encoder '{other}'. Available: openh264, nvenc"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSO Credential Provider install/uninstall (Windows)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_os = "windows", feature = "sso"))]
+const CP_CLSID: &str = "{ccd145e9-71bb-4e91-a604-2ee449adfd54}";
+
+#[cfg(all(target_os = "windows", feature = "sso"))]
+fn install_credential_provider(
+    dll_override: Option<&std::path::Path>,
+    reg_override: Option<&std::path::Path>,
+) -> Result<()> {
+    use anyhow::Context;
+
+    let exe_dir = std::env::current_exe()
+        .context("current_exe")?
+        .parent()
+        .context("exe has no parent")?
+        .to_path_buf();
+
+    let dll_src: std::path::PathBuf = dll_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| exe_dir.join("phantom_cp.dll"));
+    let reg_src: std::path::PathBuf = reg_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| exe_dir.join("phantom_cp.reg"));
+
+    if !dll_src.exists() {
+        anyhow::bail!(
+            "phantom_cp.dll not found at {}. Build crates/cred-provider-win first, or pass --cp-dll.",
+            dll_src.display()
+        );
+    }
+    if !reg_src.exists() {
+        anyhow::bail!(
+            "phantom_cp.reg not found at {}. Build crates/cred-provider-win first, or pass --cp-reg.",
+            reg_src.display()
+        );
+    }
+
+    let dll_dst = std::path::PathBuf::from(r"C:\Windows\System32\phantom_cp.dll");
+    println!("Installing Phantom Credential Provider...");
+    std::fs::copy(&dll_src, &dll_dst)
+        .with_context(|| format!("copy {} -> {}", dll_src.display(), dll_dst.display()))?;
+    println!("  Copied {} -> {}", dll_src.display(), dll_dst.display());
+
+    let status = std::process::Command::new("reg")
+        .args(["import", reg_src.to_str().unwrap()])
+        .status()
+        .context("spawn reg import")?;
+    if !status.success() {
+        anyhow::bail!("reg import failed ({status}). Run as Administrator.");
+    }
+    println!("  Registered CLSID {CP_CLSID}");
+
+    // Ensure C:\ProgramData\phantom exists so phantom-server can drop the
+    // auth file there. Writable by LocalSystem (phantom-server service),
+    // readable by LogonUI (SYSTEM).
+    let _ = std::fs::create_dir_all(r"C:\ProgramData\phantom");
+
+    println!("  Done.");
+    println!("  Next:");
+    println!("    1. Build phantom-server with --features sso");
+    println!("    2. Run phantom-server with --sso-password-file <path-to-pw>");
+    println!("    3. Next LogonUI invocation will pick up our CP");
+    Ok(())
+}
+
+#[cfg(all(target_os = "windows", feature = "sso"))]
+fn uninstall_credential_provider() -> Result<()> {
+    println!("Uninstalling Phantom Credential Provider...");
+
+    let _ = std::process::Command::new("reg")
+        .args([
+            "delete",
+            &format!(
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{CP_CLSID}"
+            ),
+            "/f",
+        ])
+        .status();
+    let _ = std::process::Command::new("reg")
+        .args(["delete", &format!(r"HKCR\CLSID\{CP_CLSID}"), "/f"])
+        .status();
+    println!("  Unregistered CLSID");
+
+    let dll = std::path::PathBuf::from(r"C:\Windows\System32\phantom_cp.dll");
+    if dll.exists() {
+        match std::fs::remove_file(&dll) {
+            Ok(()) => println!("  Removed {}", dll.display()),
+            Err(e) => println!(
+                "  WARN: could not remove {}: {e} (LogonUI may have the DLL mapped; reboot then re-run)",
+                dll.display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 // ── Auto-start install/uninstall ────────────────────────────────────────────

@@ -26,6 +26,10 @@ use windows::Win32::UI::Shell::*;
 pub const PHANTOM_CP_CLSID: GUID = GUID::from_u128(0xccd145e9_71bb_4e91_a604_2ee449adfd54);
 
 const AUTH_FILE: &str = r"C:\ProgramData\phantom\auth";
+/// How long a ticket is considered fresh after phantom-server wrote it.
+/// Beyond this window, the ticket is treated as absent (prevents stale
+/// tickets from auto-logging in the wrong user later).
+const TICKET_MAX_AGE_SECS: u64 = 10;
 
 static G_REF: AtomicI32 = AtomicI32::new(0);
 fn dll_addref() {
@@ -334,6 +338,20 @@ fn alloc_wide(s: &str) -> PWSTR {
 }
 
 fn read_creds_from_file() -> std::result::Result<(String, String, String), std::io::Error> {
+    // TTL: reject tickets older than TICKET_MAX_AGE_SECS.
+    let meta = std::fs::metadata(AUTH_FILE)?;
+    if let Ok(modified) = meta.modified() {
+        if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+            if age.as_secs() > TICKET_MAX_AGE_SECS {
+                let _ = std::fs::remove_file(AUTH_FILE);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ticket stale",
+                ));
+            }
+        }
+    }
+
     let raw = std::fs::read_to_string(AUTH_FILE)?;
     let line = raw.lines().next().unwrap_or("").trim();
     let (userpart, pass) = line.split_once(':').ok_or_else(|| {
@@ -343,6 +361,10 @@ fn read_creds_from_file() -> std::result::Result<(String, String, String), std::
         Some((d, u)) => (d.to_string(), u.to_string()),
         None => (String::new(), userpart.to_string()),
     };
+    // Single-use: burn the ticket now so a crashed / retried logon can't
+    // re-consume it. If LSA rejects the creds the user will just see the
+    // normal password prompt and phantom-server can re-issue.
+    let _ = std::fs::remove_file(AUTH_FILE);
     Ok((domain, user, pass.to_string()))
 }
 

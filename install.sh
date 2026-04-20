@@ -42,6 +42,7 @@ parse_args() {
     INSTALL_SERVER=false
     INSTALL_CLIENT=false
     AUTOLOGIN=false
+    SSO=false
     GOT_ROLE=false
 
     for _arg in "$@"; do
@@ -50,7 +51,8 @@ parse_args() {
             client) INSTALL_CLIENT=true; GOT_ROLE=true ;;
             both)   INSTALL_SERVER=true; INSTALL_CLIENT=true; GOT_ROLE=true ;;
             --autologin) AUTOLOGIN=true ;;
-            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin]"; exit 1 ;;
+            --sso)  SSO=true ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--sso]"; exit 1 ;;
         esac
     done
 }
@@ -62,6 +64,11 @@ apply_defaults() {
             linux) INSTALL_SERVER=true ;;
             macos) INSTALL_CLIENT=true ;;
         esac
+    fi
+
+    if [ "$SSO" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
+        echo "--sso only applies to Linux server installs; ignoring"
+        SSO=false
     fi
 
     if [ "$AUTOLOGIN" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
@@ -444,6 +451,87 @@ print_post_install_hints() {
 }
 
 # ===========================================================================
+# Linux SSO plugin (pam_phantom.so + /etc/pam.d/gdm-password patch)
+# ===========================================================================
+# After phantom-server verifies a JWT, it writes /run/phantom/auth. GDM's
+# PAM stack asks pam_phantom.so first (`auth sufficient`); the module matches
+# the ticket against PAM_USER and, on success, short-circuits the whole
+# stack — no password prompt shown.
+#
+# This function requires a full source checkout (cargo + libpam-dev + the
+# pam-phantom crate at ./crates/pam-phantom). Release builds don't ship
+# the .so yet — Phase 2 will add it to release.yml.
+
+linux_install_sso() {
+    echo "Installing SSO plugin (per --sso)..."
+
+    if ! have_cmd cargo; then
+        echo "  ERROR: cargo not on PATH. --sso currently builds from source."
+        echo "  Install rustup (https://rustup.rs) and re-run."
+        return 1
+    fi
+    if [ ! -d "./crates/pam-phantom" ]; then
+        echo "  ERROR: ./crates/pam-phantom not found — run --sso from a phantom source checkout."
+        return 1
+    fi
+    if ! dpkg -s libpam0g-dev > /dev/null 2>&1; then
+        echo "  Installing libpam0g-dev..."
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libpam0g-dev
+    fi
+
+    TARGET_USER=${SUDO_USER:-$(logname 2>/dev/null || whoami)}
+    if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+        echo "  ERROR: cannot determine non-root user to own /run/phantom."
+        return 1
+    fi
+
+    echo "  Building libpam_phantom.so..."
+    ( cd ./crates/pam-phantom && cargo build --release 2>&1 | tail -4 )
+    SO="./crates/pam-phantom/target/release/libpam_phantom.so"
+    if [ ! -f "$SO" ]; then
+        echo "  ERROR: $SO did not build."
+        return 1
+    fi
+
+    SO_DST="/lib/x86_64-linux-gnu/security/pam_phantom.so"
+    sudo cp "$SO" "$SO_DST"
+    sudo chmod 644 "$SO_DST"
+    echo "  Installed $SO_DST"
+
+    # tmpfiles.d: recreate /run/phantom on every boot (tmpfs is volatile),
+    # owned by the phantom-server user so the agent can write the ticket.
+    TMPFILES=/etc/tmpfiles.d/phantom.conf
+    printf 'd /run/phantom 0755 %s %s\n' "$TARGET_USER" "$TARGET_USER" | sudo tee "$TMPFILES" > /dev/null
+    sudo systemd-tmpfiles --create "$TMPFILES" > /dev/null 2>&1 || true
+    echo "  tmpfiles.d: /run/phantom on boot (owner $TARGET_USER)"
+
+    # Patch /etc/pam.d/gdm-password — insert `auth sufficient pam_phantom.so`
+    # ABOVE the `@include common-auth` line. Backup first; skip if already
+    # present. If the line isn't found, insert after the first `auth` line.
+    PAMD=/etc/pam.d/gdm-password
+    if [ -f "$PAMD" ]; then
+        if sudo grep -q pam_phantom "$PAMD"; then
+            echo "  $PAMD already references pam_phantom — leaving alone"
+        else
+            sudo cp "$PAMD" "${PAMD}.phantom-backup"
+            if sudo grep -q '^@include common-auth' "$PAMD"; then
+                sudo sed -i '/^@include common-auth/i auth sufficient pam_phantom.so' "$PAMD"
+            else
+                sudo sed -i '0,/^auth/s//auth sufficient pam_phantom.so\n&/' "$PAMD"
+            fi
+            echo "  Patched $PAMD (backup at ${PAMD}.phantom-backup)"
+        fi
+    else
+        echo "  $PAMD not found — skipping (non-GDM display manager?)"
+    fi
+
+    echo "  Done. Remember:"
+    echo "    1. Build phantom-server with --features sso (cargo build --release -p phantom-server --features sso)"
+    echo "    2. Launch phantom-server with --sso-password-file pointing at the OS password"
+    echo "    3. Connect with a JWT carrying \"sub\"=<target user>; PAM will pick up the ticket"
+}
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -468,6 +556,9 @@ main() {
         linux_configure_uinput
         if [ "$AUTOLOGIN" = true ]; then
             linux_configure_autologin
+        fi
+        if [ "$SSO" = true ]; then
+            linux_install_sso
         fi
     fi
 
