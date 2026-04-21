@@ -29,13 +29,13 @@ jobs:
             build_server: true
             build_client: true
 
-          # Linux aarch64 (cross-compiled — for AWS Graviton, Ampere, etc.)
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-            suffix: linux-aarch64
-            build_server: true
-            build_client: true
-            cross: true
+          # Linux aarch64 cross-compile is temporarily disabled — the
+          # ports.ubuntu.com arm64 sources have an unresolvable
+          # libsystemd0:arm64 -> libcap2:arm64 dependency on the
+          # current ubuntu-22.04 runner image. Re-enable after pinning
+          # a working sources list (likely needs the security pocket
+          # and an arm64-only sources.list.d entry instead of editing
+          # the main sources.list).
 
           # macOS ARM (client only — server needs X11/DXGI for capture)
           - target: aarch64-apple-darwin
@@ -189,6 +189,10 @@ jobs:
 
   release:
     needs: [build]
+    # Don't let a single matrix-leg failure (e.g. flaky cross-compile)
+    # block publishing the rest of the artifacts. download-artifact will
+    # only pull the legs that actually uploaded.
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
