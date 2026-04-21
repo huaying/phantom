@@ -1257,6 +1257,15 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
 
     // Import signing certificates from the .cat file into TrustedPublisher store.
     // Without this, Windows shows a "publisher not trusted" dialog blocking silent install.
+    //
+    // Pre-create HKLM:\SOFTWARE\Microsoft\SystemCertificates\TrustedPublisher first.
+    // On freshly-provisioned Windows images (e.g. cloudbase-init'd VMs that have
+    // never opened certlm.msc) this registry key does not exist, and Import-Certificate
+    // returns E_ACCESSDENIED — even when running as NT AUTHORITY\SYSTEM. This was
+    // previously misdiagnosed as a GPU-mode-transition issue (see git history of
+    // pitfalls.md). The only stores Windows initialises by default are Root, MY,
+    // Disallowed, etc.; TrustedPublisher is created lazily by certlm.msc / certutil.
+    // See: https://learn.microsoft.com/en-us/answers/questions/1679945/
     println!("  Importing driver certificates...");
     let cat_path = vdd_dir.join("mttvdd.cat");
     let _ = std::process::Command::new("powershell")
@@ -1264,7 +1273,9 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
             "-NoProfile",
             "-Command",
             &format!(
-                "Add-Type -AssemblyName System.Security; \
+                "$key = 'HKLM:\\SOFTWARE\\Microsoft\\SystemCertificates\\TrustedPublisher'; \
+                 if (-not (Test-Path $key)) {{ New-Item -Path $key -Force | Out-Null }}; \
+                 Add-Type -AssemblyName System.Security; \
                  $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms; \
                  $cms.Decode([System.IO.File]::ReadAllBytes('{}')); \
                  foreach ($cert in $cms.Certificates) {{ \

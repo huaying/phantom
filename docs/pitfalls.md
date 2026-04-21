@@ -234,23 +234,22 @@ you're making touches one of these areas, re-read the relevant entry first.
   client.
 - **Toast JS eval + Windows paths**: backslashes in `C:\Users\...` break
   JS eval. Must escape `\\` before `\'` and `\"`.
-- **First-time `--install` on TCC-mode GPU silently falls back to CPU**:
-  on a clean Win VM where the A40 boots in TCC, `--install` runs the
-  TCC→WDDM switch BEFORE attempting VDD install. The mode switch
-  needs a reboot to take effect, but cert import + nefcon device
-  install for VDD run in the same invocation and fail with
-  `Import-Certificate: Access is denied (E_ACCESSDENIED)` and
-  `nefcon error -536870334`. The service still gets registered + the
-  firewall rule still gets added, so the install LOOKS successful, but
-  `phantom-debug.log` shows `vdd_device = None` →
-  `Tier 1 DXGI+NVENC unavailable: NV_ENC_ERR_UNKNOWN` →
-  `Tier 2 ScrapCapture+OpenH264 (CPU path)` at 1280x800 forever.
-  Workaround: reboot, then `--uninstall` + `--install` again — the
-  second `--install` sees WDDM already in effect, skips the GPU mode
-  switch, and VDD install succeeds. Real fix: when `--install` decides
-  it needs to switch GPU mode, exit early after the switch (and after
-  scheduling itself to re-run on next boot via `RunOnce` or similar)
-  instead of trying VDD install in the same invocation.
+- **`Import-Certificate` E_ACCESSDENIED on fresh Windows images** (FIXED
+  in `install_vdd`): on a freshly-provisioned Windows VM that has never
+  opened certlm.msc / certutil, the registry key
+  `HKLM:\SOFTWARE\Microsoft\SystemCertificates\TrustedPublisher`
+  *does not exist* — Windows initialises only `Root`, `MY`, `Disallowed`,
+  etc. by default. `Import-Certificate -CertStoreLocation Cert:\LocalMachine\TrustedPublisher`
+  then fails with E_ACCESSDENIED *even when running as NT AUTHORITY\SYSTEM*,
+  because the underlying store can't be opened for write. This used to
+  be misdiagnosed as a TCC→WDDM GPU-mode-transition race ("first
+  `--install` silently falls back to CPU because cert import fails
+  during mode switch"); both the symptom and the eventual recovery
+  (reboot + `--uninstall` + `--install`) match because some Windows
+  service initialises the missing key after first boot. The actual
+  fix is `New-Item -Path $key -Force` before `Import-Certificate`,
+  applied in `service_win.rs::install_vdd`.
+  See: https://learn.microsoft.com/en-us/answers/questions/1679945/
 - **`phantom-server.exe --install` re-run while service is running fails**:
   the service holds an exclusive lock on `C:\Program Files\Phantom\phantom-server.exe`,
   so the install's "copy exe to install dir" step errors with
