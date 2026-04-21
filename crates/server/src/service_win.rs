@@ -1522,6 +1522,20 @@ pub fn install_service() -> anyhow::Result<()> {
         ])
         .status();
 
+    // ── Windows Firewall inbound rule ──
+    // Without this, the service listens on 9900 but `DefaultInboundAction`
+    // (NotConfigured → Block) silently drops remote connections. Add a
+    // program-scoped allow rule so the exe is reachable from the network.
+    println!();
+    println!("Adding Windows Firewall inbound rule...");
+    match install_firewall_rule(&install_exe) {
+        Ok(()) => println!("  Firewall rule '{SERVICE_NAME}' added (inbound allow for phantom-server.exe)."),
+        Err(e) => {
+            println!("  Warning: firewall rule add failed: {e}");
+            println!("  Remote clients may be blocked by Windows Firewall until you add a rule manually.");
+        }
+    }
+
     // ── GPU setup (like DCV: auto-detect, auto-configure) ──
     println!();
     println!("Configuring GPU...");
@@ -1583,6 +1597,71 @@ pub fn install_service() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add an inbound Windows Firewall rule for phantom-server.exe.
+///
+/// The rule is program-scoped (not port-scoped) so it still works when the
+/// user overrides `--port` or enables QUIC (UDP) / WebRTC. Without this,
+/// Windows Firewall's default `NotConfigured` inbound action silently drops
+/// all connections to the service, and the user sees a confusing "service
+/// running but nothing connects" state.
+///
+/// Uses `netsh` (not PowerShell's `New-NetFirewallRule`) to match the rest
+/// of the install flow, which already uses `sc.exe` / `schtasks.exe` —
+/// avoids one more dependency on the PS execution environment.
+fn install_firewall_rule(program: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let _ = std::process::Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={SERVICE_NAME}"),
+        ])
+        .status();
+
+    let status = std::process::Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={SERVICE_NAME}"),
+            "dir=in",
+            "action=allow",
+            &format!("program={}", program.display()),
+            "enable=yes",
+            "profile=any",
+            &format!(
+                "description={SERVICE_DISPLAY_NAME} — allow inbound connections to phantom-server.exe"
+            ),
+        ])
+        .status()
+        .context("netsh advfirewall firewall add rule")?;
+
+    if !status.success() {
+        anyhow::bail!("netsh add rule failed with {status}. Run as Administrator.");
+    }
+
+    Ok(())
+}
+
+/// Remove the inbound Windows Firewall rule added by `install_firewall_rule`.
+/// Silent on missing rule — this is called from `--uninstall` which must
+/// succeed on partial installs.
+fn uninstall_firewall_rule() {
+    let _ = std::process::Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={SERVICE_NAME}"),
+        ])
+        .status();
+}
+
 /// Uninstall the Phantom Windows Service.
 pub fn uninstall_service() -> anyhow::Result<()> {
     use anyhow::Context;
@@ -1628,6 +1707,8 @@ pub fn uninstall_service() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("sc delete failed with {status}. Run as Administrator.");
     }
+
+    uninstall_firewall_rule();
 
     // Intentionally *not* removing the Virtual Display Driver here — we
     // want `--uninstall` to be safe to run as part of an upgrade. The
