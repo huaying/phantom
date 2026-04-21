@@ -200,6 +200,16 @@ you're making touches one of these areas, re-read the relevant entry first.
   `~/.local/share/keyrings/` and drops an autostart hook that unlocks
   with empty password via `gnome-keyring-daemon --unlock <<< ""`.
   Trade-off: stored secrets are effectively plaintext.
+- **Manual screen lock traps autologin user**: if the autologin user
+  has no Unix password (typical for VMs that only ever auth via SSH
+  keys), and they hit the lock corner / Super+L / idle lock, GNOME's
+  unlock dialog requires the account password they don't have. The
+  remote viewer sees a stuck lock screen and cannot recover without
+  out-of-band SSH access to set a password. `install.sh --autologin`
+  should also disable `org.gnome.desktop.screensaver.lock-enabled`,
+  `org.gnome.desktop.lockdown.disable-lock-screen=true`, and the idle
+  delay — the same way it already hides "Switch User" — so a
+  manual/idle lock can never strand the only user with access.
 
 ## Service mode (Windows)
 - **Windows IPC pipe deadlock**: synchronous named pipes only allow ONE
@@ -224,3 +234,36 @@ you're making touches one of these areas, re-read the relevant entry first.
   client.
 - **Toast JS eval + Windows paths**: backslashes in `C:\Users\...` break
   JS eval. Must escape `\\` before `\'` and `\"`.
+- **First-time `--install` on TCC-mode GPU silently falls back to CPU**:
+  on a clean Win VM where the A40 boots in TCC, `--install` runs the
+  TCC→WDDM switch BEFORE attempting VDD install. The mode switch
+  needs a reboot to take effect, but cert import + nefcon device
+  install for VDD run in the same invocation and fail with
+  `Import-Certificate: Access is denied (E_ACCESSDENIED)` and
+  `nefcon error -536870334`. The service still gets registered + the
+  firewall rule still gets added, so the install LOOKS successful, but
+  `phantom-debug.log` shows `vdd_device = None` →
+  `Tier 1 DXGI+NVENC unavailable: NV_ENC_ERR_UNKNOWN` →
+  `Tier 2 ScrapCapture+OpenH264 (CPU path)` at 1280x800 forever.
+  Workaround: reboot, then `--uninstall` + `--install` again — the
+  second `--install` sees WDDM already in effect, skips the GPU mode
+  switch, and VDD install succeeds. Real fix: when `--install` decides
+  it needs to switch GPU mode, exit early after the switch (and after
+  scheduling itself to re-run on next boot via `RunOnce` or similar)
+  instead of trying VDD install in the same invocation.
+- **`phantom-server.exe --install` re-run while service is running fails**:
+  the service holds an exclusive lock on `C:\Program Files\Phantom\phantom-server.exe`,
+  so the install's "copy exe to install dir" step errors with
+  `os error 32 (file in use)`. `sc stop PhantomServer` may also hang
+  (state stays RUNNING after an `sc stop`) because the Session 1 agent
+  child process doesn't shut down on the SCM stop signal. Reliable
+  recovery: `sc stop`, then `Stop-Process -Force phantom-server`, then
+  `--uninstall`, then `--install`. Worth wiring into `--install` as
+  an automatic "kill stale processes" step.
+- **VDD virtual display defaults to 640x480**: even though `--install`
+  prints `Virtual Display Driver installed (1920x1080 default)`, the
+  agent log reports `display[0] 640x480 primary=true` and `Tier 1
+  DXGI→NVENC ready 640x480`. The real session resolution then comes
+  from the client's `resolution hint`. Investigate whether the
+  "1920x1080 default" log line is misleading or the VDD config isn't
+  actually being applied.
