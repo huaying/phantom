@@ -43,6 +43,7 @@ parse_args() {
     INSTALL_CLIENT=false
     AUTOLOGIN=false
     SSO=false
+    NO_AUTOSTART=false
     GOT_ROLE=false
 
     for _arg in "$@"; do
@@ -52,7 +53,8 @@ parse_args() {
             both)   INSTALL_SERVER=true; INSTALL_CLIENT=true; GOT_ROLE=true ;;
             --autologin) AUTOLOGIN=true ;;
             --sso)  SSO=true ;;
-            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--sso]"; exit 1 ;;
+            --no-autostart) NO_AUTOSTART=true ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--sso] [--no-autostart]"; exit 1 ;;
         esac
     done
 }
@@ -77,10 +79,19 @@ apply_defaults() {
     fi
 }
 
-# Resolve the invoking non-root user. SUDO_USER is set when install.sh
-# is piped through sudo; fall back to $USER.
+# Resolve the invoking non-root user and their home directory. SUDO_USER
+# is set when install.sh is piped through sudo; fall back to $USER.
+# USER_HOME is used by the autostart and autologin steps to write files
+# under ~/.config/autostart, ~/.local/share/keyrings, etc.
 get_target_user() {
     TARGET_USER="${SUDO_USER:-$USER}"
+    USER_HOME=""
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        USER_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+    fi
+    if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+        USER_HOME="$HOME"
+    fi
 }
 
 download_and_install() {
@@ -220,6 +231,45 @@ linux_configure_uinput() {
 }
 
 # ===========================================================================
+# Linux server autostart: XDG autostart entry so phantom-server launches
+# whenever the user starts a graphical session. This is the default path
+# (opt out with --no-autostart) and is safer than a plain
+# `phantom-server --install` systemd user unit pinned to DISPLAY=:0,
+# because GDM rotates DISPLAY per session (sign out → :0 → :1 → ...) and
+# a pinned unit breaks after the first sign-out. XDG autostart gives us
+# DISPLAY + XAUTHORITY + seat from the live session for free.
+# ===========================================================================
+
+linux_install_autostart() {
+    echo ""
+    echo "Installing phantom-server autostart entry..."
+    if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+        echo "  WARN: could not resolve home directory for $TARGET_USER — skipping autostart."
+        echo "        Start manually with: phantom-server"
+        return 0
+    fi
+    _autostart_dir="$USER_HOME/.config/autostart"
+    # NOTE on the Exec= wrapper: phantom-server from a previous autologin
+    # session can survive past the session (gets reparented to init when
+    # gnome-session exits) and keep ports 9900/9901 bound. The new
+    # session's autostart would then bind-fail silently. Wrapper kills
+    # stale instances first, then launches fresh on the current DISPLAY.
+    sudo -u "$TARGET_USER" mkdir -p "$_autostart_dir"
+    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-server.desktop" > /dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Phantom Server
+Comment=Remote-desktop server. Edit Exec= below to change transport/encryption/auth.
+Exec=sh -c 'pkill -x phantom-server 2>/dev/null; for i in 1 2 3 4 5; do pgrep -x phantom-server >/dev/null 2>&1 || break; sleep 1; done; exec /usr/local/bin/phantom-server --no-encrypt --transport tcp,web'
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+    echo "  Wrote $_autostart_dir/phantom-server.desktop"
+    echo "  phantom-server will start at your next graphical login."
+    echo "  Edit Exec= in that file to change transport / encryption / auth flags."
+}
+
+# ===========================================================================
 # Linux server --autologin: GDM autologin + disable screen lock
 # + auto-unlock keyring. Target use case is remote VMs where the phantom
 # session needs to survive user sign out (Windows-style service feel).
@@ -235,7 +285,6 @@ linux_configure_autologin() {
         echo "  ERROR: cannot determine non-root user for autologin. Re-run as a regular user via sudo."
         exit 1
     fi
-    USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
     if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
         echo "  ERROR: could not find home directory for $TARGET_USER"
         exit 1
@@ -245,7 +294,8 @@ linux_configure_autologin() {
     linux_autologin_disable_screenlock
     linux_autologin_reset_keyring
     linux_autologin_install_keyring_unlock
-    linux_autologin_install_phantom_autostart
+    # Autostart entry is already installed by the default path; --autologin
+    # just layers on GDM autologin + screen-lock disable + watchdog.
     linux_autologin_install_watchdog
 
     echo ""
@@ -356,33 +406,6 @@ EOF
     echo "  Installed keyring auto-unlock autostart entry"
 }
 
-linux_autologin_install_phantom_autostart() {
-    # 5. phantom-server autostart. GDM assigns a fresh DISPLAY number to
-    #    each new session (sign out + TimedLogin fire = :0 → :1 → :2 ...),
-    #    so a daemon pinned to DISPLAY=:0 breaks after the first sign-out.
-    #    Launching from XDG autostart gives us the right DISPLAY and
-    #    XAUTHORITY for free, one instance per session. This is the Linux
-    #    analogue of Windows Service mode: session lifecycle drives
-    #    phantom-server, with GDM autologin+TimedLogin making sure there's
-    #    always a session.
-    # NOTE on the Exec= wrapper: phantom-server from a previous autologin
-    # session can survive past the session (gets reparented to init when
-    # gnome-session exits) and keep ports 9900/9901 bound. The new
-    # session's autostart would then bind-fail silently. Wrapper kills
-    # stale instances first, then launches fresh on the current DISPLAY.
-    _autostart_dir="$USER_HOME/.config/autostart"
-    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-server.desktop" > /dev/null <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Phantom Server
-Comment=Remote-desktop server. Edit Exec= below to change transport/encryption/auth.
-Exec=sh -c 'pkill -x phantom-server 2>/dev/null; for i in 1 2 3 4 5; do pgrep -x phantom-server >/dev/null 2>&1 || break; sleep 1; done; exec /usr/local/bin/phantom-server --no-encrypt --transport tcp,web'
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
-EOF
-    echo "  Installed phantom-server autostart entry (edit ~/.config/autostart/phantom-server.desktop to change flags)"
-}
-
 linux_autologin_install_watchdog() {
     # 6. Watchdog timer. GDM 42 on Ubuntu 22.04 has a regression where
     #    TimedLogin doesn't fire reliably after sign-out — the greeter
@@ -434,14 +457,31 @@ EOF
 print_post_install_hints() {
     echo ""
     echo "Done!"
-    if [ "$INSTALL_SERVER" = true ]; then
+    if [ "$INSTALL_SERVER" = true ] && [ "$OS" = "linux" ]; then
         echo ""
-        echo "Start server:"
-        echo "  phantom-server"
-        echo "  # TCP:9900 (native client) + Web:9901 (browser: https://localhost:9901)"
+        if [ "$NO_AUTOSTART" = false ]; then
+            if [ "$AUTOLOGIN" = true ]; then
+                echo "Server will auto-start after the next reboot (via GDM autologin)."
+                echo "Access it at: TCP:9900 (native client) / https://<host>:9901 (browser)"
+            else
+                echo "Server will auto-start at your next graphical login."
+                echo "To start it now in the current session:"
+                echo "  phantom-server"
+                echo "  # TCP:9900 (native client) + https://localhost:9901 (browser)"
+            fi
+        else
+            echo "Start server manually:"
+            echo "  phantom-server"
+            echo "  # TCP:9900 (native client) + https://localhost:9901 (browser)"
+        fi
         echo ""
         echo "With GPU (NVIDIA):"
         echo "  DISPLAY=:0 phantom-server --capture nvfbc --encoder nvenc"
+    elif [ "$INSTALL_SERVER" = true ]; then
+        echo ""
+        echo "Start server:"
+        echo "  phantom-server"
+        echo "  # TCP:9900 (native client) + https://localhost:9901 (browser)"
     fi
     if [ "$INSTALL_CLIENT" = true ]; then
         echo ""
@@ -558,6 +598,9 @@ main() {
 
     if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
         linux_configure_uinput
+        if [ "$NO_AUTOSTART" = false ]; then
+            linux_install_autostart
+        fi
         if [ "$AUTOLOGIN" = true ]; then
             linux_configure_autologin
         fi

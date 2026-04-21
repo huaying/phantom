@@ -19,24 +19,53 @@ A high-performance, open-source remote desktop in Rust. Browser and native acces
 
 ## Install
 
-### One-line install
+One line, and you're done. The install scripts download the binary **and** wire
+up auto-start — no second command, no "now run `--install`" step.
 
-**Linux / macOS:**
+**Linux** (one box, your current user):
+```bash
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
+```
+Installs `phantom-server` to `/usr/local/bin`, pulls runtime libraries, sets
+up `/dev/uinput` for keyboard injection, and drops an XDG autostart entry so
+`phantom-server` starts at your next graphical login. To start it immediately
+in the current session, just run `phantom-server`.
+
+**Linux** (dedicated remote-access VM — survives sign-out, no screen lock):
+```bash
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s server --autologin
+```
+Layers GDM autologin + screen-lock disable + a systemd watchdog on top of
+the default autostart. After the next reboot the VM comes up logged in with
+phantom already serving, and will recover itself on sign-out.
+
+**macOS** (client only):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
 ```
 
-**Windows** (elevated PowerShell):
+**Windows** (elevated PowerShell — required to register the service):
 ```powershell
 irm https://raw.githubusercontent.com/huaying/phantom/main/install.ps1 | iex
 ```
+Downloads the binaries to `%LOCALAPPDATA%\phantom`, adds them to PATH,
+registers the Phantom Windows Service (LocalSystem / auto-start) and
+installs the Virtual Display Driver. If you run this from a **non-elevated**
+shell the download still succeeds but service registration is skipped and
+the script tells you how to finish with `phantom-server.exe --install`.
 
-For a dedicated Linux remote-access VM (autologin + no screen lock + watchdog):
-```bash
-curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s server --autologin
-```
+### Opt-outs and knobs
 
-### Pre-built binaries
+| You want | Command |
+|---|---|
+| Install but don't touch autostart (Linux) | `... \| sh -s server --no-autostart` |
+| Install but don't register service (Windows) | `$env:PHANTOM_NO_AUTOSTART=1; irm ... \| iex` |
+| Client only on Linux | `... \| sh -s client` |
+| Server **and** client on one box | `... \| sh -s both` |
+| Remove autostart (Linux) | `rm ~/.config/autostart/phantom-server.desktop` |
+| Remove Windows Service | `phantom-server.exe --uninstall` (elevated) |
+
+### Pre-built binaries (manual install)
 
 From [GitHub Releases](https://github.com/huaying/phantom/releases):
 
@@ -46,20 +75,9 @@ From [GitHub Releases](https://github.com/huaying/phantom/releases):
 | Windows x86_64 | `phantom-server-windows-x86_64.exe` | `phantom-client-windows-x86_64.exe` |
 | macOS x86_64 / ARM | — | `phantom-client-macos-{x86_64,aarch64}` |
 
-### Auto-start on boot
-
-**Windows** (Windows Service + Virtual Display Driver, run in elevated PowerShell):
-```powershell
-phantom-server.exe --install        # register service + install VDD
-phantom-server.exe --install-vdd    # re-run just the VDD step if it failed
-phantom-server.exe --uninstall      # remove everything
-```
-
-**Linux** (systemd user unit):
-```bash
-phantom-server --install
-phantom-server --uninstall
-```
+After copying the binary somewhere on PATH you can run
+`phantom-server --install` (elevated on Windows) to get the same auto-start
+the install scripts configure.
 
 ### Docker
 

@@ -46,7 +46,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "phantom-server", about = "Phantom remote desktop server")]
+#[command(
+    name = "phantom-server",
+    version,
+    about = "Phantom remote desktop server"
+)]
 struct Args {
     #[arg(short, long, default_value = "0.0.0.0:9900")]
     listen: String,
@@ -87,11 +91,15 @@ struct Args {
     #[arg(long)]
     list_displays: bool,
 
-    /// Install as auto-start (Windows: logon task, Linux: systemd service).
+    /// Install as auto-start. Windows: registers the Phantom Windows Service
+    /// (LocalSystem, auto start) and installs the Virtual Display Driver.
+    /// Linux: writes a systemd --user unit and enables it. The blessed Linux
+    /// path for end users is the XDG autostart entry written by install.sh;
+    /// use --install only when running manually outside of that flow.
     #[arg(long)]
     install: bool,
 
-    /// Remove auto-start registration.
+    /// Remove auto-start registration (counterpart to --install).
     #[arg(long)]
     uninstall: bool,
 
