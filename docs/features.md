@@ -23,7 +23,10 @@ All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); ses
 | GDI | Service agent fallback | Windows Session 0 / lock screen | `server/src/capture/gdi.rs` |
 | PipeWire + XDG Portal | `--capture pipewire` | Linux Wayland (feature `wayland`) | `server/src/capture/pipewire.rs` |
 
-`--capture auto` probes GPU via `gpu_probe::best_capture()` then falls back to scrap.
+`--capture auto` probes GPU via `gpu_probe::best_capture()` then falls back to a CPU backend.
+On Linux that is usually `scrap` (X11) or `pipewire` (Wayland). On Windows
+service mode, runtime fallback is handled inside the agent loop: DXGI→NVENC first,
+then CPU capture backends as needed.
 
 ## Encoding
 
@@ -143,6 +146,10 @@ Structured fields via `tracing`; stdout + file if `--log-file` set.
 - Registers `PhantomServer` Windows Service (runs in Session 0, SYSTEM, pre-login)
 - Downloads + installs [MTT Virtual Display Driver](https://github.com/VirtualDrivers) via nefcon (so headless GPU servers have something for DXGI to capture)
 - Service spawns an agent in the active console session via `CreateProcessAsUser`; agent does DXGI capture + enigo injection, service relays frames over two named pipes (`\\.\pipe\PhantomIPC_{up,down}_{session_id}`)
+- Agent runtime capture order is tiered: DXGI→NVENC when available; on no-GPU /
+  lock-screen / VM edge cases it falls back to CPU capture. Current Windows
+  service implementation can switch from ScrapCapture to GDI when DXGI-style
+  CPU capture stalls.
 - `--install-vdd` re-runs just the VDD step if a transient download blip killed the first attempt
 
 ## Linux VM autologin mode

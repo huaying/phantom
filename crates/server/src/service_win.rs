@@ -38,7 +38,7 @@ pub fn svc_log(msg: &str) {
         );
     }
 }
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -496,6 +496,8 @@ fn create_service_session(
         // resize on the client.
         let mut attempts = 0;
         svc_log("Waiting for first encoded frame from agent...");
+        let mut fallback_frame: Option<(u32, u32)> = None;
+        let mut fallback_since: Option<Instant> = None;
         let (width, height) = 'wait: loop {
             for ef in ipc.recv_encoded_frames() {
                 if let Some((hw, hh)) = resolution_hint {
@@ -504,6 +506,8 @@ fn create_service_session(
                             "Discarding stale frame {}x{} (waiting for {}x{})",
                             ef.width, ef.height, hw, hh
                         ));
+                        fallback_frame = Some((ef.width, ef.height));
+                        fallback_since.get_or_insert_with(Instant::now);
                         continue;
                     }
                 }
@@ -523,6 +527,17 @@ fn create_service_session(
                 );
                 break 'wait (ef.width, ef.height);
             }
+            if let Some((fw, fh)) = fallback_frame {
+                if fallback_since
+                    .is_some_and(|since| since.elapsed() > Duration::from_millis(1500))
+                {
+                    svc_log(&format!(
+                        "No frame matched resolution hint quickly; accepting stable fallback {}x{}",
+                        fw, fh
+                    ));
+                    break 'wait (fw, fh);
+                }
+            }
             attempts += 1;
             if attempts % 10 == 0 {
                 tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
@@ -532,6 +547,13 @@ fn create_service_session(
             // 5s (was 2s) so the VDD reinit can finish on slower GPUs.
             let cap = if resolution_hint.is_some() { 250 } else { 100 };
             if attempts > cap {
+                if let Some((fw, fh)) = fallback_frame {
+                    svc_log(&format!(
+                        "No frame matched resolution hint in time; falling back to {}x{}",
+                        fw, fh
+                    ));
+                    break 'wait (fw, fh);
+                }
                 svc_log("No matching frames from agent within timeout");
                 anyhow::bail!("agent connected but not producing frames in time");
             }

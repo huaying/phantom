@@ -225,6 +225,24 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **DO NOT disable Basic Display Adapter**: causes Windows boot failure.
   Even with NVIDIA WDDM, Windows needs Basic Display during early boot.
   DXGI targets VDD by device name instead.
+- **No-GPU Windows VM fallback order**: on Basic Display Adapter / no
+  `nvEncodeAPI64.dll`, `ScrapCapture` may initialize successfully but
+  never produce a frame. Do NOT assume "scrap is the safer CPU path" on
+  Windows — on the tested Win11 no-GPU VMs, GDI was the reliable
+  fallback. Agent must switch to GDI immediately on Scrap stall instead
+  of re-entering a Tier-2 reinit loop.
+- **Do not force VDD primary before Tier 1 is proven**: if the agent
+  sets VDD primary first and only afterwards discovers DXGI→NVENC is
+  unavailable, Windows can move the desktop onto VDD while the CPU
+  fallback captures another adapter. Result: black stream even though
+  service and client both look healthy. Only call `set_vdd_primary()`
+  after Tier 1 init succeeds.
+- **Resolution hint mismatch can delay first frame by ~8s**: on
+  no-GPU/GDI fallback, the session may settle at 1280x800 while the
+  client initially asks for 1920x1080. `create_service_session()`
+  should not wait the full timeout discarding stale frames forever; it
+  needs a last-seen-frame fallback so the session starts with the actual
+  working resolution.
 - **IPC dead thread detection**: `is_connected()` must check
   `JoinHandle::is_finished()`. Raw `connected` bool stays true after IO
   threads die.

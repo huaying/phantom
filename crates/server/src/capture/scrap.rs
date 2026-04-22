@@ -85,6 +85,10 @@ impl ScrapCapture {
             })
             .collect())
     }
+
+    pub fn display_index(&self) -> usize {
+        self.display_index
+    }
 }
 
 /// Information about an available display.
