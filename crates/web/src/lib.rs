@@ -133,7 +133,6 @@ struct AppState {
     /// After the fence arrives, still wait for the first keyframe before
     /// resuming decode so the decoder restarts from a fresh reference.
     drop_until_keyframe: bool,
-    video_assembler: ChunkAssembler,
     control_assembler: ChunkAssembler,
     /// For sending input — either the input DataChannel or WebSocket fallback.
     send_input_dc: Option<web_sys::RtcDataChannel>,
@@ -299,7 +298,6 @@ pub fn main() {
         got_keyframe: false,
         waiting_for_keyframe_fence: false,
         drop_until_keyframe: false,
-        video_assembler: ChunkAssembler::new(),
         control_assembler: ChunkAssembler::new(),
         send_input_dc: None,
         send_control_dc: None,
@@ -473,9 +471,6 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
     let _ = pc.add_transceiver_with_str_and_init("video", &media_init);
     let _ = pc.add_transceiver_with_str_and_init("audio", &media_init);
 
-    let video_dc = pc.create_data_channel("video");
-    video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
-
     let input_init = RtcDataChannelInit::new();
     input_init.set_ordered(true);
     input_init.set_max_retransmits(2);
@@ -490,21 +485,6 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
         st.send_input_dc = Some(input_dc.clone());
         st.send_control_dc = Some(control_dc.clone());
         update_debug_snapshot(&st);
-    }
-
-    {
-        let s = state.clone();
-        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let raw = js_sys::Uint8Array::new(&buf).to_vec();
-                let complete = s.borrow_mut().video_assembler.feed(&raw);
-                if let Some(data) = complete {
-                    on_message(&s, &data);
-                }
-            }
-        });
-        video_dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
-        cb.forget();
     }
 
     {

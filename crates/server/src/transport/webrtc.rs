@@ -6,36 +6,17 @@ use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-mod backend_str0m;
 mod backend_phantom;
+mod sctp;
 
 pub struct PendingRtcSession {
     mode: RtcMode,
-    backend_kind: BackendKind,
-    backend: BackendPendingSession,
+    backend: backend_phantom::PhantomPendingRtcSession,
 }
 
 pub struct AcceptedRtcSession {
     pub session: PendingRtcSession,
     pub answer_sdp: String,
-}
-
-enum BackendPendingSession {
-    Str0m(backend_str0m::Str0mPendingRtcSession),
-    Phantom(backend_phantom::PhantomPendingRtcSession),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
-    Str0m,
-    Phantom,
-}
-
-fn default_backend() -> BackendKind {
-    match std::env::var("PHANTOM_WEBRTC_BACKEND").ok().as_deref() {
-        Some("phantom") => BackendKind::Phantom,
-        _ => BackendKind::Str0m,
-    }
 }
 
 trait BackendClient {
@@ -62,19 +43,8 @@ impl PendingRtcSession {
         self.mode
     }
 
-    fn backend_kind(&self) -> BackendKind {
-        self.backend_kind
-    }
-
     fn into_client(self) -> Box<dyn BackendClient + Send> {
-        match self.backend {
-            BackendPendingSession::Str0m(session) => {
-                Box::new(backend_str0m::Str0mClient::new(session, self.mode))
-            }
-            BackendPendingSession::Phantom(session) => {
-                Box::new(backend_phantom::PhantomClient::new(session, self.mode))
-            }
-        }
+        Box::new(backend_phantom::PhantomClient::new(self.backend, self.mode))
     }
 }
 
@@ -83,38 +53,19 @@ pub fn accept_http_offer(
     sdp_str: &str,
     mode: RtcMode,
 ) -> Result<AcceptedRtcSession> {
-    let (backend_kind, backend, answer_sdp) = match default_backend() {
-        BackendKind::Str0m => {
-            let accepted = backend_str0m::accept_http_offer(candidate_addr, sdp_str)?;
-            (
-                BackendKind::Str0m,
-                BackendPendingSession::Str0m(accepted.session),
-                accepted.answer_sdp,
-            )
-        }
-        BackendKind::Phantom => {
-            let accepted = backend_phantom::accept_http_offer(candidate_addr, sdp_str)?;
-            (
-                BackendKind::Phantom,
-                BackendPendingSession::Phantom(accepted.session),
-                accepted.answer_sdp,
-            )
-        }
-    };
+    let accepted = backend_phantom::accept_http_offer(candidate_addr, sdp_str)?;
     Ok(AcceptedRtcSession {
         session: PendingRtcSession {
             mode,
-            backend_kind,
-            backend,
+            backend: accepted.session,
         },
-        answer_sdp,
+        answer_sdp: accepted.answer_sdp,
     })
 }
 
 /// A single WebRTC run loop managing one client at a time.
-/// The transport backend currently lives in `backend_str0m`, but the run loop,
-/// session bridge, and public sender/receiver types are Phantom-owned so we can
-/// swap the backend incrementally.
+/// The transport backend lives in `backend_phantom`; the run loop, session
+/// bridge, and public sender/receiver types are Phantom-owned.
 ///
 /// Lifecycle:
 ///   1. Loop waits for Rtc from POST /rtc (via channel)
@@ -155,7 +106,7 @@ pub fn run_loop(
                 if active.is_some() {
                     tracing::info!("replacing old client (browser refreshed)");
                 }
-                tracing::info!(mode = ?session.mode(), backend = ?session.backend_kind(), "new WebRTC client from POST /rtc");
+                tracing::info!(mode = ?session.mode(), backend = %"phantom", "new WebRTC client from POST /rtc");
                 active = Some(session.into_client());
             }
         }
@@ -172,7 +123,7 @@ pub fn run_loop(
             }
         }
 
-        // 3. Poll active client's str0m outputs
+        // 3. Poll active client's backend outputs
         if let Some(ref mut client) = active {
             client.poll_and_flush(&socket, &session_slot, &notify_tx);
 
@@ -204,7 +155,6 @@ pub fn run_loop(
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RtcMode {
-    DataChannelV1,
     MediaTracksV1Compat,
 }
 
@@ -212,7 +162,7 @@ impl RtcMode {
     pub fn from_offer_mode(mode: &str) -> Self {
         match mode {
             "media_tracks_v1_compat" => Self::MediaTracksV1Compat,
-            _ => Self::DataChannelV1,
+            _ => Self::MediaTracksV1Compat,
         }
     }
 }
@@ -227,7 +177,6 @@ pub(crate) struct MediaAudioFrame {
 pub(crate) struct SessionBridge {
     pub(crate) sender: WebRtcSender,
     pub(crate) receiver: WebRtcReceiver,
-    pub(crate) video_rx: mpsc::Receiver<Vec<u8>>,
     pub(crate) media_video_rx: mpsc::Receiver<EncodedFrame>,
     pub(crate) media_audio_rx: mpsc::Receiver<MediaAudioFrame>,
     pub(crate) control_out_rx: mpsc::Receiver<Vec<u8>>,
@@ -235,8 +184,7 @@ pub(crate) struct SessionBridge {
     pub(crate) control_in_tx: mpsc::Sender<Vec<u8>>,
 }
 
-pub(crate) fn make_session_bridge(mode: RtcMode) -> SessionBridge {
-    let (video_tx, video_rx) = mpsc::sync_channel(30);
+pub(crate) fn make_session_bridge(_mode: RtcMode) -> SessionBridge {
     let (media_video_tx, media_video_rx) = mpsc::sync_channel(8);
     let (media_audio_tx, media_audio_rx) = mpsc::sync_channel(64);
     let (control_tx, control_out_rx) = mpsc::sync_channel(64);
@@ -245,8 +193,6 @@ pub(crate) fn make_session_bridge(mode: RtcMode) -> SessionBridge {
 
     SessionBridge {
         sender: WebRtcSender {
-            mode,
-            video_tx,
             media_video_tx,
             media_audio_tx,
             control_tx,
@@ -255,7 +201,6 @@ pub(crate) fn make_session_bridge(mode: RtcMode) -> SessionBridge {
             input_rx,
             control_rx,
         },
-        video_rx,
         media_video_rx,
         media_audio_rx,
         control_out_rx,
@@ -265,8 +210,6 @@ pub(crate) fn make_session_bridge(mode: RtcMode) -> SessionBridge {
 }
 
 pub struct WebRtcSender {
-    mode: RtcMode,
-    video_tx: mpsc::SyncSender<Vec<u8>>,
     media_video_tx: mpsc::SyncSender<EncodedFrame>,
     media_audio_tx: mpsc::SyncSender<MediaAudioFrame>,
     control_tx: mpsc::SyncSender<Vec<u8>>,
@@ -275,7 +218,7 @@ pub struct WebRtcSender {
 impl MessageSender for WebRtcSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         match msg {
-            Message::VideoFrame { frame, .. } if self.mode == RtcMode::MediaTracksV1Compat => self
+            Message::VideoFrame { frame, .. } => self
                 .media_video_tx
                 .try_send((**frame).clone())
                 .map_err(|e| match e {
@@ -288,7 +231,7 @@ impl MessageSender for WebRtcSender {
                 sample_rate,
                 data,
                 ..
-            } if self.mode == RtcMode::MediaTracksV1Compat => self
+            } => self
                 .media_audio_tx
                 .try_send(MediaAudioFrame {
                     codec: *codec,
@@ -300,19 +243,11 @@ impl MessageSender for WebRtcSender {
                     mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
                 })
                 .or(Ok(())),
-            Message::Hello { .. } if self.mode == RtcMode::MediaTracksV1Compat => self
+            Message::Hello { .. } => self
                 .control_tx
                 .try_send(bincode::serialize(msg).context("serialize")?)
                 .map_err(|e| match e {
                     mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
-                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
-                })
-                .or(Ok(())),
-            Message::Hello { .. } | Message::VideoFrame { .. } | Message::AudioFrame { .. } => self
-                .video_tx
-                .try_send(bincode::serialize(msg).context("serialize")?)
-                .map_err(|e| match e {
-                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
                     mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
                 })
                 .or(Ok(())),
@@ -386,26 +321,21 @@ mod tests {
     use phantom_core::frame::PixelFormat;
     use phantom_core::protocol::Message;
 
-    fn make_sender(mode: RtcMode) -> (
+    fn make_sender(_mode: RtcMode) -> (
         WebRtcSender,
-        mpsc::Receiver<Vec<u8>>,
         mpsc::Receiver<EncodedFrame>,
         mpsc::Receiver<MediaAudioFrame>,
         mpsc::Receiver<Vec<u8>>,
     ) {
-        let (video_tx, video_rx) = mpsc::sync_channel(8);
         let (media_video_tx, media_video_rx) = mpsc::sync_channel(8);
         let (media_audio_tx, media_audio_rx) = mpsc::sync_channel(8);
         let (control_tx, control_rx) = mpsc::sync_channel(8);
         (
             WebRtcSender {
-                mode,
-                video_tx,
                 media_video_tx,
                 media_audio_tx,
                 control_tx,
             },
-            video_rx,
             media_video_rx,
             media_audio_rx,
             control_rx,
@@ -413,18 +343,24 @@ mod tests {
     }
 
     #[test]
-    fn rtc_mode_parsing_defaults_to_datachannel() {
-        assert_eq!(RtcMode::from_offer_mode("datachannel_v1"), RtcMode::DataChannelV1);
+    fn rtc_mode_parsing_defaults_to_media_tracks() {
+        assert_eq!(
+            RtcMode::from_offer_mode("datachannel_v1"),
+            RtcMode::MediaTracksV1Compat
+        );
         assert_eq!(
             RtcMode::from_offer_mode("media_tracks_v1_compat"),
             RtcMode::MediaTracksV1Compat
         );
-        assert_eq!(RtcMode::from_offer_mode("unknown_future_mode"), RtcMode::DataChannelV1);
+        assert_eq!(
+            RtcMode::from_offer_mode("unknown_future_mode"),
+            RtcMode::MediaTracksV1Compat
+        );
     }
 
     #[test]
     fn sender_routes_media_track_payloads_in_media_mode() {
-        let (mut sender, video_rx, media_video_rx, media_audio_rx, control_rx) =
+        let (mut sender, media_video_rx, media_audio_rx, control_rx) =
             make_sender(RtcMode::MediaTracksV1Compat);
 
         let hello = Message::Hello {
@@ -439,8 +375,6 @@ mod tests {
         sender.send_msg(&hello).unwrap();
         let got: Message = bincode::deserialize(&control_rx.try_recv().unwrap()).unwrap();
         assert!(matches!(got, Message::Hello { .. }));
-        assert!(video_rx.try_recv().is_err());
-
         let frame = EncodedFrame {
             codec: VideoCodec::H264,
             data: vec![0, 0, 0, 1, 0x65, 0x88],
@@ -453,7 +387,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(media_video_rx.try_recv().unwrap().data, frame.data);
-        assert!(video_rx.try_recv().is_err());
 
         sender
             .send_msg(&Message::AudioFrame {
@@ -469,9 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn sender_keeps_legacy_routing_in_datachannel_mode() {
-        let (mut sender, video_rx, media_video_rx, media_audio_rx, control_rx) =
-            make_sender(RtcMode::DataChannelV1);
+    fn sender_routes_control_to_control_channel() {
+        let (mut sender, media_video_rx, media_audio_rx, control_rx) =
+            make_sender(RtcMode::MediaTracksV1Compat);
 
         sender
             .send_msg(&Message::RequestKeyframe)
@@ -490,20 +423,10 @@ mod tests {
                 session_token: vec![],
             })
             .unwrap();
-        let video_msg: Message = bincode::deserialize(&video_rx.try_recv().unwrap()).unwrap();
-        assert!(matches!(video_msg, Message::Hello { .. }));
+        let control_hello: Message = bincode::deserialize(&control_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(control_hello, Message::Hello { .. }));
         assert!(media_video_rx.try_recv().is_err());
         assert!(media_audio_rx.try_recv().is_err());
     }
 
-    #[test]
-    fn backend_selection_uses_env_override() {
-        unsafe { std::env::remove_var("PHANTOM_WEBRTC_BACKEND") };
-        assert_eq!(default_backend(), BackendKind::Str0m);
-
-        unsafe { std::env::set_var("PHANTOM_WEBRTC_BACKEND", "phantom") };
-        assert_eq!(default_backend(), BackendKind::Phantom);
-
-        unsafe { std::env::remove_var("PHANTOM_WEBRTC_BACKEND") };
-    }
 }

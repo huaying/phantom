@@ -1,30 +1,22 @@
-use super::{BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender, make_session_bridge};
+use super::{
+    BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender, make_session_bridge,
+    sctp::{DataPpi, PhantomSctpStack, SctpNotice},
+};
 use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray};
 use aes::{Aes128, Aes256};
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce, Tag};
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
-use dimpl::{Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile, certificate};
+use dimpl::{Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile};
 use phantom_core::encode::EncodedFrame;
 use phantom_core::protocol::Message;
-use sctp_proto::{
-    Association as SctpAssociation,
-    AssociationHandle as SctpAssociationHandle,
-    DatagramEvent as SctpDatagramEvent, Endpoint as SctpEndpoint, EndpointConfig as SctpEndpointConfig,
-    Event as SctpEvent, Payload as SctpPayload, PayloadProtocolIdentifier,
-    ServerConfig as SctpServerConfig, StreamEvent as SctpStreamEvent,
-};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
-use stun_proto::types::attribute::{Username, XorMappedAddress};
-use stun_proto::types::message::{
-    IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
-    MessageWriteVec, ShortTermCredentials, BINDING,
-};
 use uuid::Uuid;
 use ring::hmac;
+use ring::digest;
+use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 const DCEP_OPEN: u8 = 0x03;
 const DCEP_ACK: u8 = 0x02;
@@ -37,6 +29,14 @@ const H264_NALU_REF_IDC_MASK: u8 = 0x60;
 const H264_SPS_NALU_TYPE: u8 = 7;
 const H264_PPS_NALU_TYPE: u8 = 8;
 const H264_IDR_NALU_TYPE: u8 = 5;
+const STUN_BINDING_REQUEST: u16 = 0x0001;
+const STUN_BINDING_SUCCESS: u16 = 0x0101;
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+const STUN_ATTR_USERNAME: u16 = 0x0006;
+const STUN_ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const STUN_ATTR_FINGERPRINT: u16 = 0x8028;
+const STUN_FINGERPRINT_XOR: u32 = 0x5354_554e;
 
 /// Placeholder for the in-tree Phantom-owned WebRTC backend.
 ///
@@ -93,14 +93,10 @@ pub(super) struct PhantomClient {
     disconnecting: bool,
     connected: bool,
     pending_transmits: Vec<(SocketAddr, Vec<u8>)>,
-    sctp_endpoint: SctpEndpoint,
-    sctp_assoc_handle: Option<SctpAssociationHandle>,
-    sctp_assoc: Option<SctpAssociation>,
+    sctp: PhantomSctpStack,
     channels_ready: bool,
-    video_stream: Option<u16>,
     input_stream: Option<u16>,
     control_stream: Option<u16>,
-    video_rx: Option<mpsc::Receiver<Vec<u8>>>,
     media_video_rx: Option<mpsc::Receiver<EncodedFrame>>,
     media_audio_rx: Option<mpsc::Receiver<MediaAudioFrame>>,
     control_out_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -134,17 +130,10 @@ impl PhantomClient {
             disconnecting: false,
             connected: false,
             pending_transmits: Vec::new(),
-            sctp_endpoint: SctpEndpoint::new(
-                Arc::new(SctpEndpointConfig::default()),
-                Some(Arc::new(SctpServerConfig::default())),
-            ),
-            sctp_assoc_handle: None,
-            sctp_assoc: None,
+            sctp: PhantomSctpStack::new(),
             channels_ready: false,
-            video_stream: None,
             input_stream: None,
             control_stream: None,
-            video_rx: None,
             media_video_rx: None,
             media_audio_rx: None,
             control_out_rx: None,
@@ -173,27 +162,7 @@ impl PhantomClient {
 
     fn handle_sctp_dtls_payload(&mut self, source: SocketAddr, payload: &[u8]) {
         let now = Instant::now();
-        let Some((handle, event)) = self
-            .sctp_endpoint
-            .handle(now, source, None, None, Bytes::copy_from_slice(payload))
-        else {
-            return;
-        };
-
-        match event {
-            SctpDatagramEvent::NewAssociation(association) => {
-                tracing::info!("phantom backend accepted SCTP association");
-                self.sctp_assoc_handle = Some(handle);
-                self.sctp_assoc = Some(association);
-            }
-            SctpDatagramEvent::AssociationEvent(event) => {
-                if self.sctp_assoc_handle == Some(handle) {
-                    if let Some(assoc) = self.sctp_assoc.as_mut() {
-                        assoc.handle_event(event);
-                    }
-                }
-            }
-        }
+        let _ = self.sctp.handle_dtls_payload(now, source, payload);
     }
 
     fn maybe_publish_session(
@@ -204,12 +173,7 @@ impl PhantomClient {
         if self.channels_ready {
             return;
         }
-        let channels_ready = match self.mode {
-            RtcMode::DataChannelV1 => {
-                self.video_stream.is_some() && self.input_stream.is_some() && self.control_stream.is_some()
-            }
-            RtcMode::MediaTracksV1Compat => self.input_stream.is_some() && self.control_stream.is_some(),
-        };
+        let channels_ready = self.input_stream.is_some() && self.control_stream.is_some();
         if !channels_ready {
             return;
         }
@@ -217,7 +181,6 @@ impl PhantomClient {
         let bridge = make_session_bridge(self.mode);
         let sender = bridge.sender;
         let receiver = bridge.receiver;
-        self.video_rx = Some(bridge.video_rx);
         self.media_video_rx = Some(bridge.media_video_rx);
         self.media_audio_rx = Some(bridge.media_audio_rx);
         self.control_out_rx = Some(bridge.control_out_rx);
@@ -227,7 +190,6 @@ impl PhantomClient {
         let _ = notify_tx.send(());
         self.channels_ready = true;
         tracing::info!(
-            video = ?self.video_stream,
             input = ?self.input_stream,
             control = ?self.control_stream,
             "phantom backend DataChannels ready"
@@ -246,36 +208,28 @@ impl PhantomClient {
         };
         tracing::info!(stream_id, label = %label, "phantom backend DataChannel opened");
         match label.as_str() {
-            "video" => self.video_stream = Some(stream_id),
             "input" => self.input_stream = Some(stream_id),
             "control" => self.control_stream = Some(stream_id),
             _ => {}
         }
-        if let Some(assoc) = self.sctp_assoc.as_mut() {
-            if let Ok(mut stream) = assoc.stream(stream_id) {
-                let _ = stream.write_sctp(&Bytes::from_static(&[DCEP_ACK]), PayloadProtocolIdentifier::Dcep);
-            }
-        }
+        self.sctp.write_stream(stream_id, &[DCEP_ACK], DataPpi::Dcep);
         self.maybe_publish_session(session_slot, notify_tx);
     }
 
     fn handle_stream_message(
         &mut self,
         stream_id: u16,
-        ppi: PayloadProtocolIdentifier,
+        ppi: DataPpi,
         payload: &[u8],
         session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
         notify_tx: &mpsc::Sender<()>,
     ) {
         match ppi {
-            PayloadProtocolIdentifier::Dcep if payload.first().copied() == Some(DCEP_OPEN) => {
+            DataPpi::Dcep if payload.first().copied() == Some(DCEP_OPEN) => {
                 self.handle_dcep_open(stream_id, payload, session_slot, notify_tx);
             }
-            PayloadProtocolIdentifier::Dcep => {}
-            PayloadProtocolIdentifier::Binary
-            | PayloadProtocolIdentifier::BinaryEmpty
-            | PayloadProtocolIdentifier::String
-            | PayloadProtocolIdentifier::StringEmpty => {
+            DataPpi::Dcep => {}
+            DataPpi::Binary | DataPpi::BinaryEmpty | DataPpi::String | DataPpi::StringEmpty => {
                 if Some(stream_id) == self.input_stream {
                     if let Some(tx) = &self.input_in_tx {
                         let _ = tx.send(payload.to_vec());
@@ -296,18 +250,7 @@ impl PhantomClient {
         session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
         notify_tx: &mpsc::Sender<()>,
     ) {
-        let mut messages = Vec::new();
-        if let Some(assoc) = self.sctp_assoc.as_mut() {
-            if let Ok(mut stream) = assoc.stream(stream_id) {
-                while let Ok(Some(chunks)) = stream.read_sctp() {
-                    let mut payload = vec![0u8; chunks.len()];
-                    if chunks.read(&mut payload).is_ok() {
-                        messages.push((chunks.ppi, payload));
-                    }
-                }
-            }
-        }
-        for (ppi, payload) in messages {
+        for (ppi, payload) in self.sctp.read_stream_messages(stream_id) {
             self.handle_stream_message(stream_id, ppi, &payload, session_slot, notify_tx);
         }
     }
@@ -318,58 +261,32 @@ impl PhantomClient {
         notify_tx: &mpsc::Sender<()>,
     ) {
         let now = Instant::now();
-        while let Some(event) = self.sctp_assoc.as_mut().and_then(|assoc| assoc.poll()) {
+        for event in self.sctp.poll(now) {
             match event {
-                SctpEvent::Connected => {
+                SctpNotice::Connected => {
                     tracing::info!("phantom backend SCTP connected");
                 }
-                SctpEvent::DatagramReceived => {
-                    tracing::debug!("phantom backend SCTP datagram received");
-                }
-                SctpEvent::Stream(SctpStreamEvent::Opened { .. }) => {
-                    if let Some(assoc) = self.sctp_assoc.as_mut() {
-                        while let Some(stream) = assoc.accept_stream() {
-                            tracing::debug!(id = stream.stream_identifier(), "phantom backend accepted SCTP stream");
-                        }
+                SctpNotice::StreamOpened(_) => {
+                    for id in self.sctp.accept_streams() {
+                        tracing::debug!(id, "phantom backend accepted SCTP stream");
                     }
                 }
-                SctpEvent::Stream(SctpStreamEvent::Readable { id }) => {
+                SctpNotice::StreamReadable(id) => {
                     self.handle_readable_stream(id, session_slot, notify_tx);
                 }
-                SctpEvent::Stream(event) => {
-                    tracing::debug!(?event, "phantom backend SCTP stream event");
-                }
-                SctpEvent::HandshakeFailed { reason } => {
+                SctpNotice::HandshakeFailed(reason) => {
                     self.disconnecting = true;
-                    tracing::warn!(?reason, "phantom backend SCTP handshake failed");
+                    tracing::warn!(%reason, "phantom backend SCTP handshake failed");
                 }
-                SctpEvent::AssociationLost { reason, id } => {
-                    tracing::warn!(?reason, id, "phantom backend SCTP association lost");
+                SctpNotice::AssociationLost { reason, id } => {
+                    tracing::warn!(%reason, id, "phantom backend SCTP association lost");
                 }
-                _ => {}
             }
         }
-
-        while let Some(transmit) = self.sctp_assoc.as_mut().and_then(|assoc| assoc.poll_transmit(now)) {
-            match transmit.payload {
-                SctpPayload::RawEncode(chunks) => {
-                    for chunk in chunks {
-                        let _ = self.dtls.send_application_data(chunk.as_ref());
-                    }
-                }
-                SctpPayload::PartialDecode(_) => {}
-            }
-        }
-
-        while let Some(endpoint_event) = self
-            .sctp_assoc
-            .as_mut()
-            .and_then(|assoc| assoc.poll_endpoint_event())
-        {
-            if let Some(handle) = self.sctp_assoc_handle {
-                let _ = self.sctp_endpoint.handle_event(handle, endpoint_event);
-            }
-        }
+        self.sctp
+            .drain_transmits(now, |chunk| {
+                let _ = self.dtls.send_application_data(chunk);
+            });
     }
 
     fn send_video_frame(&mut self, frame: &EncodedFrame) {
@@ -465,8 +382,7 @@ impl BackendClient for PhantomClient {
                     }
                 }
                 DtlsOutput::PeerCert(cert_der) => {
-                    let actual =
-                        certificate::format_fingerprint(&certificate::calculate_fingerprint(cert_der));
+                    let actual = format_fingerprint(&calculate_fingerprint(cert_der));
                     let expected = &self.params.remote_fingerprint_sha256;
                     if actual != *expected {
                         self.disconnecting = true;
@@ -512,9 +428,6 @@ impl BackendClient for PhantomClient {
         if let Some(rx) = &self.control_out_rx {
             control_msgs.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
-        if let Some(rx) = &self.video_rx {
-            for _ in std::iter::from_fn(|| rx.try_recv().ok()) {}
-        }
         if let Some(rx) = &self.media_video_rx {
             video_frames.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
@@ -524,21 +437,14 @@ impl BackendClient for PhantomClient {
         let Some(stream_id) = self.control_stream else {
             return;
         };
-        if let Some(assoc) = self.sctp_assoc.as_mut() {
-            for msg in control_msgs {
-                if let Ok(mut stream) = assoc.stream(stream_id) {
-                    let payload = Bytes::from(msg);
-                    let _ = stream.write_sctp(&payload, PayloadProtocolIdentifier::Binary);
-                }
-            }
+        for msg in control_msgs {
+            self.sctp.write_stream(stream_id, &msg, DataPpi::Binary);
         }
-        if self.mode == RtcMode::MediaTracksV1Compat {
-            for frame in &video_frames {
-                self.send_video_frame(frame);
-            }
-            for frame in &audio_frames {
-                self.send_audio_frame(frame);
-            }
+        for frame in &video_frames {
+            self.send_video_frame(frame);
+        }
+        for frame in &audio_frames {
+            self.send_audio_frame(frame);
         }
     }
 
@@ -628,9 +534,6 @@ impl BackendClient for PhantomClient {
     fn handle_timeout(&mut self) {
         if let Err(error) = self.dtls.handle_timeout(Instant::now()) {
             tracing::debug!(%error, "phantom backend DTLS timeout step failed");
-        }
-        if let Some(assoc) = self.sctp_assoc.as_mut() {
-            assoc.handle_timeout(Instant::now());
         }
     }
 }
@@ -1559,15 +1462,23 @@ struct PhantomSessionParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StunBindingRequest {
     username: Option<String>,
+    transaction_id: [u8; 12],
 }
 
 fn parse_stun_binding_request(packet: &[u8]) -> Option<StunBindingRequest> {
-    let msg = StunMessage::from_bytes(packet).ok()?;
-    if !msg.has_class(MessageClass::Request) || msg.method() != BINDING {
+    let header = parse_stun_header(packet)?;
+    if header.msg_type != STUN_BINDING_REQUEST {
         return None;
     }
+    let mut username = None;
+    for attribute in parse_stun_attributes(packet, header.body_len)? {
+        if attribute.ty == STUN_ATTR_USERNAME {
+            username = std::str::from_utf8(attribute.value).ok().map(|s| s.to_string());
+        }
+    }
     Some(StunBindingRequest {
-        username: msg.attribute::<Username>().ok().map(|u| u.username().to_string()),
+        username,
+        transaction_id: header.transaction_id,
     })
 }
 
@@ -1576,26 +1487,194 @@ fn build_stun_success_response(
     source: SocketAddr,
     params: &PhantomSessionParams,
 ) -> Option<Vec<u8>> {
-    let request = StunMessage::from_bytes(request_packet).ok()?;
-    if !request.has_class(MessageClass::Request) || request.method() != BINDING {
+    let request = parse_stun_binding_request(request_packet)?;
+    let mut response = Vec::with_capacity(64);
+    response.extend_from_slice(&STUN_BINDING_SUCCESS.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    response.extend_from_slice(&request.transaction_id);
+    append_stun_xor_mapped_address(&mut response, source, request.transaction_id);
+    append_stun_message_integrity(&mut response, params.ice_pwd.as_bytes());
+    append_stun_fingerprint(&mut response);
+    let body_len = response.len().checked_sub(20)? as u16;
+    response[2..4].copy_from_slice(&body_len.to_be_bytes());
+    Some(response)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StunHeader {
+    msg_type: u16,
+    body_len: usize,
+    transaction_id: [u8; 12],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StunAttribute<'a> {
+    ty: u16,
+    value: &'a [u8],
+}
+
+fn parse_stun_header(packet: &[u8]) -> Option<StunHeader> {
+    if packet.len() < 20 {
         return None;
     }
-    let mut response = StunMessage::builder_success(&request, MessageWriteVec::new());
-    response
-        .add_attribute(&XorMappedAddress::new(source, request.transaction_id()))
-        .ok()?;
-    let credentials = ShortTermCredentials::new(params.ice_pwd.clone());
-    response
-        .add_message_integrity(&credentials.into(), IntegrityAlgorithm::Sha1)
-        .ok()?;
-    response.add_fingerprint().ok()?;
-    Some(response.finish())
+    if packet[0] & 0b1100_0000 != 0 {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes(packet[0..2].try_into().ok()?);
+    let body_len = u16::from_be_bytes(packet[2..4].try_into().ok()?) as usize;
+    if packet.len() != 20 + body_len {
+        return None;
+    }
+    let magic_cookie = u32::from_be_bytes(packet[4..8].try_into().ok()?);
+    if magic_cookie != STUN_MAGIC_COOKIE {
+        return None;
+    }
+    let mut transaction_id = [0u8; 12];
+    transaction_id.copy_from_slice(&packet[8..20]);
+    Some(StunHeader {
+        msg_type,
+        body_len,
+        transaction_id,
+    })
+}
+
+fn parse_stun_attributes(packet: &[u8], body_len: usize) -> Option<Vec<StunAttribute<'_>>> {
+    let mut out = Vec::new();
+    let mut offset = 20usize;
+    let end = 20usize.checked_add(body_len)?;
+    while offset < end {
+        let header_end = offset.checked_add(4)?;
+        if header_end > end {
+            return None;
+        }
+        let ty = u16::from_be_bytes(packet[offset..offset + 2].try_into().ok()?);
+        let len = u16::from_be_bytes(packet[offset + 2..offset + 4].try_into().ok()?) as usize;
+        let value_start = header_end;
+        let value_end = value_start.checked_add(len)?;
+        if value_end > end {
+            return None;
+        }
+        out.push(StunAttribute {
+            ty,
+            value: &packet[value_start..value_end],
+        });
+        offset = align4(value_end);
+    }
+    if offset != end {
+        return None;
+    }
+    Some(out)
+}
+
+fn append_stun_attribute(buf: &mut Vec<u8>, ty: u16, value: &[u8]) {
+    buf.extend_from_slice(&ty.to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    buf.extend_from_slice(value);
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
+}
+
+fn append_stun_xor_mapped_address(buf: &mut Vec<u8>, source: SocketAddr, transaction_id: [u8; 12]) {
+    let mut value = Vec::with_capacity(match source {
+        SocketAddr::V4(_) => 8,
+        SocketAddr::V6(_) => 20,
+    });
+    value.push(0);
+    match source {
+        SocketAddr::V4(addr) => {
+            value.push(0x01);
+            let xport = addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+            value.extend_from_slice(&xport.to_be_bytes());
+            let mut ip = addr.ip().octets();
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            for (dst, mask) in ip.iter_mut().zip(cookie) {
+                *dst ^= mask;
+            }
+            value.extend_from_slice(&ip);
+        }
+        SocketAddr::V6(addr) => {
+            value.push(0x02);
+            let xport = addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+            value.extend_from_slice(&xport.to_be_bytes());
+            let mut ip = addr.ip().octets();
+            let mut mask = [0u8; 16];
+            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+            mask[4..].copy_from_slice(&transaction_id);
+            for (dst, key) in ip.iter_mut().zip(mask) {
+                *dst ^= key;
+            }
+            value.extend_from_slice(&ip);
+        }
+    }
+    append_stun_attribute(buf, STUN_ATTR_XOR_MAPPED_ADDRESS, &value);
+}
+
+fn append_stun_message_integrity(buf: &mut Vec<u8>, key: &[u8]) {
+    let attr_start = buf.len();
+    buf.extend_from_slice(&STUN_ATTR_MESSAGE_INTEGRITY.to_be_bytes());
+    buf.extend_from_slice(&20u16.to_be_bytes());
+    let digest_start = buf.len();
+    buf.resize(digest_start + 20, 0);
+    let body_len = (buf.len() - 20) as u16;
+    buf[2..4].copy_from_slice(&body_len.to_be_bytes());
+    let digest = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key),
+        &buf[..digest_start + 20],
+    );
+    buf[digest_start..digest_start + 20].copy_from_slice(&digest.as_ref()[..20]);
+    debug_assert_eq!(attr_start + 24, buf.len());
+}
+
+fn append_stun_fingerprint(buf: &mut Vec<u8>) {
+    let mut crc_input = buf.clone();
+    let final_body_len = (buf.len() - 20 + 8) as u16;
+    crc_input[2..4].copy_from_slice(&final_body_len.to_be_bytes());
+    let fingerprint = crc32fast::hash(&crc_input) ^ STUN_FINGERPRINT_XOR;
+    append_stun_attribute(buf, STUN_ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
+    let body_len = (buf.len() - 20) as u16;
+    buf[2..4].copy_from_slice(&body_len.to_be_bytes());
+}
+
+#[cfg(test)]
+fn decode_stun_xor_mapped_address(value: &[u8], transaction_id: [u8; 12]) -> Option<SocketAddr> {
+    if value.len() < 4 || value[0] != 0 {
+        return None;
+    }
+    let port = u16::from_be_bytes(value[2..4].try_into().ok()?) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    match value[1] {
+        0x01 if value.len() == 8 => {
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&value[4..8]);
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            for (dst, mask) in ip.iter_mut().zip(cookie) {
+                *dst ^= mask;
+            }
+            Some(SocketAddr::from((ip, port)))
+        }
+        0x02 if value.len() == 20 => {
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&value[4..20]);
+            let mut mask = [0u8; 16];
+            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+            mask[4..].copy_from_slice(&transaction_id);
+            for (dst, key) in ip.iter_mut().zip(mask) {
+                *dst ^= key;
+            }
+            Some(SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
+}
+
+fn align4(n: usize) -> usize {
+    (n + 3) & !3
 }
 
 impl PhantomSessionParams {
     fn derive(candidate_addr: SocketAddr, offer: &ParsedOffer) -> Result<Self> {
-        let local_certificate = certificate::generate_self_signed_certificate()
-            .map_err(|error| anyhow!("generate DTLS certificate: {error}"))?;
+        let local_certificate = make_dtls_certificate()?;
         let dtls_config = Arc::new(
             DtlsConfig::builder()
                 .require_client_certificate(false)
@@ -1608,7 +1687,7 @@ impl PhantomSessionParams {
             candidate_addr,
             ice_ufrag: format!("p{}", &Uuid::new_v4().simple().to_string()[..7]),
             ice_pwd: Uuid::new_v4().simple().to_string(),
-            fingerprint_sha256: local_certificate.fingerprint_str(),
+            fingerprint_sha256: format_fingerprint(&calculate_fingerprint(&local_certificate.certificate)),
             remote_ice_ufrag: offer.ice_ufrag.clone().unwrap_or_default(),
             _remote_ice_pwd: offer.ice_pwd.clone().unwrap_or_default(),
             remote_fingerprint_sha256: offer.fingerprint_sha256.clone().unwrap_or_default(),
@@ -1650,16 +1729,50 @@ impl PhantomSessionParams {
     }
 }
 
+fn make_dtls_certificate() -> Result<DtlsCertificate> {
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| anyhow!("generate DTLS key pair: {e}"))?;
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|e| anyhow!("build DTLS certificate params: {e}"))?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::OrganizationName, "Phantom".to_string());
+    distinguished_name.push(DnType::CommonName, "Phantom DTLS Peer".to_string());
+    params.distinguished_name = distinguished_name;
+    params.is_ca = IsCa::NoCa;
+    let not_before = rcgen::date_time_ymd(2026, 1, 1);
+    let not_after = rcgen::date_time_ymd(2031, 1, 1);
+    params.not_before = not_before;
+    params.not_after = not_after;
+    params.serial_number = Some(Uuid::new_v4().as_u128().to_be_bytes().to_vec().into());
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| anyhow!("self-sign DTLS certificate: {e}"))?;
+    Ok(DtlsCertificate {
+        certificate: cert.der().to_vec(),
+        private_key: key_pair.serialize_der(),
+    })
+}
+
+fn calculate_fingerprint(cert_der: &[u8]) -> Vec<u8> {
+    digest::digest(&digest::SHA256, cert_der).as_ref().to_vec()
+}
+
+fn format_fingerprint(fingerprint: &[u8]) -> String {
+    fingerprint
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<String>>()
+        .join(":")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerBuilder, DCEP_OPEN, ParsedOffer, PhantomSessionParams, build_stun_success_response,
-        parse_dcep_open_label, parse_stun_binding_request,
-    };
-    use stun_proto::types::attribute::{Fingerprint, MessageIntegrity, Username, XorMappedAddress};
-    use stun_proto::types::message::{
-        Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt, MessageWriteVec,
-        BINDING,
+        AnswerBuilder, DCEP_OPEN, ParsedOffer, PhantomSessionParams, STUN_ATTR_FINGERPRINT,
+        STUN_ATTR_MESSAGE_INTEGRITY, STUN_ATTR_USERNAME, STUN_ATTR_XOR_MAPPED_ADDRESS,
+        STUN_BINDING_SUCCESS, STUN_MAGIC_COOKIE, build_stun_success_response,
+        decode_stun_xor_mapped_address, parse_dcep_open_label, parse_stun_attributes,
+        parse_stun_binding_request, parse_stun_header,
     };
 
     #[test]
@@ -1770,22 +1883,34 @@ mod tests {
         let offer = ParsedOffer::parse(sdp).unwrap();
         let params = PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
         let username = format!("{}:{}", params.ice_ufrag, params.remote_ice_ufrag);
-        let mut request = StunMessage::builder_request(BINDING, MessageWriteVec::new());
-        request
-            .add_attribute(&Username::new(&username).unwrap())
-            .unwrap();
-        let request = request.finish();
+        let mut request = Vec::new();
+        request.extend_from_slice(&0x0001u16.to_be_bytes());
+        request.extend_from_slice(&8u16.to_be_bytes());
+        request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        request.extend_from_slice(&STUN_ATTR_USERNAME.to_be_bytes());
+        request.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        request.extend_from_slice(username.as_bytes());
+        while request.len() % 4 != 0 {
+            request.push(0);
+        }
+        let request_len = (request.len() - 20) as u16;
+        request[2..4].copy_from_slice(&request_len.to_be_bytes());
         let parsed = parse_stun_binding_request(&request).unwrap();
         assert_eq!(parsed.username.as_deref(), Some(username.as_str()));
 
         let response = build_stun_success_response(&request, "10.0.0.9:50000".parse().unwrap(), &params).unwrap();
-        let response = StunMessage::from_bytes(&response).unwrap();
-        assert!(response.has_class(MessageClass::Success));
-        assert_eq!(response.method(), BINDING);
-        assert!(response.attribute::<MessageIntegrity>().is_ok());
-        assert!(response.attribute::<Fingerprint>().is_ok());
-        let mapped = response.attribute::<XorMappedAddress>().unwrap();
-        assert_eq!(mapped.addr(response.transaction_id()), "10.0.0.9:50000".parse().unwrap());
+        let header = parse_stun_header(&response).unwrap();
+        assert_eq!(header.msg_type, STUN_BINDING_SUCCESS);
+        let attrs = parse_stun_attributes(&response, header.body_len).unwrap();
+        assert!(attrs.iter().any(|a| a.ty == STUN_ATTR_MESSAGE_INTEGRITY && a.value.len() == 20));
+        assert!(attrs.iter().any(|a| a.ty == STUN_ATTR_FINGERPRINT && a.value.len() == 4));
+        let mapped = attrs
+            .iter()
+            .find(|a| a.ty == STUN_ATTR_XOR_MAPPED_ADDRESS)
+            .and_then(|a| decode_stun_xor_mapped_address(a.value, header.transaction_id))
+            .unwrap();
+        assert_eq!(mapped, "10.0.0.9:50000".parse().unwrap());
     }
 
     #[test]
