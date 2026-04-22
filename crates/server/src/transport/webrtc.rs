@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
-use phantom_core::protocol::Message;
+use phantom_core::encode::{EncodedFrame, VideoCodec};
+use phantom_core::protocol::{AudioCodec, Message};
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use str0m::channel::ChannelId;
+use str0m::format::Codec;
+use str0m::media::{Frequency, MediaKind, MediaTime, Mid};
 use str0m::net::Protocol;
 use str0m::{Event, Input, Output, Rtc};
 
@@ -20,6 +23,8 @@ const DC_CHUNK_SIZE: usize = 16_384;
 /// buffered amount drops below this, str0m fires `ChannelBufferedAmountLow`
 /// and we resume draining the pending queue.
 const BUFFERED_LOW_THRESHOLD: usize = 32_768; // 32 KB
+/// Don't tear down immediately on transient ICE disconnects.
+const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(5);
 
 /// A single WebRTC run loop managing one client at a time.
 /// Uses the str0m official pattern: one UDP socket, one loop, demux via accepts().
@@ -31,7 +36,7 @@ const BUFFERED_LOW_THRESHOLD: usize = 32_768; // 32 KB
 ///   4. When client disconnects, cleans up and goes back to step 1
 pub fn run_loop(
     candidate_addr: std::net::SocketAddr,
-    rtc_rx: mpsc::Receiver<Rtc>,
+    rtc_rx: mpsc::Receiver<(Rtc, RtcMode)>,
     session_slot: Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
     notify_tx: mpsc::Sender<()>,
 ) {
@@ -55,26 +60,26 @@ pub fn run_loop(
         // 1. Accept new Rtc from POST /rtc.
         //    Drain ALL pending — only keep the latest (browser may have refreshed multiple times).
         {
-            let mut latest: Option<Rtc> = None;
+            let mut latest: Option<(Rtc, RtcMode)> = None;
             while let Ok(rtc) = rtc_rx.try_recv() {
                 latest = Some(rtc);
             }
-            if let Some(rtc) = latest {
+            if let Some((rtc, mode)) = latest {
                 if active.is_some() {
                     tracing::info!("replacing old client (browser refreshed)");
                 }
-                tracing::info!("new WebRTC client from POST /rtc");
-                active = Some(ActiveClient::new(rtc));
+                tracing::info!(?mode, "new WebRTC client from POST /rtc");
+                active = Some(ActiveClient::new(rtc, mode));
             }
         }
 
         // 2. Clean up disconnected client
         if let Some(ref client) = active {
-            if !client.rtc.is_alive() || client.ice_disconnected {
+            if !client.rtc.is_alive() || client.should_disconnect() {
                 tracing::info!(
-                    "WebRTC client disconnected (alive={}, ice_disconnected={})",
+                    "WebRTC client disconnected (alive={}, disconnecting={})",
                     client.rtc.is_alive(),
-                    client.ice_disconnected
+                    client.should_disconnect()
                 );
                 active = None;
             }
@@ -143,13 +148,17 @@ impl PendingQueue {
 
 struct ActiveClient {
     rtc: Rtc,
+    mode: RtcMode,
     video_id: Option<ChannelId>,
     input_id: Option<ChannelId>,
     control_id: Option<ChannelId>,
+    media: MediaTrackState,
     channels_ready: bool,
-    ice_disconnected: bool,
+    ice_disconnected_since: Option<Instant>,
     /// Session loop sends data here → we write to DataChannels
     video_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    media_video_rx: Option<mpsc::Receiver<EncodedFrame>>,
+    media_audio_rx: Option<mpsc::Receiver<MediaAudioFrame>>,
     control_out_rx: Option<mpsc::Receiver<Vec<u8>>>,
     /// We receive data from DataChannels → send to session loop
     input_in_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -160,15 +169,19 @@ struct ActiveClient {
 }
 
 impl ActiveClient {
-    fn new(rtc: Rtc) -> Self {
+    fn new(rtc: Rtc, mode: RtcMode) -> Self {
         Self {
             rtc,
+            mode,
             video_id: None,
             input_id: None,
             control_id: None,
+            media: MediaTrackState::default(),
             channels_ready: false,
-            ice_disconnected: false,
+            ice_disconnected_since: None,
             video_rx: None,
+            media_video_rx: None,
+            media_audio_rx: None,
             control_out_rx: None,
             input_in_tx: None,
             control_in_tx: None,
@@ -234,22 +247,22 @@ impl ActiveClient {
                     _ => {}
                 }
 
-                if self.video_id.is_some()
-                    && self.input_id.is_some()
-                    && self.control_id.is_some()
-                    && !self.channels_ready
-                {
+                if self.can_start_session() && !self.channels_ready {
                     tracing::info!("all 3 DataChannels open — session ready");
                     self.channels_ready = true;
 
                     // Bounded for session→runloop (video is high bandwidth)
                     let (video_tx, video_rx) = mpsc::sync_channel(30); // ~1s of frames
+                    let (media_video_tx, media_video_rx) = mpsc::sync_channel(8);
+                    let (media_audio_tx, media_audio_rx) = mpsc::sync_channel(64);
                     let (ctrl_out_tx, ctrl_out_rx) = mpsc::sync_channel(64);
                     // Unbounded for runloop→session (input/control are small + infrequent)
                     let (input_in_tx, input_in_rx) = mpsc::channel();
                     let (ctrl_in_tx, ctrl_in_rx) = mpsc::channel();
 
                     self.video_rx = Some(video_rx);
+                    self.media_video_rx = Some(media_video_rx);
+                    self.media_audio_rx = Some(media_audio_rx);
                     self.control_out_rx = Some(ctrl_out_rx);
                     self.input_in_tx = Some(input_in_tx);
                     self.control_in_tx = Some(ctrl_in_tx);
@@ -257,7 +270,10 @@ impl ActiveClient {
                     // Overwrite any stale session — main thread always gets the latest
                     *session_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((
                         WebRtcSender {
+                            mode: self.mode,
                             video_tx,
+                            media_video_tx,
+                            media_audio_tx,
                             control_tx: ctrl_out_tx,
                         },
                         WebRtcReceiver {
@@ -266,6 +282,21 @@ impl ActiveClient {
                         },
                     ));
                     let _ = notify_tx.send(());
+                }
+            }
+            Event::MediaAdded(media) => {
+                tracing::info!(
+                    kind = ?media.kind,
+                    direction = ?media.direction,
+                    mid = %media.mid,
+                    "WebRTC media added"
+                );
+                match media.kind {
+                    MediaKind::Video => self.media.video_mid = Some(media.mid),
+                    MediaKind::Audio => self.media.audio_mid = Some(media.mid),
+                }
+                if self.can_start_session() && !self.channels_ready {
+                    tracing::info!("WebRTC media transceivers negotiated; waiting for channels");
                 }
             }
             Event::ChannelData(cd) => {
@@ -291,11 +322,36 @@ impl ActiveClient {
             }
             Event::IceConnectionStateChange(s) => {
                 tracing::info!(?s, "ICE state");
-                if matches!(s, str0m::IceConnectionState::Disconnected) {
-                    self.ice_disconnected = true;
+                match s {
+                    str0m::IceConnectionState::Disconnected => {
+                        self.ice_disconnected_since.get_or_insert_with(Instant::now);
+                    }
+                    _ => {
+                        self.ice_disconnected_since = None;
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn should_disconnect(&self) -> bool {
+        self.ice_disconnected_since
+            .map(|t| t.elapsed() >= ICE_DISCONNECT_GRACE)
+            .unwrap_or(false)
+    }
+
+    fn can_start_session(&self) -> bool {
+        let channels_ready =
+            self.video_id.is_some() && self.input_id.is_some() && self.control_id.is_some();
+        if !channels_ready {
+            return false;
+        }
+        match self.mode {
+            RtcMode::DataChannelV1 => true,
+            RtcMode::MediaTracksV1Compat => {
+                self.media.video_mid.is_some() && self.media.audio_mid.is_some()
+            }
         }
     }
 
@@ -334,6 +390,75 @@ impl ActiveClient {
             for data in &ctrl_msgs {
                 self.write_with_backpressure(ctrl, data, &mut PendingRef::Control);
             }
+        }
+
+        if self.mode == RtcMode::MediaTracksV1Compat {
+            let video_frames: Vec<EncodedFrame> = self
+                .media_video_rx
+                .as_ref()
+                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+                .unwrap_or_default();
+            let audio_frames: Vec<MediaAudioFrame> = self
+                .media_audio_rx
+                .as_ref()
+                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+                .unwrap_or_default();
+
+            for frame in &video_frames {
+                self.write_video_track(frame);
+            }
+            for frame in &audio_frames {
+                self.write_audio_track(frame);
+            }
+        }
+    }
+
+    fn write_video_track(&mut self, frame: &EncodedFrame) {
+        if frame.codec != VideoCodec::H264 {
+            return;
+        }
+        let Some(mid) = self.media.video_mid else {
+            return;
+        };
+        let Some(writer) = self.rtc.writer(mid) else {
+            return;
+        };
+        let Some(pt) = writer
+            .payload_params()
+            .find(|p| p.spec().codec == Codec::H264)
+            .map(|p| p.pt())
+        else {
+            return;
+        };
+        let rtp_time = MediaTime::from_90khz(self.media.video_rtp_time);
+        self.media.video_rtp_time = self.media.video_rtp_time.saturating_add(3_000);
+        if let Err(e) = writer.write(pt, Instant::now(), rtp_time, frame.data.clone()) {
+            tracing::debug!("WebRTC video track write failed: {e}");
+        }
+    }
+
+    fn write_audio_track(&mut self, frame: &MediaAudioFrame) {
+        if frame.codec != AudioCodec::Opus {
+            return;
+        }
+        let Some(mid) = self.media.audio_mid else {
+            return;
+        };
+        let Some(writer) = self.rtc.writer(mid) else {
+            return;
+        };
+        let Some(pt) = writer
+            .payload_params()
+            .find(|p| p.spec().codec == Codec::Opus)
+            .map(|p| p.pt())
+        else {
+            return;
+        };
+        let rtp_time = MediaTime::new(self.media.audio_rtp_time, Frequency::FORTY_EIGHT_KHZ);
+        let step = (frame.sample_rate as u64 / 50).max(1);
+        self.media.audio_rtp_time = self.media.audio_rtp_time.saturating_add(step);
+        if let Err(e) = writer.write(pt, Instant::now(), rtp_time, frame.data.clone()) {
+            tracing::debug!("WebRTC audio track write failed: {e}");
         }
     }
 
@@ -505,31 +630,91 @@ enum PendingRef {
     Control,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtcMode {
+    DataChannelV1,
+    MediaTracksV1Compat,
+}
+
+impl RtcMode {
+    pub fn from_offer_mode(mode: &str) -> Self {
+        match mode {
+            "media_tracks_v1_compat" => Self::MediaTracksV1Compat,
+            _ => Self::DataChannelV1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MediaTrackState {
+    video_mid: Option<Mid>,
+    audio_mid: Option<Mid>,
+    video_rtp_time: u64,
+    audio_rtp_time: u64,
+}
+
+#[derive(Clone)]
+struct MediaAudioFrame {
+    codec: AudioCodec,
+    sample_rate: u32,
+    data: Vec<u8>,
+}
+
 pub struct WebRtcSender {
+    mode: RtcMode,
     video_tx: mpsc::SyncSender<Vec<u8>>,
+    media_video_tx: mpsc::SyncSender<EncodedFrame>,
+    media_audio_tx: mpsc::SyncSender<MediaAudioFrame>,
     control_tx: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl MessageSender for WebRtcSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
-        let payload = bincode::serialize(msg).context("serialize")?;
         match msg {
-            // Video data (including Hello) → video DC (reliable + ordered)
-            Message::Hello { .. } | Message::VideoFrame { .. } | Message::AudioFrame { .. } => {
-                self.video_tx
-                    .try_send(payload)
-                    .map_err(|e| match e {
-                        mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
-                        mpsc::TrySendError::Full(_) => {
-                            /* backpressure */
-                            anyhow::anyhow!("")
-                        }
-                    })
-                    .or(Ok(()))
-            }
+            Message::VideoFrame { frame, .. } if self.mode == RtcMode::MediaTracksV1Compat => self
+                .media_video_tx
+                .try_send((**frame).clone())
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video track closed"),
+                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                })
+                .or(Ok(())),
+            Message::AudioFrame {
+                codec,
+                sample_rate,
+                data,
+                ..
+            } if self.mode == RtcMode::MediaTracksV1Compat => self
+                .media_audio_tx
+                .try_send(MediaAudioFrame {
+                    codec: *codec,
+                    sample_rate: *sample_rate,
+                    data: data.clone(),
+                })
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("audio track closed"),
+                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                })
+                .or(Ok(())),
+            Message::Hello { .. } if self.mode == RtcMode::MediaTracksV1Compat => self
+                .control_tx
+                .try_send(bincode::serialize(msg).context("serialize")?)
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
+                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                })
+                .or(Ok(())),
+            Message::Hello { .. } | Message::VideoFrame { .. } | Message::AudioFrame { .. } => self
+                .video_tx
+                .try_send(bincode::serialize(msg).context("serialize")?)
+                .map_err(|e| match e {
+                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video DC closed"),
+                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
+                })
+                .or(Ok(())),
             _ => self
                 .control_tx
-                .try_send(payload)
+                .try_send(bincode::serialize(msg).context("serialize")?)
                 .map_err(|e| match e {
                     mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
                     mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
@@ -587,5 +772,123 @@ impl MessageReceiver for WebRtcReceiver {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phantom_core::encode::{EncodedFrame, VideoCodec};
+    use phantom_core::frame::PixelFormat;
+    use phantom_core::protocol::Message;
+
+    fn make_sender(mode: RtcMode) -> (
+        WebRtcSender,
+        mpsc::Receiver<Vec<u8>>,
+        mpsc::Receiver<EncodedFrame>,
+        mpsc::Receiver<MediaAudioFrame>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (video_tx, video_rx) = mpsc::sync_channel(8);
+        let (media_video_tx, media_video_rx) = mpsc::sync_channel(8);
+        let (media_audio_tx, media_audio_rx) = mpsc::sync_channel(8);
+        let (control_tx, control_rx) = mpsc::sync_channel(8);
+        (
+            WebRtcSender {
+                mode,
+                video_tx,
+                media_video_tx,
+                media_audio_tx,
+                control_tx,
+            },
+            video_rx,
+            media_video_rx,
+            media_audio_rx,
+            control_rx,
+        )
+    }
+
+    #[test]
+    fn rtc_mode_parsing_defaults_to_datachannel() {
+        assert_eq!(RtcMode::from_offer_mode("datachannel_v1"), RtcMode::DataChannelV1);
+        assert_eq!(
+            RtcMode::from_offer_mode("media_tracks_v1_compat"),
+            RtcMode::MediaTracksV1Compat
+        );
+        assert_eq!(RtcMode::from_offer_mode("unknown_future_mode"), RtcMode::DataChannelV1);
+    }
+
+    #[test]
+    fn sender_routes_media_track_payloads_in_media_mode() {
+        let (mut sender, video_rx, media_video_rx, media_audio_rx, control_rx) =
+            make_sender(RtcMode::MediaTracksV1Compat);
+
+        let hello = Message::Hello {
+            width: 1280,
+            height: 720,
+            format: PixelFormat::Bgra8,
+            protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+            audio: true,
+            video_codec: VideoCodec::H264,
+            session_token: vec![],
+        };
+        sender.send_msg(&hello).unwrap();
+        let got: Message = bincode::deserialize(&control_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(got, Message::Hello { .. }));
+        assert!(video_rx.try_recv().is_err());
+
+        let frame = EncodedFrame {
+            codec: VideoCodec::H264,
+            data: vec![0, 0, 0, 1, 0x65, 0x88],
+            is_keyframe: true,
+        };
+        sender
+            .send_msg(&Message::VideoFrame {
+                sequence: 7,
+                frame: Box::new(frame.clone()),
+            })
+            .unwrap();
+        assert_eq!(media_video_rx.try_recv().unwrap().data, frame.data);
+        assert!(video_rx.try_recv().is_err());
+
+        sender
+            .send_msg(&Message::AudioFrame {
+                codec: phantom_core::protocol::AudioCodec::Opus,
+                sample_rate: 48_000,
+                channels: 2,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        let audio = media_audio_rx.try_recv().unwrap();
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sender_keeps_legacy_routing_in_datachannel_mode() {
+        let (mut sender, video_rx, media_video_rx, media_audio_rx, control_rx) =
+            make_sender(RtcMode::DataChannelV1);
+
+        sender
+            .send_msg(&Message::RequestKeyframe)
+            .unwrap();
+        let control_msg: Message = bincode::deserialize(&control_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(control_msg, Message::RequestKeyframe));
+
+        sender
+            .send_msg(&Message::Hello {
+                width: 800,
+                height: 600,
+                format: PixelFormat::Bgra8,
+                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+                audio: false,
+                video_codec: VideoCodec::H264,
+                session_token: vec![],
+            })
+            .unwrap();
+        let video_msg: Message = bincode::deserialize(&video_rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(video_msg, Message::Hello { .. }));
+        assert!(media_video_rx.try_recv().is_err());
+        assert!(media_audio_rx.try_recv().is_err());
     }
 }

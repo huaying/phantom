@@ -714,6 +714,7 @@ impl SessionRunner {
                     }
                 }
                 Ok(InboundEvent::RequestKeyframe) => {
+                    let _ = self.sender.send_msg(&Message::KeyframeFence);
                     // Force `needs_keyframe()` to return true on the next tick.
                     // Pipeline::tick honors it via `ctx.needs_keyframe` and
                     // calls force_keyframe() on the encoder.

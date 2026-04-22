@@ -23,6 +23,17 @@ fn extract_query_param<'a>(raw_path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+fn extract_content_length(request: &str) -> Option<usize> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// Verify a JWT token signed with HMAC-SHA256.
 /// Returns (sub, vm_id) claims on success.
 fn verify_jwt(token: &str, secret: &[u8]) -> Result<(String, String)> {
@@ -77,9 +88,10 @@ fn verify_jwt(token: &str, secret: &[u8]) -> Result<(String, String)> {
     Ok((sub, vm_id))
 }
 
-/// Check JWT auth on a WebSocket upgrade request. Returns Ok(()) if auth passes
-/// or if no auth is configured. Returns Err with HTTP 401 already sent on failure.
-fn check_ws_auth(
+/// Check JWT auth on an HTTP request that carries `?token=...`.
+/// Returns Ok(()) if auth passes or if no auth is configured.
+/// Returns Err with HTTP 401 already sent on failure.
+fn check_request_auth(
     stream: &mut (impl Read + Write),
     raw_path: &str,
     auth_secret: &Option<Vec<u8>>,
@@ -91,7 +103,7 @@ fn check_ws_auth(
     match extract_query_param(raw_path, "token") {
         Some(token) => match verify_jwt(token, secret) {
             Ok((user, vm_id)) => {
-                tracing::info!(user, vm_id, "authenticated WebSocket");
+                tracing::info!(user, vm_id, "authenticated HTTP request");
                 crate::sso::on_jwt_verified(&user);
                 Ok(())
             }
@@ -106,7 +118,7 @@ fn check_ws_auth(
             }
         },
         None => {
-            tracing::warn!("WebSocket missing ?token= param");
+            tracing::warn!("request missing ?token= param");
             let _ = write!(
                 stream,
                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized"
@@ -243,9 +255,12 @@ const WASM_BIN: &[u8] = b"";
 
 #[cfg(feature = "webrtc")]
 type SessionPair = (
-    super::transport::webrtc::WebRtcSender,
-    super::transport::webrtc::WebRtcReceiver,
+    super::webrtc::WebRtcSender,
+    super::webrtc::WebRtcReceiver,
 );
+
+#[cfg(feature = "webrtc")]
+type RtcRequest = (str0m::Rtc, super::webrtc::RtcMode);
 
 #[allow(dead_code)]
 pub struct WebServerTransport {
@@ -281,8 +296,6 @@ impl WebServerTransport {
         // --- WebRTC setup (only when feature enabled) ---
         #[cfg(feature = "webrtc")]
         let (rtc_session, rtc_notify) = {
-            use str0m::Rtc;
-
             let host_ip: std::net::IpAddr = std::env::var("PHANTOM_HOST")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -290,13 +303,13 @@ impl WebServerTransport {
             let candidate_addr = std::net::SocketAddr::new(host_ip, _udp_port);
             tracing::info!(%candidate_addr, "WebRTC ICE candidate address");
 
-            let (rtc_tx, rtc_rx) = mpsc::channel::<Rtc>();
+            let (rtc_tx, rtc_rx) = mpsc::channel::<RtcRequest>();
             let rtc_session: Arc<Mutex<Option<SessionPair>>> = Arc::new(Mutex::new(None));
             let rtc_session2 = rtc_session.clone();
             let (notify_tx, rtc_notify) = mpsc::channel::<()>();
 
             std::thread::spawn(move || {
-                super::transport::webrtc::run_loop(candidate_addr, rtc_rx, rtc_session2, notify_tx);
+                super::webrtc::run_loop(candidate_addr, rtc_rx, rtc_session2, notify_tx);
             });
 
             // HTTPS server thread (serves static files + POST /rtc + WSS upgrade)
@@ -362,7 +375,10 @@ impl WebServerTransport {
                                     }
                                     Ok(HttpResult::Done) => continue,
                                     Ok(HttpResult::Close) => break,
-                                    Err(_) => break,
+                                    Err(e) => {
+                                        tracing::warn!("HTTP/WebRTC handler error: {e:#}");
+                                        break;
+                                    }
                                 }
                             }
                         })
@@ -529,7 +545,7 @@ fn handle_http_rw(
     // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
-        check_ws_auth(stream, raw_path, auth_secret)?;
+        check_request_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
             return Ok(HttpResult::WsUpgradeAudio);
@@ -549,7 +565,7 @@ fn handle_http_rw(
 #[cfg(feature = "webrtc")]
 fn handle_http_rw_rtc(
     stream: &mut (impl Read + Write),
-    rtc_tx: &mpsc::Sender<str0m::Rtc>,
+    rtc_tx: &mpsc::Sender<RtcRequest>,
     candidate_addr: std::net::SocketAddr,
     auth_secret: &Option<Vec<u8>>,
 ) -> Result<HttpResult> {
@@ -559,7 +575,7 @@ fn handle_http_rw_rtc(
         anyhow::bail!("client closed");
     }
     buf.truncate(n);
-    let request = String::from_utf8_lossy(&buf);
+    let request = String::from_utf8_lossy(&buf).into_owned();
     let method = request.split_whitespace().next().unwrap_or("GET");
     let raw_path = request.split_whitespace().nth(1).unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
@@ -569,7 +585,7 @@ fn handle_http_rw_rtc(
     // WebSocket upgrade — detect audio-only path
     let request_lower = request.to_ascii_lowercase();
     if request_lower.contains("upgrade: websocket") {
-        check_ws_auth(stream, raw_path, auth_secret)?;
+        check_request_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
             return Ok(HttpResult::WsUpgradeAudio);
@@ -582,26 +598,54 @@ fn handle_http_rw_rtc(
         .position(|w| w == b"\r\n\r\n")
         .map(|i| i + 4)
         .unwrap_or(n);
+    if method == "POST" {
+        if let Some(content_len) = extract_content_length(&request) {
+            let wanted = body_start + content_len;
+            while buf.len() < wanted {
+                let mut chunk = vec![0u8; (wanted - buf.len()).min(16 * 1024)];
+                let read = stream.read(&mut chunk)?;
+                if read == 0 {
+                    anyhow::bail!(
+                        "unexpected EOF while reading HTTP body: have {} of {} bytes",
+                        buf.len().saturating_sub(body_start),
+                        content_len
+                    );
+                }
+                chunk.truncate(read);
+                buf.extend_from_slice(&chunk);
+            }
+        }
+    }
 
     match (method, path) {
         ("POST", "/rtc") => {
             use str0m::{Candidate, Rtc};
+            check_request_auth(stream, raw_path, auth_secret)?;
             let body = &buf[body_start..];
+            tracing::info!(body_len = body.len(), "POST /rtc received");
             let offer_json: serde_json::Value = serde_json::from_slice(body)?;
             let sdp_str = offer_json["sdp"].as_str().context("missing sdp")?;
+            let rtc_mode = super::webrtc::RtcMode::from_offer_mode(
+                offer_json["mode"].as_str().unwrap_or("datachannel_v1"),
+            );
+            tracing::info!(?rtc_mode, sdp_len = sdp_str.len(), "POST /rtc parsed offer JSON");
 
             let mut rtc = Rtc::builder().build(Instant::now());
             let candidate = Candidate::host(candidate_addr, "udp").context("host candidate")?;
             rtc.add_local_candidate(candidate);
+            tracing::info!("POST /rtc added host candidate");
 
             let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str).context("parse SDP")?;
+            tracing::info!("POST /rtc parsed SDP string");
             let answer = rtc.sdp_api().accept_offer(offer).context("accept offer")?;
+            tracing::info!("POST /rtc accepted offer");
             let answer_json =
                 serde_json::json!({ "type": "answer", "sdp": answer.to_sdp_string() });
 
             rtc_tx
-                .send(rtc)
+                .send((rtc, rtc_mode))
                 .map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
+            tracing::info!("POST /rtc queued rtc for run loop");
 
             let resp_body = answer_json.to_string();
             let conn_header = if close { "close" } else { "keep-alive" };
@@ -611,7 +655,7 @@ fn handle_http_rw_rtc(
             )?;
             stream.write_all(resp_body.as_bytes())?;
             stream.flush()?;
-            tracing::info!("SDP offer/answer exchanged via POST /rtc");
+            tracing::info!(?rtc_mode, "SDP offer/answer exchanged via POST /rtc");
         }
         ("OPTIONS", "/rtc") => {
             let conn_header = if close { "close" } else { "keep-alive" };
@@ -788,6 +832,12 @@ impl WsSender {
 impl MessageSender for WsSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         let payload = bincode::serialize(msg).context("serialize")?;
+        if matches!(msg, Message::KeyframeFence) {
+            return self
+                .tx
+                .send(payload)
+                .map_err(|_| anyhow::anyhow!("ws closed"));
+        }
         match self.tx.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => {

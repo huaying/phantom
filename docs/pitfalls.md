@@ -19,6 +19,12 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **str0m DataChannel >16KB**: SCTP silently drops large messages. MUST
   chunk into ≤16KB pieces. Chrome's limit is 256KB but str0m fails well
   below that.
+- **Desktop video over DataChannel is the wrong optimization target**:
+  reliable ordered SCTP delivery preserves stale frames, large keyframes
+  force chunking/backpressure, and drag/scroll motion feels worse than WSS
+  even when average FPS looks similar. Treat the current browser WebRTC path
+  as experimental; long-term direction is media tracks for video/audio and
+  DataChannels only for input/control.
 - **str0m `Receive.destination`**: must match `candidate_addr`
   (`127.0.0.1:9902`), not socket bind addr (`0.0.0.0:9902`).
 - **WebRTC session zombie**: after ICE disconnect, `send_msg()` swallows

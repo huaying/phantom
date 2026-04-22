@@ -13,7 +13,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    console, HtmlCanvasElement, KeyboardEvent, MessageEvent, MouseEvent, WebSocket, WheelEvent,
+    console, HtmlAudioElement, HtmlCanvasElement, HtmlVideoElement, KeyboardEvent, MessageEvent,
+    MouseEvent, WebSocket, WheelEvent,
 };
 
 // -- WebCodecs bindings (not in web-sys yet) --
@@ -125,23 +126,19 @@ struct AppState {
     server_height: u32,
     frame_count: u64,
     got_keyframe: bool,
-    /// Tab-visibility recovery: wall-clock `performance.now()` before which
-    /// we drop every VideoFrame regardless of keyframe status. Set to
-    /// `now + 500ms` on visibilitychange→visible. This is the "swallow
-    /// the TCP backlog" window — backlog frames dispatched by the
-    /// browser in a single microtask burst get tossed, even if some are
-    /// keyframes, because those keyframes are stale snapshots from minutes
-    /// ago and decoding them just fast-forwards through them.
-    drop_frames_until_ms: f64,
-    /// After the initial drop window, we still need to wait for the
-    /// next keyframe before resuming decode (can't decode P-frames
-    /// without a reference). Cleared on the first keyframe seen after
-    /// `drop_frames_until_ms` has passed.
+    /// Recovery epoch: ignore all video until the server replies with an
+    /// ordered `KeyframeFence`, which means every frame queued before our
+    /// `RequestKeyframe` has already passed through the socket.
+    waiting_for_keyframe_fence: bool,
+    /// After the fence arrives, still wait for the first keyframe before
+    /// resuming decode so the decoder restarts from a fresh reference.
     drop_until_keyframe: bool,
     video_assembler: ChunkAssembler,
     control_assembler: ChunkAssembler,
-    /// For sending input — either DataChannel or WebSocket
-    send_dc: Option<web_sys::RtcDataChannel>,
+    /// For sending input — either the input DataChannel or WebSocket fallback.
+    send_input_dc: Option<web_sys::RtcDataChannel>,
+    /// For reliable control/file-transfer traffic in WebRTC mode.
+    send_control_dc: Option<web_sys::RtcDataChannel>,
     send_ws: Option<WebSocket>,
     /// Latest stats from server (for overlay display).
     last_stats: Option<StatsSnapshot>,
@@ -151,11 +148,72 @@ struct AppState {
     audio_ctx: Option<web_sys::AudioContext>,
     /// Timestamp counter for audio chunks (in microseconds).
     audio_timestamp_us: i64,
+    /// Set during page unload/navigation so old sockets don't auto-reconnect
+    /// and race the replacement page.
+    page_unloading: bool,
     /// Stable per-tab client id. Server uses this to distinguish an
     /// auto-reconnect (same id → accepted) from a fresh client (different
     /// id → takes over). Page reload yields a new id because we keep it
     /// only in memory, not sessionStorage.
     client_id: [u8; 16],
+    user_gesture_seen: bool,
+    rtc2_media_active: bool,
+    rtc2_video_el: Option<HtmlVideoElement>,
+    rtc2_audio_el: Option<HtmlAudioElement>,
+}
+
+fn update_debug_snapshot(state: &AppState) {
+    let snapshot = js_sys::Object::new();
+    let mode = if state.send_control_dc.is_some() {
+        "webrtc"
+    } else if state.send_ws.is_some() {
+        "wss"
+    } else {
+        "disconnected"
+    };
+    let _ = js_sys::Reflect::set(&snapshot, &"mode".into(), &mode.into());
+    let _ = js_sys::Reflect::set(&snapshot, &"serverWidth".into(), &state.server_width.into());
+    let _ = js_sys::Reflect::set(&snapshot, &"serverHeight".into(), &state.server_height.into());
+    let _ = js_sys::Reflect::set(&snapshot, &"frameCount".into(), &JsValue::from_f64(state.frame_count as f64));
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"gotKeyframe".into(),
+        &JsValue::from_bool(state.got_keyframe),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"waitingForKeyframeFence".into(),
+        &JsValue::from_bool(state.waiting_for_keyframe_fence),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"dropUntilKeyframe".into(),
+        &JsValue::from_bool(state.drop_until_keyframe),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"rtc2MediaActive".into(),
+        &JsValue::from_bool(state.rtc2_media_active),
+    );
+    if let Some(stats) = &state.last_stats {
+        let stats_obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&stats_obj, &"rttMs".into(), &stats.rtt_ms.into());
+        let _ = js_sys::Reflect::set(&stats_obj, &"fps".into(), &stats.fps.into());
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"bandwidthKbps".into(),
+            &stats.bandwidth_kbps.into(),
+        );
+        let _ = js_sys::Reflect::set(&stats_obj, &"encodeMs".into(), &stats.encode_ms.into());
+        let _ = js_sys::Reflect::set(&snapshot, &"stats".into(), &stats_obj.into());
+    } else {
+        let _ = js_sys::Reflect::set(&snapshot, &"stats".into(), &JsValue::NULL);
+    }
+    let snapshot_js: JsValue = snapshot.into();
+    let _ = js_sys::Reflect::set(&js_sys::global(), &"__phantom_debug".into(), &snapshot_js);
+    if let Some(window) = web_sys::window() {
+        let _ = js_sys::Reflect::set(window.as_ref(), &"__phantom_debug".into(), &snapshot_js);
+    }
 }
 
 /// Generate a random 16-byte client id via Web Crypto.
@@ -183,25 +241,42 @@ thread_local! {
     static STATE: RefCell<Option<Rc<RefCell<AppState>>>> = const { RefCell::new(None) };
 }
 
-#[wasm_bindgen(start)]
-pub fn main() {
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
+fn query_has_flag(query: &str, name: &str) -> bool {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .any(|pair| pair == name || pair.split_once('=').map(|(k, _)| k == name).unwrap_or(false))
+}
 
-    // Default: WebSocket. Add ?rtc to URL for WebRTC DataChannel mode.
-    let query = window.location().search().unwrap_or_default();
-    let use_rtc = query.contains("rtc");
-
-    // Extract ?token=<jwt> for authenticated connections
-    let auth_token: Option<String> = query.trim_start_matches('?').split('&').find_map(|pair| {
+fn query_token(query: &str) -> Option<String> {
+    query.trim_start_matches('?').split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         if k == "token" {
             Some(v.to_string())
         } else {
             None
         }
-    });
-    let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
+    })
+}
+
+#[wasm_bindgen(start)]
+pub fn main() {
+    let window = web_sys::window().unwrap();
+    let document = window.document().unwrap();
+
+    // Default: WebSocket. `?rtc` enables the in-place WebRTC path, now moving
+    // toward media tracks for video/audio while keeping input/control on
+    // DataChannels.
+    let query = window.location().search().unwrap_or_default();
+    let use_rtc = query_has_flag(&query, "rtc") || query_has_flag(&query, "rtc2");
+
+    // Extract ?token=<jwt> for authenticated connections
+    let auth_token = query_token(&query);
+    let mode = if use_rtc {
+        "WebRTC"
+    } else {
+        "WebSocket"
+    };
     console::log_1(
         &format!(
             "Phantom Web Client v{} starting ({mode} mode)...",
@@ -222,18 +297,28 @@ pub fn main() {
         server_height: 0,
         frame_count: 0,
         got_keyframe: false,
-        drop_frames_until_ms: 0.0,
+        waiting_for_keyframe_fence: false,
         drop_until_keyframe: false,
         video_assembler: ChunkAssembler::new(),
         control_assembler: ChunkAssembler::new(),
-        send_dc: None,
+        send_input_dc: None,
+        send_control_dc: None,
         send_ws: None,
         last_stats: None,
         audio_decoder: None,
         audio_ctx: None,
         audio_timestamp_us: 0,
+        page_unloading: false,
         client_id: gen_client_id(),
+        user_gesture_seen: false,
+        rtc2_media_active: false,
+        rtc2_video_el: None,
+        rtc2_audio_el: None,
     }));
+    {
+        let st = state.borrow();
+        update_debug_snapshot(&st);
+    }
 
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
@@ -241,16 +326,94 @@ pub fn main() {
     setup_input(&canvas, &document, &state);
 
     if use_rtc {
-        setup_webrtc(&state);
+        setup_webrtc(&state, &auth_token);
     } else {
         setup_ws(&state, &auth_token);
     }
 }
 
-fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
+async fn complete_rtc_offer(
+    pc: web_sys::RtcPeerConnection,
+    auth_token: Option<String>,
+    transport_mode: &str,
+) {
+    use web_sys::{RtcSdpType, RtcSessionDescriptionInit};
+
+    let offer = match wasm_bindgen_futures::JsFuture::from(pc.create_offer()).await {
+        Ok(o) => o,
+        Err(e) => {
+            console::error_1(&format!("createOffer: {:?}", e).into());
+            return;
+        }
+    };
+    let sdp = js_sys::Reflect::get(&offer, &"sdp".into()).unwrap();
+    let sdp_str: String = sdp.as_string().unwrap_or_default();
+
+    let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+    desc.set_sdp(&sdp_str);
+    if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc.set_local_description(&desc)).await {
+        console::error_1(&format!("setLocalDescription: {:?}", e).into());
+        return;
+    }
+    console::log_1(&format!("SDP offer created, POSTing to /rtc ({transport_mode})...").into());
+
+    let body = serde_json::json!({
+        "type": "offer",
+        "sdp": sdp_str,
+        "mode": transport_mode,
+    })
+    .to_string();
+    let window = web_sys::window().unwrap();
+    let request_init = web_sys::RequestInit::new();
+    request_init.set_method("POST");
+    request_init.set_body(&body.into());
+    let headers = web_sys::Headers::new().unwrap();
+    headers.set("Content-Type", "application/json").unwrap();
+    request_init.set_headers(&headers);
+
+    let rtc_url = match auth_token {
+        Some(token) => format!("/rtc?token={token}"),
+        None => "/rtc".to_string(),
+    };
+    let resp =
+        match wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(&rtc_url, &request_init)).await {
+            Ok(r) => r,
+            Err(e) => {
+                console::error_1(&format!("POST /rtc failed: {:?}", e).into());
+                return;
+            }
+        };
+
+    let resp: web_sys::Response = resp.dyn_into().unwrap();
+    if !resp.ok() {
+        console::error_1(&format!("POST /rtc status: {}", resp.status()).into());
+        return;
+    }
+
+    let json = match wasm_bindgen_futures::JsFuture::from(resp.json().unwrap()).await {
+        Ok(j) => j,
+        Err(e) => {
+            console::error_1(&format!("parse answer: {:?}", e).into());
+            return;
+        }
+    };
+
+    let answer_sdp = js_sys::Reflect::get(&json, &"sdp".into()).unwrap();
+    let answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+    answer_desc.set_sdp(&answer_sdp.as_string().unwrap_or_default());
+
+    if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc.set_remote_description(&answer_desc)).await {
+        console::error_1(&format!("setRemoteDescription: {:?}", e).into());
+        return;
+    }
+
+    console::log_1(&format!("WebRTC: SDP exchange complete ({transport_mode})").into());
+}
+
+fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
     use web_sys::{
-        RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcSdpType,
-        RtcSessionDescriptionInit,
+        RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcRtpTransceiverDirection,
+        RtcRtpTransceiverInit,
     };
 
     let config = RtcConfiguration::new();
@@ -262,10 +425,11 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         }
     };
 
-    // Create 3 DataChannels
-    // Video DC: reliable + ordered (same as Parsec). SCTP handles fragmentation
-    // for large keyframes. H.264 P-frames depend on previous frames, so loss
-    // corrupts the entire stream — reliable delivery is correct here.
+    let media_init = RtcRtpTransceiverInit::new();
+    media_init.set_direction(RtcRtpTransceiverDirection::Recvonly);
+    let _ = pc.add_transceiver_with_str_and_init("video", &media_init);
+    let _ = pc.add_transceiver_with_str_and_init("audio", &media_init);
+
     let video_dc = pc.create_data_channel("video");
     video_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
@@ -278,10 +442,13 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
     let control_dc = pc.create_data_channel("control");
     control_dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
-    // Store input DC for sending
-    state.borrow_mut().send_dc = Some(input_dc.clone());
+    {
+        let mut st = state.borrow_mut();
+        st.send_input_dc = Some(input_dc.clone());
+        st.send_control_dc = Some(control_dc.clone());
+        update_debug_snapshot(&st);
+    }
 
-    // onmessage for video DC (chunked reassembly)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
@@ -297,7 +464,6 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         cb.forget();
     }
 
-    // onmessage for control DC (chunked reassembly)
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
@@ -313,12 +479,9 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
         cb.forget();
     }
 
-    // When input DC opens → send ClientHello immediately so the doorbell
-    // can match this connection against the current/ghost sets and pre-size
-    // the VDD before the session spins up.
     {
         let s = state.clone();
-        let dc = input_dc.clone();
+        let dc = control_dc.clone();
         let cb = Closure::<dyn FnMut()>::new(move || {
             let id = s.borrow().client_id;
             let (pw, ph) = preferred_viewport();
@@ -330,97 +493,158 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>) {
             if let Ok(bytes) = bincode::serialize(&msg) {
                 let _ = dc.send_with_u8_array(&bytes);
             }
-        });
-        input_dc.set_onopen(Some(cb.as_ref().unchecked_ref()));
-        cb.forget();
-    }
-
-    // When control DC opens → WebRTC is fully ready
-    {
-        let cb = Closure::<dyn FnMut()>::new(|| {
-            console::log_1(&"WebRTC DataChannels OPEN — connected!".into());
+            console::log_1(
+                &"WebRTC control DC OPEN — media-track path active".into(),
+            );
         });
         control_dc.set_onopen(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
     }
 
-    // Create offer → POST /rtc → set answer
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+            let kind = js_sys::Reflect::get(e.as_ref(), &"track".into())
+                .ok()
+                .and_then(|track| js_sys::Reflect::get(&track, &"kind".into()).ok())
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let _ = js_sys::Reflect::set(
+                &js_sys::global(),
+                &"__phantom_rtc2_last_track_kind".into(),
+                &kind.clone().into(),
+            );
+            attach_rtc2_media_track(&s, &e, &kind);
+        });
+        let _ = pc.add_event_listener_with_callback("track", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
     let pc2 = pc.clone();
+    let auth_token = auth_token.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        // Create offer
-        let offer = match wasm_bindgen_futures::JsFuture::from(pc2.create_offer()).await {
-            Ok(o) => o,
-            Err(e) => {
-                console::error_1(&format!("createOffer: {:?}", e).into());
-                return;
-            }
-        };
-        let sdp = js_sys::Reflect::get(&offer, &"sdp".into()).unwrap();
-        let sdp_str: String = sdp.as_string().unwrap_or_default();
-
-        // Set local description
-        let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        desc.set_sdp(&sdp_str);
-        if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc2.set_local_description(&desc)).await
-        {
-            console::error_1(&format!("setLocalDescription: {:?}", e).into());
-            return;
-        }
-        console::log_1(&"SDP offer created, POSTing to /rtc...".into());
-
-        // POST offer to server
-        let body = serde_json::json!({ "type": "offer", "sdp": sdp_str }).to_string();
-        let window = web_sys::window().unwrap();
-        let request_init = web_sys::RequestInit::new();
-        request_init.set_method("POST");
-        request_init.set_body(&body.into());
-        let headers = web_sys::Headers::new().unwrap();
-        headers.set("Content-Type", "application/json").unwrap();
-        request_init.set_headers(&headers);
-
-        let resp = match wasm_bindgen_futures::JsFuture::from(
-            window.fetch_with_str_and_init("/rtc", &request_init),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                console::error_1(&format!("POST /rtc failed: {:?}", e).into());
-                return;
-            }
-        };
-
-        let resp: web_sys::Response = resp.dyn_into().unwrap();
-        if !resp.ok() {
-            console::error_1(&format!("POST /rtc status: {}", resp.status()).into());
-            return;
-        }
-
-        let json = match wasm_bindgen_futures::JsFuture::from(resp.json().unwrap()).await {
-            Ok(j) => j,
-            Err(e) => {
-                console::error_1(&format!("parse answer: {:?}", e).into());
-                return;
-            }
-        };
-
-        // Set remote description (answer)
-        let answer_sdp = js_sys::Reflect::get(&json, &"sdp".into()).unwrap();
-        let answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        answer_desc.set_sdp(&answer_sdp.as_string().unwrap_or_default());
-
-        if let Err(e) =
-            wasm_bindgen_futures::JsFuture::from(pc2.set_remote_description(&answer_desc)).await
-        {
-            console::error_1(&format!("setRemoteDescription: {:?}", e).into());
-            return;
-        }
-
-        console::log_1(&"WebRTC: SDP exchange complete, waiting for ICE...".into());
+        complete_rtc_offer(pc2, auth_token, "media_tracks_v1_compat").await;
     });
 
-    // Keep PC alive
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
+}
+
+fn ensure_rtc2_video_canvas_loop(state: &Rc<RefCell<AppState>>) {
+    let s = state.clone();
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        {
+            let st = s.borrow();
+            if let Some(video) = &st.rtc2_video_el {
+                if video.ready_state() >= 2 {
+                    if let Ok(Some(ctx)) = st.canvas.get_context("2d") {
+                        if let Ok(ctx) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
+                            let _ = ctx.draw_image_with_html_video_element(video, 0.0, 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            16,
+        );
+    }
+    cb.forget();
+}
+
+fn attempt_media_play<T: AsRef<JsValue>>(label: &'static str, element: &T) {
+    let play_fn = js_sys::Reflect::get(element.as_ref(), &"play".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+    let Some(play_fn) = play_fn else {
+        return;
+    };
+    let Ok(ret) = play_fn.call0(element.as_ref()) else {
+        console::warn_1(&format!("{label}: play() threw synchronously").into());
+        return;
+    };
+    if ret.is_undefined() || ret.is_null() {
+        return;
+    }
+    let promise: js_sys::Promise = ret.unchecked_into();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            if !label.contains("retry") {
+                console::warn_1(&format!("{label}: playback blocked: {:?}", e).into());
+            }
+        }
+    });
+}
+
+fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event, kind: &str) {
+    let stream = js_sys::Reflect::get(event.as_ref(), &"streams".into())
+        .ok()
+        .and_then(|streams| js_sys::Reflect::get(&streams, &0.into()).ok())
+        .and_then(|v| v.dyn_into::<web_sys::MediaStream>().ok());
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+
+    match kind {
+        "video" => {
+            let video = document
+                .create_element("video")
+                .ok()
+                .and_then(|e| e.dyn_into::<HtmlVideoElement>().ok());
+            let Some(video) = video else {
+                return;
+            };
+            video.set_autoplay(true);
+            video.set_muted(true);
+            video.set_attribute("playsinline", "true").ok();
+            video.style().set_property("display", "none").ok();
+            if let Some(stream) = stream {
+                let _ = js_sys::Reflect::set(video.as_ref(), &"srcObject".into(), stream.as_ref());
+            }
+            if let Some(body) = document.body() {
+                let _ = body.append_child(&video);
+            }
+            attempt_media_play("rtc video", &video);
+            {
+                let mut st = state.borrow_mut();
+                st.rtc2_media_active = true;
+                st.rtc2_video_el = Some(video);
+                update_debug_snapshot(&st);
+            }
+            ensure_rtc2_video_canvas_loop(state);
+        }
+        "audio" => {
+            let audio = document
+                .create_element("audio")
+                .ok()
+                .and_then(|e| e.dyn_into::<HtmlAudioElement>().ok());
+            let Some(audio) = audio else {
+                return;
+            };
+            audio.set_autoplay(true);
+            audio.set_attribute("playsinline", "true").ok();
+            if let Some(stream) = stream {
+                let _ = js_sys::Reflect::set(audio.as_ref(), &"srcObject".into(), stream.as_ref());
+            }
+            if let Some(body) = document.body() {
+                let _ = body.append_child(&audio);
+            }
+            {
+                let mut st = state.borrow_mut();
+                let can_play_now = st.user_gesture_seen;
+                st.rtc2_media_active = true;
+                st.rtc2_audio_el = Some(audio.clone());
+                update_debug_snapshot(&st);
+                if can_play_now {
+                    attempt_media_play("rtc audio", &audio);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn ws_url(token: &Option<String>) -> String {
@@ -497,18 +721,26 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
         let s = state.clone();
         let next_retry = (retry_ms * 2).min(5000); // cap at 5s
         let cb = Closure::<dyn FnMut()>::new(move || {
-            console::warn_1(
-                &format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into(),
-            );
-            // Reset state for fresh session
-            {
+            let should_reconnect = {
                 let mut st = s.borrow_mut();
                 st.frame_count = 0;
                 st.got_keyframe = false;
+                st.waiting_for_keyframe_fence = false;
+                st.drop_until_keyframe = false;
                 st.decoder = None;
+                st.send_input_dc = None;
+                st.send_control_dc = None;
                 st.send_ws = None;
+                !st.page_unloading
+            };
+            if should_reconnect {
+                console::warn_1(
+                    &format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into(),
+                );
+                schedule_reconnect(&s, next_retry);
+            } else {
+                console::log_1(&"WebSocket closed during page unload; not reconnecting".into());
             }
-            schedule_reconnect(&s, next_retry);
         });
         ws.set_onclose(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
@@ -595,9 +827,13 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             s.server_height = height;
             s.canvas.set_width(width);
             s.canvas.set_height(height);
+            let rtc_media_active = s.rtc2_media_active;
+            update_debug_snapshot(&s);
             drop(s);
-            setup_decoder(state, width, height, video_codec);
-            if audio {
+            if !rtc_media_active {
+                setup_decoder(state, width, height, video_codec);
+            }
+            if audio && !rtc_media_active {
                 setup_audio(state);
             }
             // Send viewport size so server can match resolution (adaptive, like DCV)
@@ -618,27 +854,12 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 }
             };
 
-            // Tab-visibility recovery (phase 1): hard wall-clock drop.
-            // When a backgrounded tab becomes visible, the browser
-            // dispatches the entire kernel TCP backlog of queued messages
-            // in one microtask burst — up to several seconds of stale
-            // frames, including multiple stale keyframes. A sequence- or
-            // keyframe-based filter can't reliably tell "stale backlog
-            // keyframe" from "fresh keyframe we just asked for", so we
-            // just toss everything for 500ms (covers typical burst) and
-            // then wait for the next keyframe.
-            let now_ms = web_sys::window()
-                .and_then(|w| w.performance())
-                .map(|p| p.now())
-                .unwrap_or(0.0);
-            if now_ms < s.drop_frames_until_ms {
+            if s.waiting_for_keyframe_fence {
                 return;
             }
             if s.drop_until_keyframe {
                 if is_key {
-                    console::log_1(
-                        &"visibility recovery: fresh keyframe received, resuming".into(),
-                    );
+                    console::log_1(&"video recovery: fresh keyframe received, resuming".into());
                     s.drop_until_keyframe = false;
                 } else {
                     return;
@@ -678,6 +899,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 s.got_keyframe = true;
             }
             s.frame_count += 1;
+            update_debug_snapshot(&s);
             let fc = s.frame_count;
             if let Some(ref decoder) = s.decoder {
                 // If tab was backgrounded, decoder may be stale. Reset on keyframe.
@@ -704,6 +926,14 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 js_sys::Reflect::set(&init, &"data".into(), &data_js.buffer()).unwrap();
                 let chunk = JsEncodedVideoChunk::new(&init);
                 decoder.decode(&chunk);
+            }
+        }
+        Message::KeyframeFence => {
+            let mut s = state.borrow_mut();
+            if s.waiting_for_keyframe_fence {
+                s.waiting_for_keyframe_fence = false;
+                s.drop_until_keyframe = true;
+                console::log_1(&"video recovery: fence received, waiting for fresh keyframe".into());
             }
         }
         Message::ClipboardSync(text) => {
@@ -793,6 +1023,8 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                 bandwidth_kbps: bandwidth_bps as f64 / 1024.0,
                 encode_ms: encode_us as f64 / 1000.0,
             });
+            let st = state.borrow();
+            update_debug_snapshot(&st);
         }
         _ => {}
     }
@@ -1602,20 +1834,29 @@ fn setup_input(
     document: &web_sys::Document,
     state: &Rc<RefCell<AppState>>,
 ) {
-    // Resume AudioContext on first user interaction (browser autoplay policy)
+    // Resume AudioContext / kick WebRTC media playback on first user gesture.
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
-            let st = s.borrow();
+            let mut st = s.borrow_mut();
+            st.user_gesture_seen = true;
             if let Some(ref ctx) = st.audio_ctx {
                 if ctx.state() == web_sys::AudioContextState::Suspended {
                     let _ = ctx.resume();
                     console::log_1(&"AudioContext resumed after user gesture".into());
                 }
             }
+            if let Some(ref audio) = st.rtc2_audio_el {
+                attempt_media_play("rtc audio retry", audio);
+            }
+            if let Some(ref video) = st.rtc2_video_el {
+                attempt_media_play("rtc video retry", video);
+            }
         });
         let _ = document.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
         let _ = document.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        let _ = document.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+        let _ = document.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
         cb.forget();
     }
     {
@@ -1748,7 +1989,7 @@ fn setup_input(
             if pressed && code == "KeyV" && (e.ctrl_key() || e.meta_key()) {
                 if let Some(w) = web_sys::window() {
                     let cb = w.navigator().clipboard();
-                    let clone_st = st.send_dc.clone();
+                    let clone_dc = st.send_control_dc.clone();
                     let clone_ws = st.send_ws.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Ok(val) = wasm_bindgen_futures::JsFuture::from(cb.read_text()).await
@@ -1757,7 +1998,7 @@ fn setup_input(
                             if !text.is_empty() {
                                 let msg = Message::PasteText(text);
                                 if let Ok(data) = bincode::serialize(&msg) {
-                                    if let Some(ref dc) = clone_st {
+                                    if let Some(ref dc) = clone_dc {
                                         let _ = dc.send_with_u8_array(&data);
                                     } else if let Some(ref ws) = clone_ws {
                                         let _ = ws.send_with_u8_array(&data);
@@ -1841,7 +2082,8 @@ fn setup_input(
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut()>::new(move || {
-            let st = s.borrow();
+            let mut st = s.borrow_mut();
+            st.page_unloading = true;
             // Release all common modifier and letter keys
             for kc in [
                 KeyCode::LeftShift,
@@ -1858,6 +2100,9 @@ fn setup_input(
                         pressed: false,
                     },
                 );
+            }
+            if let Some(ref ws) = st.send_ws {
+                let _ = ws.close();
             }
         });
         let window = web_sys::window().unwrap();
@@ -2049,47 +2294,16 @@ fn setup_input(
         cb.forget();
     }
 
-    // Tab becomes visible:
-    // 1. Re-check viewport — browser throttles our debounced resize when
-    //    the tab is hidden, so if the user resized in a different tab we
-    //    might not have sent the update.
-    // 2. Clear got_keyframe and request a fresh keyframe — while the tab
-    //    was hidden, the kernel TCP receive buffer accumulated frames past
-    //    our bounded server-side mpsc (up to ~5MB depending on SO_RCVBUF).
-    //    On focus the browser drains + decodes the burst in ~50ms, which
-    //    the user sees as the video fast-forwarding through the backlog.
-    //    By marking got_keyframe=false we skip all buffered P-frames
-    //    (they'd decode but there's no point rendering stale content),
-    //    and RequestKeyframe asks the server to send a fresh IDR within
-    //    one tick instead of making us wait the full ~2s periodic interval.
+    // When the page regains visibility or focus, TCP backlog may already be
+    // queued inside the browser. Start an explicit recovery epoch: request a
+    // keyframe, ignore all queued video until the ordered `KeyframeFence`
+    // arrives, then wait for the first keyframe after the fence.
     {
         let s = state.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
             let document = web_sys::window().unwrap().document().unwrap();
             if document.visibility_state() == web_sys::VisibilityState::Visible {
-                let now_ms = web_sys::window()
-                    .and_then(|w| w.performance())
-                    .map(|p| p.now())
-                    .unwrap_or(0.0);
-                {
-                    let mut st = s.borrow_mut();
-                    st.got_keyframe = false;
-                    // Hard-drop everything for 500ms to swallow the TCP
-                    // backlog burst; then wait for the next keyframe
-                    // before resuming. See docs on AppState for why.
-                    st.drop_frames_until_ms = now_ms + 500.0;
-                    st.drop_until_keyframe = true;
-                }
-                {
-                    let st = s.borrow();
-                    send_message(&st, &Message::RequestKeyframe);
-                }
-                console::log_1(
-                    &"visibility → visible: dropping 500ms of frames then \
-                     waiting for fresh keyframe"
-                        .into(),
-                );
-                send_resolution_change(&s);
+                begin_video_recovery(&s, "visibility -> visible");
             }
         });
         let document = web_sys::window().unwrap().document().unwrap();
@@ -2097,11 +2311,31 @@ fn setup_input(
             .add_event_listener_with_callback("visibilitychange", cb.as_ref().unchecked_ref());
         cb.forget();
     }
+
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+            begin_video_recovery(&s, "window focus");
+        });
+        let window = web_sys::window().unwrap();
+        let _ = window.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
 }
 
 fn send_input(state: &AppState, event: InputEvent) {
     let msg = Message::Input(event);
-    send_message(state, &msg);
+    if let Ok(data) = bincode::serialize(&msg) {
+        if let Some(ref dc) = state.send_input_dc {
+            if dc.ready_state() == web_sys::RtcDataChannelState::Open {
+                let _ = dc.send_with_u8_array(&data);
+                return;
+            }
+        }
+        if let Some(ref ws) = state.send_ws {
+            let _ = ws.send_with_u8_array(&data);
+        }
+    }
 }
 
 /// Standard resolutions supported by VDD (must match vdd_settings.xml).
@@ -2181,7 +2415,6 @@ fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
     if st.server_width == w && st.server_height == h {
         return; // Already at this resolution
     }
-    console::log_1(&format!("Requesting resolution: {w}x{h} (viewport {vw}x{vh})").into());
     let msg = Message::ResolutionChange {
         width: w,
         height: h,
@@ -2191,8 +2424,8 @@ fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
 
 fn send_message(state: &AppState, msg: &Message) {
     if let Ok(data) = bincode::serialize(msg) {
-        // Prefer DataChannel, fallback to WebSocket
-        if let Some(ref dc) = state.send_dc {
+        // Prefer the reliable control DataChannel, fallback to WebSocket.
+        if let Some(ref dc) = state.send_control_dc {
             if dc.ready_state() == web_sys::RtcDataChannelState::Open {
                 let _ = dc.send_with_u8_array(&data);
                 return;
@@ -2202,6 +2435,25 @@ fn send_message(state: &AppState, msg: &Message) {
             let _ = ws.send_with_u8_array(&data);
         }
     }
+}
+
+fn begin_video_recovery(state: &Rc<RefCell<AppState>>, reason: &str) {
+    let use_ws_fence = {
+        let st = state.borrow();
+        st.send_control_dc.is_none() && st.send_ws.is_some()
+    };
+    {
+        let mut st = state.borrow_mut();
+        st.got_keyframe = false;
+        st.waiting_for_keyframe_fence = use_ws_fence;
+        st.drop_until_keyframe = !use_ws_fence;
+    }
+    {
+        let st = state.borrow();
+        send_message(&st, &Message::RequestKeyframe);
+    }
+    let _ = reason;
+    send_resolution_change(state);
 }
 
 /// Show a toast notification. If `id` is provided, replaces existing toast with same id.

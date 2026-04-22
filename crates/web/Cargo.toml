@@ -24,8 +24,9 @@ features = [
     # DOM
     "Window", "Location", "Navigator", "Clipboard",
     "Document", "HtmlElement", "HtmlCanvasElement", "CssStyleDeclaration",
+    "HtmlVideoElement", "HtmlAudioElement", "HtmlMediaElement",
     "CanvasRenderingContext2d", "ImageData",
-    "Element", "DomRect",
+    "Element", "DomRect", "MediaStream", "MediaStreamTrack",
     # Events
     "MouseEvent", "KeyboardEvent", "WheelEvent",
     "EventTarget", "Event", "AddEventListenerOptions",
@@ -34,6 +35,7 @@ features = [
     "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
     "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelEvent", "RtcDataChannelType", "RtcDataChannelState",
     "RtcPeerConnectionIceEvent", "RtcIceCandidate", "RtcIceCandidateInit",
+    "RtcRtpTransceiver", "RtcRtpTransceiverInit", "RtcRtpTransceiverDirection",
     # Fetch API (for POST /rtc)
     "Headers", "Request", "RequestInit", "Response",
     # Web Audio API

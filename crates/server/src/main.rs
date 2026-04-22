@@ -276,6 +276,11 @@ fn init_tracing(log_file: &Option<std::path::PathBuf>, rotate: &str, keep: usize
 }
 
 type ConnectionPair = (Box<dyn MessageSender>, Box<dyn MessageReceiver>);
+type PendingConnection = (
+    Box<dyn MessageSender>,
+    Box<dyn MessageReceiver>,
+    Option<[u8; 16]>,
+);
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -768,7 +773,7 @@ fn main() -> Result<()> {
     // the parked connection and starts a new session.
 
     let conn_rx = Arc::new(std::sync::Mutex::new(conn_rx));
-    let pending: Arc<std::sync::Mutex<Option<ConnectionPair>>> =
+    let pending: Arc<std::sync::Mutex<Option<PendingConnection>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cancel = Arc::new(AtomicBool::new(false));
     // Active session token for reconnect validation (future: pre-Hello resume)
@@ -827,7 +832,7 @@ fn main() -> Result<()> {
                         }
 
                         // Replace any previously queued (but not yet consumed) connection
-                        *pending.lock().unwrap() = Some((sender, receiver));
+                        *pending.lock().unwrap() = Some((sender, receiver, id));
                         cancel.store(true, Ordering::Relaxed);
                     }
                     Err(_) => break,
@@ -856,7 +861,7 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        let (sender, receiver) = match conn {
+        let (sender, receiver, session_client_id) = match conn {
             Some(c) => c,
             None => {
                 tracing::info!("shutdown signal received, stopping accept loop");
@@ -994,6 +999,16 @@ fn main() -> Result<()> {
             _active_session_token = result.session_token.clone();
             // session end is already logged by make_session_result with
             // structured fields (session_id, reason).
+        }
+
+        if !matches!(
+            result.reason,
+            Some(session::SessionEndReason::Cancelled)
+        ) {
+            let mut cur = current_client_id.lock().unwrap();
+            if *cur == session_client_id {
+                *cur = None;
+            }
         }
 
         // Post-session cleanup

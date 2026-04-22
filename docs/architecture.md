@@ -14,11 +14,21 @@ Direct function calls (capture → encode → send) = 0ms pipeline overhead.
 Sunshine and Parsec don't use GStreamer either. Our pipeline is 3 steps,
 not 20 elements with buffer copies.
 
-### WebRTC DataChannel, not Media Track
+### WebRTC redesign direction
 
-Media Track adds a jitter buffer (designed for video calls) which adds tens
-of ms. DataChannel delivers raw bytes instantly → WebCodecs GPU decode →
-Canvas.
+The original browser WebRTC path chose DataChannel for desktop video to avoid
+media-track buffering. Real testing showed the opposite tradeoff: dragging and
+large-motion updates suffer more from reliable ordered DataChannel delivery,
+SCTP chunking, and custom backpressure queues than from media-track jitter
+handling.
+
+Current direction:
+
+- WSS remains the default browser transport.
+- WebRTC is being redesigned toward **video/audio media tracks + input/control
+  DataChannels**.
+- The existing all-DataChannel browser path should be treated as experimental
+  while that redesign is in progress.
 
 ### WebRTC, not WebTransport
 
@@ -44,9 +54,11 @@ to pause/resume writes, with per-channel pending queues.
 
 - **WSS** (default): WebSocket upgrade on the same HTTPS port 9900. No
   message size limits. Reliable. Validated by Helix at scale.
-- **WebRTC DataChannel** (feature `webrtc`, `?rtc` URL param): POST /rtc
-  signaling, str0m 0.18, reliable+ordered. Needs chunking for messages
-  >16KB (SCTP limitation). Only needed for future NAT traversal.
+- **WebRTC DataChannel** (feature `webrtc`, `?rtc` URL param): current
+  experimental browser path. POST /rtc signaling, str0m 0.18,
+  reliable+ordered video over DataChannel. Needs chunking for messages
+  >16KB (SCTP limitation) and is now considered a transition design, not
+  the long-term target.
 - **Native**: raw QUIC (no browser overhead) + raw TCP.
 - All produce same `Box<dyn MessageSender/Receiver>` → same session loop.
 

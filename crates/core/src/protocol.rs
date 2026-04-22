@@ -71,6 +71,13 @@ pub enum Message {
     /// protocol v7 (0.4.8); v6 clients simply never send it.
     RequestKeyframe,
 
+    /// Server → Client: ordered fence sent immediately after the server
+    /// receives `RequestKeyframe`. Because WSS is ordered, all stale backlog
+    /// frames queued before the request arrive before this marker; the web
+    /// client can drop everything until it sees the fence, then wait for the
+    /// next keyframe after it.
+    KeyframeFence,
+
     /// Server → Client: encoded audio chunk.
     AudioFrame {
         codec: AudioCodec,

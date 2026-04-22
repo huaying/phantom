@@ -7,8 +7,9 @@
 //! - **Ghost id** (already in the kicked set) → reject.
 //! - **Current id** (same client reconnecting) → accept, no ghost shuffle.
 //! - **New id** → accept and demote whoever was current to the ghost set.
-//! - **No id** (legacy client, no `ClientHello`) → accept, demote the
-//!   current owner but don't track the new one.
+//! - **No id** (legacy client, no `ClientHello`) → accept, but don't mutate
+//!   the tracked owner/ghost set. Anonymous or failed handshakes should not
+//!   poison browser client affinity state.
 
 use std::collections::VecDeque;
 
@@ -48,15 +49,7 @@ pub fn decide(
             *current = Some(id);
             DoorbellDecision::Accept
         }
-        None => {
-            // Legacy client — accept but don't track. Still demotes the
-            // current owner so a known client → unknown (legacy) handover
-            // also frees the slot.
-            if let Some(old) = current.take() {
-                push_ghost(ghosts, old);
-            }
-            DoorbellDecision::Accept
-        }
+        None => DoorbellDecision::Accept,
     }
 }
 
@@ -129,17 +122,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_client_with_no_id_is_accepted_but_not_tracked() {
+    fn legacy_client_with_no_id_is_accepted_without_mutating_tracking() {
         let mut current = Some(id(1));
         let mut ghosts = VecDeque::new();
         assert_eq!(
             decide(None, &mut current, &mut ghosts),
             DoorbellDecision::Accept
         );
-        // Old owner demoted to ghost; new owner not tracked (None).
-        assert_eq!(current, None);
-        assert_eq!(ghosts.len(), 1);
-        assert_eq!(ghosts[0], id(1));
+        assert_eq!(current, Some(id(1)));
+        assert!(ghosts.is_empty());
     }
 
     #[test]

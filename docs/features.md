@@ -9,7 +9,7 @@ Accurate as of v0.4.10. Each entry points at the code that implements it.
 | TCP (plain + ChaCha20-Poly1305) | ✅ | `server/src/transport/tcp.rs` | Native client; encryption on unless `--no-encrypt` |
 | WebSocket over HTTPS | ✅ | `server/src/transport/ws.rs` | Browser client, embedded WASM, same port as HTTPS static |
 | QUIC | opt-in `--transport quic` | `server/src/transport/quic.rs` | Native client only; self-signed TLS, no head-of-line blocking |
-| WebRTC DataChannel | feature `webrtc` | `server/src/transport/webrtc.rs` | str0m 0.18; 16KB SCTP limit → chunking; opt-in at build time |
+| WebRTC DataChannel | feature `webrtc` | `server/src/transport/webrtc.rs` | Experimental browser path; str0m 0.18; 16KB SCTP limit → chunking; planned redesign toward media tracks + control/input DC |
 
 All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); session loop is transport-agnostic.
 
