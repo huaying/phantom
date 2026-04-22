@@ -129,9 +129,7 @@ fn check_request_auth(
     }
 }
 
-#[cfg(feature = "webrtc")]
 use std::sync::Mutex;
-#[cfg(feature = "webrtc")]
 
 /// Maximum concurrent HTTP/WS handler threads.
 const MAX_CONNECTIONS: usize = 16;
