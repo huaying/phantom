@@ -355,11 +355,23 @@ async fn complete_rtc_offer(
         console::error_1(&format!("setLocalDescription: {:?}", e).into());
         return;
     }
-    console::log_1(&format!("SDP offer created, POSTing to /rtc ({transport_mode})...").into());
+
+    wait_for_ice_complete(&pc, 3000).await;
+    let final_offer_sdp = pc
+        .local_description()
+        .map(|d| d.sdp())
+        .unwrap_or_else(|| sdp_str.clone());
+    console::log_1(
+        &format!(
+            "SDP offer created, POSTing to /rtc ({transport_mode}, {} bytes)...",
+            final_offer_sdp.len()
+        )
+        .into(),
+    );
 
     let body = serde_json::json!({
         "type": "offer",
-        "sdp": sdp_str,
+        "sdp": final_offer_sdp,
         "mode": transport_mode,
     })
     .to_string();
@@ -408,6 +420,37 @@ async fn complete_rtc_offer(
     }
 
     console::log_1(&format!("WebRTC: SDP exchange complete ({transport_mode})").into());
+}
+
+async fn wait_for_ice_complete(pc: &web_sys::RtcPeerConnection, timeout_ms: i32) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let start = js_sys::Date::now();
+    loop {
+        let state = js_sys::Reflect::get(pc.as_ref(), &"iceGatheringState".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        if state == "complete" {
+            return;
+        }
+        if (js_sys::Date::now() - start) >= timeout_ms as f64 {
+            return;
+        }
+        let window = window.clone();
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let cb = Closure::<dyn FnMut()>::once(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                100,
+            );
+            cb.forget();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
 }
 
 fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
@@ -493,6 +536,10 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
             if let Ok(bytes) = bincode::serialize(&msg) {
                 let _ = dc.send_with_u8_array(&bytes);
             }
+            if let Ok(bytes) = bincode::serialize(&Message::RequestKeyframe) {
+                let _ = dc.send_with_u8_array(&bytes);
+            }
+            send_resolution_change(&s);
             console::log_1(
                 &"WebRTC control DC OPEN — media-track path active".into(),
             );
@@ -600,7 +647,17 @@ fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event
             video.set_autoplay(true);
             video.set_muted(true);
             video.set_attribute("playsinline", "true").ok();
-            video.style().set_property("display", "none").ok();
+            // Keep the element technically visible so browser playback quality
+            // stats reflect presented frames; `display:none` reports almost every
+            // frame as dropped in Chromium even when the canvas render path looks fine.
+            video.style().set_property("display", "block").ok();
+            video.style().set_property("position", "fixed").ok();
+            video.style().set_property("right", "0").ok();
+            video.style().set_property("bottom", "0").ok();
+            video.style().set_property("width", "8px").ok();
+            video.style().set_property("height", "8px").ok();
+            video.style().set_property("opacity", "0").ok();
+            video.style().set_property("pointer-events", "none").ok();
             if let Some(stream) = stream {
                 let _ = js_sys::Reflect::set(video.as_ref(), &"srcObject".into(), stream.as_ref());
             }

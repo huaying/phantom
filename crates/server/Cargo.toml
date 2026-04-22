@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = ["web-client", "audio", "sso"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
-webrtc = ["str0m"]  # WebRTC DataChannel transport (adds str0m + SCTP deps)
+webrtc = ["str0m", "dep:dimpl", "dep:crc32fast", "dep:sctp-proto", "dep:aes", "dep:aes-gcm", "dep:stun-proto"]  # WebRTC transport workbench (str0m today, dimpl-backed phantom backend in progress)
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
 wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + XDG Portal
 sso = []  # SSO agent: write auth ticket after JWT verified, for pam_phantom / phantom_cp plugins
@@ -31,6 +31,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ring = "0.17"
 tungstenite = "0.24"
 str0m = { version = "0.18", optional = true }
+dimpl = { version = "0.5", optional = true }
+crc32fast = { version = "1", optional = true }
+sctp-proto = { version = "0.9", optional = true }
+aes = { version = "0.8", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+stun-proto = { version = "2.0.1", optional = true }
 serde_json = "1"
 enigo = "0.3"
 arboard = "3"

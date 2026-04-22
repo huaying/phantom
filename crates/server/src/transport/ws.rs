@@ -132,7 +132,6 @@ fn check_request_auth(
 #[cfg(feature = "webrtc")]
 use std::sync::Mutex;
 #[cfg(feature = "webrtc")]
-use std::time::Instant;
 
 /// Maximum concurrent HTTP/WS handler threads.
 const MAX_CONNECTIONS: usize = 16;
@@ -260,7 +259,7 @@ type SessionPair = (
 );
 
 #[cfg(feature = "webrtc")]
-type RtcRequest = (str0m::Rtc, super::webrtc::RtcMode);
+type RtcRequest = super::webrtc::PendingRtcSession;
 
 #[allow(dead_code)]
 pub struct WebServerTransport {
@@ -619,7 +618,6 @@ fn handle_http_rw_rtc(
 
     match (method, path) {
         ("POST", "/rtc") => {
-            use str0m::{Candidate, Rtc};
             check_request_auth(stream, raw_path, auth_secret)?;
             let body = &buf[body_start..];
             tracing::info!(body_len = body.len(), "POST /rtc received");
@@ -630,20 +628,12 @@ fn handle_http_rw_rtc(
             );
             tracing::info!(?rtc_mode, sdp_len = sdp_str.len(), "POST /rtc parsed offer JSON");
 
-            let mut rtc = Rtc::builder().build(Instant::now());
-            let candidate = Candidate::host(candidate_addr, "udp").context("host candidate")?;
-            rtc.add_local_candidate(candidate);
-            tracing::info!("POST /rtc added host candidate");
-
-            let offer = str0m::change::SdpOffer::from_sdp_string(sdp_str).context("parse SDP")?;
-            tracing::info!("POST /rtc parsed SDP string");
-            let answer = rtc.sdp_api().accept_offer(offer).context("accept offer")?;
+            let accepted = super::webrtc::accept_http_offer(candidate_addr, sdp_str, rtc_mode)?;
             tracing::info!("POST /rtc accepted offer");
-            let answer_json =
-                serde_json::json!({ "type": "answer", "sdp": answer.to_sdp_string() });
+            let answer_json = serde_json::json!({ "type": "answer", "sdp": accepted.answer_sdp });
 
             rtc_tx
-                .send((rtc, rtc_mode))
+                .send(accepted.session)
                 .map_err(|_| anyhow::anyhow!("rtc channel closed"))?;
             tracing::info!("POST /rtc queued rtc for run loop");
 
