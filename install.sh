@@ -42,6 +42,8 @@ parse_args() {
     INSTALL_SERVER=false
     INSTALL_CLIENT=false
     AUTOLOGIN=false
+    LIGHT_GUI=false
+    LIGHT_GUI_FORCE=false
     SSO=false
     NO_AUTOSTART=false
     GOT_ROLE=false
@@ -52,9 +54,10 @@ parse_args() {
             client) INSTALL_CLIENT=true; GOT_ROLE=true ;;
             both)   INSTALL_SERVER=true; INSTALL_CLIENT=true; GOT_ROLE=true ;;
             --autologin) AUTOLOGIN=true ;;
+            --light-gui) LIGHT_GUI=true; LIGHT_GUI_FORCE=true ;;
             --sso)  SSO=true ;;
             --no-autostart) NO_AUTOSTART=true ;;
-            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--sso] [--no-autostart]"; exit 1 ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--light-gui] [--sso] [--no-autostart]"; exit 1 ;;
         esac
     done
 }
@@ -76,6 +79,17 @@ apply_defaults() {
     if [ "$AUTOLOGIN" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
         echo "--autologin only applies to Linux server installs; ignoring"
         AUTOLOGIN=false
+    fi
+
+    if [ "$LIGHT_GUI" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
+        echo "--light-gui only applies to Linux server installs; ignoring"
+        LIGHT_GUI=false
+    fi
+
+    # In autologin mode, a desktop stack is required for a recoverable remote
+    # session. Enable lightweight GUI bootstrap automatically.
+    if [ "$AUTOLOGIN" = true ] && [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
+        LIGHT_GUI=true
     fi
 }
 
@@ -186,6 +200,132 @@ linux_install_deps_pacman() {
 }
 
 # ===========================================================================
+# Linux server: optional lightweight GUI bootstrap (XFCE + LightDM)
+# ===========================================================================
+# For headless Ubuntu/Debian VMs, "install + run" often fails because no
+# display manager / desktop session exists, or Xorg cannot build a screen.
+# --light-gui installs a minimal desktop stack and configures a dummy X screen
+# when no physical monitor is connected.
+
+linux_has_connected_display() {
+    for _status in /sys/class/drm/*/status; do
+        [ -f "$_status" ] || continue
+        if grep -qx "connected" "$_status" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+linux_install_dummy_xorg_conf() {
+    echo "  No connected monitor detected; configuring dummy Xorg screen (1920x1080)..."
+    if [ -f /etc/X11/xorg.conf ] && [ ! -f /etc/X11/xorg.conf.phantom-bak ]; then
+        sudo cp /etc/X11/xorg.conf /etc/X11/xorg.conf.phantom-bak
+    fi
+    sudo tee /etc/X11/xorg.conf > /dev/null <<'EOF'
+# Written by phantom install.sh --light-gui
+Section "ServerLayout"
+    Identifier "Layout0"
+    Screen 0 "Screen0"
+EndSection
+
+Section "Monitor"
+    Identifier "Monitor0"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+EndSection
+
+Section "Device"
+    Identifier "Device0"
+    Driver "dummy"
+    VideoRam 256000
+EndSection
+
+Section "Screen"
+    Identifier "Screen0"
+    Device "Device0"
+    Monitor "Monitor0"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1920x1080"
+    EndSubSection
+EndSection
+EOF
+}
+
+linux_install_light_gui_apt() {
+    echo ""
+    echo "Installing lightweight GUI stack (XFCE + LightDM)..."
+    sudo apt-get update -qq
+    echo "lightdm shared/default-x-display-manager select lightdm" | sudo debconf-set-selections || true
+    echo "/etc/X11/default-display-manager string /usr/sbin/lightdm" | sudo debconf-set-selections || true
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        xorg xfce4 lightdm xserver-xorg-video-dummy dbus-x11 x11-xserver-utils || true
+
+    sudo mkdir -p /etc/lightdm/lightdm.conf.d
+    sudo tee /etc/lightdm/lightdm.conf.d/50-phantom-xfce.conf > /dev/null <<'EOF'
+[Seat:*]
+user-session=xfce
+autologin-session=xfce
+EOF
+
+    if [ "$AUTOLOGIN" = true ] && [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        sudo tee /etc/lightdm/lightdm.conf.d/60-phantom-autologin.conf > /dev/null <<EOF
+[Seat:*]
+autologin-user=$TARGET_USER
+autologin-user-timeout=0
+EOF
+    fi
+
+    if linux_has_connected_display; then
+        echo "  Physical display detected; skipping dummy Xorg config."
+    else
+        linux_install_dummy_xorg_conf
+    fi
+
+    sudo systemctl disable gdm3 > /dev/null 2>&1 || true
+    sudo systemctl enable lightdm > /dev/null 2>&1 || true
+    echo "  LightDM enabled (applies after reboot)."
+}
+
+linux_setup_headless_dummy_apt() {
+    echo ""
+    echo "Installing headless X fallback (dummy screen)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends xserver-xorg-video-dummy || true
+    linux_install_dummy_xorg_conf
+}
+
+linux_has_display_manager() {
+    if [ -f /etc/gdm3/custom.conf ] || [ -d /etc/lightdm ] || [ -f /etc/lightdm/lightdm.conf ]; then
+        return 0
+    fi
+    return 1
+}
+
+linux_setup_light_gui_if_requested() {
+    if [ "$LIGHT_GUI" != true ] || [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; then
+        return 0
+    fi
+
+    if have_cmd apt-get; then
+        if [ "$LIGHT_GUI_FORCE" = true ] || ! linux_has_display_manager; then
+            linux_install_light_gui_apt
+        elif linux_has_connected_display; then
+            echo ""
+            echo "Display manager already installed and monitor is connected; skipping --light-gui bootstrap."
+        else
+            linux_setup_headless_dummy_apt
+        fi
+    else
+        echo ""
+        echo "WARN: --light-gui currently auto-installs only on apt-based distros."
+        echo "      Install manually: XFCE + LightDM + xserver dummy driver."
+    fi
+}
+
+# ===========================================================================
 # Linux server: /dev/uinput for keyboard injection
 # ===========================================================================
 # Server uses /dev/uinput to create a virtual keyboard (bypasses the
@@ -290,7 +430,7 @@ linux_configure_autologin() {
         exit 1
     fi
 
-    linux_autologin_gdm
+    linux_autologin_configure_display_manager
     linux_autologin_disable_screenlock
     linux_autologin_reset_keyring
     linux_autologin_install_keyring_unlock
@@ -302,6 +442,28 @@ linux_configure_autologin() {
     echo "⚠️  Autologin takes effect on next reboot. Security note: the console"
     echo "   will no longer require a password, and the keyring will be stored"
     echo "   unencrypted. This is intended for dedicated remote-access VMs."
+}
+
+linux_autologin_configure_display_manager() {
+    if [ -d /etc/lightdm ] || [ -f /etc/lightdm/lightdm.conf ]; then
+        linux_autologin_lightdm
+        return 0
+    fi
+    linux_autologin_gdm
+}
+
+linux_autologin_lightdm() {
+    sudo mkdir -p /etc/lightdm/lightdm.conf.d
+    sudo tee /etc/lightdm/lightdm.conf.d/60-phantom-autologin.conf > /dev/null <<EOF
+# Written by phantom install.sh --autologin
+[Seat:*]
+autologin-user=$TARGET_USER
+autologin-user-timeout=0
+autologin-session=xfce
+user-session=xfce
+EOF
+    sudo systemctl enable lightdm > /dev/null 2>&1 || true
+    echo "  Enabled LightDM autologin for $TARGET_USER"
 }
 
 linux_autologin_gdm() {
@@ -415,19 +577,25 @@ linux_autologin_install_watchdog() {
     #    on U24 where TimedLogin does work natively.
     sudo tee /usr/local/bin/phantom-autologin-watchdog.sh > /dev/null <<EOF
 #!/bin/sh
-# Kick gdm3 if there is no active seat0 session for $TARGET_USER.
+# Kick display manager if there is no active seat0 session for $TARGET_USER.
 # Written by phantom install.sh --autologin.
 SID=\$(loginctl list-sessions --no-legend | awk '\$3=="$TARGET_USER" && \$4=="seat0" && !/closing/{print \$1}')
 if [ -z "\$SID" ]; then
-    logger "phantom-autologin-watchdog: no $TARGET_USER seat0, restarting gdm3"
-    systemctl restart gdm3
+    DM=display-manager
+    if systemctl is-enabled lightdm > /dev/null 2>&1 || systemctl is-active lightdm > /dev/null 2>&1; then
+        DM=lightdm
+    elif systemctl is-enabled gdm3 > /dev/null 2>&1 || systemctl is-active gdm3 > /dev/null 2>&1; then
+        DM=gdm3
+    fi
+    logger "phantom-autologin-watchdog: no $TARGET_USER seat0, restarting \$DM"
+    systemctl restart "\$DM"
 fi
 EOF
     sudo chmod +x /usr/local/bin/phantom-autologin-watchdog.sh
     sudo tee /etc/systemd/system/phantom-autologin-watchdog.service > /dev/null <<EOF
 [Unit]
-Description=Re-trigger GDM autologin for $TARGET_USER if no seat0 session exists
-After=gdm3.service
+Description=Re-trigger display-manager autologin for $TARGET_USER if no seat0 session exists
+After=display-manager.service
 
 [Service]
 Type=oneshot
@@ -597,6 +765,7 @@ main() {
     fi
 
     if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ]; then
+        linux_setup_light_gui_if_requested
         linux_configure_uinput
         if [ "$NO_AUTOSTART" = false ]; then
             linux_install_autostart
