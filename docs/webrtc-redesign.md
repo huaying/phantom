@@ -1,7 +1,8 @@
 # Phantom — WebRTC Redesign
 
-Status: design draft after validating the current DataChannel-based browser
-path against real user interaction on `10.63.177.119`.
+Status: baseline implemented in v0.5.3 (media tracks for video/audio,
+DataChannels for input/control). This doc is kept as design rationale and
+follow-up checklist for remaining tuning.
 
 ## Problem statement
 

@@ -139,6 +139,7 @@ pub fn run_loop(
             Ok((n, addr)) => {
                 if let Some(ref mut client) = active {
                     client.handle_receive(candidate_addr, addr, &buf[..n]);
+                    client.poll_and_flush(&socket, &session_slot, &notify_tx);
                 }
             }
             Err(e)
@@ -243,22 +244,12 @@ impl MessageSender for WebRtcSender {
                     mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
                 })
                 .or(Ok(())),
-            Message::Hello { .. } => self
-                .control_tx
-                .try_send(bincode::serialize(msg).context("serialize")?)
-                .map_err(|e| match e {
-                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
-                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
-                })
-                .or(Ok(())),
-            _ => self
-                .control_tx
-                .try_send(bincode::serialize(msg).context("serialize")?)
-                .map_err(|e| match e {
-                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("control DC closed"),
-                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
-                })
-                .or(Ok(())),
+            _ => {
+                let bytes = bincode::serialize(msg).context("serialize")?;
+                self.control_tx
+                    .send(bytes)
+                    .map_err(|_| anyhow::anyhow!("control DC closed"))
+            }
         }
     }
 }

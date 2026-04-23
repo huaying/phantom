@@ -1,6 +1,6 @@
 use super::{
     BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender, make_session_bridge,
-    sctp::{DataPpi, PhantomSctpStack, SctpNotice},
+    sctp::{PhantomSctpStack, SctpNotice},
 };
 use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray};
 use aes::{Aes128, Aes256};
@@ -10,16 +10,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use dimpl::{Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile};
 use phantom_core::encode::EncodedFrame;
 use phantom_core::protocol::Message;
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use stun_types::attribute::{Username, XorMappedAddress};
+use stun_types::message::{
+    BINDING, IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite,
+    MessageWriteExt, MessageWriteVec, ShortTermCredentials,
+};
 use uuid::Uuid;
 use ring::hmac;
 use ring::digest;
 use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 
-const DCEP_OPEN: u8 = 0x03;
-const DCEP_ACK: u8 = 0x02;
 const RTP_HEADER_LEN: usize = 12;
 const RTP_MTU: usize = 1200;
 const H264_FUA_NALU_TYPE: u8 = 28;
@@ -29,15 +33,7 @@ const H264_NALU_REF_IDC_MASK: u8 = 0x60;
 const H264_SPS_NALU_TYPE: u8 = 7;
 const H264_PPS_NALU_TYPE: u8 = 8;
 const H264_IDR_NALU_TYPE: u8 = 5;
-const STUN_BINDING_REQUEST: u16 = 0x0001;
-const STUN_BINDING_SUCCESS: u16 = 0x0101;
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-const STUN_ATTR_USERNAME: u16 = 0x0006;
-const STUN_ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
-const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
-const STUN_ATTR_FINGERPRINT: u16 = 0x8028;
-const STUN_FINGERPRINT_XOR: u32 = 0x5354_554e;
-
+const VIDEO_RTX_CACHE_SIZE: usize = 512;
 /// Placeholder for the in-tree Phantom-owned WebRTC backend.
 ///
 /// This module intentionally starts as a compileable skeleton while the public
@@ -105,6 +101,8 @@ pub(super) struct PhantomClient {
     srtp_tx: Option<PhantomSrtpTxContext>,
     srtp_rx: Option<PhantomSrtpRxContext>,
     media_tx: MediaTxState,
+    last_rtcp_report_at: Instant,
+    video_rtx_cache: VecDeque<CachedRtpPacket>,
     logged_first_packet: bool,
     logged_first_stun: bool,
     logged_first_dtls: bool,
@@ -142,6 +140,8 @@ impl PhantomClient {
             srtp_tx: None,
             srtp_rx: None,
             media_tx: MediaTxState::new(),
+            last_rtcp_report_at: Instant::now(),
+            video_rtx_cache: VecDeque::with_capacity(VIDEO_RTX_CACHE_SIZE),
             logged_first_packet: false,
             logged_first_stun: false,
             logged_first_dtls: false,
@@ -196,62 +196,35 @@ impl PhantomClient {
         );
     }
 
-    fn handle_dcep_open(
+    fn handle_datachannel_open(
         &mut self,
         stream_id: u16,
-        payload: &[u8],
+        label: &str,
         session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
         notify_tx: &mpsc::Sender<()>,
     ) {
-        let Some(label) = parse_dcep_open_label(payload) else {
-            return;
-        };
         tracing::info!(stream_id, label = %label, "phantom backend DataChannel opened");
-        match label.as_str() {
+        match label {
             "input" => self.input_stream = Some(stream_id),
             "control" => self.control_stream = Some(stream_id),
             _ => {}
         }
-        self.sctp.write_stream(stream_id, &[DCEP_ACK], DataPpi::Dcep);
         self.maybe_publish_session(session_slot, notify_tx);
     }
 
-    fn handle_stream_message(
+    fn handle_stream_payload(
         &mut self,
         stream_id: u16,
-        ppi: DataPpi,
         payload: &[u8],
-        session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
-        notify_tx: &mpsc::Sender<()>,
     ) {
-        match ppi {
-            DataPpi::Dcep if payload.first().copied() == Some(DCEP_OPEN) => {
-                self.handle_dcep_open(stream_id, payload, session_slot, notify_tx);
+        if Some(stream_id) == self.input_stream {
+            if let Some(tx) = &self.input_in_tx {
+                let _ = tx.send(payload.to_vec());
             }
-            DataPpi::Dcep => {}
-            DataPpi::Binary | DataPpi::BinaryEmpty | DataPpi::String | DataPpi::StringEmpty => {
-                if Some(stream_id) == self.input_stream {
-                    if let Some(tx) = &self.input_in_tx {
-                        let _ = tx.send(payload.to_vec());
-                    }
-                } else if Some(stream_id) == self.control_stream {
-                    if let Some(tx) = &self.control_in_tx {
-                        let _ = tx.send(payload.to_vec());
-                    }
-                }
+        } else if Some(stream_id) == self.control_stream {
+            if let Some(tx) = &self.control_in_tx {
+                let _ = tx.send(payload.to_vec());
             }
-            _ => {}
-        }
-    }
-
-    fn handle_readable_stream(
-        &mut self,
-        stream_id: u16,
-        session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
-        notify_tx: &mpsc::Sender<()>,
-    ) {
-        for (ppi, payload) in self.sctp.read_stream_messages(stream_id) {
-            self.handle_stream_message(stream_id, ppi, &payload, session_slot, notify_tx);
         }
     }
 
@@ -266,13 +239,11 @@ impl PhantomClient {
                 SctpNotice::Connected => {
                     tracing::info!("phantom backend SCTP connected");
                 }
-                SctpNotice::StreamOpened(_) => {
-                    for id in self.sctp.accept_streams() {
-                        tracing::debug!(id, "phantom backend accepted SCTP stream");
-                    }
+                SctpNotice::DataChannelOpened { stream_id, label } => {
+                    self.handle_datachannel_open(stream_id, &label, session_slot, notify_tx);
                 }
-                SctpNotice::StreamReadable(id) => {
-                    self.handle_readable_stream(id, session_slot, notify_tx);
+                SctpNotice::DataChannelData { stream_id, payload } => {
+                    self.handle_stream_payload(stream_id, &payload);
                 }
                 SctpNotice::HandshakeFailed(reason) => {
                     self.disconnecting = true;
@@ -293,29 +264,46 @@ impl PhantomClient {
         let Some(source) = self.last_source else {
             return;
         };
-        let Some(srtp) = self.srtp_tx.as_mut() else {
-            return;
-        };
         let mut payloads = self
             .media_tx
             .h264
             .packetize(RTP_MTU.saturating_sub(RTP_HEADER_LEN + 16), &frame.data);
         let packet_count = payloads.len();
+        let mut octet_count = 0u32;
+        let mut cached_packets = Vec::with_capacity(packet_count);
+        let Some(srtp) = self.srtp_tx.as_mut() else {
+            return;
+        };
         for (i, payload) in payloads.drain(..).enumerate() {
             let marker = i + 1 == packet_count;
+            octet_count = octet_count.wrapping_add(payload.len() as u32);
+            let sequence_number = self.media_tx.video_seq;
             let packet = srtp.protect_rtp(
                 self.params.video_payload_type,
                 marker,
-                self.media_tx.video_seq,
+                sequence_number,
                 self.media_tx.video_timestamp,
                 self.media_tx.video_ssrc,
                 self.params.video_mid_ext_id,
                 self.params.video_mid.as_deref(),
                 &payload,
             );
+            cached_packets.push((sequence_number, packet.clone()));
             self.pending_transmits.push((source, packet));
             self.media_tx.video_seq = self.media_tx.video_seq.wrapping_add(1);
         }
+        for (sequence_number, packet) in cached_packets {
+            self.cache_video_packet(sequence_number, packet);
+        }
+        self.media_tx.video_packet_count = self
+            .media_tx
+            .video_packet_count
+            .wrapping_add(packet_count as u32);
+        self.media_tx.video_octet_count = self
+            .media_tx
+            .video_octet_count
+            .wrapping_add(octet_count);
+        self.media_tx.video_last_rtp_timestamp = self.media_tx.video_timestamp;
         self.media_tx.video_timestamp = self.media_tx.video_timestamp.wrapping_add(3_000);
     }
 
@@ -338,10 +326,96 @@ impl PhantomClient {
         );
         self.pending_transmits.push((source, packet));
         self.media_tx.audio_seq = self.media_tx.audio_seq.wrapping_add(1);
+        self.media_tx.audio_packet_count = self.media_tx.audio_packet_count.wrapping_add(1);
+        self.media_tx.audio_octet_count = self
+            .media_tx
+            .audio_octet_count
+            .wrapping_add(frame.data.len() as u32);
+        self.media_tx.audio_last_rtp_timestamp = self.media_tx.audio_timestamp;
         self.media_tx.audio_timestamp = self
             .media_tx
             .audio_timestamp
             .wrapping_add((frame.sample_rate / 50).max(1));
+    }
+
+    fn maybe_send_sender_reports(&mut self) {
+        let Some(source) = self.last_source else {
+            return;
+        };
+        let Some(srtp) = self.srtp_tx.as_mut() else {
+            return;
+        };
+        if self.last_rtcp_report_at.elapsed().as_millis() < 1000 {
+            return;
+        }
+        self.last_rtcp_report_at = Instant::now();
+
+        let (ntp_secs, ntp_frac) = current_ntp_timestamp();
+        if self.media_tx.video_packet_count != 0 {
+            let sr = build_rtcp_sender_report(
+                self.media_tx.video_ssrc,
+                ntp_secs,
+                ntp_frac,
+                self.media_tx.video_last_rtp_timestamp,
+                self.media_tx.video_packet_count,
+                self.media_tx.video_octet_count,
+            );
+            let packet = srtp.protect_rtcp(
+                &sr,
+                self.media_tx.video_ssrc,
+                self.media_tx.video_srtcp_index,
+            );
+            self.pending_transmits.push((source, packet));
+            self.media_tx.video_srtcp_index = self.media_tx.video_srtcp_index.wrapping_add(1);
+        }
+        if self.media_tx.audio_packet_count != 0 {
+            let sr = build_rtcp_sender_report(
+                self.media_tx.audio_ssrc,
+                ntp_secs,
+                ntp_frac,
+                self.media_tx.audio_last_rtp_timestamp,
+                self.media_tx.audio_packet_count,
+                self.media_tx.audio_octet_count,
+            );
+            let packet = srtp.protect_rtcp(
+                &sr,
+                self.media_tx.audio_ssrc,
+                self.media_tx.audio_srtcp_index,
+            );
+            self.pending_transmits.push((source, packet));
+            self.media_tx.audio_srtcp_index = self.media_tx.audio_srtcp_index.wrapping_add(1);
+        }
+    }
+
+    fn cache_video_packet(&mut self, sequence_number: u16, packet: Vec<u8>) {
+        if self.video_rtx_cache.len() >= VIDEO_RTX_CACHE_SIZE {
+            self.video_rtx_cache.pop_front();
+        }
+        self.video_rtx_cache.push_back(CachedRtpPacket {
+            sequence_number,
+            packet,
+        });
+    }
+
+    fn retransmit_nacked_video(&mut self, nack_sequences: &[u16]) {
+        let Some(source) = self.last_source else {
+            return;
+        };
+        let mut resent = 0usize;
+        for seq in nack_sequences {
+            if let Some(pkt) = self
+                .video_rtx_cache
+                .iter()
+                .rev()
+                .find(|pkt| pkt.sequence_number == *seq)
+            {
+                self.pending_transmits.push((source, pkt.packet.clone()));
+                resent += 1;
+            }
+        }
+        if resent != 0 {
+            tracing::debug!(count = resent, "phantom backend retransmitted NACKed RTP packets");
+        }
     }
 }
 
@@ -423,13 +497,21 @@ impl BackendClient for PhantomClient {
 
     fn drain_outgoing(&mut self) {
         let mut control_msgs = Vec::new();
-        let mut video_frames = Vec::new();
+        let mut latest_video: Option<EncodedFrame> = None;
+        let mut latest_keyframe: Option<EncodedFrame> = None;
         let mut audio_frames = Vec::new();
         if let Some(rx) = &self.control_out_rx {
             control_msgs.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
         if let Some(rx) = &self.media_video_rx {
-            video_frames.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            for frame in std::iter::from_fn(|| rx.try_recv().ok()) {
+                if frame.is_keyframe {
+                    latest_keyframe = Some(frame);
+                    latest_video = None;
+                } else if latest_keyframe.is_none() {
+                    latest_video = Some(frame);
+                }
+            }
         }
         if let Some(rx) = &self.media_audio_rx {
             audio_frames.extend(std::iter::from_fn(|| rx.try_recv().ok()));
@@ -438,14 +520,15 @@ impl BackendClient for PhantomClient {
             return;
         };
         for msg in control_msgs {
-            self.sctp.write_stream(stream_id, &msg, DataPpi::Binary);
-        }
-        for frame in &video_frames {
-            self.send_video_frame(frame);
+            self.sctp.send_binary(stream_id, &msg);
         }
         for frame in &audio_frames {
             self.send_audio_frame(frame);
         }
+        if let Some(frame) = latest_keyframe.as_ref().or(latest_video.as_ref()) {
+            self.send_video_frame(frame);
+        }
+        self.maybe_send_sender_reports();
     }
 
     fn handle_receive(
@@ -500,12 +583,17 @@ impl BackendClient for PhantomClient {
             }
             if let Some(srtp) = self.srtp_rx.as_mut() {
                 if let Some(rtcp) = srtp.unprotect_rtcp(contents) {
-                    if rtcp_requests_keyframe(&rtcp) {
+                    let feedback = parse_rtcp_feedback(&rtcp);
+                    if feedback.requests_keyframe {
                         tracing::debug!("phantom backend received RTCP PLI/FIR");
                         if let Some(tx) = &self.control_in_tx {
                             let _ = tx.send(bincode::serialize(&Message::RequestKeyframe).unwrap_or_default());
                         }
                     }
+                    if !feedback.nack_sequences.is_empty() {
+                        self.retransmit_nacked_video(&feedback.nack_sequences);
+                    }
+                    let _ = feedback.receiver_report;
                 }
             }
             return;
@@ -538,23 +626,6 @@ impl BackendClient for PhantomClient {
     }
 }
 
-fn parse_dcep_open_label(payload: &[u8]) -> Option<String> {
-    if payload.len() < 12 || payload[0] != DCEP_OPEN {
-        return None;
-    }
-    let label_len = u16::from_be_bytes([payload[8], payload[9]]) as usize;
-    let protocol_len = u16::from_be_bytes([payload[10], payload[11]]) as usize;
-    let label_start = 12usize;
-    let label_end = label_start.checked_add(label_len)?;
-    let protocol_end = label_end.checked_add(protocol_len)?;
-    if protocol_end > payload.len() {
-        return None;
-    }
-    std::str::from_utf8(&payload[label_start..label_end])
-        .ok()
-        .map(|label| label.to_string())
-}
-
 fn is_rtp_packet(packet: &[u8]) -> bool {
     packet.len() >= 12
         && packet.first().map(|b| (0x80..=0xBF).contains(b)).unwrap_or(false)
@@ -575,6 +646,14 @@ struct MediaTxState {
     audio_seq: u16,
     video_timestamp: u32,
     audio_timestamp: u32,
+    video_last_rtp_timestamp: u32,
+    audio_last_rtp_timestamp: u32,
+    video_packet_count: u32,
+    audio_packet_count: u32,
+    video_octet_count: u32,
+    audio_octet_count: u32,
+    video_srtcp_index: u32,
+    audio_srtcp_index: u32,
     h264: H264PacketizerState,
 }
 
@@ -588,6 +667,14 @@ impl MediaTxState {
             audio_seq: (seed >> 80) as u16,
             video_timestamp: (seed >> 96) as u32,
             audio_timestamp: (seed >> 64) as u32,
+            video_last_rtp_timestamp: (seed >> 96) as u32,
+            audio_last_rtp_timestamp: (seed >> 64) as u32,
+            video_packet_count: 0,
+            audio_packet_count: 0,
+            video_octet_count: 0,
+            audio_octet_count: 0,
+            video_srtcp_index: 0,
+            audio_srtcp_index: 0,
             h264: H264PacketizerState::default(),
         }
     }
@@ -597,6 +684,25 @@ impl MediaTxState {
 struct H264PacketizerState {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRtpPacket {
+    sequence_number: u16,
+    packet: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct RtcpFeedback {
+    requests_keyframe: bool,
+    nack_sequences: Vec<u16>,
+    receiver_report: Option<ReceiverReportSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReceiverReportSummary {
+    fraction_lost: u8,
+    jitter: u32,
 }
 
 struct PhantomSrtpTxContext {
@@ -690,6 +796,20 @@ impl PhantomSrtpTxContext {
                 ssrc,
                 payload,
             ),
+        }
+    }
+
+    fn protect_rtcp(&mut self, packet: &[u8], ssrc: u32, srtcp_index: u32) -> Vec<u8> {
+        match &mut self.rtp {
+            PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
+                protect_rtcp_gcm(key, *salt, packet, ssrc, srtcp_index)
+            }
+            PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
+                protect_rtcp_gcm(key, *salt, packet, ssrc, srtcp_index)
+            }
+            PhantomSrtpCipher::Aes128CmSha1_80 {
+                auth_key, ..
+            } => protect_rtcp_aes_cm_sha1_80(auth_key, packet, srtcp_index),
         }
     }
 }
@@ -826,6 +946,28 @@ where
     }
 }
 
+fn protect_rtcp_gcm<C>(key: &C, salt: [u8; 12], packet: &[u8], ssrc: u32, srtcp_index: u32) -> Vec<u8>
+where
+    C: AeadInPlace,
+{
+    let e_and_si = 0x8000_0000 | (srtcp_index & 0x7fff_ffff);
+    let iv = rtcp_gcm_iv(salt, ssrc, srtcp_index);
+    let nonce = Nonce::from_slice(&iv);
+    let mut aad = [0u8; 12];
+    aad[..8].copy_from_slice(&packet[..8]);
+    aad[8..12].copy_from_slice(&e_and_si.to_be_bytes());
+    let mut body = packet[8..].to_vec();
+    let tag = key
+        .encrypt_in_place_detached(nonce, &aad, &mut body)
+        .expect("SRTCP GCM encrypt");
+    let mut out = Vec::with_capacity(8 + body.len() + tag.len() + 4);
+    out.extend_from_slice(&packet[..8]);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(tag.as_slice());
+    out.extend_from_slice(&e_and_si.to_be_bytes());
+    out
+}
+
 fn rtp_gcm_iv(salt: [u8; 12], ssrc: u32, roc: u32, seq: u16) -> [u8; 12] {
     let mut iv = [0u8; 12];
     iv[2..6].copy_from_slice(&ssrc.to_be_bytes());
@@ -847,13 +989,86 @@ fn rtcp_gcm_iv(salt: [u8; 12], ssrc: u32, srtcp_index: u32) -> [u8; 12] {
     iv
 }
 
-fn rtcp_requests_keyframe(packet: &[u8]) -> bool {
-    if packet.len() < 12 {
-        return false;
+fn parse_rtcp_feedback(packet: &[u8]) -> RtcpFeedback {
+    let mut out = RtcpFeedback::default();
+    let mut offset = 0usize;
+    while offset + 4 <= packet.len() {
+        let block = &packet[offset..];
+        let words = u16::from_be_bytes([block[2], block[3]]) as usize + 1;
+        let block_len = words * 4;
+        if block_len == 0 || offset + block_len > packet.len() {
+            break;
+        }
+        let fmt = block[0] & 0x1F;
+        let packet_type = block[1];
+        if matches!((packet_type, fmt), (206, 1) | (206, 4) | (192, 4)) {
+            out.requests_keyframe = true;
+        }
+        if packet_type == 205 && fmt == 1 {
+            parse_rtcp_generic_nack(&block[..block_len], &mut out.nack_sequences);
+        }
+        if packet_type == 201 {
+            out.receiver_report = parse_rtcp_receiver_report(&block[..block_len]);
+        }
+        offset += block_len;
     }
-    let fmt = packet[0] & 0x1F;
-    let packet_type = packet[1];
-    matches!((packet_type, fmt), (206, 1) | (206, 4) | (192, 4))
+    out
+}
+
+fn parse_rtcp_generic_nack(packet: &[u8], out: &mut Vec<u16>) {
+    if packet.len() < 12 {
+        return;
+    }
+    let mut offset = 12usize;
+    while offset + 4 <= packet.len() {
+        let pid = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let blp = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        out.push(pid);
+        for bit in 0..16u16 {
+            if (blp & (1 << bit)) != 0 {
+                out.push(pid.wrapping_add(bit + 1));
+            }
+        }
+        offset += 4;
+    }
+}
+
+fn parse_rtcp_receiver_report(packet: &[u8]) -> Option<ReceiverReportSummary> {
+    if packet.len() < 8 {
+        return None;
+    }
+    let report_count = (packet[0] & 0x1F) as usize;
+    if report_count == 0 {
+        return None;
+    }
+    let mut offset = 8usize;
+    let mut max_fraction_lost = 0u8;
+    let mut max_jitter = 0u32;
+    let mut seen = 0usize;
+    for _ in 0..report_count {
+        if offset + 24 > packet.len() {
+            break;
+        }
+        let fraction_lost = packet[offset + 4];
+        let jitter = u32::from_be_bytes([
+            packet[offset + 12],
+            packet[offset + 13],
+            packet[offset + 14],
+            packet[offset + 15],
+        ]);
+        max_fraction_lost = max_fraction_lost.max(fraction_lost);
+        max_jitter = max_jitter.max(jitter);
+        seen += 1;
+        offset += 24;
+    }
+    if seen == 0 {
+        None
+    } else {
+        Some(ReceiverReportSummary {
+            fraction_lost: max_fraction_lost,
+            jitter: max_jitter,
+        })
+    }
 }
 
 fn derive_gcm_material_128(material: &KeyingMaterial, left: bool) -> Result<([u8; 16], [u8; 12])> {
@@ -951,6 +1166,19 @@ fn protect_rtp_aes_cm_sha1_80(
     let tag = hmac::sign(
         &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, auth_key),
         &auth_input,
+    );
+    out.extend_from_slice(&tag.as_ref()[..10]);
+    out
+}
+
+fn protect_rtcp_aes_cm_sha1_80(auth_key: &[u8; 20], packet: &[u8], srtcp_index: u32) -> Vec<u8> {
+    let e_and_si = srtcp_index & 0x7fff_ffff;
+    let mut out = Vec::with_capacity(packet.len() + 4 + 10);
+    out.extend_from_slice(packet);
+    out.extend_from_slice(&e_and_si.to_be_bytes());
+    let tag = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, auth_key),
+        &out,
     );
     out.extend_from_slice(&tag.as_ref()[..10]);
     out
@@ -1106,6 +1334,36 @@ fn find_annexb_start(payload: &[u8], from: usize) -> Option<(usize, usize)> {
         i += 1;
     }
     None
+}
+
+fn current_ntp_timestamp() -> (u32, u32) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs().saturating_add(2_208_988_800);
+    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000u64;
+    (secs as u32, frac as u32)
+}
+
+fn build_rtcp_sender_report(
+    ssrc: u32,
+    ntp_secs: u32,
+    ntp_frac: u32,
+    rtp_timestamp: u32,
+    packet_count: u32,
+    octet_count: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(28);
+    out.push(0x80);
+    out.push(200);
+    out.extend_from_slice(&6u16.to_be_bytes());
+    out.extend_from_slice(&ssrc.to_be_bytes());
+    out.extend_from_slice(&ntp_secs.to_be_bytes());
+    out.extend_from_slice(&ntp_frac.to_be_bytes());
+    out.extend_from_slice(&rtp_timestamp.to_be_bytes());
+    out.extend_from_slice(&packet_count.to_be_bytes());
+    out.extend_from_slice(&octet_count.to_be_bytes());
+    out
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1462,23 +1720,15 @@ struct PhantomSessionParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StunBindingRequest {
     username: Option<String>,
-    transaction_id: [u8; 12],
 }
 
 fn parse_stun_binding_request(packet: &[u8]) -> Option<StunBindingRequest> {
-    let header = parse_stun_header(packet)?;
-    if header.msg_type != STUN_BINDING_REQUEST {
+    let msg = StunMessage::from_bytes(packet).ok()?;
+    if !msg.has_class(MessageClass::Request) || msg.method() != BINDING {
         return None;
     }
-    let mut username = None;
-    for attribute in parse_stun_attributes(packet, header.body_len)? {
-        if attribute.ty == STUN_ATTR_USERNAME {
-            username = std::str::from_utf8(attribute.value).ok().map(|s| s.to_string());
-        }
-    }
     Some(StunBindingRequest {
-        username,
-        transaction_id: header.transaction_id,
+        username: msg.attribute::<Username>().ok().map(|u| u.username().to_string()),
     })
 }
 
@@ -1487,189 +1737,20 @@ fn build_stun_success_response(
     source: SocketAddr,
     params: &PhantomSessionParams,
 ) -> Option<Vec<u8>> {
-    let request = parse_stun_binding_request(request_packet)?;
-    let mut response = Vec::with_capacity(64);
-    response.extend_from_slice(&STUN_BINDING_SUCCESS.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
-    response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    response.extend_from_slice(&request.transaction_id);
-    append_stun_xor_mapped_address(&mut response, source, request.transaction_id);
-    append_stun_message_integrity(&mut response, params.ice_pwd.as_bytes());
-    append_stun_fingerprint(&mut response);
-    let body_len = response.len().checked_sub(20)? as u16;
-    response[2..4].copy_from_slice(&body_len.to_be_bytes());
-    Some(response)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StunHeader {
-    msg_type: u16,
-    body_len: usize,
-    transaction_id: [u8; 12],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StunAttribute<'a> {
-    ty: u16,
-    value: &'a [u8],
-}
-
-fn parse_stun_header(packet: &[u8]) -> Option<StunHeader> {
-    if packet.len() < 20 {
+    let request = StunMessage::from_bytes(request_packet).ok()?;
+    if !request.has_class(MessageClass::Request) || request.method() != BINDING {
         return None;
     }
-    if packet[0] & 0b1100_0000 != 0 {
-        return None;
-    }
-    let msg_type = u16::from_be_bytes(packet[0..2].try_into().ok()?);
-    let body_len = u16::from_be_bytes(packet[2..4].try_into().ok()?) as usize;
-    if packet.len() != 20 + body_len {
-        return None;
-    }
-    let magic_cookie = u32::from_be_bytes(packet[4..8].try_into().ok()?);
-    if magic_cookie != STUN_MAGIC_COOKIE {
-        return None;
-    }
-    let mut transaction_id = [0u8; 12];
-    transaction_id.copy_from_slice(&packet[8..20]);
-    Some(StunHeader {
-        msg_type,
-        body_len,
-        transaction_id,
-    })
-}
-
-fn parse_stun_attributes(packet: &[u8], body_len: usize) -> Option<Vec<StunAttribute<'_>>> {
-    let mut out = Vec::new();
-    let mut offset = 20usize;
-    let end = 20usize.checked_add(body_len)?;
-    while offset < end {
-        let header_end = offset.checked_add(4)?;
-        if header_end > end {
-            return None;
-        }
-        let ty = u16::from_be_bytes(packet[offset..offset + 2].try_into().ok()?);
-        let len = u16::from_be_bytes(packet[offset + 2..offset + 4].try_into().ok()?) as usize;
-        let value_start = header_end;
-        let value_end = value_start.checked_add(len)?;
-        if value_end > end {
-            return None;
-        }
-        out.push(StunAttribute {
-            ty,
-            value: &packet[value_start..value_end],
-        });
-        offset = align4(value_end);
-    }
-    if offset != end {
-        return None;
-    }
-    Some(out)
-}
-
-fn append_stun_attribute(buf: &mut Vec<u8>, ty: u16, value: &[u8]) {
-    buf.extend_from_slice(&ty.to_be_bytes());
-    buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    buf.extend_from_slice(value);
-    while buf.len() % 4 != 0 {
-        buf.push(0);
-    }
-}
-
-fn append_stun_xor_mapped_address(buf: &mut Vec<u8>, source: SocketAddr, transaction_id: [u8; 12]) {
-    let mut value = Vec::with_capacity(match source {
-        SocketAddr::V4(_) => 8,
-        SocketAddr::V6(_) => 20,
-    });
-    value.push(0);
-    match source {
-        SocketAddr::V4(addr) => {
-            value.push(0x01);
-            let xport = addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-            value.extend_from_slice(&xport.to_be_bytes());
-            let mut ip = addr.ip().octets();
-            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-            for (dst, mask) in ip.iter_mut().zip(cookie) {
-                *dst ^= mask;
-            }
-            value.extend_from_slice(&ip);
-        }
-        SocketAddr::V6(addr) => {
-            value.push(0x02);
-            let xport = addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-            value.extend_from_slice(&xport.to_be_bytes());
-            let mut ip = addr.ip().octets();
-            let mut mask = [0u8; 16];
-            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-            mask[4..].copy_from_slice(&transaction_id);
-            for (dst, key) in ip.iter_mut().zip(mask) {
-                *dst ^= key;
-            }
-            value.extend_from_slice(&ip);
-        }
-    }
-    append_stun_attribute(buf, STUN_ATTR_XOR_MAPPED_ADDRESS, &value);
-}
-
-fn append_stun_message_integrity(buf: &mut Vec<u8>, key: &[u8]) {
-    let attr_start = buf.len();
-    buf.extend_from_slice(&STUN_ATTR_MESSAGE_INTEGRITY.to_be_bytes());
-    buf.extend_from_slice(&20u16.to_be_bytes());
-    let digest_start = buf.len();
-    buf.resize(digest_start + 20, 0);
-    let body_len = (buf.len() - 20) as u16;
-    buf[2..4].copy_from_slice(&body_len.to_be_bytes());
-    let digest = hmac::sign(
-        &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key),
-        &buf[..digest_start + 20],
-    );
-    buf[digest_start..digest_start + 20].copy_from_slice(&digest.as_ref()[..20]);
-    debug_assert_eq!(attr_start + 24, buf.len());
-}
-
-fn append_stun_fingerprint(buf: &mut Vec<u8>) {
-    let mut crc_input = buf.clone();
-    let final_body_len = (buf.len() - 20 + 8) as u16;
-    crc_input[2..4].copy_from_slice(&final_body_len.to_be_bytes());
-    let fingerprint = crc32fast::hash(&crc_input) ^ STUN_FINGERPRINT_XOR;
-    append_stun_attribute(buf, STUN_ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
-    let body_len = (buf.len() - 20) as u16;
-    buf[2..4].copy_from_slice(&body_len.to_be_bytes());
-}
-
-#[cfg(test)]
-fn decode_stun_xor_mapped_address(value: &[u8], transaction_id: [u8; 12]) -> Option<SocketAddr> {
-    if value.len() < 4 || value[0] != 0 {
-        return None;
-    }
-    let port = u16::from_be_bytes(value[2..4].try_into().ok()?) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-    match value[1] {
-        0x01 if value.len() == 8 => {
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&value[4..8]);
-            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-            for (dst, mask) in ip.iter_mut().zip(cookie) {
-                *dst ^= mask;
-            }
-            Some(SocketAddr::from((ip, port)))
-        }
-        0x02 if value.len() == 20 => {
-            let mut ip = [0u8; 16];
-            ip.copy_from_slice(&value[4..20]);
-            let mut mask = [0u8; 16];
-            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-            mask[4..].copy_from_slice(&transaction_id);
-            for (dst, key) in ip.iter_mut().zip(mask) {
-                *dst ^= key;
-            }
-            Some(SocketAddr::from((ip, port)))
-        }
-        _ => None,
-    }
-}
-
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
+    let mut response = StunMessage::builder_success(&request, MessageWriteVec::new());
+    response
+        .add_attribute(&XorMappedAddress::new(source, request.transaction_id()))
+        .ok()?;
+    let credentials = ShortTermCredentials::new(params.ice_pwd.clone());
+    response
+        .add_message_integrity(&credentials.into(), IntegrityAlgorithm::Sha1)
+        .ok()?;
+    response.add_fingerprint().ok()?;
+    Some(response.finish())
 }
 
 impl PhantomSessionParams {
@@ -1768,11 +1849,14 @@ fn format_fingerprint(fingerprint: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerBuilder, DCEP_OPEN, ParsedOffer, PhantomSessionParams, STUN_ATTR_FINGERPRINT,
-        STUN_ATTR_MESSAGE_INTEGRITY, STUN_ATTR_USERNAME, STUN_ATTR_XOR_MAPPED_ADDRESS,
-        STUN_BINDING_SUCCESS, STUN_MAGIC_COOKIE, build_stun_success_response,
-        decode_stun_xor_mapped_address, parse_dcep_open_label, parse_stun_attributes,
-        parse_stun_binding_request, parse_stun_header,
+        AnswerBuilder, ParsedOffer, PhantomSessionParams, build_stun_success_response,
+        parse_stun_binding_request,
+    };
+    use crate::transport::webrtc::sctp::{DCEP_OPEN, parse_dcep_open_label};
+    use stun_types::attribute::{Fingerprint, MessageIntegrity, Username, XorMappedAddress};
+    use stun_types::message::{
+        BINDING, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
+        MessageWriteVec,
     };
 
     #[test]
@@ -1883,34 +1967,27 @@ mod tests {
         let offer = ParsedOffer::parse(sdp).unwrap();
         let params = PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
         let username = format!("{}:{}", params.ice_ufrag, params.remote_ice_ufrag);
-        let mut request = Vec::new();
-        request.extend_from_slice(&0x0001u16.to_be_bytes());
-        request.extend_from_slice(&8u16.to_be_bytes());
-        request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-        request.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        request.extend_from_slice(&STUN_ATTR_USERNAME.to_be_bytes());
-        request.extend_from_slice(&(username.len() as u16).to_be_bytes());
-        request.extend_from_slice(username.as_bytes());
-        while request.len() % 4 != 0 {
-            request.push(0);
-        }
-        let request_len = (request.len() - 20) as u16;
-        request[2..4].copy_from_slice(&request_len.to_be_bytes());
+        let mut request = StunMessage::builder_request(BINDING, MessageWriteVec::new());
+        request
+            .add_attribute(&Username::new(&username).unwrap())
+            .unwrap();
+        let request = request.finish();
         let parsed = parse_stun_binding_request(&request).unwrap();
         assert_eq!(parsed.username.as_deref(), Some(username.as_str()));
 
-        let response = build_stun_success_response(&request, "10.0.0.9:50000".parse().unwrap(), &params).unwrap();
-        let header = parse_stun_header(&response).unwrap();
-        assert_eq!(header.msg_type, STUN_BINDING_SUCCESS);
-        let attrs = parse_stun_attributes(&response, header.body_len).unwrap();
-        assert!(attrs.iter().any(|a| a.ty == STUN_ATTR_MESSAGE_INTEGRITY && a.value.len() == 20));
-        assert!(attrs.iter().any(|a| a.ty == STUN_ATTR_FINGERPRINT && a.value.len() == 4));
-        let mapped = attrs
-            .iter()
-            .find(|a| a.ty == STUN_ATTR_XOR_MAPPED_ADDRESS)
-            .and_then(|a| decode_stun_xor_mapped_address(a.value, header.transaction_id))
-            .unwrap();
-        assert_eq!(mapped, "10.0.0.9:50000".parse().unwrap());
+        let response =
+            build_stun_success_response(&request, "10.0.0.9:50000".parse().unwrap(), &params)
+                .unwrap();
+        let response = StunMessage::from_bytes(&response).unwrap();
+        assert!(response.has_class(MessageClass::Success));
+        assert_eq!(response.method(), BINDING);
+        assert!(response.attribute::<MessageIntegrity>().is_ok());
+        assert!(response.attribute::<Fingerprint>().is_ok());
+        let mapped = response.attribute::<XorMappedAddress>().unwrap();
+        assert_eq!(
+            mapped.addr(response.transaction_id()),
+            "10.0.0.9:50000".parse().unwrap()
+        );
     }
 
     #[test]

@@ -118,7 +118,7 @@ sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
 wasm-pack build crates/web --target web --no-typescript
 
 cargo build --release
-cargo build --release --features webrtc   # +WebRTC DataChannel
+cargo build --release --features webrtc   # +WebRTC (media tracks + data channels)
 cargo test --workspace                     # 136 tests
 cargo clippy --workspace -- -D warnings
 ```

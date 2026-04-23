@@ -1,6 +1,6 @@
 # Phantom — Feature Reference
 
-Accurate as of v0.4.10. Each entry points at the code that implements it.
+Accurate as of v0.5.3. Each entry points at the code that implements it.
 
 ## Transports
 
@@ -9,7 +9,7 @@ Accurate as of v0.4.10. Each entry points at the code that implements it.
 | TCP (plain + ChaCha20-Poly1305) | ✅ | `server/src/transport/tcp.rs` | Native client; encryption on unless `--no-encrypt` |
 | WebSocket over HTTPS | ✅ | `server/src/transport/ws.rs` | Browser client, embedded WASM, same port as HTTPS static |
 | QUIC | opt-in `--transport quic` | `server/src/transport/quic.rs` | Native client only; self-signed TLS, no head-of-line blocking |
-| WebRTC DataChannel | feature `webrtc` | `server/src/transport/webrtc.rs` | Experimental browser path; str0m 0.18; 16KB SCTP limit → chunking; planned redesign toward media tracks + control/input DC |
+| WebRTC (media tracks + DataChannels) | feature `webrtc` | `server/src/transport/webrtc.rs` | Optional browser path (`?rtc` / `?rtc2`): video+audio over media tracks, input+control over DataChannels, signaling via `POST /rtc` |
 
 All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); session loop is transport-agnostic.
 
@@ -137,7 +137,7 @@ Structured fields via `tracing`; stdout + file if `--log-file` set.
 ## Network / deployment
 
 - **STUN**: `--stun auto` (Google public) or `--stun <server>` prints a connection code with discovered public `ip:port`. `--public-addr ip:port` skips STUN if you already know the externally-reachable address.
-- **JWT auth (WSS)**: `--auth-secret <hex>` turns on HMAC-SHA256 JWT verification; browser supplies `?token=<jwt>` on WebSocket URL. No token support on TCP/QUIC.
+- **JWT auth (web transports)**: `--auth-secret <hex>` turns on HMAC-SHA256 JWT verification; browser supplies `?token=<jwt>` for both WSS and `POST /rtc`. No token support on TCP/QUIC.
 
 ## Windows Service mode
 

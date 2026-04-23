@@ -1,0 +1,48 @@
+[package]
+name = "phantom-sctp"
+version = "0.9.0"
+edition = "2024"
+rust-version = "1.85"
+authors = [
+    "Rain Liu <yliu@webrtc.rs>",
+    "Martin Algesten<martin@algesten.se>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Phantom-local SCTP subset for WebRTC DataChannel"
+license = "MIT OR Apache-2.0"
+
+[features]
+_fuzz = []
+
+[lib]
+name = "phantom_sctp"
+path = "src/lib.rs"
+
+[dependencies.bytes]
+version = "1.5.0"
+
+[dependencies.crc]
+version = "3.4.0"
+
+[dependencies.log]
+version = "0.4.21"
+
+[dependencies.rand]
+version = "0.9"
+
+[dependencies.rustc-hash]
+version = "2.1.1"
+
+[dependencies.slab]
+version = "0.4.9"
+
+[dependencies.thiserror]
+version = "2.0.18"
+
+[dev-dependencies.assert_matches]
+version = "1.5.0"

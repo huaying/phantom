@@ -1,12 +1,12 @@
 [package]
 name = "phantom-server"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 
 [features]
 default = ["web-client", "audio", "sso"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
-webrtc = ["dep:dimpl", "dep:crc32fast", "dep:sctp-proto", "dep:aes", "dep:aes-gcm"]  # WebRTC transport workbench backed by Phantom's in-tree browser stack
+webrtc = ["dep:dimpl", "dep:crc32fast", "dep:phantom-sctp", "dep:aes", "dep:aes-gcm", "dep:stun-types"]  # WebRTC transport workbench backed by Phantom's in-tree browser stack
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows
 wayland = ["dep:pipewire", "dep:dbus"]  # Wayland screen capture via PipeWire + XDG Portal
 sso = []  # SSO agent: write auth ticket after JWT verified, for pam_phantom / phantom_cp plugins
@@ -32,9 +32,10 @@ ring = "0.17"
 tungstenite = "0.24"
 dimpl = { version = "0.5", optional = true, default-features = false, features = ["rust-crypto"] }
 crc32fast = { version = "1", optional = true }
-sctp-proto = { version = "0.9", optional = true }
+phantom-sctp = { path = "../phantom-sctp", optional = true }
 aes = { version = "0.8", optional = true }
 aes-gcm = { version = "0.10", optional = true }
+stun-types = { version = "2.0.1", optional = true }
 serde_json = "1"
 enigo = "0.3"
 arboard = "3"

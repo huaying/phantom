@@ -62,8 +62,11 @@ crates/server/src/                Capture → encode → ship pixels
     quic.rs                           QUIC: quinn, self-signed TLS, keep-alive
     ws.rs                             WebServerTransport: HTTPS static (serves WASM)
                                       + WSS upgrade + WebRTC POST /rtc + JWT auth
-    webrtc.rs                         str0m 0.18 run_loop, chunked writes (>16KB),
-                                      1ms UDP polling (feature `webrtc`)
+    webrtc.rs                         Phantom-owned WebRTC run loop + session bridge
+                                      (media tracks + input/control DC, feature `webrtc`)
+    webrtc/backend_phantom.rs         ICE/STUN + DTLS + SRTP/SRTCP + RTP packetization
+                                      + DataChannel wiring
+    webrtc/sctp.rs                    DataChannel adapter over in-tree `phantom-sctp`
 
   bin/mock_server.rs              Animated H.264 frames without screen capture
                                   (for transport + codec pipeline tests)
@@ -88,13 +91,16 @@ crates/client/src/                Native client (winit + softbuffer)
 
 crates/web/src/                   Browser client (Rust → WASM)
   lib.rs                            WASM entry, setup_webrtc (POST /rtc) + setup_ws
-                                    fallback, ChunkAssembler for >16KB DataChannel
-                                    messages, WebCodecs H.264/AV1 decode, Canvas
-                                    render, got_keyframe guard, mouse/keyboard/
-                                    scroll input, JWT passthrough, stuck-key
-                                    prevention, ClientHello with preferred_viewport
+                                    fallback, media-track receive path (`<video>`/`<audio>`)
+                                    + DataChannel control/input, WebCodecs H.264/AV1
+                                    decode for WSS path, mouse/keyboard/scroll input,
+                                    JWT passthrough, stuck-key prevention, ClientHello
+                                    with preferred_viewport
   pkg/                              wasm-pack output (committed so server can build
                                     without running wasm-pack every time)
+
+crates/phantom-sctp/src/          Local SCTP crate used by WebRTC DataChannels
+  lib.rs                            Endpoint/association glue and stream I/O
 
 crates/server/web/
   index.html                        Minimal HTML loader (embedded via include_str!
@@ -127,7 +133,7 @@ crates/server/tests/
   multi_transport_test.rs           TCP + WSS + QUIC simultaneously
   pipeline_test.rs                  H.264 encode/decode round trip, protocol round trip
   quic_test.rs                      QUIC ALPN + handshake
-  sctp_backpressure_test.rs         str0m buffered_amount + backpressure
+  sctp_backpressure_test.rs         chunk-framing compatibility tests
   wan_test.rs                       TCP proxy with delay/jitter, 8 WAN scenarios
   session_loop_test.rs              Mock capture/encoder/transport, 7 session-loop
                                     behavior tests (safety net for task #23)

@@ -1,11 +1,14 @@
 use bytes::Bytes;
-use sctp_proto::{
+use phantom_sctp::{
     Association, AssociationHandle, DatagramEvent, Endpoint, EndpointConfig, Event, Payload,
     PayloadProtocolIdentifier, ServerConfig, StreamEvent,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+
+pub(crate) const DCEP_OPEN: u8 = 0x03;
+const DCEP_ACK: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataPpi {
@@ -46,8 +49,8 @@ impl From<DataPpi> for PayloadProtocolIdentifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SctpNotice {
     Connected,
-    StreamOpened(u16),
-    StreamReadable(u16),
+    DataChannelOpened { stream_id: u16, label: String },
+    DataChannelData { stream_id: u16, payload: Vec<u8> },
     HandshakeFailed(String),
     AssociationLost { id: usize, reason: String },
 }
@@ -105,8 +108,42 @@ impl PhantomSctpStack {
         while let Some(event) = self.assoc.as_mut().and_then(|assoc| assoc.poll()) {
             match event {
                 Event::Connected => notices.push(SctpNotice::Connected),
-                Event::Stream(StreamEvent::Opened { id, .. }) => notices.push(SctpNotice::StreamOpened(id)),
-                Event::Stream(StreamEvent::Readable { id }) => notices.push(SctpNotice::StreamReadable(id)),
+                Event::Stream(StreamEvent::Opened { .. }) => {
+                    for id in self.accept_streams() {
+                        if let Some(label) = self.handle_dcep_open(id) {
+                            notices.push(SctpNotice::DataChannelOpened {
+                                stream_id: id,
+                                label,
+                            });
+                        }
+                    }
+                }
+                Event::Stream(StreamEvent::Readable { id }) => {
+                    for (ppi, payload) in self.read_stream_messages(id) {
+                        match ppi {
+                            DataPpi::Dcep if payload.first().copied() == Some(DCEP_OPEN) => {
+                                if let Some(label) = parse_dcep_open_label(&payload) {
+                                    self.write_stream(id, &[DCEP_ACK], DataPpi::Dcep);
+                                    notices.push(SctpNotice::DataChannelOpened {
+                                        stream_id: id,
+                                        label,
+                                    });
+                                }
+                            }
+                            DataPpi::Dcep => {}
+                            DataPpi::Binary
+                            | DataPpi::BinaryEmpty
+                            | DataPpi::String
+                            | DataPpi::StringEmpty => {
+                                notices.push(SctpNotice::DataChannelData {
+                                    stream_id: id,
+                                    payload,
+                                });
+                            }
+                            DataPpi::Other => {}
+                        }
+                    }
+                }
                 Event::HandshakeFailed { reason } => {
                     notices.push(SctpNotice::HandshakeFailed(format!("{reason:?}")))
                 }
@@ -186,4 +223,36 @@ impl PhantomSctpStack {
             }
         }
     }
+
+    pub(crate) fn send_binary(&mut self, stream_id: u16, payload: &[u8]) {
+        self.write_stream(stream_id, payload, DataPpi::Binary);
+    }
+
+    fn handle_dcep_open(&mut self, stream_id: u16) -> Option<String> {
+        for (ppi, payload) in self.read_stream_messages(stream_id) {
+            if ppi == DataPpi::Dcep && payload.first().copied() == Some(DCEP_OPEN) {
+                let label = parse_dcep_open_label(&payload)?;
+                self.write_stream(stream_id, &[DCEP_ACK], DataPpi::Dcep);
+                return Some(label);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) fn parse_dcep_open_label(payload: &[u8]) -> Option<String> {
+    if payload.len() < 12 || payload[0] != DCEP_OPEN {
+        return None;
+    }
+    let label_len = u16::from_be_bytes([payload[8], payload[9]]) as usize;
+    let protocol_len = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+    let label_start = 12usize;
+    let label_end = label_start.checked_add(label_len)?;
+    let protocol_end = label_end.checked_add(protocol_len)?;
+    if protocol_end > payload.len() {
+        return None;
+    }
+    std::str::from_utf8(&payload[label_start..label_end])
+        .ok()
+        .map(|label| label.to_string())
 }

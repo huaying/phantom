@@ -16,17 +16,14 @@ you're making touches one of these areas, re-read the relevant entry first.
   `-e PHANTOM_HOST=127.0.0.1`.
 
 ## Networking
-- **str0m DataChannel >16KB**: SCTP silently drops large messages. MUST
-  chunk into ≤16KB pieces. Chrome's limit is 256KB but str0m fails well
-  below that.
-- **Desktop video over DataChannel is the wrong optimization target**:
-  reliable ordered SCTP delivery preserves stale frames, large keyframes
-  force chunking/backpressure, and drag/scroll motion feels worse than WSS
-  even when average FPS looks similar. Treat the current browser WebRTC path
-  as experimental; long-term direction is media tracks for video/audio and
-  DataChannels only for input/control.
-- **str0m `Receive.destination`**: must match `candidate_addr`
-  (`127.0.0.1:9902`), not socket bind addr (`0.0.0.0:9902`).
+- **WebRTC mode mismatch**: browser needs `?rtc` (or `?rtc2`) and server
+  must be built with feature `webrtc`; otherwise you'll silently exercise
+  WSS and think WebRTC is broken.
+- **WebRTC autoplay policy**: browser may reject media `play()` before
+  user interaction (`NotAllowedError`). Keep the retry-on-gesture path
+  wired, especially for audio.
+- **Media/Control split**: video/audio are media tracks; input/control are
+  DataChannels. Do not route `Message::VideoFrame` through control DC again.
 - **WebRTC session zombie**: after ICE disconnect, `send_msg()` swallows
   Full errors. Session never ends. Must detect and terminate.
 - **WSS same port**: WS upgrade lives on HTTPS port 9900 (not separate
@@ -143,8 +140,9 @@ you're making touches one of these areas, re-read the relevant entry first.
   channels after browser refresh.
 - **Mutex poison**: use `unwrap_or_else(|e| e.into_inner())` not
   `.unwrap()`.
-- **Bounded channels**: WebRTC + WSS video both use `sync_channel(30)` +
-  `try_send` — drops on full, never blocks.
+- **Bounded channels**: WSS video queue is bounded (`sync_channel(30)` +
+  `try_send`) and WebRTC bridge queues are bounded too (video 8,
+  audio/control 64). Keep them bounded to avoid stale backlog replay.
 - **IPC encoded frames must be sequential**: H.264 P-frames depend on
   previous frames. Never drain-to-latest — forward ALL queued frames in
   order.
