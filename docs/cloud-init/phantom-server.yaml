@@ -1,0 +1,56 @@
+#cloud-config
+#
+# Phantom Linux server first-boot provisioning.
+#
+# Replace `dev-user` with the login user that should own the graphical session.
+# This intentionally uses the release installer instead of cloning the repo:
+# cloud-init prepares the OS/display state, then Phantom's installer verifies it
+# with `--doctor`.
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - sudo
+
+write_files:
+  - path: /usr/local/sbin/phantom-firstboot-doctor.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      for i in $(seq 1 30); do
+        if /usr/local/share/phantom/install.sh --doctor --doctor-strict --user=dev-user; then
+          exit 0
+        fi
+        echo "phantom doctor not ready yet; retry $i/30"
+        sleep 10
+      done
+      exit 1
+
+  - path: /etc/systemd/system/phantom-firstboot-doctor.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Validate Phantom remote desktop readiness after first reboot
+      Wants=network-online.target graphical.target
+      After=network-online.target graphical.target display-manager.service
+
+      [Service]
+      Type=oneshot
+      TimeoutStartSec=6min
+      ExecStart=/usr/local/sbin/phantom-firstboot-doctor.sh
+      ExecStartPost=/bin/systemctl disable phantom-firstboot-doctor.service
+
+      [Install]
+      WantedBy=graphical.target
+
+runcmd:
+  - mkdir -p /usr/local/share/phantom
+  - curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh -o /usr/local/share/phantom/install.sh
+  - chmod +x /usr/local/share/phantom/install.sh
+  - /usr/local/share/phantom/install.sh server --autologin --install-mode=auto --user=dev-user
+  - systemctl enable phantom-firstboot-doctor.service
+  - reboot

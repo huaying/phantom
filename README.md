@@ -33,11 +33,19 @@ in the current session, just run `phantom-server`.
 
 **Linux** (dedicated remote-access VM — survives sign-out, no screen lock):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s server --autologin
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s server --autologin --user=$USER
 ```
 Layers GDM autologin + screen-lock disable + a systemd watchdog on top of
 the default autostart. After the next reboot the VM comes up logged in with
-phantom already serving, and will recover itself on sign-out.
+phantom already serving, and will recover itself on sign-out. The installer
+runs a post-install doctor by default; re-run it after reboot with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s -- --doctor --doctor-strict --user=$USER
+```
+
+For first-boot VM provisioning, use [`docs/cloud-init/phantom-server.yaml`](docs/cloud-init/phantom-server.yaml)
+as the starting point.
 
 **macOS** (client only):
 ```bash
@@ -59,6 +67,9 @@ the script tells you how to finish with `phantom-server.exe --install`.
 | You want | Command |
 |---|---|
 | Install but don't touch autostart (Linux) | `... \| sh -s server --no-autostart` |
+| Install for a specific Linux login user | `... \| sh -s server --autologin --user=dev-user` |
+| Run installer health checks only | `... \| sh -s -- --doctor --doctor-strict --user=dev-user` |
+| Skip post-install health checks | `... \| sh -s server --no-doctor` |
 | Install but don't register service (Windows) | `$env:PHANTOM_NO_AUTOSTART=1; irm ... \| iex` |
 | Client only on Linux | `... \| sh -s client` |
 | Server **and** client on one box | `... \| sh -s both` |

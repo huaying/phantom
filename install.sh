@@ -46,10 +46,15 @@ parse_args() {
     LIGHT_GUI_FORCE=false
     SSO=false
     NO_AUTOSTART=false
+    RUN_DOCTOR=true
+    DOCTOR_ONLY=false
+    DOCTOR_STRICT=false
+    DOCTOR_CAPTURE_TIMEOUT=8
     GOT_ROLE=false
     INSTALL_MODE="auto"
     DISPLAY_PROFILE_RESULT="not-run"
     DISPLAY_PROFILE_REASON="light-gui path not executed"
+    TARGET_USER_ARG=""
 
     for _arg in "$@"; do
         case "$_arg" in
@@ -63,12 +68,24 @@ parse_args() {
             --gpu-strict) INSTALL_MODE="gpu-strict" ;;
             --safe-display) INSTALL_MODE="safe" ;;
             --install-mode=*) INSTALL_MODE="${_arg#--install-mode=}" ;;
-            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--light-gui] [--sso] [--no-autostart] [--install-mode=auto|gpu-strict|safe]"; exit 1 ;;
+            --user=*) TARGET_USER_ARG="${_arg#--user=}" ;;
+            --target-user=*) TARGET_USER_ARG="${_arg#--target-user=}" ;;
+            --doctor) DOCTOR_ONLY=true; RUN_DOCTOR=true ;;
+            --no-doctor) RUN_DOCTOR=false ;;
+            --doctor-strict) DOCTOR_STRICT=true ;;
+            --doctor-timeout=*) DOCTOR_CAPTURE_TIMEOUT="${_arg#--doctor-timeout=}" ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--user=<login>] [--autologin] [--light-gui] [--sso] [--no-autostart] [--install-mode=auto|gpu-strict|safe] [--doctor|--no-doctor|--doctor-strict]"; exit 1 ;;
         esac
     done
 }
 
 apply_defaults() {
+    if [ "$DOCTOR_ONLY" = true ]; then
+        INSTALL_SERVER=false
+        INSTALL_CLIENT=false
+        GOT_ROLE=true
+    fi
+
     if [ "$GOT_ROLE" = false ]; then
         # Default: server on Linux, client on macOS
         case "$OS" in
@@ -118,10 +135,22 @@ apply_defaults() {
 # USER_HOME is used by the autostart and autologin steps to write files
 # under ~/.config/autostart, ~/.local/share/keyrings, etc.
 get_target_user() {
-    TARGET_USER="${SUDO_USER:-$USER}"
+    if [ -n "$TARGET_USER_ARG" ]; then
+        TARGET_USER="$TARGET_USER_ARG"
+    elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        TARGET_USER="$SUDO_USER"
+    elif [ -n "${USER:-}" ] && [ "$USER" != "root" ]; then
+        TARGET_USER="$USER"
+    elif have_cmd getent; then
+        TARGET_USER=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $6 ~ /^\// {print $1; exit}')
+    else
+        TARGET_USER=""
+    fi
     USER_HOME=""
     if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
-        USER_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+        if have_cmd getent; then
+            USER_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)
+        fi
     fi
     if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
         USER_HOME="$HOME"
@@ -187,6 +216,7 @@ linux_install_deps_apt() {
     fi
     if [ -n "$_pkgs" ]; then
         sudo apt-get update -qq
+        # shellcheck disable=SC2086 # package list must split into separate args
         sudo apt-get install -y --no-install-recommends $_pkgs || true
     fi
 }
@@ -201,6 +231,7 @@ linux_install_deps_dnf() {
         _pkgs="$_pkgs libxcb alsa-lib"
     fi
     if [ -n "$_pkgs" ]; then
+        # shellcheck disable=SC2086 # package list must split into separate args
         sudo dnf install -y $_pkgs || true
     fi
 }
@@ -215,6 +246,7 @@ linux_install_deps_pacman() {
         _pkgs="$_pkgs libxcb alsa-lib"
     fi
     if [ -n "$_pkgs" ]; then
+        # shellcheck disable=SC2086 # package list must split into separate args
         sudo pacman -S --needed --noconfirm $_pkgs || true
     fi
 }
@@ -521,10 +553,16 @@ linux_configure_uinput() {
     if [ ! -f "$_udev_rule_path" ] || ! grep -qxF "$_udev_rule_content" "$_udev_rule_path" 2>/dev/null; then
         echo "$_udev_rule_content" | sudo tee "$_udev_rule_path" > /dev/null
         sudo udevadm control --reload-rules
+        if have_cmd modprobe; then
+            sudo modprobe uinput 2>/dev/null || true
+        fi
         sudo udevadm trigger /dev/uinput 2>/dev/null || true
         echo "  Wrote $_udev_rule_path"
     else
         echo "  udev rule already in place"
+        if have_cmd modprobe; then
+            sudo modprobe uinput 2>/dev/null || true
+        fi
     fi
 
     # Add invoking user to input group. SUDO_USER preferred when
@@ -924,6 +962,334 @@ linux_install_sso() {
 }
 
 # ===========================================================================
+# Linux server doctor
+# ===========================================================================
+# The installer can set up packages and config files, but a remote desktop VM
+# is only usable when the OS display stack is ready. The doctor turns that
+# hidden state into explicit pass/warn/fail output so cloud-init and humans can
+# tell whether the next step is "reboot", "fix GPU display", or "start server".
+
+doctor_reset() {
+    DOCTOR_FAILS=0
+    DOCTOR_WARNS=0
+    DOCTOR_REBOOT_REQUIRED=false
+}
+
+doctor_ok() {
+    echo "  OK: $*"
+}
+
+doctor_warn() {
+    DOCTOR_WARNS=$((DOCTOR_WARNS + 1))
+    echo "  WARN: $*"
+}
+
+doctor_fail() {
+    DOCTOR_FAILS=$((DOCTOR_FAILS + 1))
+    echo "  FAIL: $*"
+}
+
+doctor_reboot() {
+    DOCTOR_REBOOT_REQUIRED=true
+    doctor_warn "$* (reboot or graphical re-login required)"
+}
+
+linux_phantom_server_bin() {
+    if have_cmd phantom-server; then
+        command -v phantom-server
+        return 0
+    fi
+    if [ -x "$INSTALL_DIR/phantom-server" ]; then
+        echo "$INSTALL_DIR/phantom-server"
+        return 0
+    fi
+    return 1
+}
+
+linux_doctor_run_as_user() {
+    _doctor_display="${PHANTOM_DOCTOR_DISPLAY:-:0}"
+    _doctor_home="${USER_HOME:-$HOME}"
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ] && have_cmd sudo; then
+        sudo -u "$TARGET_USER" env \
+            HOME="$_doctor_home" \
+            DISPLAY="$_doctor_display" \
+            XAUTHORITY="$_doctor_home/.Xauthority" \
+            "$@"
+    else
+        env \
+            HOME="$_doctor_home" \
+            DISPLAY="$_doctor_display" \
+            XAUTHORITY="$_doctor_home/.Xauthority" \
+            "$@"
+    fi
+}
+
+linux_doctor_first_line() {
+    printf "%s\n" "$1" | sed -n '1p'
+}
+
+linux_doctor_port_listening() {
+    _port="$1"
+    if have_cmd ss; then
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${_port}$"
+        return $?
+    fi
+    if have_cmd lsof; then
+        lsof -nP -iTCP:"$_port" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    return 2
+}
+
+linux_doctor_runtime_deps() {
+    _bin="$1"
+    if ! have_cmd ldd; then
+        doctor_warn "ldd not found; skipping runtime dependency check"
+        return 0
+    fi
+    _missing="$(ldd "$_bin" 2>/dev/null | grep 'not found' || true)"
+    if [ -z "$_missing" ]; then
+        doctor_ok "runtime shared-library dependencies are present"
+    else
+        doctor_fail "missing runtime libraries:"
+        printf "%s\n" "$_missing" | sed 's/^/    /'
+    fi
+}
+
+linux_doctor_display_stack() {
+    if linux_has_display_manager; then
+        doctor_ok "display manager config found"
+    else
+        doctor_warn "no GDM/LightDM config found; headless VMs need --light-gui or --autologin"
+    fi
+
+    if have_cmd systemctl; then
+        if systemctl is-active --quiet lightdm 2>/dev/null; then
+            doctor_ok "LightDM is active"
+        elif systemctl is-active --quiet gdm3 2>/dev/null; then
+            doctor_ok "GDM is active"
+        elif systemctl is-active --quiet display-manager 2>/dev/null; then
+            doctor_ok "display-manager is active"
+        elif [ "$LIGHT_GUI" = true ] || [ "$AUTOLOGIN" = true ]; then
+            doctor_reboot "display manager is not active yet"
+        else
+            doctor_warn "display manager is not active; server will need a graphical login"
+        fi
+    else
+        doctor_warn "systemctl not found; skipping display-manager active check"
+    fi
+
+    if [ -S /tmp/.X11-unix/X0 ]; then
+        doctor_ok "X socket exists at /tmp/.X11-unix/X0"
+    elif [ "$LIGHT_GUI" = true ] || [ "$AUTOLOGIN" = true ]; then
+        doctor_reboot "X display :0 is not available yet"
+    else
+        doctor_warn "X display :0 is not available; start a graphical session before running phantom-server"
+    fi
+
+    if have_cmd loginctl && [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        if loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$TARGET_USER" '$3 == u && $4 == "seat0" {found=1} END {exit !found}'; then
+            doctor_ok "active seat0 session found for $TARGET_USER"
+        elif [ "$AUTOLOGIN" = true ]; then
+            doctor_reboot "no active seat0 session for $TARGET_USER"
+        else
+            doctor_warn "no active seat0 session for $TARGET_USER; autostart runs only after graphical login"
+        fi
+    fi
+
+    if have_cmd xrandr; then
+        _xrandr_out="$(linux_doctor_run_as_user xrandr --query 2>&1 || true)"
+        if printf "%s\n" "$_xrandr_out" | grep -Eq ' connected'; then
+            doctor_ok "xrandr reports a connected output on DISPLAY=${PHANTOM_DOCTOR_DISPLAY:-:0}"
+        else
+            _first="$(linux_doctor_first_line "$_xrandr_out")"
+            if [ -S /tmp/.X11-unix/X0 ]; then
+                doctor_warn "xrandr did not report a connected output: $_first"
+            else
+                doctor_warn "xrandr cannot query DISPLAY=${PHANTOM_DOCTOR_DISPLAY:-:0} yet: $_first"
+            fi
+        fi
+    else
+        doctor_warn "xrandr not found; display-output validation skipped"
+    fi
+}
+
+linux_doctor_gpu() {
+    if linux_has_nvidia_gpu; then
+        _gpu_line="$(nvidia-smi -L 2>/dev/null | head -n1 || true)"
+        doctor_ok "NVIDIA GPU detected: $_gpu_line"
+
+        if linux_nvidia_display_active; then
+            doctor_ok "NVIDIA display_active is Enabled"
+        elif [ "$INSTALL_MODE" = "gpu-strict" ]; then
+            doctor_fail "NVIDIA GPU exists but display_active is not Enabled"
+        else
+            doctor_warn "NVIDIA GPU exists but display_active is not Enabled; zero-copy capture may fall back"
+        fi
+
+        if have_cmd xrandr; then
+            if linux_xorg_has_nvidia_output; then
+                doctor_ok "Xorg exposes an NVIDIA display output"
+            elif [ "$INSTALL_MODE" = "gpu-strict" ]; then
+                doctor_fail "gpu-strict requested but Xorg does not expose a DP/HDMI/DVI NVIDIA output"
+            else
+                doctor_warn "Xorg does not expose a NVIDIA display output; dummy/CPU fallback may be used"
+            fi
+        fi
+    elif [ "$INSTALL_MODE" = "gpu-strict" ]; then
+        doctor_fail "gpu-strict requested but nvidia-smi found no NVIDIA GPU"
+    else
+        doctor_ok "no NVIDIA GPU detected; CPU/dummy capture path is expected"
+    fi
+}
+
+linux_doctor_input() {
+    if [ -e /dev/uinput ]; then
+        doctor_ok "/dev/uinput exists"
+    else
+        doctor_warn "/dev/uinput is missing; keyboard injection may fall back to XTest"
+    fi
+
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        if id -nG "$TARGET_USER" 2>/dev/null | grep -qw input; then
+            doctor_ok "$TARGET_USER is in the input group"
+        else
+            doctor_reboot "$TARGET_USER is not in the input group yet"
+        fi
+    else
+        doctor_warn "target user is unresolved/root; pass --user=<login> for autologin and input checks"
+    fi
+}
+
+linux_doctor_autostart() {
+    if [ "$NO_AUTOSTART" = true ]; then
+        doctor_warn "--no-autostart selected; phantom-server will not start automatically"
+        return 0
+    fi
+
+    if [ -n "$USER_HOME" ] && [ -f "$USER_HOME/.config/autostart/phantom-server.desktop" ]; then
+        doctor_ok "XDG autostart entry exists for $TARGET_USER"
+    else
+        doctor_warn "XDG autostart entry not found; phantom-server may not start on graphical login"
+    fi
+
+    if [ "$AUTOLOGIN" = true ]; then
+        if [ -f /etc/lightdm/lightdm.conf.d/60-phantom-autologin.conf ]; then
+            doctor_ok "LightDM autologin config exists"
+        elif [ -f /etc/gdm3/custom.conf ] && grep -q "AutomaticLogin = $TARGET_USER" /etc/gdm3/custom.conf 2>/dev/null; then
+            doctor_ok "GDM autologin config exists"
+        else
+            doctor_fail "autologin requested but no matching LightDM/GDM autologin config was found"
+        fi
+
+        if have_cmd systemctl; then
+            if systemctl is-enabled --quiet phantom-autologin-watchdog.timer 2>/dev/null; then
+                doctor_ok "autologin watchdog timer is enabled"
+            else
+                doctor_warn "autologin watchdog timer is not enabled"
+            fi
+        fi
+    fi
+}
+
+linux_doctor_capture_probe() {
+    _bin="$1"
+    if [ ! -x "$_bin" ]; then
+        doctor_fail "phantom-server is not executable: $_bin"
+        return 0
+    fi
+
+    if have_cmd timeout; then
+        _probe_out="$(linux_doctor_run_as_user timeout "$DOCTOR_CAPTURE_TIMEOUT" "$_bin" --list-displays 2>&1 || true)"
+    else
+        _probe_out="$(linux_doctor_run_as_user "$_bin" --list-displays 2>&1 || true)"
+    fi
+
+    if printf "%s\n" "$_probe_out" | grep -q "Available displays:"; then
+        doctor_ok "phantom-server can enumerate capture displays"
+        printf "%s\n" "$_probe_out" | sed -n '1,6p' | sed 's/^/    /'
+    elif printf "%s\n" "$_probe_out" | grep -q "No displays found"; then
+        if [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
+            doctor_reboot "phantom-server sees no displays yet"
+        else
+            doctor_fail "phantom-server sees no capture displays"
+        fi
+    else
+        _first="$(linux_doctor_first_line "$_probe_out")"
+        if [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
+            doctor_warn "capture display probe is not ready yet: $_first"
+        else
+            doctor_fail "capture display probe failed: $_first"
+        fi
+    fi
+}
+
+linux_doctor_runtime() {
+    if pgrep -x phantom-server >/dev/null 2>&1; then
+        doctor_ok "phantom-server process is running"
+        if linux_doctor_port_listening 9901; then
+            doctor_ok "browser port 9901 is listening"
+        else
+            _port_status=$?
+            if [ "$_port_status" -eq 2 ]; then
+                doctor_warn "cannot check listening ports; ss/lsof not found"
+            else
+                doctor_warn "phantom-server is running but browser port 9901 is not listening"
+            fi
+        fi
+    elif [ "$DOCTOR_ONLY" = true ] || [ "$DOCTOR_STRICT" = true ]; then
+        doctor_fail "phantom-server process is not running"
+    elif [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
+        doctor_reboot "phantom-server is not running yet"
+    else
+        doctor_warn "phantom-server is not running; it starts after graphical login or manual launch"
+    fi
+}
+
+linux_run_doctor() {
+    echo ""
+    echo "Running Phantom Linux server doctor..."
+    doctor_reset
+
+    if [ "$OS" != "linux" ]; then
+        doctor_fail "doctor currently supports Linux server installs only"
+        echo ""
+        echo "Doctor summary: failures=$DOCTOR_FAILS warnings=$DOCTOR_WARNS reboot_required=$DOCTOR_REBOOT_REQUIRED"
+        echo "Doctor result: failed"
+        return 1
+    fi
+
+    _server_bin="$(linux_phantom_server_bin || true)"
+    if [ -n "$_server_bin" ]; then
+        doctor_ok "phantom-server found at $_server_bin"
+        linux_doctor_runtime_deps "$_server_bin"
+    else
+        doctor_fail "phantom-server not found on PATH or at $INSTALL_DIR/phantom-server"
+    fi
+
+    linux_doctor_display_stack
+    linux_doctor_gpu
+    linux_doctor_input
+    linux_doctor_autostart
+    if [ -n "$_server_bin" ]; then
+        linux_doctor_capture_probe "$_server_bin"
+    fi
+    linux_doctor_runtime
+
+    echo ""
+    echo "Doctor summary: failures=$DOCTOR_FAILS warnings=$DOCTOR_WARNS reboot_required=$DOCTOR_REBOOT_REQUIRED"
+    if [ "$DOCTOR_REBOOT_REQUIRED" = true ]; then
+        echo "Next step: reboot the VM, then rerun the installer with --doctor --doctor-strict"
+    fi
+    if [ "$DOCTOR_FAILS" -gt 0 ]; then
+        echo "Doctor result: failed"
+        return 1
+    fi
+    echo "Doctor result: pass"
+    return 0
+}
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -932,6 +1298,11 @@ main() {
     parse_args "$@"
     apply_defaults
     get_target_user
+
+    if [ "$DOCTOR_ONLY" = true ]; then
+        linux_run_doctor
+        exit $?
+    fi
 
     if [ "$OS" = "linux" ]; then
         linux_install_deps
@@ -958,7 +1329,15 @@ main() {
         fi
     fi
 
+    DOCTOR_STATUS=0
+    if [ "$OS" = "linux" ] && [ "$INSTALL_SERVER" = true ] && [ "$RUN_DOCTOR" = true ]; then
+        linux_run_doctor || DOCTOR_STATUS=$?
+    fi
+
     print_post_install_hints
+    if [ "$DOCTOR_STATUS" -ne 0 ]; then
+        exit "$DOCTOR_STATUS"
+    fi
 }
 
 main "$@"
