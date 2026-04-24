@@ -1009,7 +1009,8 @@ linux_phantom_server_bin() {
 linux_doctor_run_as_user() {
     _doctor_display="${PHANTOM_DOCTOR_DISPLAY:-:0}"
     _doctor_home="${USER_HOME:-$HOME}"
-    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ] && have_cmd sudo; then
+    _current_user="$(id -un 2>/dev/null || true)"
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ] && [ "$_current_user" != "$TARGET_USER" ] && have_cmd sudo; then
         sudo -u "$TARGET_USER" env \
             HOME="$_doctor_home" \
             DISPLAY="$_doctor_display" \
