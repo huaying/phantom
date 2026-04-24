@@ -47,6 +47,9 @@ parse_args() {
     SSO=false
     NO_AUTOSTART=false
     GOT_ROLE=false
+    INSTALL_MODE="auto"
+    DISPLAY_PROFILE_RESULT="not-run"
+    DISPLAY_PROFILE_REASON="light-gui path not executed"
 
     for _arg in "$@"; do
         case "$_arg" in
@@ -57,7 +60,10 @@ parse_args() {
             --light-gui) LIGHT_GUI=true; LIGHT_GUI_FORCE=true ;;
             --sso)  SSO=true ;;
             --no-autostart) NO_AUTOSTART=true ;;
-            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--light-gui] [--sso] [--no-autostart]"; exit 1 ;;
+            --gpu-strict) INSTALL_MODE="gpu-strict" ;;
+            --safe-display) INSTALL_MODE="safe" ;;
+            --install-mode=*) INSTALL_MODE="${_arg#--install-mode=}" ;;
+            *) echo "Unknown argument: $_arg"; echo "Usage: $0 [server|client|both] [--autologin] [--light-gui] [--sso] [--no-autostart] [--install-mode=auto|gpu-strict|safe]"; exit 1 ;;
         esac
     done
 }
@@ -84,6 +90,20 @@ apply_defaults() {
     if [ "$LIGHT_GUI" = true ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
         echo "--light-gui only applies to Linux server installs; ignoring"
         LIGHT_GUI=false
+    fi
+
+    case "$INSTALL_MODE" in
+        auto|gpu-strict|safe) ;;
+        *)
+            echo "Invalid --install-mode: $INSTALL_MODE"
+            echo "Expected one of: auto, gpu-strict, safe"
+            exit 1
+            ;;
+    esac
+
+    if [ "$INSTALL_MODE" != "auto" ] && { [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ]; }; then
+        echo "--install-mode=$INSTALL_MODE only applies to Linux server installs; ignoring"
+        INSTALL_MODE="auto"
     fi
 
     # In autologin mode, a desktop stack is required for a recoverable remote
@@ -204,8 +224,12 @@ linux_install_deps_pacman() {
 # ===========================================================================
 # For headless Ubuntu/Debian VMs, "install + run" often fails because no
 # display manager / desktop session exists, or Xorg cannot build a screen.
-# --light-gui installs a minimal desktop stack and configures a dummy X screen
-# when no physical monitor is connected.
+# --light-gui installs a minimal desktop stack and configures a headless
+# display profile when no physical monitor is connected.
+# Profile choice is controlled by --install-mode:
+#   auto (default): try NVIDIA headless profile first, then fallback dummy
+#   gpu-strict: require NVIDIA headless profile; fail if not healthy
+#   safe: always force dummy profile
 
 linux_has_connected_display() {
     for _status in /sys/class/drm/*/status; do
@@ -215,6 +239,39 @@ linux_has_connected_display() {
         fi
     done
     return 1
+}
+
+linux_has_nvidia_gpu() {
+    if ! have_cmd nvidia-smi; then
+        return 1
+    fi
+    nvidia-smi -L > /dev/null 2>&1
+}
+
+linux_nvidia_display_active() {
+    if ! have_cmd nvidia-smi; then
+        return 1
+    fi
+    nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null | grep -qi "Enabled"
+}
+
+linux_xorg_has_nvidia_output() {
+    DISPLAY=:0 xrandr --query 2>/dev/null | grep -Eq '^DP-[0-9]+ connected|^HDMI-[0-9]+ connected|^DVI-[0-9]+ connected'
+}
+
+linux_nvidia_profile_healthy() {
+    linux_nvidia_display_active && linux_xorg_has_nvidia_output
+}
+
+linux_restart_display_manager() {
+    _dm="display-manager"
+    if systemctl is-enabled lightdm > /dev/null 2>&1 || systemctl is-active lightdm > /dev/null 2>&1; then
+        _dm="lightdm"
+    elif systemctl is-enabled gdm3 > /dev/null 2>&1 || systemctl is-active gdm3 > /dev/null 2>&1; then
+        _dm="gdm3"
+    fi
+    sudo systemctl restart "$_dm" > /dev/null 2>&1 || sudo systemctl restart display-manager > /dev/null 2>&1 || true
+    sleep 4
 }
 
 linux_install_dummy_xorg_conf() {
@@ -254,6 +311,119 @@ EndSection
 EOF
 }
 
+linux_install_nvidia_edid_file() {
+    _edid_hex='00 ff ff ff ff ff ff 00 0d 82 70 27 0f 2c 9b 03 0e 18 01 04 a2 00
+01 78 fb 6e a5 a3 54 4f 9f 26 11 50 54 a5 6b 80 61 c0 81 c0 81 00
+8b c0 8c c0 a9 c0 a9 40 b3 00 a9 36 80 b8 71 38 2d 40 58 58 45 00
+80 38 74 00 00 1e 00 00 00 fc 00 66 69 74 48 65 61 64 6c 65 73 73
+34 6b 2b 32 00 a0 f0 70 23 80 31 20 36 00 00 70 f8 00 00 18 70 17
+40 a0 b0 08 2d 70 08 60 22 01 40 08 b7 00 00 18 01 0b 02 03 09 00
+44 05 81 0f 04 70 17 00 a0 a0 40 2d 60 08 60 22 01 00 40 a6 00 00
+18 70 17 00 a0 a0 a0 2d 50 08 60 22 01 00 a0 a5 00 00 18 70 17 00
+a0 80 00 2d 60 08 60 22 01 00 00 86 00 00 18 d7 09 50 a0 50 00 2d
+30 08 60 22 01 50 00 53 00 00 18 b0 68 56 a0 50 00 2e 30 30 20 36
+00 56 00 53 00 00 1c 30 2a f8 c0 f1 00 24 90 40 80 13 00 f8 00 f9
+00 00 1e 00 00 00 00 00 00 00 00 00 8e de'
+    sudo mkdir -p /etc/X11
+    if have_cmd xxd; then
+        printf "%s\n" "$_edid_hex" | tr -d ' \n' | xxd -r -p | sudo tee /etc/X11/fitHeadless4k.edid > /dev/null
+    else
+        echo "  WARN: xxd not found; writing EDID in text form."
+        printf "%s\n" "$_edid_hex" | sudo tee /etc/X11/fitHeadless4k.edid > /dev/null
+    fi
+    sudo chmod 644 /etc/X11/fitHeadless4k.edid
+}
+
+linux_disable_dummy_xorg_if_present() {
+    if [ -f /etc/X11/xorg.conf ] && grep -qi 'Driver[[:space:]]*"dummy"' /etc/X11/xorg.conf 2>/dev/null; then
+        sudo cp /etc/X11/xorg.conf /etc/X11/xorg.conf.disabled-dummy 2>/dev/null || true
+        sudo rm -f /etc/X11/xorg.conf
+        echo "  Disabled dummy /etc/X11/xorg.conf to allow NVIDIA display ownership."
+    fi
+}
+
+linux_install_nvidia_headless_xorg_conf() {
+    sudo mkdir -p /etc/X11/xorg.conf.d
+    sudo tee /etc/X11/xorg.conf.d/90-nvidia.conf > /dev/null <<'EOF'
+Section "OutputClass"
+    Identifier "nvidia"
+    MatchDriver "nvidia-drm"
+    Driver "nvidia"
+    Option "PrimaryGPU" "true"
+    Option "ModeDebug" "true"
+    Option "ConnectToAcpid" "false"
+    Option "UseDisplayDevice" "DFP"
+    Option "CustomEDID" "DFP-0:/etc/X11/fitHeadless4k.edid"
+    Option "ConnectedMonitor" "DFP-0"
+    Option "SLI" "Mosaic"
+    ModulePath "/usr/lib/x86_64-linux-gnu/xorg/modules"
+EndSection
+EOF
+}
+
+linux_try_nvidia_headless_profile() {
+    echo "  No physical display detected; trying NVIDIA headless profile..."
+    linux_install_nvidia_edid_file
+    linux_install_nvidia_headless_xorg_conf
+    linux_disable_dummy_xorg_if_present
+    linux_restart_display_manager
+
+    if linux_nvidia_profile_healthy; then
+        echo "  NVIDIA headless profile is healthy (display_active=Enabled, DP output connected)."
+        return 0
+    fi
+
+    _active="$(nvidia-smi --query-gpu=display_active,display_mode --format=csv,noheader 2>/dev/null | head -n1 || true)"
+    _xr="$(DISPLAY=:0 xrandr --query 2>/dev/null | head -n3 || true)"
+    echo "  NVIDIA headless profile validation failed."
+    [ -n "$_active" ] && echo "    nvidia-smi: $_active"
+    [ -n "$_xr" ] && echo "    xrandr:"
+    [ -n "$_xr" ] && echo "$_xr" | sed 's/^/      /'
+    return 1
+}
+
+linux_setup_headless_display_profile() {
+    if [ "$INSTALL_MODE" = "safe" ]; then
+        linux_setup_headless_dummy_apt
+        DISPLAY_PROFILE_RESULT="dummy"
+        DISPLAY_PROFILE_REASON="forced by --install-mode=safe"
+        return 0
+    fi
+
+    if linux_has_nvidia_gpu; then
+        if linux_try_nvidia_headless_profile; then
+            DISPLAY_PROFILE_RESULT="nvidia-headless"
+            DISPLAY_PROFILE_REASON="NVIDIA profile healthy"
+            return 0
+        fi
+
+        if [ "$INSTALL_MODE" = "gpu-strict" ]; then
+            DISPLAY_PROFILE_RESULT="failed"
+            DISPLAY_PROFILE_REASON="gpu-strict requested but NVIDIA headless validation failed"
+            echo "ERROR: --install-mode=gpu-strict requested, but NVIDIA headless profile is not healthy."
+            echo "       Refusing to fallback to dummy profile."
+            exit 1
+        fi
+
+        echo "  Falling back to dummy profile (mode=auto)."
+        linux_setup_headless_dummy_apt
+        DISPLAY_PROFILE_RESULT="dummy-fallback"
+        DISPLAY_PROFILE_REASON="NVIDIA profile probe failed, fell back in auto mode"
+        return 0
+    fi
+
+    if [ "$INSTALL_MODE" = "gpu-strict" ]; then
+        DISPLAY_PROFILE_RESULT="failed"
+        DISPLAY_PROFILE_REASON="gpu-strict requested but no NVIDIA GPU detected"
+        echo "ERROR: --install-mode=gpu-strict requested, but no NVIDIA GPU was detected."
+        exit 1
+    fi
+
+    linux_setup_headless_dummy_apt
+    DISPLAY_PROFILE_RESULT="dummy"
+    DISPLAY_PROFILE_REASON="no NVIDIA GPU detected"
+}
+
 linux_install_light_gui_apt() {
     echo ""
     echo "Installing lightweight GUI stack (XFCE + LightDM)..."
@@ -280,8 +450,10 @@ EOF
 
     if linux_has_connected_display; then
         echo "  Physical display detected; skipping dummy Xorg config."
+        DISPLAY_PROFILE_RESULT="physical-display"
+        DISPLAY_PROFILE_REASON="monitor connected; no headless profile required"
     else
-        linux_install_dummy_xorg_conf
+        linux_setup_headless_display_profile
     fi
 
     sudo systemctl disable gdm3 > /dev/null 2>&1 || true
@@ -315,8 +487,10 @@ linux_setup_light_gui_if_requested() {
         elif linux_has_connected_display; then
             echo ""
             echo "Display manager already installed and monitor is connected; skipping --light-gui bootstrap."
+            DISPLAY_PROFILE_RESULT="physical-display"
+            DISPLAY_PROFILE_REASON="display manager present and monitor connected"
         else
-            linux_setup_headless_dummy_apt
+            linux_setup_headless_display_profile
         fi
     else
         echo ""
@@ -627,6 +801,12 @@ print_post_install_hints() {
     echo "Done!"
     if [ "$INSTALL_SERVER" = true ] && [ "$OS" = "linux" ]; then
         echo ""
+        if [ "$LIGHT_GUI" = true ]; then
+            echo "Display profile result: $DISPLAY_PROFILE_RESULT"
+            echo "Display profile reason: $DISPLAY_PROFILE_REASON"
+            echo "Install mode: $INSTALL_MODE"
+            echo ""
+        fi
         if [ "$NO_AUTOSTART" = false ]; then
             if [ "$AUTOLOGIN" = true ]; then
                 echo "Server will auto-start after the next reboot (via GDM autologin)."

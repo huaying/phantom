@@ -495,6 +495,7 @@ fn create_service_session(
         // before the agent applied the mode switch and would cause a visible
         // resize on the client.
         let mut attempts = 0;
+        let mut last_keyframe_nudge = Instant::now();
         svc_log("Waiting for first encoded frame from agent...");
         let mut fallback_frame: Option<(u32, u32)> = None;
         let mut fallback_since: Option<Instant> = None;
@@ -528,8 +529,7 @@ fn create_service_session(
                 break 'wait (ef.width, ef.height);
             }
             if let Some((fw, fh)) = fallback_frame {
-                if fallback_since
-                    .is_some_and(|since| since.elapsed() > Duration::from_millis(1500))
+                if fallback_since.is_some_and(|since| since.elapsed() > Duration::from_millis(700))
                 {
                     svc_log(&format!(
                         "No frame matched resolution hint quickly; accepting stable fallback {}x{}",
@@ -542,6 +542,13 @@ fn create_service_session(
             if attempts % 10 == 0 {
                 tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
             }
+            // Keep nudging the agent while waiting for the very first frame.
+            // Resolution switches can consume the initial keyframe request;
+            // repeated nudges avoid timing out into a black session.
+            if last_keyframe_nudge.elapsed() > Duration::from_millis(500) {
+                let _ = ipc.request_keyframe();
+                last_keyframe_nudge = Instant::now();
+            }
             // With a resolution hint, the agent needs ~500ms to apply the
             // mode switch before producing a matching frame. Give it up to
             // 5s (was 2s) so the VDD reinit can finish on slower GPUs.
@@ -553,6 +560,13 @@ fn create_service_session(
                         fw, fh
                     ));
                     break 'wait (fw, fh);
+                }
+                if let Some((hw, hh)) = resolution_hint {
+                    svc_log(&format!(
+                        "No first frame from agent within timeout; starting session with resolution hint {}x{}",
+                        hw, hh
+                    ));
+                    break 'wait (hw, hh);
                 }
                 svc_log("No matching frames from agent within timeout");
                 anyhow::bail!("agent connected but not producing frames in time");
@@ -1562,7 +1576,9 @@ pub fn install_service() -> anyhow::Result<()> {
     println!();
     println!("Adding Windows Firewall inbound rule...");
     match install_firewall_rule(&install_exe) {
-        Ok(()) => println!("  Firewall rule '{SERVICE_NAME}' added (inbound allow for phantom-server.exe)."),
+        Ok(()) => println!(
+            "  Firewall rule '{SERVICE_NAME}' added (inbound allow for phantom-server.exe)."
+        ),
         Err(e) => {
             println!("  Warning: firewall rule add failed: {e}");
             println!("  Remote clients may be blocked by Windows Firewall until you add a rule manually.");

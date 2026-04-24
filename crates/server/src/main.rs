@@ -1001,10 +1001,7 @@ fn main() -> Result<()> {
             // structured fields (session_id, reason).
         }
 
-        if !matches!(
-            result.reason,
-            Some(session::SessionEndReason::Cancelled)
-        ) {
+        if !matches!(result.reason, Some(session::SessionEndReason::Cancelled)) {
             let mut cur = current_client_id.lock().unwrap();
             if *cur == session_client_id {
                 *cur = None;
@@ -1526,6 +1523,44 @@ fn find_vdd_device_name() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn find_attached_non_vdd_device_name() -> Option<String> {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let mut device_idx = 0u32;
+        loop {
+            let mut dd = DISPLAY_DEVICEW::default();
+            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(None, device_idx, &mut dd, 0).as_bool() {
+                break;
+            }
+            device_idx += 1;
+            if (dd.StateFlags & 0x1) == 0 {
+                continue;
+            }
+            let name = String::from_utf16_lossy(
+                &dd.DeviceName[..dd
+                    .DeviceName
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceName.len())],
+            );
+            let desc = String::from_utf16_lossy(
+                &dd.DeviceString[..dd
+                    .DeviceString
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(dd.DeviceString.len())],
+            );
+            if desc != "Virtual Display Driver" {
+                tracing::info!(name, desc, "Found attached non-VDD display");
+                return Some(name);
+            }
+        }
+        None
+    }
+}
+
 /// Change the display resolution using ChangeDisplaySettingsExW.
 /// Targets the VDD virtual display (highest-res non-primary monitor).
 /// Same approach as Sunshine: find the right display device and change its settings.
@@ -1782,7 +1817,10 @@ fn activate_gdi_fallback(
             match encode::h264::OpenH264Encoder::new(w, h, 15.0, 2000) {
                 Ok(mut enc) => {
                     enc.force_keyframe();
-                    crate::service_win::svc_log(&format!("Tier 3: GDI+OpenH264 {}x{}", *width, *height));
+                    crate::service_win::svc_log(&format!(
+                        "Tier 3: GDI+OpenH264 {}x{}",
+                        *width, *height
+                    ));
                     *cpu_encoder = Some(Box::new(enc));
                     *gdi_capture = Some(gdi);
                     *capture_mode = "gdi_h264";
@@ -1791,6 +1829,79 @@ fn activate_gdi_fallback(
             }
         }
         Err(e) => tracing::warn!("GDI fallback init failed: {e}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn activate_cpu_fallback(
+    reason: &str,
+    cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
+    scrap_capture: &mut Option<capture::scrap::ScrapCapture>,
+    gdi_capture: &mut Option<capture::gdi::GdiCapture>,
+    width: &mut u32,
+    height: &mut u32,
+    display_x: &mut i32,
+    display_y: &mut i32,
+    capture_mode: &mut &'static str,
+    scrap_waiting_for_frame_since: &mut Option<std::time::Instant>,
+) {
+    use phantom_core::capture::FrameCapture;
+    use phantom_core::encode::FrameEncoder;
+
+    crate::service_win::svc_log(reason);
+
+    let displays = capture::scrap::ScrapCapture::list_displays().unwrap_or_default();
+    let best_idx = displays
+        .iter()
+        .find(|d| d.is_primary)
+        .or_else(|| displays.first())
+        .map(|d| d.index)
+        .unwrap_or(0);
+    tracing::info!(
+        best_idx,
+        displays = ?displays.iter().map(|d| format!("{}:{}x{}", d.index, d.width, d.height)).collect::<Vec<_>>(),
+        "ScrapCapture fallback display selection"
+    );
+
+    match capture::scrap::ScrapCapture::with_display(best_idx) {
+        Ok(scrap) => {
+            let (w, h) = scrap.resolution();
+            *width = w;
+            *height = h;
+            let (dx, dy) = get_display_origin(w, h, scrap.display_index());
+            *display_x = dx;
+            *display_y = dy;
+            match encode::h264::OpenH264Encoder::new(*width, *height, 30.0, 5000) {
+                Ok(mut enc) => {
+                    enc.force_keyframe();
+                    crate::service_win::svc_log(&format!(
+                        "Tier 2: ScrapCapture+OpenH264 {}x{} (CPU path)",
+                        *width, *height
+                    ));
+                    *scrap_capture = Some(scrap);
+                    *cpu_encoder = Some(Box::new(enc));
+                    *scrap_waiting_for_frame_since = Some(std::time::Instant::now());
+                    *capture_mode = "scrap_h264";
+                }
+                Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
+            }
+        }
+        Err(e) => {
+            tracing::debug!("ScrapCapture unavailable: {e}");
+            activate_gdi_fallback(
+                cpu_encoder,
+                gdi_capture,
+                width,
+                height,
+                display_x,
+                display_y,
+                capture_mode,
+            );
+            if gdi_capture.is_some() {
+                tracing::info!(width, height, "Tier 3: GDI+OpenH264 fallback");
+                *scrap_waiting_for_frame_since = None;
+            }
+        }
     }
 }
 
@@ -1872,6 +1983,7 @@ fn run_agent_loop(
     let mut height = 1080u32;
     let mut capture_mode = "none";
     let mut scrap_waiting_for_frame_since: Option<Instant> = None;
+    let mut gpu_waiting_for_frame_since: Option<Instant> = None;
     // Display offset on virtual desktop — needed to map mouse coordinates
     // when capturing from a secondary display (e.g. VDD).
     let mut display_x: i32 = 0;
@@ -1892,6 +2004,9 @@ fn run_agent_loop(
         // desktop. Without this, after lock→unlock the client keeps seeing
         // the login screen until the user manually reconnects.
         let cur_desktop = capture::gdi::current_input_desktop_name();
+        let on_winlogon_desktop = cur_desktop
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Winlogon"));
         if cur_desktop != last_desktop_name {
             if last_desktop_name.is_some() {
                 crate::service_win::svc_log(&format!(
@@ -1902,17 +2017,41 @@ fn run_agent_loop(
                 scrap_capture = None;
                 gdi_capture = None;
                 cpu_encoder = None;
+                gpu_waiting_for_frame_since = None;
                 last_init_attempt = Instant::now() - Duration::from_secs(10);
             }
             last_desktop_name = cur_desktop;
         }
 
         // Try to init/reinit capture pipeline (best available)
-        if gpu_pipeline.is_none()
+        let needs_capture_init = gpu_pipeline.is_none()
             && scrap_capture.is_none()
             && gdi_capture.is_none()
-            && last_init_attempt.elapsed() > Duration::from_secs(1)
-        {
+            && last_init_attempt.elapsed() > Duration::from_secs(1);
+        if needs_capture_init && on_winlogon_desktop {
+            last_init_attempt = Instant::now();
+            if let Some(ref dev) = find_attached_non_vdd_device_name() {
+                if set_vdd_primary_legacy(dev) {
+                    crate::service_win::svc_log(&format!(
+                        "Winlogon desktop: restored non-VDD primary {dev}"
+                    ));
+                    vdd_primary_active = false;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            activate_cpu_fallback(
+                "Winlogon desktop: using CPU fallback instead of VDD/NVENC",
+                &mut cpu_encoder,
+                &mut scrap_capture,
+                &mut gdi_capture,
+                &mut width,
+                &mut height,
+                &mut display_x,
+                &mut display_y,
+                &mut capture_mode,
+                &mut scrap_waiting_for_frame_since,
+            );
+        } else if needs_capture_init {
             last_init_attempt = Instant::now();
 
             // Tier 1: DXGI(VDD)→NVENC zero-copy
@@ -1944,7 +2083,11 @@ fn run_agent_loop(
                     }
                     width = gpu.width;
                     height = gpu.height;
-                    gpu.force_keyframe();
+                    // On static desktops, a plain keyframe flag may not emit
+                    // a frame immediately after DXGI pipeline init. Force a
+                    // capture reset so the service receives a first frame
+                    // promptly (avoids black screen on session start).
+                    gpu.force_keyframe_with_capture_reset();
                     crate::service_win::svc_log(&format!(
                         "Tier 1: DXGI→NVENC ready {}x{}",
                         width, height
@@ -1954,74 +2097,24 @@ fn run_agent_loop(
                     gdi_capture = None;
                     cpu_encoder = None;
                     scrap_waiting_for_frame_since = None;
+                    gpu_waiting_for_frame_since = None;
                     capture_mode = "dxgi_nvenc";
                 }
                 Err(e) => {
-                    crate::service_win::svc_log(&format!("Tier 1 DXGI→NVENC unavailable: {e:#}"));
-
-                    // Tier 2: ScrapCapture (DXGI + CPU readback) — follow the
-                    // existing primary display instead of forcing VDD.
-                    let displays =
-                        capture::scrap::ScrapCapture::list_displays().unwrap_or_default();
-                    let best_idx = displays
-                        .iter()
-                        .find(|d| d.is_primary)
-                        .or_else(|| displays.first())
-                        .map(|d| d.index)
-                        .unwrap_or(0);
-                    tracing::info!(
-                        best_idx,
-                        displays = ?displays.iter().map(|d| format!("{}:{}x{}", d.index, d.width, d.height)).collect::<Vec<_>>(),
-                        "ScrapCapture fallback display selection"
+                    activate_cpu_fallback(
+                        &format!("Tier 1 DXGI/NVENC unavailable: {e:#}"),
+                        &mut cpu_encoder,
+                        &mut scrap_capture,
+                        &mut gdi_capture,
+                        &mut width,
+                        &mut height,
+                        &mut display_x,
+                        &mut display_y,
+                        &mut capture_mode,
+                        &mut scrap_waiting_for_frame_since,
                     );
-                    match capture::scrap::ScrapCapture::with_display(best_idx) {
-                        Ok(scrap) => {
-                            let (w, h) = scrap.resolution();
-                            width = w;
-                            height = h;
-                            // Get display origin on virtual desktop for mouse offset
-                            let (dx, dy) = get_display_origin(w, h, scrap.display_index());
-                            display_x = dx;
-                            display_y = dy;
-                            match encode::h264::OpenH264Encoder::new(width, height, 30.0, 5000) {
-                                Ok(mut enc) => {
-                                    enc.force_keyframe();
-                                    crate::service_win::svc_log(&format!(
-                                        "Tier 2: ScrapCapture+OpenH264 {}x{} (CPU path)",
-                                        width, height
-                                    ));
-                                    scrap_capture = Some(scrap);
-                                    cpu_encoder = Some(Box::new(enc));
-                                    scrap_waiting_for_frame_since = Some(Instant::now());
-                                    capture_mode = "scrap_h264";
-                                }
-                                Err(e) => tracing::warn!("OpenH264 init failed: {e}"),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("ScrapCapture unavailable: {e}");
-
-                            // Tier 3: GDI + OpenH264 (lock screen fallback)
-                            activate_gdi_fallback(
-                                &mut cpu_encoder,
-                                &mut gdi_capture,
-                                &mut width,
-                                &mut height,
-                                &mut display_x,
-                                &mut display_y,
-                                &mut capture_mode,
-                            );
-                            if gdi_capture.is_some() {
-                                tracing::info!(
-                                    width,
-                                    height,
-                                    "Tier 3: GDI+OpenH264 fallback"
-                                );
-                                scrap_waiting_for_frame_since = None;
-                            } else if frame_count == 0 {
-                                tracing::warn!("All capture methods failed");
-                            }
-                        }
+                    if scrap_capture.is_none() && gdi_capture.is_none() && frame_count == 0 {
+                        tracing::warn!("All capture methods failed");
                     }
                 }
             }
@@ -2029,7 +2122,12 @@ fn run_agent_loop(
 
         // Handle resolution change requests (adaptive resolution like DCV/Sunshine)
         if let Some((new_w, new_h)) = ipc.take_resolution_request() {
-            if new_w != width || new_h != height {
+            if on_winlogon_desktop {
+                crate::service_win::svc_log(&format!(
+                    "Winlogon desktop: ignoring resolution request {}x{} while using login-screen fallback",
+                    new_w, new_h
+                ));
+            } else if new_w != width || new_h != height {
                 tracing::info!(
                     old_w = width,
                     old_h = height,
@@ -2048,6 +2146,7 @@ fn run_agent_loop(
                 gdi_capture = None;
                 cpu_encoder = None;
                 scrap_waiting_for_frame_since = None;
+                gpu_waiting_for_frame_since = None;
 
                 if change_display_resolution(new_w, new_h) {
                     // change_display_resolution uses legacy ChangeDisplaySettingsExW
@@ -2093,6 +2192,7 @@ fn run_agent_loop(
             }
             if let Some(ref mut gpu) = gpu_pipeline {
                 gpu.force_keyframe_with_capture_reset();
+                gpu_waiting_for_frame_since = Some(Instant::now());
             }
             if let Some(ref mut scrap) = scrap_capture {
                 // Reset ScrapCapture so DXGI returns a frame on static desktop
@@ -2122,6 +2222,7 @@ fn run_agent_loop(
             match gpu.capture_and_encode() {
                 Ok(Some(encoded)) => {
                     frame_count += 1;
+                    gpu_waiting_for_frame_since = None;
                     if frame_count <= 3 || frame_count.is_multiple_of(300) {
                         tracing::info!(
                             frame = frame_count,
@@ -2141,11 +2242,31 @@ fn run_agent_loop(
                     }
                 }
                 Ok(None) => {
+                    if gpu_waiting_for_frame_since
+                        .is_some_and(|since| since.elapsed() > Duration::from_millis(750))
+                    {
+                        gpu_pipeline = None;
+                        gpu_waiting_for_frame_since = None;
+                        activate_cpu_fallback(
+                            "Tier 1 DXGI/NVENC produced no frame after keyframe reset; switching to CPU fallback",
+                            &mut cpu_encoder,
+                            &mut scrap_capture,
+                            &mut gdi_capture,
+                            &mut width,
+                            &mut height,
+                            &mut display_x,
+                            &mut display_y,
+                            &mut capture_mode,
+                            &mut scrap_waiting_for_frame_since,
+                        );
+                        continue;
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
                     tracing::warn!("DXGI→NVENC error: {e:#}, falling back");
                     gpu_pipeline = None;
+                    gpu_waiting_for_frame_since = None;
                     // Cooldown before retrying Tier 1 — let Tier 2/3 take over.
                     // Without this, ACCESS_LOST on lock screen causes infinite
                     // Tier 1 init→fail loop that never reaches Tier 2/3.
@@ -2155,7 +2276,11 @@ fn run_agent_loop(
         }
         // Capture + encode: Tier 2 — ScrapCapture (DXGI CPU) + OpenH264
         else if scrap_capture.is_some() && cpu_encoder.is_some() {
-            match scrap_capture.as_mut().expect("scrap_capture checked").capture() {
+            match scrap_capture
+                .as_mut()
+                .expect("scrap_capture checked")
+                .capture()
+            {
                 Ok(Some(frame)) => match cpu_encoder
                     .as_mut()
                     .expect("cpu_encoder checked")
@@ -2187,7 +2312,7 @@ fn run_agent_loop(
                 },
                 Ok(None) => {
                     if scrap_waiting_for_frame_since
-                        .is_some_and(|since| since.elapsed() > Duration::from_millis(1500))
+                        .is_some_and(|since| since.elapsed() > Duration::from_millis(750))
                     {
                         tracing::warn!(
                             width,

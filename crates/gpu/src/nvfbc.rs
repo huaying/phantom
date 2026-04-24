@@ -23,6 +23,8 @@ pub struct NvfbcCapture {
     width: u32,
     height: u32,
     runtime_version: u32,
+    /// NVFBC API minor byte used in structure versions (e.g. 0x08 / 0x07).
+    api_minor: u32,
     /// Format requested from NVFBC (BGRA for CPU path, NV12 for GPU path).
     _buffer_format: u32,
     grab_info: NvFbcFrameGrabInfo,
@@ -52,14 +54,26 @@ impl NvfbcCapture {
 
         // Create handle
         let mut handle: NVFBC_SESSION_HANDLE = 0;
-        let mut params = NvFbcCreateHandleParams::new();
-        let status = unsafe { (api.create_handle)(&mut handle, params.as_mut_ptr()) };
-        if status != NVFBC_SUCCESS {
-            bail!("NvFBCCreateHandle failed: {status}");
+        let mut chosen_api_minor = NVFBC_API_MINOR_DEFAULT;
+        let mut last_status: NVFBCSTATUS = NVFBC_SUCCESS;
+        let mut created = false;
+        for api_minor in NVFBC_API_MINOR_CANDIDATES {
+            let mut params = NvFbcCreateHandleParams::with_api_minor(api_minor);
+            let status = unsafe { (api.create_handle)(&mut handle, params.as_mut_ptr()) };
+            if status == NVFBC_SUCCESS {
+                chosen_api_minor = api_minor;
+                created = true;
+                break;
+            }
+            last_status = status;
+            tracing::warn!(status, api_minor, "NvFBCCreateHandle attempt failed");
+        }
+        if !created {
+            bail!("NvFBCCreateHandle failed across API minors: status={last_status}");
         }
 
         // Get status to learn screen dimensions
-        let mut status_params = NvFbcGetStatusParams::new();
+        let mut status_params = NvFbcGetStatusParams::with_api_minor(chosen_api_minor);
         let status = unsafe { (api.get_status)(handle, status_params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             bail!(
@@ -71,10 +85,16 @@ impl NvfbcCapture {
         let runtime_version = status_params.nvfbc_version();
         let width = status_params.screen_w();
         let height = status_params.screen_h();
-        tracing::info!(width, height, runtime_version, "NVFBC screen detected");
+        tracing::info!(
+            width,
+            height,
+            runtime_version,
+            api_minor = chosen_api_minor,
+            "NVFBC screen detected"
+        );
 
         // Create capture session (CUDA output, no cursor, polling mode)
-        let mut session_params = NvFbcCreateCaptureSessionParams::new();
+        let mut session_params = NvFbcCreateCaptureSessionParams::with_api_minor(chosen_api_minor);
         session_params.set_capture_type(NVFBC_CAPTURE_SHARED_CUDA);
         session_params.set_tracking_type(NVFBC_TRACKING_DEFAULT);
         session_params.set_with_cursor(if with_cursor { NVFBC_TRUE } else { NVFBC_FALSE });
@@ -90,7 +110,7 @@ impl NvfbcCapture {
         }
 
         // Setup CUDA capture with requested format
-        let mut setup = NvFbcToCudaSetupParams::new(buffer_format);
+        let mut setup = NvFbcToCudaSetupParams::with_api_minor(buffer_format, chosen_api_minor);
         let status = unsafe { (api.to_cuda_setup)(handle, setup.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             bail!(
@@ -118,6 +138,7 @@ impl NvfbcCapture {
             width,
             height,
             runtime_version,
+            api_minor: chosen_api_minor,
             _buffer_format: buffer_format,
             grab_info: unsafe { std::mem::zeroed() },
             _lib: lib,
@@ -131,11 +152,11 @@ impl NvfbcCapture {
         let _ = self.bind_context();
 
         // Destroy old session (ignore error if already destroyed)
-        let mut destroy = NvFbcDestroyCaptureSessionParams::new();
+        let mut destroy = NvFbcDestroyCaptureSessionParams::with_api_minor(self.api_minor);
         let _ = unsafe { (self.api.destroy_capture_session)(self.handle, destroy.as_mut_ptr()) };
 
         // Recreate capture session
-        let mut session_params = NvFbcCreateCaptureSessionParams::new();
+        let mut session_params = NvFbcCreateCaptureSessionParams::with_api_minor(self.api_minor);
         session_params.set_capture_type(NVFBC_CAPTURE_SHARED_CUDA);
         session_params.set_tracking_type(NVFBC_TRACKING_DEFAULT);
         session_params.set_with_cursor(NVFBC_FALSE);
@@ -152,7 +173,7 @@ impl NvfbcCapture {
             );
         }
 
-        let mut setup = NvFbcToCudaSetupParams::new(self._buffer_format);
+        let mut setup = NvFbcToCudaSetupParams::with_api_minor(self._buffer_format, self.api_minor);
         let status = unsafe { (self.api.to_cuda_setup)(self.handle, setup.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             let _ = self.release_context();
@@ -176,7 +197,7 @@ impl NvfbcCapture {
 
     /// Release the NVFBC context so other CUDA operations (e.g., NVENC) can use it.
     pub fn release_context(&self) -> Result<()> {
-        let mut params = NvFbcReleaseContextParams::new();
+        let mut params = NvFbcReleaseContextParams::with_api_minor(self.api_minor);
         let status = unsafe { (self.api.release_context)(self.handle, params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             bail!(
@@ -189,7 +210,7 @@ impl NvfbcCapture {
 
     /// Re-bind the NVFBC context to the current thread (after release).
     pub fn bind_context(&self) -> Result<()> {
-        let mut params = NvFbcBindContextParams::new();
+        let mut params = NvFbcBindContextParams::with_api_minor(self.api_minor);
         let status = unsafe { (self.api.bind_context)(self.handle, params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
             bail!(
@@ -215,7 +236,8 @@ impl NvfbcCapture {
     fn grab_cuda_flags(&mut self, flags: u32) -> Result<Option<GpuFrame>> {
         let mut device_buffer: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        let mut params = NvFbcToCudaGrabFrameParams::new(&mut self.grab_info);
+        let mut params =
+            NvFbcToCudaGrabFrameParams::with_api_minor(&mut self.grab_info, self.api_minor);
         params.set_flags(flags);
         params.set_cuda_device_buffer(&mut device_buffer as *mut _ as *mut std::ffi::c_void);
 
@@ -326,10 +348,10 @@ impl FrameCapture for NvfbcCapture {
 
 impl Drop for NvfbcCapture {
     fn drop(&mut self) {
-        let mut params = NvFbcDestroyCaptureSessionParams::new();
+        let mut params = NvFbcDestroyCaptureSessionParams::with_api_minor(self.api_minor);
         unsafe { (self.api.destroy_capture_session)(self.handle, params.as_mut_ptr()) };
 
-        let mut params = NvFbcDestroyHandleParams::new();
+        let mut params = NvFbcDestroyHandleParams::with_api_minor(self.api_minor);
         unsafe { (self.api.destroy_handle)(self.handle, params.as_mut_ptr()) };
 
         tracing::debug!("NVFBC capture session destroyed");

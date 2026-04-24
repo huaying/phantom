@@ -693,22 +693,18 @@ pub type NVFBCSTATUS = u32;
 pub const NVFBC_SUCCESS: NVFBCSTATUS = 0;
 pub const NVFBC_ERR_MUST_RECREATE: NVFBCSTATUS = 16;
 
-const NVFBC_VERSION: u32 = 1 | (7 << 8); // 1.7 — minor | (major << 8)? No: NVFBC_VERSION_MINOR | (NVFBC_VERSION_MAJOR << 8)
-                                         // Actually: NVFBC_VERSION = NVFBC_VERSION_MINOR | (NVFBC_VERSION_MAJOR << 8) = 7 | (1 << 8) = 0x107
+/// NVFBC API minor byte used in NVFBC struct versions.
+///
+/// NVIDIA drivers in the field can disagree on this byte (notably 0x08 vs
+/// 0x07). We default to 0x08 and let higher layers retry 0x07 when handle
+/// creation fails.
+pub const NVFBC_API_MINOR_DEFAULT: u32 = 0x08;
+pub const NVFBC_API_MINOR_LEGACY: u32 = 0x07;
+pub const NVFBC_API_MINOR_CANDIDATES: [u32; 2] = [NVFBC_API_MINOR_DEFAULT, NVFBC_API_MINOR_LEGACY];
 
-// NVFBC_STRUCT_VERSION embeds sizeof into the version:
-// (uint32_t)(sizeof(typeName) | ((ver) << 16) | (NVFBC_VERSION << 24))
-// But NVFBC_VERSION = 0x107, and shifting 24 would overflow.
-// Looking closer: NVFBC_VERSION << 24 = 0x07_000000 (only low byte matters at shift 24)
-// Actually the header says: NVFBC_VERSION = MINOR | (MAJOR << 8) = 7 | (1 << 8) = 0x107
-// And NVFBC_VERSION << 24 = 0x07000000 (since 0x107 << 24 would lose the 1).
-// Wait: 0x107 << 24 = 0x07_00_00_00 on 32-bit. The `1` is lost.
-// So effectively NVFBC_VERSION << 24 = 7 << 24 = 0x0700_0000.
-
-/// Compute NVFBC struct version: sizeof | (ver << 16) | (NVFBC_VERSION << 24)
-/// NVFBC_VERSION = 1.8 = 8 | (1 << 8) = 0x108. Shifted 24: 0x08000000.
-const fn nvfbc_sv(size: u32, ver: u32) -> u32 {
-    size | (ver << 16) | (0x08 << 24)
+/// Compute NVFBC struct version: sizeof | (ver << 16) | (api_minor << 24).
+const fn nvfbc_sv_with_minor(size: u32, ver: u32, api_minor: u32) -> u32 {
+    size | (ver << 16) | (api_minor << 24)
 }
 
 // Capture type
@@ -741,8 +737,11 @@ pub const NVFBC_FALSE: u32 = 0;
 opaque_struct!(NvFbcCreateHandleParams, 40);
 impl NvFbcCreateHandleParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(40, 2)); // version
+        s.write_u32(0, nvfbc_sv_with_minor(40, 2, api_minor)); // version
         s
     }
     pub fn set_private_data(&mut self, data: *const c_void, size: u32) {
@@ -755,8 +754,11 @@ impl NvFbcCreateHandleParams {
 opaque_struct!(NvFbcDestroyHandleParams, 8); // pad to 8 for alignment
 impl NvFbcDestroyHandleParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(4, 1));
+        s.write_u32(0, nvfbc_sv_with_minor(4, 1, api_minor));
         s
     }
 }
@@ -765,8 +767,11 @@ impl NvFbcDestroyHandleParams {
 opaque_struct!(NvFbcDestroyCaptureSessionParams, 8);
 impl NvFbcDestroyCaptureSessionParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(4, 1));
+        s.write_u32(0, nvfbc_sv_with_minor(4, 1, api_minor));
         s
     }
 }
@@ -775,8 +780,11 @@ impl NvFbcDestroyCaptureSessionParams {
 opaque_struct!(NvFbcGetStatusParams, 780);
 impl NvFbcGetStatusParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(780, 2));
+        s.write_u32(0, nvfbc_sv_with_minor(780, 2, api_minor));
         s
     }
     pub fn screen_w(&self) -> u32 {
@@ -797,8 +805,11 @@ impl NvFbcGetStatusParams {
 opaque_struct!(NvFbcCreateCaptureSessionParams, 64);
 impl NvFbcCreateCaptureSessionParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(64, 6));
+        s.write_u32(0, nvfbc_sv_with_minor(64, 6, api_minor));
         s
     }
     pub fn set_capture_type(&mut self, v: u32) {
@@ -822,8 +833,11 @@ impl NvFbcCreateCaptureSessionParams {
 opaque_struct!(NvFbcToCudaSetupParams, 8);
 impl NvFbcToCudaSetupParams {
     pub fn new(format: u32) -> Self {
+        Self::with_api_minor(format, NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(format: u32, api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(8, 1));
+        s.write_u32(0, nvfbc_sv_with_minor(8, 1, api_minor));
         s.write_u32(4, format);
         s
     }
@@ -849,8 +863,11 @@ pub struct NvFbcFrameGrabInfo {
 opaque_struct!(NvFbcToCudaGrabFrameParams, 32);
 impl NvFbcToCudaGrabFrameParams {
     pub fn new(info: *mut NvFbcFrameGrabInfo) -> Self {
+        Self::with_api_minor(info, NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(info: *mut NvFbcFrameGrabInfo, api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(32, 2));
+        s.write_u32(0, nvfbc_sv_with_minor(32, 2, api_minor));
         // flags at offset 4 (default 0 = NOFLAGS)
         // pCUDADeviceBuffer at offset 8
         s.write_ptr(16, info as *mut c_void); // pFrameGrabInfo at offset 16
@@ -872,8 +889,11 @@ impl NvFbcToCudaGrabFrameParams {
 opaque_struct!(NvFbcBindContextParams, 8);
 impl NvFbcBindContextParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(4, 1));
+        s.write_u32(0, nvfbc_sv_with_minor(4, 1, api_minor));
         s
     }
 }
@@ -882,8 +902,11 @@ impl NvFbcBindContextParams {
 opaque_struct!(NvFbcReleaseContextParams, 8);
 impl NvFbcReleaseContextParams {
     pub fn new() -> Self {
+        Self::with_api_minor(NVFBC_API_MINOR_DEFAULT)
+    }
+    pub fn with_api_minor(api_minor: u32) -> Self {
         let mut s = Self::zeroed();
-        s.write_u32(0, nvfbc_sv(4, 1));
+        s.write_u32(0, nvfbc_sv_with_minor(4, 1, api_minor));
         s
     }
 }
