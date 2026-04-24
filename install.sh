@@ -465,6 +465,7 @@ linux_install_light_gui_apt() {
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xorg xfce4 lightdm xserver-xorg-video-dummy dbus-x11 x11-xserver-utils || true
 
+    echo "/usr/sbin/lightdm" | sudo tee /etc/X11/default-display-manager > /dev/null
     sudo mkdir -p /etc/lightdm/lightdm.conf.d
     sudo tee /etc/lightdm/lightdm.conf.d/50-phantom-xfce.conf > /dev/null <<'EOF'
 [Seat:*]
@@ -657,14 +658,34 @@ linux_configure_autologin() {
 }
 
 linux_autologin_configure_display_manager() {
+    _default_dm="$(basename "$(cat /etc/X11/default-display-manager 2>/dev/null || true)")"
+
+    if [ "$_default_dm" = "lightdm" ] \
+        || systemctl is-active --quiet lightdm 2>/dev/null \
+        || systemctl is-enabled --quiet lightdm 2>/dev/null; then
+        linux_autologin_lightdm
+        return 0
+    fi
+
+    if [ "$_default_dm" = "gdm3" ] || [ "$_default_dm" = "gdm" ] \
+        || systemctl is-active --quiet gdm3 2>/dev/null \
+        || systemctl is-active --quiet gdm 2>/dev/null \
+        || systemctl is-enabled --quiet gdm3 2>/dev/null \
+        || systemctl is-enabled --quiet gdm 2>/dev/null; then
+        linux_autologin_gdm
+        return 0
+    fi
+
     if [ -d /etc/lightdm ] || [ -f /etc/lightdm/lightdm.conf ]; then
         linux_autologin_lightdm
         return 0
     fi
+
     linux_autologin_gdm
 }
 
 linux_autologin_lightdm() {
+    echo "/usr/sbin/lightdm" | sudo tee /etc/X11/default-display-manager > /dev/null
     sudo mkdir -p /etc/lightdm/lightdm.conf.d
     sudo tee /etc/lightdm/lightdm.conf.d/60-phantom-autologin.conf > /dev/null <<EOF
 # Written by phantom install.sh --autologin
@@ -681,6 +702,7 @@ EOF
 linux_autologin_gdm() {
     # 1. GDM autologin (Ubuntu 22/24 default DM)
     if [ -f /etc/gdm3/custom.conf ]; then
+        echo "/usr/sbin/gdm3" | sudo tee /etc/X11/default-display-manager > /dev/null
         # Back up original once so we can revert cleanly later
         if [ ! -f /etc/gdm3/custom.conf.phantom-bak ]; then
             sudo cp /etc/gdm3/custom.conf /etc/gdm3/custom.conf.phantom-bak
@@ -708,6 +730,7 @@ TimedLoginDelay = 5
 
 [debug]
 EOF
+        sudo systemctl enable gdm3 > /dev/null 2>&1 || true
         echo "  Enabled GDM autologin for $TARGET_USER"
     else
         echo "  WARN: /etc/gdm3/custom.conf not found. Only GDM is supported here — configure autologin manually for your DM."
