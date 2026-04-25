@@ -1638,47 +1638,46 @@ fn configure_crash_dumps() {
     let key =
         r"HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\phantom-server.exe";
     let dump_dir_s = dump_dir.to_string_lossy().to_string();
-    let commands = [
-        vec![
-            "add",
-            key,
-            "/v",
-            "DumpFolder",
-            "/t",
-            "REG_EXPAND_SZ",
-            "/d",
-            dump_dir_s.as_str(),
-            "/f",
-        ],
-        vec![
-            "add",
-            key,
-            "/v",
-            "DumpType",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            "2",
-            "/f",
-        ],
-        vec![
-            "add",
-            key,
-            "/v",
-            "DumpCount",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            "5",
-            "/f",
-        ],
-    ];
-    for args in commands {
-        match std::process::Command::new("reg").args(args).status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => println!("  Warning: reg add for crash dumps failed with {status}"),
-            Err(e) => println!("  Warning: reg add for crash dumps failed: {e}"),
-        }
+    reg_add(&[
+        "add",
+        key,
+        "/v",
+        "DumpFolder",
+        "/t",
+        "REG_EXPAND_SZ",
+        "/d",
+        dump_dir_s.as_str(),
+        "/f",
+    ]);
+    reg_add(&[
+        "add",
+        key,
+        "/v",
+        "DumpType",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "2",
+        "/f",
+    ]);
+    reg_add(&[
+        "add",
+        key,
+        "/v",
+        "DumpCount",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "5",
+        "/f",
+    ]);
+}
+
+fn reg_add(args: &[&str]) {
+    match std::process::Command::new("reg").args(args).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => println!("  Warning: reg add for crash dumps failed with {status}"),
+        Err(e) => println!("  Warning: reg add for crash dumps failed: {e}"),
     }
 }
 
