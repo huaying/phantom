@@ -173,8 +173,16 @@ fn update_debug_snapshot(state: &AppState) {
     };
     let _ = js_sys::Reflect::set(&snapshot, &"mode".into(), &mode.into());
     let _ = js_sys::Reflect::set(&snapshot, &"serverWidth".into(), &state.server_width.into());
-    let _ = js_sys::Reflect::set(&snapshot, &"serverHeight".into(), &state.server_height.into());
-    let _ = js_sys::Reflect::set(&snapshot, &"frameCount".into(), &JsValue::from_f64(state.frame_count as f64));
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"serverHeight".into(),
+        &state.server_height.into(),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"frameCount".into(),
+        &JsValue::from_f64(state.frame_count as f64),
+    );
     let _ = js_sys::Reflect::set(
         &snapshot,
         &"gotKeyframe".into(),
@@ -242,10 +250,13 @@ thread_local! {
 }
 
 fn query_has_flag(query: &str, name: &str) -> bool {
-    query
-        .trim_start_matches('?')
-        .split('&')
-        .any(|pair| pair == name || pair.split_once('=').map(|(k, _)| k == name).unwrap_or(false))
+    query.trim_start_matches('?').split('&').any(|pair| {
+        pair == name
+            || pair
+                .split_once('=')
+                .map(|(k, _)| k == name)
+                .unwrap_or(false)
+    })
 }
 
 fn query_token(query: &str) -> Option<String> {
@@ -272,11 +283,7 @@ pub fn main() {
 
     // Extract ?token=<jwt> for authenticated connections
     let auth_token = query_token(&query);
-    let mode = if use_rtc {
-        "WebRTC"
-    } else {
-        "WebSocket"
-    };
+    let mode = if use_rtc { "WebRTC" } else { "WebSocket" };
     console::log_1(
         &format!(
             "Phantom Web Client v{} starting ({mode} mode)...",
@@ -387,14 +394,17 @@ async fn complete_rtc_offer(
         Some(token) => format!("/rtc?token={token}"),
         None => "/rtc".to_string(),
     };
-    let resp =
-        match wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(&rtc_url, &request_init)).await {
-            Ok(r) => r,
-            Err(e) => {
-                console::error_1(&format!("POST /rtc failed: {:?}", e).into());
-                return;
-            }
-        };
+    let resp = match wasm_bindgen_futures::JsFuture::from(
+        window.fetch_with_str_and_init(&rtc_url, &request_init),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            console::error_1(&format!("POST /rtc failed: {:?}", e).into());
+            return;
+        }
+    };
 
     let resp: web_sys::Response = resp.dyn_into().unwrap();
     if !resp.ok() {
@@ -414,7 +424,9 @@ async fn complete_rtc_offer(
     let answer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
     answer_desc.set_sdp(&answer_sdp.as_string().unwrap_or_default());
 
-    if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc.set_remote_description(&answer_desc)).await {
+    if let Err(e) =
+        wasm_bindgen_futures::JsFuture::from(pc.set_remote_description(&answer_desc)).await
+    {
         console::error_1(&format!("setRemoteDescription: {:?}", e).into());
         return;
     }
@@ -522,9 +534,7 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
                 let _ = dc.send_with_u8_array(&bytes);
             }
             send_resolution_change(&s);
-            console::log_1(
-                &"WebRTC control DC OPEN — media-track path active".into(),
-            );
+            console::log_1(&"WebRTC control DC OPEN — media-track path active".into());
         });
         control_dc.set_onopen(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
@@ -569,6 +579,9 @@ fn draw_rtc2_video_to_canvas(state: &AppState, video: &HtmlVideoElement) {
     }
 }
 
+type VideoFrameCallbackSlot = Rc<RefCell<Option<Closure<dyn FnMut(JsValue, JsValue)>>>>;
+type AnimationFrameCallbackSlot = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
+
 fn ensure_rtc2_video_canvas_loop(
     state: &Rc<RefCell<AppState>>,
     video: &HtmlVideoElement,
@@ -578,8 +591,7 @@ fn ensure_rtc2_video_canvas_loop(
         .ok()
         .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
     if let Some(request_vfc) = request_vfc {
-        let cb_slot: Rc<RefCell<Option<Closure<dyn FnMut(JsValue, JsValue)>>>> =
-            Rc::new(RefCell::new(None));
+        let cb_slot: VideoFrameCallbackSlot = Rc::new(RefCell::new(None));
         let cb_slot2 = cb_slot.clone();
         let s = state.clone();
         let video_for_cb = video.clone();
@@ -591,9 +603,7 @@ fn ensure_rtc2_video_canvas_loop(
                     let is_current = st
                         .rtc2_video_el
                         .as_ref()
-                        .map(|current| {
-                            js_sys::Object::is(current.as_ref(), video_for_cb.as_ref())
-                        })
+                        .map(|current| js_sys::Object::is(current.as_ref(), video_for_cb.as_ref()))
                         .unwrap_or(false);
                     if is_current && st.rtc2_video_loop_generation == generation {
                         draw_rtc2_video_to_canvas(&st, &video_for_cb);
@@ -604,10 +614,8 @@ fn ensure_rtc2_video_canvas_loop(
                 };
                 if should_continue {
                     if let Some(cb) = cb_slot2.borrow().as_ref() {
-                        let _ = request_vfc2.call1(
-                            video_for_cb.as_ref(),
-                            cb.as_ref().unchecked_ref(),
-                        );
+                        let _ =
+                            request_vfc2.call1(video_for_cb.as_ref(), cb.as_ref().unchecked_ref());
                     }
                 }
             },
@@ -619,7 +627,7 @@ fn ensure_rtc2_video_canvas_loop(
         return;
     }
 
-    let cb_slot: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+    let cb_slot: AnimationFrameCallbackSlot = Rc::new(RefCell::new(None));
     let cb_slot2 = cb_slot.clone();
     let s = state.clone();
     let video_for_cb = video.clone();
@@ -745,7 +753,10 @@ fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event
                     st.canvas.style().set_property("width", "100vw").ok();
                     st.canvas.style().set_property("height", "100vh").ok();
                     st.canvas.style().set_property("z-index", "2").ok();
-                    st.canvas.style().set_property("background", "transparent").ok();
+                    st.canvas
+                        .style()
+                        .set_property("background", "transparent")
+                        .ok();
                     if let Ok(Some(ctx)) = st.canvas.get_context("2d") {
                         if let Ok(ctx2d) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
                             ctx2d.clear_rect(
@@ -1083,7 +1094,19 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             if s.waiting_for_keyframe_fence {
                 s.waiting_for_keyframe_fence = false;
                 s.drop_until_keyframe = true;
-                console::log_1(&"video recovery: fence received, waiting for fresh keyframe".into());
+                console::log_1(
+                    &"video recovery: fence received, waiting for fresh keyframe".into(),
+                );
+            }
+        }
+        Message::Disconnect { reason } => {
+            console::warn_1(&format!("server disconnected this client: {reason}").into());
+            let mut s = state.borrow_mut();
+            // Replacement/ghost disconnects are intentional. Do not let an old
+            // tab auto-reconnect forever and keep stealing/resetting sessions.
+            s.page_unloading = true;
+            if let Some(ws) = s.send_ws.take() {
+                let _ = ws.close();
             }
         }
         Message::ClipboardSync(text) => {

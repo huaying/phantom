@@ -2844,6 +2844,7 @@ dependencies = [
  "uuid",
  "windows 0.58.0",
  "windows-service",
+ "x11-dl",
 ]
 
 [[package]]

@@ -157,7 +157,7 @@ Structured fields via `tracing`; stdout + file if `--log-file` set.
 `install.sh server --autologin` (`install.sh`):
 
 - GDM `AutomaticLogin` + `TimedLogin` (5s) — session auto-restores after sign-out
-- dconf overrides disable screen lock, idle, and the GNOME "Switch User" menu item (that menu entry backgrounds the session and breaks phantom's DISPLAY binding)
+- dconf + XDG autostart overrides disable GNOME/XFCE screen lock, idle, and the GNOME "Switch User" menu item (lockers/greeters background the desktop and break phantom's DISPLAY binding)
 - Clears + re-seeds keyring with empty password so Chrome/Evolution don't pop a keyring dialog under autologin
 - Drops an XDG autostart `.desktop` for phantom-server (with wrapper that kills any stale instance first, since phantom-server sometimes survives gnome-session exit and blocks port 9900/9901)
 - Installs a systemd timer watchdog that polls every 30s and kicks `gdm3` if no horde seat0 session exists — workaround for GDM 42's `TimedLogin` regression on Ubuntu 22

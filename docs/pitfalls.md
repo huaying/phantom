@@ -210,10 +210,10 @@ you're making touches one of these areas, re-read the relevant entry first.
   unlock dialog requires the account password they don't have. The
   remote viewer sees a stuck lock screen and cannot recover without
   out-of-band SSH access to set a password. `install.sh --autologin`
-  should also disable `org.gnome.desktop.screensaver.lock-enabled`,
-  `org.gnome.desktop.lockdown.disable-lock-screen=true`, and the idle
-  delay — the same way it already hides "Switch User" — so a
-  manual/idle lock can never strand the only user with access.
+  disables GNOME lock/idle settings and drops XFCE/light-locker
+  autostart overrides so an idle lock cannot switch the active seat to a
+  display-manager greeter and make NVFBC capture a black/backgrounded
+  desktop.
 
 ## Service mode (Windows)
 - **Windows IPC pipe deadlock**: synchronous named pipes only allow ONE

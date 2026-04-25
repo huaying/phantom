@@ -1,10 +1,10 @@
+use crate::Side;
 use crate::association::Association;
 use crate::association::state::AssociationState;
+use crate::chunk::ErrorCauseCode;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::error::{Error, Result};
 use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
-use crate::Side;
-use crate::chunk::ErrorCauseCode;
 
 use crate::util::{ByteSlice, BytesArray, BytesSource};
 use alloc::vec;

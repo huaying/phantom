@@ -55,6 +55,7 @@ libpulse-binding = { version = "2", optional = true }
 libpulse-simple-binding = { version = "2", optional = true }
 # uinput virtual keyboard (bypasses XKB/XTest — Wayland + GDM login work)
 evdev = "0.13"
+x11-dl = "2"
 
 # Windows: WASAPI capture for audio feature + Windows Service + Session management
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -74,5 +75,6 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
     "Win32_Devices_Display",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 windows-service = "0.7"

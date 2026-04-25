@@ -70,8 +70,34 @@ pub fn run_as_service() -> Result<(), windows_service::Error> {
 define_windows_service!(ffi_service_main, phantom_service_main);
 
 fn phantom_service_main(arguments: Vec<OsString>) {
-    if let Err(e) = run_service(arguments) {
-        tracing::error!("Service failed: {e}");
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        svc_log(&format!("service panic: {info}"));
+        previous_hook(info);
+    }));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_service(arguments)));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            svc_log(&format!("Service failed: {e:#}"));
+            tracing::error!("Service failed: {e}");
+            std::process::exit(1);
+        }
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "unknown panic payload"
+            };
+            svc_log(&format!("Service panicked: {msg}"));
+            tracing::error!("Service panicked: {msg}");
+            // Do not swallow the panic and leave the service silently stopped.
+            // Exiting non-zero lets SCM failure actions restart the service.
+            std::process::exit(101);
+        }
     }
 }
 
@@ -287,7 +313,7 @@ fn run_server_loop(
             .spawn(move || loop {
                 let pair = { conn_rx.lock().unwrap().recv() };
                 match pair {
-                    Ok((sender, mut receiver)) => {
+                    Ok((mut sender, mut receiver)) => {
                         // Expect ClientHello as the first message. Clients
                         // built after we added client-id tracking always send
                         // one; legacy clients don't, and we grant them a
@@ -318,10 +344,9 @@ fn run_server_loop(
 
                         if matches!(decision, crate::doorbell::DoorbellDecision::Reject) {
                             tracing::info!("Doorbell: rejecting ghost client (already kicked)");
-                            // Drop sender+receiver → transport IO thread
-                            // sees EOF → closes socket → client sees
-                            // onclose → auto-reconnect (will be rejected
-                            // again until page reload gives it a new id).
+                            let _ = sender.send_msg(&phantom_core::protocol::Message::Disconnect {
+                                reason: "ghost client rejected".to_string(),
+                            });
                             drop(sender);
                             drop(receiver);
                             continue;
@@ -471,6 +496,17 @@ fn create_service_session(
     {
         let ipc = session_mgr.ipc.as_ref().unwrap();
 
+        // The agent keeps capturing even when no web/native session is active.
+        // Drop any queued frames from the previous client/mode before applying
+        // this client's viewport hint; otherwise first-frame selection can see
+        // a burst of stale old-resolution frames and start the session blurry.
+        let drained = ipc.recv_encoded_frames().len();
+        if drained > 0 {
+            svc_log(&format!(
+                "create_service_session: dropped {drained} stale IPC frames before startup"
+            ));
+        }
+
         // If the client hinted a preferred resolution, apply it now so the
         // first frame we wait for below is already at that size. The agent's
         // capture loop polls the resolution arc each iteration; when it sees
@@ -529,7 +565,7 @@ fn create_service_session(
                 break 'wait (ef.width, ef.height);
             }
             if let Some((fw, fh)) = fallback_frame {
-                if fallback_since.is_some_and(|since| since.elapsed() > Duration::from_millis(700))
+                if fallback_since.is_some_and(|since| since.elapsed() > Duration::from_millis(3500))
                 {
                     svc_log(&format!(
                         "No frame matched resolution hint quickly; accepting stable fallback {}x{}",
@@ -549,10 +585,12 @@ fn create_service_session(
                 let _ = ipc.request_keyframe();
                 last_keyframe_nudge = Instant::now();
             }
-            // With a resolution hint, the agent needs ~500ms to apply the
-            // mode switch before producing a matching frame. Give it up to
-            // 5s (was 2s) so the VDD reinit can finish on slower GPUs.
-            let cap = if resolution_hint.is_some() { 250 } else { 100 };
+            // With a resolution hint, the agent may be on the Winlogon
+            // desktop and forced into CPU/GDI fallback; that can take a few
+            // seconds after ScrapCapture stalls. Never start the session with
+            // a fake hinted size: the web client then has no real first frame
+            // and shows a gray surface. Wait for an actual frame or fail.
+            let cap = if resolution_hint.is_some() { 600 } else { 100 };
             if attempts > cap {
                 if let Some((fw, fh)) = fallback_frame {
                     svc_log(&format!(
@@ -563,10 +601,9 @@ fn create_service_session(
                 }
                 if let Some((hw, hh)) = resolution_hint {
                     svc_log(&format!(
-                        "No first frame from agent within timeout; starting session with resolution hint {}x{}",
+                        "No real first frame from agent within timeout for resolution hint {}x{}",
                         hw, hh
                     ));
-                    break 'wait (hw, hh);
                 }
                 svc_log("No matching frames from agent within timeout");
                 anyhow::bail!("agent connected but not producing frames in time");
@@ -987,44 +1024,67 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             exe_path.display(),
             session_id,
         );
-        let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+        let env: Option<*const std::ffi::c_void> = if env_block.is_null() {
+            None
+        } else {
+            Some(env_block as *const std::ffi::c_void)
+        };
 
-        let mut si: STARTUPINFOW = mem::zeroed();
-        si.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
-        si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
+        let mut last_error: Option<anyhow::Error> = None;
+        for desktop_name in ["winsta0\\default", "winsta0\\winlogon"] {
+            let mut cmd_wide: Vec<u16> =
+                cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut desktop: Vec<u16> = desktop_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut si: STARTUPINFOW = mem::zeroed();
+            si.cb = mem::size_of::<STARTUPINFOW>() as u32;
+            si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
+            let mut pi: PROCESS_INFORMATION = mem::zeroed();
 
-        let mut pi: PROCESS_INFORMATION = mem::zeroed();
+            let result = CreateProcessAsUserW(
+                dup_token,
+                None,
+                windows::core::PWSTR(cmd_wide.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                env,
+                None,
+                &si,
+                &mut pi,
+            )
+            .with_context(|| format!("CreateProcessAsUserW failed on {desktop_name}"));
 
-        let result = CreateProcessAsUserW(
-            dup_token,
-            None,
-            windows::core::PWSTR(cmd_wide.as_mut_ptr()),
-            None,
-            None,
-            false,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            if env_block.is_null() {
-                None
-            } else {
-                Some(env_block)
-            },
-            None,
-            &si,
-            &mut pi,
-        );
+            match result {
+                Ok(()) => {
+                    let _ = CloseHandle(dup_token);
+                    if !env_block.is_null() {
+                        let _ =
+                            windows::Win32::System::Environment::DestroyEnvironmentBlock(env_block);
+                    }
+                    let _ = CloseHandle(pi.hThread);
+                    return Ok(WinProcessHandle {
+                        handle: pi.hProcess,
+                        pid: pi.dwProcessId,
+                    });
+                }
+                Err(e) => {
+                    svc_log(&format!(
+                        "CreateProcessAsUserW on {desktop_name} failed: {e:#}"
+                    ));
+                    last_error = Some(e);
+                }
+            }
+        }
+
         let _ = CloseHandle(dup_token);
         if !env_block.is_null() {
             let _ = windows::Win32::System::Environment::DestroyEnvironmentBlock(env_block);
         }
-        result.context("CreateProcessAsUserW failed")?;
-
-        let _ = CloseHandle(pi.hThread);
-
-        Ok(WinProcessHandle {
-            handle: pi.hProcess,
-            pid: pi.dwProcessId,
-        })
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("CreateProcessAsUserW failed")))
     }
 }
 
@@ -1512,6 +1572,116 @@ pub fn uninstall_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
 
 // ── Service installation helpers ────────────────────────────────────────────
 
+fn query_service_text() -> Option<String> {
+    let output = std::process::Command::new("sc")
+        .args(["query", SERVICE_NAME])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn service_exists() -> bool {
+    query_service_text().is_some()
+}
+
+fn service_is_running() -> bool {
+    query_service_text()
+        .as_deref()
+        .is_some_and(|text| text.contains("RUNNING"))
+}
+
+fn stop_service_for_update() -> anyhow::Result<()> {
+    if !service_exists() {
+        return Ok(());
+    }
+
+    println!("Stopping existing {SERVICE_DISPLAY_NAME} service...");
+    let _ = std::process::Command::new("sc")
+        .args(["stop", SERVICE_NAME])
+        .status();
+
+    for _ in 0..30 {
+        if !service_is_running() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    println!("  Service did not stop quickly; force-killing service process...");
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/FI", &format!("SERVICES eq {SERVICE_NAME}")])
+        .status();
+
+    for _ in 0..10 {
+        if !service_is_running() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    anyhow::bail!("existing {SERVICE_NAME} service is still running after stop/kill")
+}
+
+fn configure_crash_dumps() {
+    let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let dump_dir = std::path::Path::new(&program_data)
+        .join("Phantom")
+        .join("Dumps");
+    if let Err(e) = std::fs::create_dir_all(&dump_dir) {
+        println!("  Warning: could not create crash dump directory: {e}");
+        return;
+    }
+
+    let key =
+        r"HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\phantom-server.exe";
+    let dump_dir_s = dump_dir.to_string_lossy().to_string();
+    let commands = [
+        vec![
+            "add",
+            key,
+            "/v",
+            "DumpFolder",
+            "/t",
+            "REG_EXPAND_SZ",
+            "/d",
+            dump_dir_s.as_str(),
+            "/f",
+        ],
+        vec![
+            "add",
+            key,
+            "/v",
+            "DumpType",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "2",
+            "/f",
+        ],
+        vec![
+            "add",
+            key,
+            "/v",
+            "DumpCount",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "5",
+            "/f",
+        ],
+    ];
+    for args in commands {
+        match std::process::Command::new("reg").args(args).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => println!("  Warning: reg add for crash dumps failed with {status}"),
+            Err(e) => println!("  Warning: reg add for crash dumps failed: {e}"),
+        }
+    }
+}
+
 /// Install Phantom as a Windows Service (replaces schtasks approach).
 ///
 /// Uses `sc.exe` to create a service that runs as LocalSystem at boot.
@@ -1524,30 +1694,63 @@ pub fn install_service() -> anyhow::Result<()> {
     let install_dir = std::path::PathBuf::from(r"C:\Program Files\Phantom");
     std::fs::create_dir_all(&install_dir).context("create install dir")?;
     let install_exe = install_dir.join("phantom-server.exe");
+    let service_already_exists = service_exists();
+
+    if service_already_exists {
+        stop_service_for_update()?;
+    }
 
     let src_exe = std::env::current_exe().context("get current exe path")?;
-    std::fs::copy(&src_exe, &install_exe)
-        .context("copy exe to install dir (is the service already running? --uninstall first)")?;
+    let same_exe = src_exe
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&install_exe.to_string_lossy());
+    if same_exe {
+        println!("  Running from install location; service binary is already in place.");
+    } else {
+        std::fs::copy(&src_exe, &install_exe).context(
+            "copy exe to install dir (could not update service binary after stopping service)",
+        )?;
+    }
 
     let bin_path = format!("\"{}\" --service", install_exe.display());
-    let status = std::process::Command::new("sc")
-        .args([
-            "create",
-            SERVICE_NAME,
-            "binPath=",
-            &bin_path,
-            "start=",
-            "auto",
-            "obj=",
-            "LocalSystem",
-            "DisplayName=",
-            SERVICE_DISPLAY_NAME,
-        ])
-        .status()
-        .context("sc create")?;
+    if service_already_exists {
+        println!("Updating existing {SERVICE_DISPLAY_NAME} service...");
+        let status = std::process::Command::new("sc")
+            .args([
+                "config",
+                SERVICE_NAME,
+                "binPath=",
+                &bin_path,
+                "start=",
+                "auto",
+                "obj=",
+                "LocalSystem",
+            ])
+            .status()
+            .context("sc config")?;
+        if !status.success() {
+            anyhow::bail!("sc config failed with {status}. Run as Administrator.");
+        }
+    } else {
+        let status = std::process::Command::new("sc")
+            .args([
+                "create",
+                SERVICE_NAME,
+                "binPath=",
+                &bin_path,
+                "start=",
+                "auto",
+                "obj=",
+                "LocalSystem",
+                "DisplayName=",
+                SERVICE_DISPLAY_NAME,
+            ])
+            .status()
+            .context("sc create")?;
 
-    if !status.success() {
-        anyhow::bail!("sc create failed with {status}. Run as Administrator.");
+        if !status.success() {
+            anyhow::bail!("sc create failed with {status}. Run as Administrator.");
+        }
     }
 
     // Set description
@@ -1555,9 +1758,8 @@ pub fn install_service() -> anyhow::Result<()> {
         .args(["description", SERVICE_NAME, SERVICE_DESCRIPTION])
         .status();
 
-    // No automatic restart on failure — sc stop must actually stop the service.
-    // If restart-on-crash is needed, use "actions= restart/30000///" (one restart
-    // after 30s, then nothing) instead of the aggressive policy below.
+    // Auto-restart after crashes. `sc stop` still stops cleanly because this
+    // policy applies to unexpected failures, not normal service stops.
     let _ = std::process::Command::new("sc")
         .args([
             "failure",
@@ -1565,9 +1767,13 @@ pub fn install_service() -> anyhow::Result<()> {
             "reset=",
             "86400",
             "actions=",
-            "\"\"", // No actions — don't auto-restart
+            "restart/5000/restart/5000/restart/30000",
         ])
         .status();
+    let _ = std::process::Command::new("sc")
+        .args(["failureflag", SERVICE_NAME, "1"])
+        .status();
+    configure_crash_dumps();
 
     // ── Windows Firewall inbound rule ──
     // Without this, the service listens on 9900 but `DefaultInboundAction`

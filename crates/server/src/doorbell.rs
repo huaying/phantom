@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn ghost_set_caps_at_max_evicting_oldest() {
-        let mut current = None;
+        let mut current;
         let mut ghosts = VecDeque::new();
         // Push GHOST_MAX + 5 unique ids through the takeover path.
         for i in 0..(GHOST_MAX + 5) as u8 {

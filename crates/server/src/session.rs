@@ -218,8 +218,8 @@ impl CongestionTracker {
 /// Dynamically adjusts encoder bitrate based on RTT and congestion.
 ///
 /// Strategy:
-/// - RTT > 100ms or congested → decrease bitrate (×0.7)
-/// - RTT < 50ms and stable for 10s → increase bitrate (×1.2)
+/// - RTT rising above baseline, high jitter, or send-side skips → decrease bitrate (×0.7)
+/// - RTT near baseline with low jitter for 10s → increase bitrate (×1.2)
 /// - Clamped to \[min_kbps, max_kbps\]
 /// - Changes at most once per 5s (hysteresis)
 pub struct AdaptiveBitrate {
@@ -236,7 +236,7 @@ impl AdaptiveBitrate {
     pub fn new(initial_kbps: u32) -> Self {
         Self {
             current_kbps: initial_kbps,
-            min_kbps: 1500, // Don't go below 1500kbps (was 500 — too low, causes blur)
+            min_kbps: initial_kbps.clamp(500, 1500),
             max_kbps: initial_kbps * 3,
             last_change: Instant::now(),
             stable_since: None,
@@ -248,7 +248,20 @@ impl AdaptiveBitrate {
     ///
     /// Key insight: only decrease on CONGESTION (RTT increasing above baseline),
     /// not on fixed high latency (e.g. 100ms to a distant server).
-    pub fn evaluate(&mut self, rtt_us: Option<u64>, congestion_skip_ratio: u32) -> Option<u32> {
+    pub fn evaluate(
+        &mut self,
+        rtt_us: Option<u64>,
+        jitter_us: Option<u64>,
+        congestion_skip_ratio: u32,
+    ) -> Option<u32> {
+        const CONGESTED_RTT_MULTIPLIER: f64 = 1.5;
+        const CONGESTED_RTT_DELTA_MS: f64 = 30.0;
+        const SEVERE_RTT_MS: f64 = 500.0;
+        const HIGH_JITTER_MS: f64 = 80.0;
+        const SEVERE_JITTER_MS: f64 = 180.0;
+        const STABLE_RTT_DELTA_MS: f64 = 20.0;
+        const STABLE_JITTER_MS: f64 = 40.0;
+
         // Don't change more than once every 5s
         if self.last_change.elapsed() < Duration::from_secs(5) {
             return None;
@@ -259,26 +272,37 @@ impl AdaptiveBitrate {
             return None;
         }
 
-        // Track baseline RTT (minimum observed = fixed network latency)
+        let jitter_ms = jitter_us.map(|us| us as f64 / 1000.0).unwrap_or(0.0);
+
+        // Track baseline RTT (minimum observed = fixed network latency).
+        // Do not drift the baseline upward during congestion; that masks a
+        // growing queue as "normal" and lets ABR increase into bad latency.
         match self.baseline_rtt_ms {
             None => self.baseline_rtt_ms = Some(rtt_ms),
             Some(ref mut base) => {
-                // Slowly adapt baseline upward (EMA) but snap down immediately
                 if rtt_ms < *base {
                     *base = rtt_ms;
-                } else {
-                    *base = *base * 0.95 + rtt_ms * 0.05;
                 }
             }
         }
         let baseline = self.baseline_rtt_ms.unwrap_or(rtt_ms);
 
         // Congestion = RTT significantly above baseline (>50% increase)
-        let congested = rtt_ms > baseline * 1.5 && rtt_ms > baseline + 30.0;
+        let rtt_congested = rtt_ms > baseline * CONGESTED_RTT_MULTIPLIER
+            && rtt_ms > baseline + CONGESTED_RTT_DELTA_MS;
+        let severe_latency = rtt_ms >= SEVERE_RTT_MS || jitter_ms >= SEVERE_JITTER_MS;
+        let jitter_congested =
+            jitter_ms >= HIGH_JITTER_MS && rtt_ms > baseline + STABLE_RTT_DELTA_MS;
+        let congested = rtt_congested || jitter_congested || severe_latency;
 
         // Decrease: actual congestion or frame skip
         if congested || congestion_skip_ratio > 1 {
-            let new = ((self.current_kbps as f64 * 0.7) as u32).max(self.min_kbps);
+            let factor = if severe_latency || congestion_skip_ratio >= 4 {
+                0.6
+            } else {
+                0.7
+            };
+            let new = ((self.current_kbps as f64 * factor) as u32).max(self.min_kbps);
             if new < self.current_kbps {
                 self.stable_since = None;
                 return Some(new);
@@ -286,7 +310,11 @@ impl AdaptiveBitrate {
         }
 
         // Increase: RTT near baseline (not congested) and stable for 10s
-        if !congested && congestion_skip_ratio <= 1 {
+        let stable_network = !congested
+            && rtt_ms <= baseline + STABLE_RTT_DELTA_MS
+            && jitter_ms <= STABLE_JITTER_MS
+            && congestion_skip_ratio <= 1;
+        if stable_network {
             if self.stable_since.is_none() {
                 self.stable_since = Some(Instant::now());
             }
@@ -432,11 +460,21 @@ impl SessionRunner {
         cancel: Arc<AtomicBool>,
         video_codec: phantom_core::encode::VideoCodec,
         is_resume: bool,
+        local_input: bool,
+        local_clipboard: bool,
     ) -> Result<Self> {
         let event_rx = spawn_receive_thread(receiver);
-        let injector = InputInjector::new().ok();
+        let injector = if local_input {
+            InputInjector::new().ok()
+        } else {
+            None
+        };
         let clipboard = ClipboardTracker::new();
-        let arboard = arboard::Clipboard::new().ok();
+        let arboard = if local_clipboard {
+            arboard::Clipboard::new().ok()
+        } else {
+            None
+        };
 
         // Start audio capture (best-effort: don't fail session if audio unavailable)
         #[cfg(feature = "audio")]
@@ -797,7 +835,7 @@ impl SessionRunner {
         congestion: &CongestionTracker,
         encoder: &mut dyn FrameEncoder,
     ) {
-        if let Some(new_kbps) = abr.evaluate(self.rtt_us, congestion.skip_ratio) {
+        if let Some(new_kbps) = abr.evaluate(self.rtt_us, self.jitter_us, congestion.skip_ratio) {
             match encoder.set_bitrate_kbps(new_kbps) {
                 Ok(()) => abr.apply(new_kbps),
                 Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
@@ -1157,6 +1195,8 @@ fn run_session_inner(
 ) -> Result<Vec<u8>> {
     pipeline.prepare()?;
     let (width, height) = pipeline.dimensions();
+    let local_input = cfg.input_forwarder.is_none();
+    let local_clipboard = cfg.paste_fn.is_none();
 
     let mut runner = SessionRunner::new(
         cfg.sender,
@@ -1167,6 +1207,8 @@ fn run_session_inner(
         cfg.cancel,
         cfg.video_codec,
         cfg.is_resume,
+        local_input,
+        local_clipboard,
     )?;
     *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
@@ -1186,7 +1228,7 @@ fn run_session_inner(
         let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
     }
 
-    let mut abr = AdaptiveBitrate::new(pipeline.bitrate_kbps().max(5000));
+    let mut abr = AdaptiveBitrate::new(pipeline.bitrate_kbps());
     let log_label = pipeline.log_label();
 
     loop {
@@ -1218,7 +1260,7 @@ fn run_session_inner(
 
         // ABR: snapshot skip_ratio before calling set_bitrate_kbps (both borrow pipeline).
         let skip_ratio = pipeline.congestion_mut().map(|c| c.skip_ratio).unwrap_or(0);
-        if let Some(new_kbps) = abr.evaluate(runner.rtt_us, skip_ratio) {
+        if let Some(new_kbps) = abr.evaluate(runner.rtt_us, runner.jitter_us, skip_ratio) {
             match pipeline.set_bitrate_kbps(new_kbps) {
                 Ok(()) => abr.apply(new_kbps),
                 Err(e) => tracing::warn!("adaptive bitrate change failed: {e}"),
@@ -1291,6 +1333,8 @@ fn run_session_ipc_inner(
         cfg.cancel,
         cfg.video_codec,
         cfg.is_resume,
+        false,
+        false,
     )?;
     *session_id_out = runner.session_id.clone();
     runner.input_forwarder = cfg.input_forwarder;
@@ -1465,7 +1509,7 @@ mod tests {
     fn abr_no_change_initially() {
         let mut abr = AdaptiveBitrate::new(5000);
         // Within the 5s hysteresis window — should not change
-        assert!(abr.evaluate(Some(200_000), 1).is_none());
+        assert!(abr.evaluate(Some(200_000), None, 1).is_none());
     }
 
     #[test]
@@ -1476,7 +1520,7 @@ mod tests {
         // Establish a low baseline RTT first
         abr.baseline_rtt_ms = Some(30.0);
         // RTT = 150ms with baseline 30ms → congested (150 > 30*1.5=45 && 150 > 30+30=60)
-        let new = abr.evaluate(Some(150_000), 1);
+        let new = abr.evaluate(Some(150_000), None, 1);
         assert!(new.is_some(), "should decrease on congestion");
         let new_kbps = new.unwrap();
         assert!(new_kbps < 5000, "should decrease: got {new_kbps}");
@@ -1488,7 +1532,7 @@ mod tests {
         let mut abr = AdaptiveBitrate::new(5000);
         abr.last_change = Instant::now() - Duration::from_secs(10);
         // Good RTT but congested
-        let new = abr.evaluate(Some(30_000), 2);
+        let new = abr.evaluate(Some(30_000), None, 2);
         assert!(new.is_some());
         assert!(new.unwrap() < 5000);
     }
@@ -1499,7 +1543,7 @@ mod tests {
         abr.last_change = Instant::now() - Duration::from_secs(10);
         abr.baseline_rtt_ms = Some(30.0);
         // Already at minimum — 1500 * 0.7 = 1050, clamped to 1500 = no change
-        let new = abr.evaluate(Some(200_000), 1);
+        let new = abr.evaluate(Some(200_000), None, 1);
         assert!(new.is_none(), "should not go below minimum");
     }
 
@@ -1508,7 +1552,7 @@ mod tests {
         let mut abr = AdaptiveBitrate::new(5000);
         abr.last_change = Instant::now() - Duration::from_secs(10);
         // Good RTT but just started — stable_since is None, need 10s stability
-        let new = abr.evaluate(Some(20_000), 1);
+        let new = abr.evaluate(Some(20_000), None, 1);
         assert!(new.is_none());
     }
 
@@ -1518,10 +1562,32 @@ mod tests {
         abr.last_change = Instant::now() - Duration::from_secs(10);
         abr.stable_since = Some(Instant::now() - Duration::from_secs(15));
         // Good RTT + stable for >10s → should increase
-        let new = abr.evaluate(Some(20_000), 1);
+        let new = abr.evaluate(Some(20_000), None, 1);
         assert!(new.is_some());
         let new_kbps = new.unwrap();
         assert!(new_kbps > 5000, "should increase: got {new_kbps}");
         assert_eq!(new_kbps, 6000); // 5000 * 1.2 = 6000
+    }
+
+    #[test]
+    fn abr_does_not_increase_with_high_jitter() {
+        let mut abr = AdaptiveBitrate::new(2000);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        abr.baseline_rtt_ms = Some(200.0);
+        abr.stable_since = Some(Instant::now() - Duration::from_secs(15));
+
+        let new = abr.evaluate(Some(210_000), Some(120_000), 0);
+        assert!(new.is_none(), "high jitter should block bitrate increase");
+    }
+
+    #[test]
+    fn abr_baseline_does_not_drift_upward_under_congestion() {
+        let mut abr = AdaptiveBitrate::new(5000);
+        abr.last_change = Instant::now() - Duration::from_secs(10);
+        abr.baseline_rtt_ms = Some(200.0);
+
+        let new = abr.evaluate(Some(330_000), None, 0);
+        assert_eq!(new, Some(3500));
+        assert_eq!(abr.baseline_rtt_ms, Some(200.0));
     }
 }

@@ -381,20 +381,11 @@ mod platform {
                                 break;
                             }
 
-                            // Check keyframe request flag (set by request_keyframe)
-                            if kf_flag.swap(false, Ordering::SeqCst) {
-                                tracing::info!("IPC write thread: sending FORCE_KEYFRAME");
-                                if let Err(e) =
-                                    unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) }
-                                {
-                                    if !shutdown2.load(Ordering::Relaxed) {
-                                        tracing::warn!("IPC keyframe write error: {e}");
-                                    }
-                                    break;
-                                }
-                            }
-
-                            // Check resolution change request
+                            // Send resize before keyframe when both are pending.
+                            // A new web client sends a viewport hint before Hello;
+                            // if FORCE_KEYFRAME reaches the agent first, it emits
+                            // a keyframe at the old mode and service startup can
+                            // lock onto a stale/blurred first frame.
                             if let Some((w, h)) =
                                 res_change.lock().unwrap_or_else(|e| e.into_inner()).take()
                             {
@@ -413,6 +404,19 @@ mod platform {
                                 {
                                     if !shutdown2.load(Ordering::Relaxed) {
                                         tracing::warn!("IPC resolution change write error: {e}");
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Check keyframe request flag (set by request_keyframe)
+                            if kf_flag.swap(false, Ordering::SeqCst) {
+                                tracing::info!("IPC write thread: sending FORCE_KEYFRAME");
+                                if let Err(e) =
+                                    unsafe { send_message(handle, MSG_FORCE_KEYFRAME, &[]) }
+                                {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC keyframe write error: {e}");
                                     }
                                     break;
                                 }

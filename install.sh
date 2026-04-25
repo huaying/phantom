@@ -259,8 +259,8 @@ linux_install_deps_pacman() {
 # --light-gui installs a minimal desktop stack and configures a headless
 # display profile when no physical monitor is connected.
 # Profile choice is controlled by --install-mode:
-#   auto (default): try NVIDIA headless profile first, then fallback dummy
-#   gpu-strict: require NVIDIA headless profile; fail if not healthy
+#   auto (default): prefer NVIDIA headless profile on NVIDIA VMs; use dummy only without NVIDIA
+#   gpu-strict: require NVIDIA headless profile; never write dummy
 #   safe: always force dummy profile
 
 linux_has_connected_display() {
@@ -287,12 +287,48 @@ linux_nvidia_display_active() {
     nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null | grep -qi "Enabled"
 }
 
+linux_has_dummy_xorg_conf() {
+    [ -f /etc/X11/xorg.conf ] && grep -qi 'Driver[[:space:]]*"dummy"' /etc/X11/xorg.conf 2>/dev/null
+}
+
+linux_xrandr_query() {
+    DISPLAY=:0 xrandr --query 2>/dev/null && return 0
+
+    if [ -n "$USER_HOME" ] && [ -f "$USER_HOME/.Xauthority" ] && have_cmd sudo; then
+        sudo -u "$TARGET_USER" env DISPLAY=:0 XAUTHORITY="$USER_HOME/.Xauthority" xrandr --query 2>/dev/null && return 0
+    fi
+
+    if have_cmd sudo; then
+        for _auth in $(sudo find /run/user \( -path '*/gdm/Xauthority' -o -path '*/lightdm/Xauthority' \) -type f 2>/dev/null || true); do
+            sudo env DISPLAY=:0 XAUTHORITY="$_auth" xrandr --query 2>/dev/null && return 0
+        done
+    fi
+
+    for _auth in /run/user/*/gdm/Xauthority /run/user/*/lightdm/Xauthority; do
+        [ -f "$_auth" ] || continue
+        XAUTHORITY="$_auth" DISPLAY=:0 xrandr --query 2>/dev/null && return 0
+    done
+
+    return 1
+}
+
 linux_xorg_has_nvidia_output() {
-    DISPLAY=:0 xrandr --query 2>/dev/null | grep -Eq '^DP-[0-9]+ connected|^HDMI-[0-9]+ connected|^DVI-[0-9]+ connected'
+    linux_xrandr_query | grep -Eq '^DP-[0-9]+ connected|^HDMI-[0-9]+ connected|^DVI-[0-9]+ connected'
 }
 
 linux_nvidia_profile_healthy() {
     linux_nvidia_display_active && linux_xorg_has_nvidia_output
+}
+
+linux_wait_nvidia_profile_healthy() {
+    _deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+        if linux_nvidia_profile_healthy; then
+            return 0
+        fi
+        sleep 2
+    done
+    linux_nvidia_profile_healthy
 }
 
 linux_restart_display_manager() {
@@ -367,7 +403,7 @@ a0 80 00 2d 60 08 60 22 01 00 00 86 00 00 18 d7 09 50 a0 50 00 2d
 }
 
 linux_disable_dummy_xorg_if_present() {
-    if [ -f /etc/X11/xorg.conf ] && grep -qi 'Driver[[:space:]]*"dummy"' /etc/X11/xorg.conf 2>/dev/null; then
+    if linux_has_dummy_xorg_conf; then
         sudo cp /etc/X11/xorg.conf /etc/X11/xorg.conf.disabled-dummy 2>/dev/null || true
         sudo rm -f /etc/X11/xorg.conf
         echo "  Disabled dummy /etc/X11/xorg.conf to allow NVIDIA display ownership."
@@ -400,13 +436,13 @@ linux_try_nvidia_headless_profile() {
     linux_disable_dummy_xorg_if_present
     linux_restart_display_manager
 
-    if linux_nvidia_profile_healthy; then
+    if linux_wait_nvidia_profile_healthy; then
         echo "  NVIDIA headless profile is healthy (display_active=Enabled, DP output connected)."
         return 0
     fi
 
     _active="$(nvidia-smi --query-gpu=display_active,display_mode --format=csv,noheader 2>/dev/null | head -n1 || true)"
-    _xr="$(DISPLAY=:0 xrandr --query 2>/dev/null | head -n3 || true)"
+    _xr="$(linux_xrandr_query 2>/dev/null | head -n3 || true)"
     echo "  NVIDIA headless profile validation failed."
     [ -n "$_active" ] && echo "    nvidia-smi: $_active"
     [ -n "$_xr" ] && echo "    xrandr:"
@@ -429,18 +465,11 @@ linux_setup_headless_display_profile() {
             return 0
         fi
 
-        if [ "$INSTALL_MODE" = "gpu-strict" ]; then
-            DISPLAY_PROFILE_RESULT="failed"
-            DISPLAY_PROFILE_REASON="gpu-strict requested but NVIDIA headless validation failed"
-            echo "ERROR: --install-mode=gpu-strict requested, but NVIDIA headless profile is not healthy."
-            echo "       Refusing to fallback to dummy profile."
-            exit 1
-        fi
-
-        echo "  Falling back to dummy profile (mode=auto)."
-        linux_setup_headless_dummy_apt
-        DISPLAY_PROFILE_RESULT="dummy-fallback"
-        DISPLAY_PROFILE_REASON="NVIDIA profile probe failed, fell back in auto mode"
+        echo "  WARN: NVIDIA headless profile was installed but is not healthy yet."
+        echo "        Keeping NVIDIA config in place; not writing dummy xorg.conf on an NVIDIA VM."
+        echo "        Reboot once, then run: install.sh --doctor --doctor-strict --install-mode=$INSTALL_MODE"
+        DISPLAY_PROFILE_RESULT="nvidia-headless-pending"
+        DISPLAY_PROFILE_REASON="NVIDIA profile installed; live validation did not become healthy before timeout"
         return 0
     fi
 
@@ -764,10 +793,40 @@ idle-activation-enabled=false
 idle-delay=uint32 0
 
 [org/gnome/desktop/lockdown]
+disable-lock-screen=true
 disable-user-switching=true
 EOF
     sudo dconf update 2>/dev/null || true
-    echo "  Disabled GNOME screen lock + idle timeout + user switching"
+
+    # XFCE/lightdm images often start light-locker from XDG autostart. If it
+    # locks the session, LightDM switches the active seat to a greeter VT while
+    # phantom keeps streaming the backgrounded desktop, which commonly appears
+    # black through NVFBC.
+    _autostart_dir="$USER_HOME/.config/autostart"
+    sudo -u "$TARGET_USER" mkdir -p "$_autostart_dir"
+    for _locker_desktop in light-locker.desktop xfce4-screensaver.desktop org.xfce.ScreenSaver.desktop gnome-screensaver.desktop; do
+        sudo -u "$TARGET_USER" tee "$_autostart_dir/$_locker_desktop" > /dev/null <<EOF
+[Desktop Entry]
+Type=Application
+Name=Disabled by Phantom
+Hidden=true
+X-GNOME-Autostart-enabled=false
+EOF
+    done
+    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-no-screenlock.desktop" > /dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Phantom No Screen Lock
+Comment=Keep the autologin desktop visible for remote capture.
+Exec=sh -c 'xset s off -dpms s noblank 2>/dev/null || true; xfconf-query -c xfce4-session -p /general/LockCommand -s "" --create -t string 2>/dev/null || true; (sleep 5; pkill -x light-locker 2>/dev/null || true; pkill -x xfce4-screensav 2>/dev/null || true; pkill -x gnome-screensav 2>/dev/null || true; xset s off -dpms s noblank 2>/dev/null || true) &'
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+
+    sudo pkill -x light-locker 2>/dev/null || true
+    sudo pkill -x xfce4-screensav 2>/dev/null || true
+    sudo pkill -x gnome-screensav 2>/dev/null || true
+    echo "  Disabled GNOME/XFCE screen lock + idle timeout + user switching"
 }
 
 linux_autologin_reset_keyring() {
@@ -866,6 +925,10 @@ print_post_install_hints() {
             echo "Display profile result: $DISPLAY_PROFILE_RESULT"
             echo "Display profile reason: $DISPLAY_PROFILE_REASON"
             echo "Install mode: $INSTALL_MODE"
+            if [ "$DISPLAY_PROFILE_RESULT" = "nvidia-headless-pending" ]; then
+                echo "NVIDIA profile is installed but the current graphical session did not validate yet."
+                echo "Reboot once, then verify with: install.sh --doctor --doctor-strict --install-mode=$INSTALL_MODE"
+            fi
             echo ""
         fi
         if [ "$NO_AUTOSTART" = false ]; then
@@ -1112,12 +1175,20 @@ linux_doctor_display_stack() {
     fi
 
     if have_cmd loginctl && [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
-        if loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$TARGET_USER" '$3 == u && $4 == "seat0" {found=1} END {exit !found}'; then
+        if loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$TARGET_USER" '$3 == u && $4 == "seat0" && (NF < 6 || $6 == "active") {found=1} END {exit !found}'; then
             doctor_ok "active seat0 session found for $TARGET_USER"
         elif [ "$AUTOLOGIN" = true ]; then
             doctor_reboot "no active seat0 session for $TARGET_USER"
         else
             doctor_warn "no active seat0 session for $TARGET_USER; autostart runs only after graphical login"
+        fi
+
+        if loginctl list-sessions --no-legend 2>/dev/null | awk '$4 == "seat0" && (NF < 6 || $6 == "active") && ($3 == "lightdm" || $3 == "gdm" || $3 == "gdm3" || $3 == "sddm") {found=1} END {exit !found}'; then
+            if [ "$AUTOLOGIN" = true ]; then
+                doctor_fail "display-manager greeter is active on seat0; autologin desktop is locked/backgrounded"
+            else
+                doctor_warn "display-manager greeter is active on seat0; capture may show the login/lock screen"
+            fi
         fi
     fi
 
@@ -1138,10 +1209,44 @@ linux_doctor_display_stack() {
     fi
 }
 
+linux_doctor_screenlock() {
+    if [ "$AUTOLOGIN" != true ] || [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+        return 0
+    fi
+
+    if [ -n "$USER_HOME" ] && [ -f "$USER_HOME/.config/autostart/phantom-no-screenlock.desktop" ]; then
+        doctor_ok "screen-lock prevention autostart exists"
+    else
+        doctor_warn "screen-lock prevention autostart is missing; rerun install.sh --autologin"
+    fi
+
+    if [ -n "$USER_HOME" ] && [ -f "$USER_HOME/.config/autostart/light-locker.desktop" ] \
+        && grep -q '^Hidden=true' "$USER_HOME/.config/autostart/light-locker.desktop" 2>/dev/null; then
+        doctor_ok "light-locker autostart is disabled for $TARGET_USER"
+    elif [ -f /etc/xdg/autostart/light-locker.desktop ]; then
+        doctor_warn "light-locker is installed and not disabled for $TARGET_USER"
+    fi
+
+    if have_cmd ps && ps -u "$TARGET_USER" -o comm= 2>/dev/null | awk '$1 == "light-locker" || $1 == "xfce4-screensav" || $1 == "gnome-screensav" {found=1} END {exit !found}'; then
+        doctor_fail "screen locker is currently running for $TARGET_USER"
+    else
+        doctor_ok "no screen locker process is running for $TARGET_USER"
+    fi
+}
+
 linux_doctor_gpu() {
     if linux_has_nvidia_gpu; then
         _gpu_line="$(nvidia-smi -L 2>/dev/null | head -n1 || true)"
         doctor_ok "NVIDIA GPU detected: $_gpu_line"
+
+        if linux_has_dummy_xorg_conf; then
+            if [ "$INSTALL_MODE" = "safe" ]; then
+                doctor_warn "dummy /etc/X11/xorg.conf is active by --install-mode=safe; NVIDIA zero-copy is disabled"
+            else
+                doctor_fail "dummy /etc/X11/xorg.conf is active on an NVIDIA VM; it prevents NVIDIA display ownership"
+                doctor_fail "remove /etc/X11/xorg.conf or rerun installer after updating; fallback capture will be used until fixed"
+            fi
+        fi
 
         if linux_nvidia_display_active; then
             doctor_ok "NVIDIA display_active is Enabled"
@@ -1223,15 +1328,35 @@ linux_doctor_capture_probe() {
         return 0
     fi
 
-    if have_cmd timeout; then
-        _probe_out="$(linux_doctor_run_as_user timeout "$DOCTOR_CAPTURE_TIMEOUT" "$_bin" --list-displays 2>&1 || true)"
-    else
-        _probe_out="$(linux_doctor_run_as_user "$_bin" --list-displays 2>&1 || true)"
+    _probe_args="--probe-capture"
+    if [ "$INSTALL_MODE" = "gpu-strict" ]; then
+        _probe_args="--probe-capture --capture nvfbc --encoder nvenc"
+    elif [ "$INSTALL_MODE" = "safe" ]; then
+        _probe_args="--probe-capture --capture scrap --encoder openh264"
     fi
 
-    if printf "%s\n" "$_probe_out" | grep -q "Available displays:"; then
-        doctor_ok "phantom-server can enumerate capture displays"
-        printf "%s\n" "$_probe_out" | sed -n '1,6p' | sed 's/^/    /'
+    if have_cmd timeout; then
+        # shellcheck disable=SC2086 # _probe_args intentionally splits into flags
+        _probe_out="$(linux_doctor_run_as_user timeout "$DOCTOR_CAPTURE_TIMEOUT" "$_bin" $_probe_args 2>&1 || true)"
+    else
+        # shellcheck disable=SC2086 # _probe_args intentionally splits into flags
+        _probe_out="$(linux_doctor_run_as_user "$_bin" $_probe_args 2>&1 || true)"
+    fi
+
+    if printf "%s\n" "$_probe_out" | grep -q "Capture probe result: pass"; then
+        doctor_ok "phantom-server captured and encoded a non-black frame"
+        printf "%s\n" "$_probe_out" \
+            | grep -E 'Phantom capture probe:|resolved:|gpu_probe:|zero_copy:|frame:|encode:|Capture probe result:' \
+            | sed 's/^/    /'
+    elif printf "%s\n" "$_probe_out" | grep -q "Capture probe result: mostly-black"; then
+        printf "%s\n" "$_probe_out" \
+            | grep -E 'Phantom capture probe:|resolved:|gpu_probe:|zero_copy:|frame:|Capture probe result:|mostly black' \
+            | sed 's/^/    /'
+        if [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
+            doctor_reboot "phantom-server capture probe returned a mostly black frame"
+        else
+            doctor_fail "phantom-server capture probe returned a mostly black frame"
+        fi
     elif printf "%s\n" "$_probe_out" | grep -q "No displays found"; then
         if [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
             doctor_reboot "phantom-server sees no displays yet"
@@ -1239,11 +1364,14 @@ linux_doctor_capture_probe() {
             doctor_fail "phantom-server sees no capture displays"
         fi
     else
-        _first="$(linux_doctor_first_line "$_probe_out")"
+        _first="$(printf "%s\n" "$_probe_out" | grep -E '^(Error:|Caused by:|Capture probe result:)' | head -n1 || true)"
+        if [ -z "$_first" ]; then
+            _first="$(linux_doctor_first_line "$_probe_out")"
+        fi
         if [ "$AUTOLOGIN" = true ] || [ "$LIGHT_GUI" = true ]; then
-            doctor_warn "capture display probe is not ready yet: $_first"
+            doctor_warn "capture probe is not ready yet: $_first"
         else
-            doctor_fail "capture display probe failed: $_first"
+            doctor_fail "capture probe failed: $_first"
         fi
     fi
 }
@@ -1295,6 +1423,7 @@ linux_run_doctor() {
     linux_doctor_gpu
     linux_doctor_input
     linux_doctor_autostart
+    linux_doctor_screenlock
     if [ -n "$_server_bin" ]; then
         linux_doctor_capture_probe "$_server_bin"
     fi

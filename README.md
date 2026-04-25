@@ -44,6 +44,10 @@ runs a post-install doctor by default; re-run it after reboot with:
 curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh -s -- --doctor --doctor-strict --user=$USER
 ```
 
+The doctor checks OS display state and runs `phantom-server --probe-capture`,
+which initializes the resolved capture/encoder path, captures one frame, rejects
+mostly-black output, and verifies the frame can be encoded.
+
 For first-boot VM provisioning, use [`docs/cloud-init/phantom-server.yaml`](docs/cloud-init/phantom-server.yaml)
 as the starting point.
 
@@ -71,6 +75,8 @@ the script tells you how to finish with `phantom-server.exe --install`.
 | Run installer health checks only | `... \| sh -s -- --doctor --doctor-strict --user=dev-user` |
 | Skip post-install health checks | `... \| sh -s server --no-doctor` |
 | Install but don't register service (Windows) | `$env:PHANTOM_NO_AUTOSTART=1; irm ... \| iex` |
+| Skip post-install health checks (Windows) | `$env:PHANTOM_NO_DOCTOR=1; irm ... \| iex` |
+| Fail install command when Windows doctor fails | `$env:PHANTOM_DOCTOR_STRICT=1; irm ... \| iex` |
 | Client only on Linux | `... \| sh -s client` |
 | Server **and** client on one box | `... \| sh -s both` |
 | Remove autostart (Linux) | `rm ~/.config/autostart/phantom-server.desktop` |

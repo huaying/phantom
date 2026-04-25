@@ -32,10 +32,10 @@ use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResul
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
 use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
+use crate::shared::AssociationEvent;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{Payload, Side, Transmit};
-use crate::shared::AssociationEvent;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 

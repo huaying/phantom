@@ -8,6 +8,7 @@ use core::ops::{Index, IndexMut};
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::association::Association;
 use crate::chunk::chunk_type::CT_INIT;
 use crate::config::{EndpointConfig, ServerConfig, TransportConfig};
 use crate::packet::PartialDecode;
@@ -16,7 +17,6 @@ use crate::shared::{AssociationEventInner, AssociationId};
 use crate::shared::{EndpointEvent, EndpointEventInner};
 use crate::util::AssociationIdGenerator;
 use crate::{EcnCodepoint, Payload, Transmit};
-use crate::association::Association;
 
 use bytes::Bytes;
 use log::{debug, trace};

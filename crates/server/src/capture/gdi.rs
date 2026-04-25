@@ -16,11 +16,13 @@ use phantom_core::frame::{Frame, PixelFormat};
 use std::time::Instant;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    RedrawWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
-    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS,
+    DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, UOI_NAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
@@ -33,16 +35,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Returns true if the switch succeeded, false otherwise.
 pub fn switch_to_input_desktop() -> bool {
     unsafe {
-        // Use the same access flags as RustDesk — GENERIC_WRITE is required
-        // for SendInput to work from the switched desktop context.
-        let hdesk = match OpenInputDesktop(
-            DESKTOP_CONTROL_FLAGS(0),
-            false,
-            DESKTOP_ACCESS_FLAGS(
-                windows::Win32::Foundation::GENERIC_WRITE.0
-                    | windows::Win32::Foundation::GENERIC_READ.0,
-            ),
-        ) {
+        // SetThreadDesktop requires DESKTOP_CREATEWINDOW access. Request the
+        // read/write/switch rights explicitly instead of relying on GENERIC_*
+        // mapping, which is opaque and has behaved differently across images.
+        let hdesk = match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, input_desktop_access())
+        {
             Ok(d) => d,
             Err(_) => return false,
         };
@@ -59,12 +56,7 @@ pub fn switch_to_input_desktop() -> bool {
 /// keep returning stale frames from the wrong desktop after a switch.
 pub fn current_input_desktop_name() -> Option<String> {
     unsafe {
-        let hdesk = OpenInputDesktop(
-            DESKTOP_CONTROL_FLAGS(0),
-            false,
-            DESKTOP_ACCESS_FLAGS(windows::Win32::Foundation::GENERIC_READ.0),
-        )
-        .ok()?;
+        let hdesk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
         let mut buf = [0u16; 256];
         let mut needed: u32 = 0;
         let ok = GetUserObjectInformationW(
@@ -82,6 +74,33 @@ pub fn current_input_desktop_name() -> Option<String> {
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..end]))
     }
+}
+
+/// Ask Windows to repaint the interactive desktop.
+///
+/// DXGI/VDD can report a valid frame immediately after a mode/topology switch
+/// while the virtual display still contains an all-black surface. A repaint
+/// nudge is harmless when the desktop is already fresh and helps headless
+/// VDD sessions produce a real first frame without requiring user input.
+pub fn nudge_desktop_repaint() {
+    unsafe {
+        let hwnd = GetDesktopWindow();
+        let _ = RedrawWindow(
+            hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+        );
+    }
+}
+
+fn input_desktop_access() -> DESKTOP_ACCESS_FLAGS {
+    DESKTOP_ACCESS_FLAGS(
+        DESKTOP_CREATEWINDOW.0
+            | DESKTOP_READOBJECTS.0
+            | DESKTOP_WRITEOBJECTS.0
+            | DESKTOP_SWITCHDESKTOP.0,
+    )
 }
 
 /// GDI-based screen capture. Works in Session 0 (service context).

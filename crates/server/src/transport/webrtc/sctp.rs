@@ -80,9 +80,9 @@ impl PhantomSctpStack {
         payload: &[u8],
     ) -> Vec<SctpNotice> {
         let notices = Vec::new();
-        let Some((handle, event)) = self
-            .endpoint
-            .handle(now, source, None, None, Bytes::copy_from_slice(payload))
+        let Some((handle, event)) =
+            self.endpoint
+                .handle(now, source, None, None, Bytes::copy_from_slice(payload))
         else {
             return Vec::new();
         };
@@ -178,7 +178,11 @@ impl PhantomSctpStack {
     where
         F: FnMut(&[u8]),
     {
-        while let Some(transmit) = self.assoc.as_mut().and_then(|assoc| assoc.poll_transmit(now)) {
+        while let Some(transmit) = self
+            .assoc
+            .as_mut()
+            .and_then(|assoc| assoc.poll_transmit(now))
+        {
             match transmit.payload {
                 Payload::RawEncode(chunks) => {
                     for chunk in chunks {

@@ -312,7 +312,9 @@ mod tests {
     use phantom_core::frame::PixelFormat;
     use phantom_core::protocol::Message;
 
-    fn make_sender(_mode: RtcMode) -> (
+    fn make_sender(
+        _mode: RtcMode,
+    ) -> (
         WebRtcSender,
         mpsc::Receiver<EncodedFrame>,
         mpsc::Receiver<MediaAudioFrame>,
@@ -397,9 +399,7 @@ mod tests {
         let (mut sender, media_video_rx, media_audio_rx, control_rx) =
             make_sender(RtcMode::MediaTracksV1Compat);
 
-        sender
-            .send_msg(&Message::RequestKeyframe)
-            .unwrap();
+        sender.send_msg(&Message::RequestKeyframe).unwrap();
         let control_msg: Message = bincode::deserialize(&control_rx.try_recv().unwrap()).unwrap();
         assert!(matches!(control_msg, Message::RequestKeyframe));
 
@@ -419,5 +419,4 @@ mod tests {
         assert!(media_video_rx.try_recv().is_err());
         assert!(media_audio_rx.try_recv().is_err());
     }
-
 }

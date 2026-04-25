@@ -22,6 +22,21 @@ pub struct DxgiCapture {
     target_device: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BgraSampleStats {
+    pub sampled: u32,
+    pub black_pct: u32,
+    pub mean_r: u32,
+    pub mean_g: u32,
+    pub mean_b: u32,
+}
+
+impl BgraSampleStats {
+    pub fn is_mostly_black(&self) -> bool {
+        self.black_pct >= 99 && self.mean_r < 8 && self.mean_g < 8 && self.mean_b < 8
+    }
+}
+
 unsafe impl Send for DxgiCapture {}
 
 impl DxgiCapture {
@@ -247,6 +262,47 @@ impl DxgiCapture {
         unsafe { std::mem::transmute_copy(&self.staging) }
     }
 
+    /// Copy the latest GPU staging texture to a CPU-readable texture and sample
+    /// BGRA pixels. Used by install doctor/probes to catch encoded black frames.
+    pub fn sample_bgra_stats(&self, max_samples: usize) -> Result<BgraSampleStats> {
+        unsafe {
+            let readback_desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut readback = None;
+            self.device
+                .CreateTexture2D(&readback_desc, None, Some(&mut readback))?;
+            let readback = readback.context("CreateTexture2D(readback) returned None")?;
+            self.context.CopyResource(&readback, &self.staging);
+
+            let resource: ID3D11Resource = readback.cast()?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let stats = sample_mapped_bgra(
+                mapped.pData as *const u8,
+                mapped.RowPitch as usize,
+                self.width as usize,
+                self.height as usize,
+                max_samples,
+            );
+            self.context.Unmap(&resource, 0);
+            Ok(stats)
+        }
+    }
+
     /// Get the D3D11 device pointer for NVENC session.
     pub fn device_ptr(&self) -> *mut std::ffi::c_void {
         unsafe { std::mem::transmute_copy(&self.device) }
@@ -277,6 +333,68 @@ impl DxgiCapture {
             tracing::debug!(self.width, self.height, "DXGI duplicator recreated");
             Ok(())
         }
+    }
+}
+
+fn sample_mapped_bgra(
+    data: *const u8,
+    row_pitch: usize,
+    width: usize,
+    height: usize,
+    max_samples: usize,
+) -> BgraSampleStats {
+    if data.is_null() || row_pitch == 0 || width == 0 || height == 0 {
+        return BgraSampleStats {
+            sampled: 0,
+            black_pct: 100,
+            mean_r: 0,
+            mean_g: 0,
+            mean_b: 0,
+        };
+    }
+
+    let pixels = width.saturating_mul(height);
+    let step = (pixels / max_samples.max(1)).max(1);
+    let mut sampled = 0u32;
+    let mut black = 0u32;
+    let mut sum_r = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_b = 0u64;
+
+    for pixel in (0..pixels).step_by(step) {
+        let row = pixel / width;
+        let col = pixel % width;
+        let offset = row.saturating_mul(row_pitch).saturating_add(col * 4);
+        unsafe {
+            let b = *data.add(offset) as u32;
+            let g = *data.add(offset + 1) as u32;
+            let r = *data.add(offset + 2) as u32;
+            sampled += 1;
+            sum_r += r as u64;
+            sum_g += g as u64;
+            sum_b += b as u64;
+            if r < 8 && g < 8 && b < 8 {
+                black += 1;
+            }
+        }
+    }
+
+    if sampled == 0 {
+        return BgraSampleStats {
+            sampled: 0,
+            black_pct: 100,
+            mean_r: 0,
+            mean_g: 0,
+            mean_b: 0,
+        };
+    }
+
+    BgraSampleStats {
+        sampled,
+        black_pct: black * 100 / sampled,
+        mean_r: (sum_r / sampled as u64) as u32,
+        mean_g: (sum_g / sampled as u64) as u32,
+        mean_b: (sum_b / sampled as u64) as u32,
     }
 }
 

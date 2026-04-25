@@ -38,6 +38,8 @@ use anyhow::Result;
 use clap::Parser;
 use phantom_core::crypto;
 use phantom_core::encode::{FrameEncoder, VideoCodec};
+use phantom_core::frame::Frame;
+use phantom_core::protocol::Message;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,6 +92,12 @@ struct Args {
     /// List available displays and exit.
     #[arg(long)]
     list_displays: bool,
+
+    /// Probe capture + encode once and exit. Intended for installers and
+    /// health checks that need to distinguish "display exists" from "a real,
+    /// non-black frame can be captured".
+    #[arg(long)]
+    probe_capture: bool,
 
     /// Install as auto-start. Windows: registers the Phantom Windows Service
     /// (LocalSystem, auto start) and installs the Virtual Display Driver.
@@ -357,6 +365,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.probe_capture {
+        return run_capture_probe(&args);
+    }
+
     if args.install {
         return install_autostart();
     }
@@ -411,83 +423,11 @@ fn main() -> Result<()> {
         Some(key)
     };
 
-    // Hardware probe: resolve "auto" encoder and capture
     let gpu_probe = phantom_gpu::probe::probe();
-    // `mut` used only on linux/windows fallback paths
+    // `mut` used only on linux/windows fallback paths.
     #[allow(unused_mut)]
-    let mut encoder_name = if args.encoder == "auto" {
-        gpu_probe.best_encoder().to_string()
-    } else {
-        args.encoder.clone()
-    };
-    let mut capture_name = if args.capture == "auto" {
-        // On Wayland sessions, prefer PipeWire capture (if feature enabled)
-        #[cfg(feature = "wayland")]
-        {
-            if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
-                || std::env::var("WAYLAND_DISPLAY").is_ok()
-            {
-                tracing::info!("Wayland session detected, using PipeWire capture");
-                "pipewire".to_string()
-            } else {
-                gpu_probe.best_capture().to_string()
-            }
-        }
-        #[cfg(not(feature = "wayland"))]
-        {
-            gpu_probe.best_capture().to_string()
-        }
-    } else {
-        args.capture.clone()
-    };
-    // If encoder is explicitly non-GPU but capture resolved to a GPU-only method, fix it
-    if encoder_name == "openh264" && (capture_name == "nvfbc" || capture_name == "dxgi") {
-        tracing::info!(
-            "encoder is openh264, overriding capture from {} to scrap",
-            capture_name
-        );
-        capture_name = "scrap".to_string();
-    }
-
-    // Default codec selection intentionally picks H.264 even when the
-    // GPU can do AV1. Reason: AV1 support on the client side is the
-    // weak link — software dav1d on a mid-range Mac / Intel Chrome can
-    // cost 20-40 ms per 1080p frame, which shows up as typing lag on
-    // the native client and as outright browser-tab OOM crashes on the
-    // web client (observed on U22 L40). H.264 decodes on every
-    // platform we ship with hardware acceleration (VideoToolbox on
-    // macOS, NVDEC on Linux/Windows, WebCodecs H.264 everywhere).
-    //
-    // AV1 is kept as an explicit opt-in (`--codec av1`) while we:
-    //   (a) teach ClientHello to advertise supported decoders
-    //   (b) let the server pick the codec intersection
-    // Until (a) + (b) land, defaulting to AV1 is a regression for the
-    // majority of clients even when the server supports it.
-    let video_codec = match args.codec.as_str() {
-        "auto" => {
-            tracing::info!(
-                "codec=auto → H.264 (AV1 is opt-in via --codec av1; client decode support still rolling out)"
-            );
-            VideoCodec::H264
-        }
-        "h264" | "H264" | "h.264" => VideoCodec::H264,
-        "av1" | "AV1" => {
-            if encoder_name != "nvenc" {
-                anyhow::bail!("AV1 codec requires --encoder nvenc (OpenH264 only supports H.264)");
-            }
-            // Non-fatal probe: warn if the GPU isn't reporting AV1 but
-            // let it through — the NVENC init will surface the real
-            // error in a consistent format if it really can't.
-            if gpu_probe.best_codec() != "av1" {
-                tracing::warn!(
-                    "AV1 requested but GPU probe did not confirm AV1 support; \
-                     continuing anyway — NVENC will error out cleanly if unsupported"
-                );
-            }
-            VideoCodec::Av1
-        }
-        other => anyhow::bail!("unknown codec: {other} (supported: auto, h264, av1)"),
-    };
+    let (mut encoder_name, mut capture_name, video_codec) =
+        resolve_media_config(&args, &gpu_probe)?;
 
     tracing::info!(encoder = %encoder_name, capture = %capture_name, codec = ?video_codec, display = args.display, "configuration resolved");
 
@@ -804,7 +744,7 @@ fn main() -> Result<()> {
             .spawn(move || loop {
                 let pair = { conn_rx.lock().unwrap().recv() };
                 match pair {
-                    Ok((sender, mut receiver)) => {
+                    Ok((mut sender, mut receiver)) => {
                         // Read ClientHello with a short timeout. Legacy clients
                         // (pre-feature) don't send one — they get a None id and
                         // are accepted unconditionally (no tracking). New
@@ -826,6 +766,9 @@ fn main() -> Result<()> {
 
                         if matches!(decision, doorbell::DoorbellDecision::Reject) {
                             tracing::info!("Doorbell: rejecting ghost client (already kicked)");
+                            let _ = sender.send_msg(&Message::Disconnect {
+                                reason: "ghost client rejected".to_string(),
+                            });
                             drop(sender);
                             drop(receiver);
                             continue;
@@ -1041,6 +984,370 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_media_config(
+    args: &Args,
+    gpu_probe: &phantom_gpu::probe::GpuProbeResult,
+) -> Result<(String, String, VideoCodec)> {
+    #[allow(unused_mut)]
+    let mut encoder_name = if args.encoder == "auto" {
+        gpu_probe.best_encoder().to_string()
+    } else {
+        args.encoder.clone()
+    };
+
+    let mut capture_name = if args.capture == "auto" {
+        // On Wayland sessions, prefer PipeWire capture (if feature enabled).
+        #[cfg(feature = "wayland")]
+        {
+            if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+                || std::env::var("WAYLAND_DISPLAY").is_ok()
+            {
+                tracing::info!("Wayland session detected, using PipeWire capture");
+                "pipewire".to_string()
+            } else {
+                gpu_probe.best_capture().to_string()
+            }
+        }
+        #[cfg(not(feature = "wayland"))]
+        {
+            gpu_probe.best_capture().to_string()
+        }
+    } else {
+        args.capture.clone()
+    };
+
+    // If encoder is explicitly non-GPU but capture resolved to a GPU-only
+    // method, fix it. The CPU encoder needs CPU-visible BGRA frames.
+    if encoder_name == "openh264" && (capture_name == "nvfbc" || capture_name == "dxgi") {
+        tracing::info!(
+            "encoder is openh264, overriding capture from {} to scrap",
+            capture_name
+        );
+        capture_name = "scrap".to_string();
+    }
+
+    // Default codec selection intentionally picks H.264 even when the GPU can
+    // do AV1. Reason: AV1 support on the client side is the weak link —
+    // software dav1d on a mid-range Mac / Intel Chrome can cost 20-40 ms per
+    // 1080p frame, which shows up as typing lag on the native client and as
+    // outright browser-tab OOM crashes on the web client (observed on U22
+    // L40). H.264 decodes on every platform we ship with hardware acceleration
+    // (VideoToolbox on macOS, NVDEC on Linux/Windows, WebCodecs H.264
+    // everywhere).
+    //
+    // AV1 is kept as an explicit opt-in (`--codec av1`) while we:
+    //   (a) teach ClientHello to advertise supported decoders
+    //   (b) let the server pick the codec intersection
+    // Until (a) + (b) land, defaulting to AV1 is a regression for the majority
+    // of clients even when the server supports it.
+    let video_codec = match args.codec.as_str() {
+        "auto" => {
+            tracing::info!(
+                "codec=auto -> H.264 (AV1 is opt-in via --codec av1; client decode support still rolling out)"
+            );
+            VideoCodec::H264
+        }
+        "h264" | "H264" | "h.264" => VideoCodec::H264,
+        "av1" | "AV1" => {
+            if encoder_name != "nvenc" {
+                anyhow::bail!("AV1 codec requires --encoder nvenc (OpenH264 only supports H.264)");
+            }
+            // Non-fatal probe: warn if the GPU isn't reporting AV1 but let it
+            // through — the NVENC init will surface the real error in a
+            // consistent format if it really can't.
+            if gpu_probe.best_codec() != "av1" {
+                tracing::warn!(
+                    "AV1 requested but GPU probe did not confirm AV1 support; \
+                     continuing anyway — NVENC will error out cleanly if unsupported"
+                );
+            }
+            VideoCodec::Av1
+        }
+        other => anyhow::bail!("unknown codec: {other} (supported: auto, h264, av1)"),
+    };
+
+    Ok((encoder_name, capture_name, video_codec))
+}
+
+fn run_capture_probe(args: &Args) -> Result<()> {
+    let gpu_probe = phantom_gpu::probe::probe();
+    let (encoder_name, capture_name, video_codec) = resolve_media_config(args, &gpu_probe)?;
+
+    println!("Phantom capture probe:");
+    println!(
+        "  resolved: capture={} encoder={} codec={:?} display={}",
+        capture_name, encoder_name, video_codec, args.display
+    );
+    println!(
+        "  gpu_probe: encoder={} capture={} gpu_pipeline={} gpu={}",
+        gpu_probe.best_encoder(),
+        gpu_probe.best_capture(),
+        gpu_probe.has_gpu_pipeline(),
+        gpu_probe.gpu_name.as_deref().unwrap_or("none")
+    );
+
+    if capture_name == "nvfbc" && encoder_name == "nvenc" {
+        #[cfg(target_os = "linux")]
+        {
+            match run_linux_nvfbc_probe(args, video_codec) {
+                Ok(()) => return Ok(()),
+                Err(e) if args.capture == "auto" && args.encoder == "auto" => {
+                    println!("  zero_copy: failed: {e:#}");
+                    println!("  fallback: trying capture=scrap encoder=nvenc");
+                    return run_cpu_visible_capture_probe(
+                        "scrap",
+                        "nvenc",
+                        args.display,
+                        args.fps,
+                        args.bitrate,
+                        video_codec,
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("NVFBC capture is only available on Linux");
+        }
+    }
+
+    if capture_name == "dxgi" && encoder_name == "nvenc" {
+        #[cfg(target_os = "windows")]
+        {
+            match run_windows_dxgi_probe(args) {
+                Ok(()) => return Ok(()),
+                Err(e) if args.capture == "auto" && args.encoder == "auto" => {
+                    println!("  dxgi_nvenc: failed: {e:#}");
+                    println!("  fallback: trying capture=scrap encoder=nvenc");
+                    return run_cpu_visible_capture_probe(
+                        "scrap",
+                        "nvenc",
+                        args.display,
+                        args.fps,
+                        args.bitrate,
+                        video_codec,
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            anyhow::bail!("DXGI capture is only available on Windows");
+        }
+    }
+
+    run_cpu_visible_capture_probe(
+        &capture_name,
+        &encoder_name,
+        args.display,
+        args.fps,
+        args.bitrate,
+        video_codec,
+    )
+}
+
+fn run_cpu_visible_capture_probe(
+    capture_name: &str,
+    encoder_name: &str,
+    display: usize,
+    fps: u32,
+    bitrate: u32,
+    video_codec: VideoCodec,
+) -> Result<()> {
+    let mut capture = create_capture(capture_name, display)?;
+    let frame = wait_for_probe_frame(capture.as_mut(), Duration::from_secs(3))?;
+    print_frame_probe_stats(&frame)?;
+
+    let mut encoder = create_encoder(
+        encoder_name,
+        frame.width,
+        frame.height,
+        fps as f32,
+        bitrate,
+        video_codec,
+    )?;
+    encoder.force_keyframe();
+    let encoded = encoder.encode_frame(&frame)?;
+    if encoded.data.is_empty() {
+        anyhow::bail!("encoder produced an empty frame");
+    }
+    println!(
+        "  encode: ok bytes={} keyframe={} codec={:?}",
+        encoded.data.len(),
+        encoded.is_keyframe,
+        encoded.codec
+    );
+    println!("Capture probe result: pass");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_dxgi_probe(args: &Args) -> Result<()> {
+    let mut gpu = phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::new(args.fps, args.bitrate)?;
+    println!("  dxgi_nvenc: initialized {}x{}", gpu.width, gpu.height);
+    gpu.force_keyframe_with_capture_reset();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(encoded) = gpu.capture_and_encode()? {
+            if encoded.data.is_empty() {
+                anyhow::bail!("DXGI/NVENC produced an empty encoded frame");
+            }
+            let stats = gpu.capture.sample_bgra_stats(4096)?;
+            println!(
+                "  dxgi_nvenc: encoded bytes={} keyframe={} codec={:?}",
+                encoded.data.len(),
+                encoded.is_keyframe,
+                encoded.codec
+            );
+            println!(
+                "  frame: ok {}x{} black_pct={} mean_rgb={},{},{}",
+                gpu.width, gpu.height, stats.black_pct, stats.mean_r, stats.mean_g, stats.mean_b
+            );
+            if stats.is_mostly_black() {
+                println!("Capture probe result: mostly-black");
+                anyhow::bail!(
+                    "DXGI captured frame is mostly black (black_pct={} mean_rgb={},{},{})",
+                    stats.black_pct,
+                    stats.mean_r,
+                    stats.mean_g,
+                    stats.mean_b
+                );
+            }
+            println!("Capture probe result: pass");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    anyhow::bail!("DXGI/NVENC timed out waiting for the first encoded frame")
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_nvfbc_probe(args: &Args, video_codec: VideoCodec) -> Result<()> {
+    let gpu = GpuPipeline::new(args.fps, args.bitrate, video_codec)?;
+    println!(
+        "  zero_copy: ok {}x{} (nvfbc -> nvenc)",
+        gpu.width, gpu.height
+    );
+    drop(gpu);
+
+    // The zero-copy path proves NVFBC and NVENC can initialize, but it doesn't
+    // let the doctor inspect pixels. Open a short-lived BGRA NVFBC session too
+    // so black-screen installs fail before a user opens the browser.
+    let cuda = std::sync::Arc::new(phantom_gpu::cuda::CudaLib::load()?);
+    let dev = cuda.device_get(0)?;
+    let primary_ctx = cuda.primary_ctx_retain(dev)?;
+    unsafe { cuda.ctx_push(primary_ctx)? };
+    let mut capture = phantom_gpu::nvfbc::NvfbcCapture::new(
+        std::sync::Arc::clone(&cuda),
+        primary_ctx,
+        phantom_gpu::sys::NVFBC_BUFFER_FORMAT_BGRA,
+    )?;
+    let frame = wait_for_probe_frame(&mut capture, Duration::from_secs(3))?;
+    let _ = capture.release_context();
+    print_frame_probe_stats(&frame)?;
+    println!("Capture probe result: pass");
+    Ok(())
+}
+
+fn wait_for_probe_frame(
+    capture: &mut dyn phantom_core::capture::FrameCapture,
+    timeout: Duration,
+) -> Result<Frame> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(frame) = capture.capture()? {
+            return Ok(frame);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    anyhow::bail!("timed out waiting for a capture frame");
+}
+
+fn print_frame_probe_stats(frame: &Frame) -> Result<()> {
+    let stats = frame_probe_stats(&frame.data);
+    println!(
+        "  frame: ok {}x{} black_pct={} mean_rgb={},{},{}",
+        frame.width, frame.height, stats.black_pct, stats.mean_r, stats.mean_g, stats.mean_b
+    );
+    if stats.is_mostly_black() {
+        println!("Capture probe result: mostly-black");
+        anyhow::bail!(
+            "captured frame is mostly black (black_pct={} mean_rgb={},{},{})",
+            stats.black_pct,
+            stats.mean_r,
+            stats.mean_g,
+            stats.mean_b
+        );
+    }
+    Ok(())
+}
+
+struct FrameProbeStats {
+    black_pct: u32,
+    mean_r: u32,
+    mean_g: u32,
+    mean_b: u32,
+}
+
+impl FrameProbeStats {
+    fn is_mostly_black(&self) -> bool {
+        self.black_pct >= 99 && self.mean_r < 8 && self.mean_g < 8 && self.mean_b < 8
+    }
+}
+
+fn frame_probe_stats(data: &[u8]) -> FrameProbeStats {
+    if data.len() < 4 {
+        return FrameProbeStats {
+            black_pct: 100,
+            mean_r: 0,
+            mean_g: 0,
+            mean_b: 0,
+        };
+    }
+
+    let pixels = data.len() / 4;
+    let step = (pixels / 4096).max(1);
+    let mut sampled = 0u32;
+    let mut black = 0u32;
+    let mut sum_r = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_b = 0u64;
+
+    for pixel in (0..pixels).step_by(step) {
+        let offset = pixel * 4;
+        let b = data[offset] as u32;
+        let g = data[offset + 1] as u32;
+        let r = data[offset + 2] as u32;
+        sampled += 1;
+        sum_r += r as u64;
+        sum_g += g as u64;
+        sum_b += b as u64;
+        if r < 8 && g < 8 && b < 8 {
+            black += 1;
+        }
+    }
+
+    if sampled == 0 {
+        return FrameProbeStats {
+            black_pct: 100,
+            mean_r: 0,
+            mean_g: 0,
+            mean_b: 0,
+        };
+    }
+
+    FrameProbeStats {
+        black_pct: black * 100 / sampled,
+        mean_r: (sum_r / sampled as u64) as u32,
+        mean_g: (sum_g / sampled as u64) as u32,
+        mean_b: (sum_b / sampled as u64) as u32,
+    }
+}
+
 // ── GPU pipeline struct (Linux) ─────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -1072,7 +1379,11 @@ impl GpuPipeline {
         )?;
         let (sw, sh) = capture.resolution();
 
+        let first_deadline = Instant::now() + Duration::from_secs(3);
         let first = loop {
+            if Instant::now() >= first_deadline {
+                anyhow::bail!("NVFBC initial grab timed out waiting for the first frame");
+            }
             std::thread::sleep(Duration::from_millis(20));
             match capture.grab_cuda() {
                 Ok(Some(f)) => break f,
@@ -1408,6 +1719,12 @@ fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
         }
     };
 
+    // Attach the agent's main thread to the current input desktop before
+    // initializing anything that may create user32 windows/hooks. Once a
+    // thread owns windows, SetThreadDesktop can no longer move it between
+    // Winlogon and Default reliably.
+    let _ = capture::gdi::switch_to_input_desktop();
+
     // Set up input injection
     let mut injector = match input_injector::InputInjector::new() {
         Ok(inj) => Some(inj),
@@ -1430,7 +1747,22 @@ fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
     // Run agent capture+encode loop.
     // Like RustDesk/Sunshine: calls OpenInputDesktop+SetThreadDesktop before capture,
     // reinits DXGI on ACCESS_LOST (desktop switch: lock/unlock).
-    run_agent_loop(&ipc, &mut injector, &shutdown)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_agent_loop(&ipc, &mut injector, &shutdown)
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "unknown panic payload"
+            };
+            crate::service_win::svc_log(&format!("agent recovered from panic: {msg}"));
+            anyhow::bail!("agent panic: {msg}");
+        }
+    }
 }
 
 /// Get the origin (left, top) of a display on the virtual desktop by matching resolution.
@@ -1920,8 +2252,10 @@ fn run_agent_loop(
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
 
-    // Clipboard monitoring (agent → service → client)
-    let mut arboard = arboard::Clipboard::new().ok();
+    // Do not initialize arboard/clipboard in the agent capture thread. On
+    // Windows, clipboard/user32 helpers may create thread-owned windows, after
+    // which SetThreadDesktop can no longer follow Winlogon <-> Default.
+    let mut arboard: Option<arboard::Clipboard> = None;
     let mut last_clipboard = String::new();
     let mut clipboard_poll = Instant::now();
 
@@ -2072,6 +2406,7 @@ fn run_agent_loop(
                                     ));
                                     topology_guard.0 = Some(topo);
                                     vdd_primary_active = true;
+                                    capture::gdi::nudge_desktop_repaint();
                                 }
                                 Err(e) => {
                                     crate::service_win::svc_log(&format!(
@@ -2097,7 +2432,7 @@ fn run_agent_loop(
                     gdi_capture = None;
                     cpu_encoder = None;
                     scrap_waiting_for_frame_since = None;
-                    gpu_waiting_for_frame_since = None;
+                    gpu_waiting_for_frame_since = Some(Instant::now());
                     capture_mode = "dxgi_nvenc";
                 }
                 Err(e) => {
@@ -2158,9 +2493,12 @@ fn run_agent_loop(
                         if let Some(ref dev) = vdd_device {
                             if !display_ccd::is_vdd_primary(dev) {
                                 match display_ccd::set_vdd_primary(dev) {
-                                    Ok(_) => crate::service_win::svc_log(
-                                        "agent: re-applied CCD after resize (was broken)",
-                                    ),
+                                    Ok(_) => {
+                                        crate::service_win::svc_log(
+                                            "agent: re-applied CCD after resize (was broken)",
+                                        );
+                                        capture::gdi::nudge_desktop_repaint();
+                                    }
                                     Err(e) => crate::service_win::svc_log(&format!(
                                         "agent: re-apply CCD failed after resize: {e:#}"
                                     )),
@@ -2171,6 +2509,7 @@ fn run_agent_loop(
                     last_init_attempt = Instant::now() - Duration::from_secs(10);
                     // Brief pause for Windows to settle. 200ms is enough for
                     // DXGI/GDI to reflect the new mode; 500ms was overly safe.
+                    capture::gdi::nudge_desktop_repaint();
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
@@ -2221,8 +2560,43 @@ fn run_agent_loop(
         if let Some(ref mut gpu) = gpu_pipeline {
             match gpu.capture_and_encode() {
                 Ok(Some(encoded)) => {
+                    if let Some(since) = gpu_waiting_for_frame_since {
+                        match gpu.capture.sample_bgra_stats(2048) {
+                            Ok(stats) if stats.is_mostly_black() => {
+                                crate::service_win::svc_log(&format!(
+                                    "Tier 1 DXGI/NVENC produced black startup frame {}x{} black_pct={} mean_rgb={},{},{}",
+                                    width,
+                                    height,
+                                    stats.black_pct,
+                                    stats.mean_r,
+                                    stats.mean_g,
+                                    stats.mean_b
+                                ));
+                                if since.elapsed() > Duration::from_millis(2500) {
+                                    crate::service_win::svc_log(
+                                        "Tier 1 DXGI/NVENC stayed black after resize/startup; reinitializing before sending frames",
+                                    );
+                                    gpu_pipeline = None;
+                                    gpu_waiting_for_frame_since = None;
+                                    last_init_attempt = Instant::now() - Duration::from_secs(10);
+                                } else {
+                                    capture::gdi::nudge_desktop_repaint();
+                                    gpu.force_keyframe_with_capture_reset();
+                                }
+                                continue;
+                            }
+                            Ok(_) => {
+                                gpu_waiting_for_frame_since = None;
+                            }
+                            Err(e) => {
+                                crate::service_win::svc_log(&format!(
+                                    "Tier 1 DXGI/NVENC startup frame sample failed: {e:#}"
+                                ));
+                                gpu_waiting_for_frame_since = None;
+                            }
+                        }
+                    }
                     frame_count += 1;
-                    gpu_waiting_for_frame_since = None;
                     if frame_count <= 3 || frame_count.is_multiple_of(300) {
                         tracing::info!(
                             frame = frame_count,
@@ -2398,6 +2772,11 @@ fn run_agent_loop(
 
         // Handle paste text from service (clipboard forwarding)
         if let Some(text) = ipc.take_paste_request() {
+            let switched = capture::gdi::switch_to_input_desktop();
+            crate::service_win::svc_log(&format!(
+                "agent paste: switch_to_input_desktop={switched} desktop={:?}",
+                capture::gdi::current_input_desktop_name()
+            ));
             if let Some(ref mut inj) = injector {
                 tracing::info!(len = text.len(), "agent: pasting text");
                 if let Err(e) = inj.type_text(&text) {
@@ -2410,9 +2789,26 @@ fn run_agent_loop(
         let inputs = ipc.recv_inputs();
         if !inputs.is_empty() {
             tracing::info!(count = inputs.len(), "agent received input events");
+            crate::service_win::svc_log(&format!(
+                "agent received {} input events on desktop {:?}",
+                inputs.len(),
+                capture::gdi::current_input_desktop_name()
+            ));
         }
         for mut event in inputs {
-            capture::gdi::switch_to_input_desktop();
+            let switched = capture::gdi::switch_to_input_desktop();
+            let input_kind = match &event {
+                InputEvent::MouseMove { .. } => "mouse_move",
+                InputEvent::MouseButton { .. } => "mouse_button",
+                InputEvent::MouseScroll { .. } => "mouse_scroll",
+                InputEvent::Key { .. } => "key",
+            };
+            if input_kind != "mouse_move" {
+                crate::service_win::svc_log(&format!(
+                    "agent input {input_kind}: switch_to_input_desktop={switched} desktop={:?}",
+                    capture::gdi::current_input_desktop_name()
+                ));
+            }
             // Offset mouse coordinates to the captured display's position
             // on the virtual desktop (needed for secondary displays like VDD).
             if let InputEvent::MouseMove {

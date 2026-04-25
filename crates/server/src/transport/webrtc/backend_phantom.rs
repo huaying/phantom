@@ -1,28 +1,31 @@
 use super::{
-    BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender, make_session_bridge,
+    make_session_bridge,
     sctp::{PhantomSctpStack, SctpNotice},
+    BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender,
 };
-use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray};
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit as AesKeyInit};
 use aes::{Aes128, Aes256};
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce, Tag};
-use anyhow::{Context, Result, anyhow, bail};
-use dimpl::{Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile};
+use anyhow::{anyhow, bail, Context, Result};
+use dimpl::{
+    Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile,
+};
 use phantom_core::encode::EncodedFrame;
 use phantom_core::protocol::Message;
+use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
+use ring::digest;
+use ring::hmac;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use stun_types::attribute::{Username, XorMappedAddress};
 use stun_types::message::{
-    BINDING, IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite,
-    MessageWriteExt, MessageWriteVec, ShortTermCredentials,
+    IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
+    MessageWriteVec, ShortTermCredentials, BINDING,
 };
 use uuid::Uuid;
-use ring::hmac;
-use ring::digest;
-use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 const RTP_HEADER_LEN: usize = 12;
 const RTP_MTU: usize = 1200;
@@ -212,11 +215,7 @@ impl PhantomClient {
         self.maybe_publish_session(session_slot, notify_tx);
     }
 
-    fn handle_stream_payload(
-        &mut self,
-        stream_id: u16,
-        payload: &[u8],
-    ) {
+    fn handle_stream_payload(&mut self, stream_id: u16, payload: &[u8]) {
         if Some(stream_id) == self.input_stream {
             if let Some(tx) = &self.input_in_tx {
                 let _ = tx.send(payload.to_vec());
@@ -254,10 +253,9 @@ impl PhantomClient {
                 }
             }
         }
-        self.sctp
-            .drain_transmits(now, |chunk| {
-                let _ = self.dtls.send_application_data(chunk);
-            });
+        self.sctp.drain_transmits(now, |chunk| {
+            let _ = self.dtls.send_application_data(chunk);
+        });
     }
 
     fn send_video_frame(&mut self, frame: &EncodedFrame) {
@@ -299,10 +297,7 @@ impl PhantomClient {
             .media_tx
             .video_packet_count
             .wrapping_add(packet_count as u32);
-        self.media_tx.video_octet_count = self
-            .media_tx
-            .video_octet_count
-            .wrapping_add(octet_count);
+        self.media_tx.video_octet_count = self.media_tx.video_octet_count.wrapping_add(octet_count);
         self.media_tx.video_last_rtp_timestamp = self.media_tx.video_timestamp;
         self.media_tx.video_timestamp = self.media_tx.video_timestamp.wrapping_add(3_000);
     }
@@ -414,7 +409,10 @@ impl PhantomClient {
             }
         }
         if resent != 0 {
-            tracing::debug!(count = resent, "phantom backend retransmitted NACKed RTP packets");
+            tracing::debug!(
+                count = resent,
+                "phantom backend retransmitted NACKed RTP packets"
+            );
         }
     }
 }
@@ -531,12 +529,7 @@ impl BackendClient for PhantomClient {
         self.maybe_send_sender_reports();
     }
 
-    fn handle_receive(
-        &mut self,
-        _candidate_addr: SocketAddr,
-        source: SocketAddr,
-        contents: &[u8],
-    ) {
+    fn handle_receive(&mut self, _candidate_addr: SocketAddr, source: SocketAddr, contents: &[u8]) {
         self.last_source = Some(source);
         if !self.logged_first_packet {
             self.logged_first_packet = true;
@@ -558,7 +551,8 @@ impl BackendClient for PhantomClient {
                 );
             }
             if request.username.as_deref() == Some(self.expected_stun_username().as_str()) {
-                if let Some(response) = build_stun_success_response(contents, source, &self.params) {
+                if let Some(response) = build_stun_success_response(contents, source, &self.params)
+                {
                     self.pending_transmits.push((source, response));
                     tracing::debug!(source = %source, "phantom backend queued STUN success response");
                 } else {
@@ -587,7 +581,9 @@ impl BackendClient for PhantomClient {
                     if feedback.requests_keyframe {
                         tracing::debug!("phantom backend received RTCP PLI/FIR");
                         if let Some(tx) = &self.control_in_tx {
-                            let _ = tx.send(bincode::serialize(&Message::RequestKeyframe).unwrap_or_default());
+                            let _ = tx.send(
+                                bincode::serialize(&Message::RequestKeyframe).unwrap_or_default(),
+                            );
                         }
                     }
                     if !feedback.nack_sequences.is_empty() {
@@ -628,14 +624,23 @@ impl BackendClient for PhantomClient {
 
 fn is_rtp_packet(packet: &[u8]) -> bool {
     packet.len() >= 12
-        && packet.first().map(|b| (0x80..=0xBF).contains(b)).unwrap_or(false)
+        && packet
+            .first()
+            .map(|b| (0x80..=0xBF).contains(b))
+            .unwrap_or(false)
         && packet.get(1).map(|b| *b < 192 || *b > 223).unwrap_or(false)
 }
 
 fn is_rtcp_packet(packet: &[u8]) -> bool {
     packet.len() >= 8
-        && packet.first().map(|b| (0x80..=0xBF).contains(b)).unwrap_or(false)
-        && packet.get(1).map(|b| (192..=223).contains(b)).unwrap_or(false)
+        && packet
+            .first()
+            .map(|b| (0x80..=0xBF).contains(b))
+            .unwrap_or(false)
+        && packet
+            .get(1)
+            .map(|b| (192..=223).contains(b))
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -714,8 +719,14 @@ struct PhantomSrtpRxContext {
 }
 
 enum PhantomSrtpCipher {
-    AeadAes128Gcm { key: Aes128Gcm, salt: [u8; 12] },
-    AeadAes256Gcm { key: Aes256Gcm, salt: [u8; 12] },
+    AeadAes128Gcm {
+        key: Aes128Gcm,
+        salt: [u8; 12],
+    },
+    AeadAes256Gcm {
+        key: Aes256Gcm,
+        salt: [u8; 12],
+    },
     Aes128CmSha1_80 {
         enc_key: [u8; 16],
         auth_key: [u8; 20],
@@ -730,14 +741,16 @@ impl PhantomSrtpTxContext {
             SrtpProfile::AEAD_AES_128_GCM => {
                 let (key, salt) = derive_gcm_material_128(material, left)?;
                 PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Aes128Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    key: Aes128Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
                     salt,
                 }
             }
             SrtpProfile::AEAD_AES_256_GCM => {
                 let (key, salt) = derive_gcm_material_256(material, left)?;
                 PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    key: Aes256Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
                     salt,
                 }
             }
@@ -777,12 +790,24 @@ impl PhantomSrtpTxContext {
             mid,
         );
         match &mut self.rtp {
-            PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
-                protect_rtp_gcm(key, *salt, &header, sequence_number, timestamp, ssrc, payload)
-            }
-            PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
-                protect_rtp_gcm(key, *salt, &header, sequence_number, timestamp, ssrc, payload)
-            }
+            PhantomSrtpCipher::AeadAes128Gcm { key, salt } => protect_rtp_gcm(
+                key,
+                *salt,
+                &header,
+                sequence_number,
+                timestamp,
+                ssrc,
+                payload,
+            ),
+            PhantomSrtpCipher::AeadAes256Gcm { key, salt } => protect_rtp_gcm(
+                key,
+                *salt,
+                &header,
+                sequence_number,
+                timestamp,
+                ssrc,
+                payload,
+            ),
             PhantomSrtpCipher::Aes128CmSha1_80 {
                 enc_key,
                 auth_key,
@@ -807,9 +832,9 @@ impl PhantomSrtpTxContext {
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
                 protect_rtcp_gcm(key, *salt, packet, ssrc, srtcp_index)
             }
-            PhantomSrtpCipher::Aes128CmSha1_80 {
-                auth_key, ..
-            } => protect_rtcp_aes_cm_sha1_80(auth_key, packet, srtcp_index),
+            PhantomSrtpCipher::Aes128CmSha1_80 { auth_key, .. } => {
+                protect_rtcp_aes_cm_sha1_80(auth_key, packet, srtcp_index)
+            }
         }
     }
 }
@@ -821,14 +846,16 @@ impl PhantomSrtpRxContext {
             SrtpProfile::AEAD_AES_128_GCM => {
                 let (key, salt) = derive_gcm_material_128(material, left)?;
                 PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Aes128Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    key: Aes128Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
                     salt,
                 }
             }
             SrtpProfile::AEAD_AES_256_GCM => {
                 let (key, salt) = derive_gcm_material_256(material, left)?;
                 PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    key: Aes256Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
                     salt,
                 }
             }
@@ -849,8 +876,12 @@ impl PhantomSrtpRxContext {
 
     fn unprotect_rtcp(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         match &mut self.rtcp {
-            PhantomSrtpCipher::AeadAes128Gcm { key, salt } => unprotect_rtcp_gcm(key, *salt, packet),
-            PhantomSrtpCipher::AeadAes256Gcm { key, salt } => unprotect_rtcp_gcm(key, *salt, packet),
+            PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
+                unprotect_rtcp_gcm(key, *salt, packet)
+            }
+            PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
+                unprotect_rtcp_gcm(key, *salt, packet)
+            }
             PhantomSrtpCipher::Aes128CmSha1_80 { .. } => None,
         }
     }
@@ -937,7 +968,8 @@ where
         }
         let mut ciphertext = body[..body.len() - 16].to_vec();
         let tag = Tag::from_slice(&body[body.len() - 16..]);
-        key.decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag).ok()?;
+        key.decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag)
+            .ok()?;
         let mut out = packet[..8].to_vec();
         out.extend_from_slice(&ciphertext);
         Some(out)
@@ -946,7 +978,13 @@ where
     }
 }
 
-fn protect_rtcp_gcm<C>(key: &C, salt: [u8; 12], packet: &[u8], ssrc: u32, srtcp_index: u32) -> Vec<u8>
+fn protect_rtcp_gcm<C>(
+    key: &C,
+    salt: [u8; 12],
+    packet: &[u8],
+    ssrc: u32,
+    srtcp_index: u32,
+) -> Vec<u8>
 where
     C: AeadInPlace,
 {
@@ -1089,7 +1127,10 @@ fn derive_gcm_material_256(material: &KeyingMaterial, left: bool) -> Result<([u8
     Ok((key, salt))
 }
 
-fn derive_cm_material_128(material: &KeyingMaterial, left: bool) -> Result<([u8; 16], [u8; 20], [u8; 14])> {
+fn derive_cm_material_128(
+    material: &KeyingMaterial,
+    left: bool,
+) -> Result<([u8; 16], [u8; 20], [u8; 14])> {
     let master = slice_master::<16, 14>(material, left)?;
     let mut enc_key = [0u8; 16];
     derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, 0, &mut enc_key);
@@ -1105,7 +1146,10 @@ fn slice_master<const ML: usize, const SL: usize>(
     left: bool,
 ) -> Result<([u8; ML], [u8; SL])> {
     if material.len() != ML * 2 + SL * 2 {
-        bail!("unexpected DTLS-SRTP keying material length {}", material.len());
+        bail!(
+            "unexpected DTLS-SRTP keying material length {}",
+            material.len()
+        );
     }
     let (key_offset, salt_offset) = if left { (0, 0) } else { (ML, SL) };
     let mut master = [0u8; ML];
@@ -1310,7 +1354,9 @@ fn split_annexb_nalus(payload: &[u8]) -> Vec<&[u8]> {
     let mut i = 0usize;
     while let Some(start) = find_annexb_start(payload, i) {
         let nal_start = start.0 + start.1;
-        let next = find_annexb_start(payload, nal_start).map(|v| v.0).unwrap_or(payload.len());
+        let next = find_annexb_start(payload, nal_start)
+            .map(|v| v.0)
+            .unwrap_or(payload.len());
         if nal_start < next {
             out.push(&payload[nal_start..next]);
         }
@@ -1436,7 +1482,9 @@ impl ParsedOffer {
                 if let Some(ix) = current_media {
                     if let Some((pt_str, value)) = fmtp.split_once(' ') {
                         if let Ok(pt) = pt_str.parse::<u8>() {
-                            if let Some(payload) = out.media[ix].payloads.iter_mut().find(|p| p.pt == pt) {
+                            if let Some(payload) =
+                                out.media[ix].payloads.iter_mut().find(|p| p.pt == pt)
+                            {
                                 payload.fmtp = Some(value.trim().to_string());
                             }
                         }
@@ -1525,7 +1573,10 @@ impl MediaSection {
                     .iter()
                     .find(|p| {
                         p.codec == "H264"
-                            && p.fmtp.as_deref().unwrap_or_default().contains("packetization-mode=1")
+                            && p.fmtp
+                                .as_deref()
+                                .unwrap_or_default()
+                                .contains("packetization-mode=1")
                             && p.fmtp
                                 .as_deref()
                                 .unwrap_or_default()
@@ -1624,12 +1675,9 @@ impl<'a> AnswerBuilder<'a> {
                     sdp.push_str("a=fmtp:");
                     sdp.push_str(&pt.to_string());
                     sdp.push(' ');
-                    sdp.push_str(
-                        media
-                            .video_fmtp
-                            .as_deref()
-                            .unwrap_or("packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1"),
-                    );
+                    sdp.push_str(media.video_fmtp.as_deref().unwrap_or(
+                        "packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1",
+                    ));
                     sdp.push_str("\r\n");
                 }
                 Some(MediaKind::Audio) => {
@@ -1728,7 +1776,10 @@ fn parse_stun_binding_request(packet: &[u8]) -> Option<StunBindingRequest> {
         return None;
     }
     Some(StunBindingRequest {
-        username: msg.attribute::<Username>().ok().map(|u| u.username().to_string()),
+        username: msg
+            .attribute::<Username>()
+            .ok()
+            .map(|u| u.username().to_string()),
     })
 }
 
@@ -1768,7 +1819,9 @@ impl PhantomSessionParams {
             candidate_addr,
             ice_ufrag: format!("p{}", &Uuid::new_v4().simple().to_string()[..7]),
             ice_pwd: Uuid::new_v4().simple().to_string(),
-            fingerprint_sha256: format_fingerprint(&calculate_fingerprint(&local_certificate.certificate)),
+            fingerprint_sha256: format_fingerprint(&calculate_fingerprint(
+                &local_certificate.certificate,
+            )),
             remote_ice_ufrag: offer.ice_ufrag.clone().unwrap_or_default(),
             _remote_ice_pwd: offer.ice_pwd.clone().unwrap_or_default(),
             remote_fingerprint_sha256: offer.fingerprint_sha256.clone().unwrap_or_default(),
@@ -1849,14 +1902,14 @@ fn format_fingerprint(fingerprint: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerBuilder, ParsedOffer, PhantomSessionParams, build_stun_success_response,
-        parse_stun_binding_request,
+        build_stun_success_response, parse_stun_binding_request, AnswerBuilder, ParsedOffer,
+        PhantomSessionParams,
     };
-    use crate::transport::webrtc::sctp::{DCEP_OPEN, parse_dcep_open_label};
+    use crate::transport::webrtc::sctp::{parse_dcep_open_label, DCEP_OPEN};
     use stun_types::attribute::{Fingerprint, MessageIntegrity, Username, XorMappedAddress};
     use stun_types::message::{
-        BINDING, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
-        MessageWriteVec,
+        Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt, MessageWriteVec,
+        BINDING,
     };
 
     #[test]
@@ -1915,7 +1968,8 @@ mod tests {
             "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n",
         );
         let offer = ParsedOffer::parse(sdp).unwrap();
-        let params = PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
+        let params =
+            PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
         let answer = AnswerBuilder::from_offer(&offer, &params).build();
         assert!(answer.contains("a=group:BUNDLE 0 data"));
         assert!(answer.contains("m=video 9 UDP/TLS/RTP/SAVPF 109"));
@@ -1925,7 +1979,10 @@ mod tests {
         assert!(answer.contains("a=ice-ufrag:"));
         assert!(answer.contains("a=ice-pwd:"));
         assert!(answer.contains("a=rtpmap:109 H264/90000"));
-        assert!(answer.contains(&format!("a=fingerprint:sha-256 {}\r\n", params.fingerprint_sha256)));
+        assert!(answer.contains(&format!(
+            "a=fingerprint:sha-256 {}\r\n",
+            params.fingerprint_sha256
+        )));
         assert_eq!(params.remote_ice_ufrag, "browserUfrag");
         assert_eq!(params._remote_ice_pwd, "browserPasswordValue");
         assert_eq!(params.video_payload_type, 109);
@@ -1965,7 +2022,8 @@ mod tests {
             "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n",
         );
         let offer = ParsedOffer::parse(sdp).unwrap();
-        let params = PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
+        let params =
+            PhantomSessionParams::derive("10.0.0.5:9903".parse().unwrap(), &offer).unwrap();
         let username = format!("{}:{}", params.ice_ufrag, params.remote_ice_ufrag);
         let mut request = StunMessage::builder_request(BINDING, MessageWriteVec::new());
         request

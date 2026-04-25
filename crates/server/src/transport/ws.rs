@@ -23,17 +23,6 @@ fn extract_query_param<'a>(raw_path: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-fn extract_content_length(request: &str) -> Option<usize> {
-    request.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
-        }
-    })
-}
-
 /// Verify a JWT token signed with HMAC-SHA256.
 /// Returns (sub, vm_id) claims on success.
 fn verify_jwt(token: &str, secret: &[u8]) -> Result<(String, String)> {
@@ -128,8 +117,6 @@ fn check_request_auth(
         }
     }
 }
-
-use std::sync::Mutex;
 
 /// Maximum concurrent HTTP/WS handler threads.
 const MAX_CONNECTIONS: usize = 16;
@@ -251,10 +238,7 @@ const WASM_BIN: &[u8] = b"";
 // --- WebRTC types (only when feature enabled) ---
 
 #[cfg(feature = "webrtc")]
-type SessionPair = (
-    super::webrtc::WebRtcSender,
-    super::webrtc::WebRtcReceiver,
-);
+type SessionPair = (super::webrtc::WebRtcSender, super::webrtc::WebRtcReceiver);
 
 #[cfg(feature = "webrtc")]
 type RtcRequest = super::webrtc::PendingRtcSession;
@@ -624,7 +608,11 @@ fn handle_http_rw_rtc(
             let rtc_mode = super::webrtc::RtcMode::from_offer_mode(
                 offer_json["mode"].as_str().unwrap_or("datachannel_v1"),
             );
-            tracing::info!(?rtc_mode, sdp_len = sdp_str.len(), "POST /rtc parsed offer JSON");
+            tracing::info!(
+                ?rtc_mode,
+                sdp_len = sdp_str.len(),
+                "POST /rtc parsed offer JSON"
+            );
 
             let accepted = super::webrtc::accept_http_offer(candidate_addr, sdp_str, rtc_mode)?;
             tracing::info!("POST /rtc accepted offer");
@@ -689,7 +677,7 @@ fn serve_static(stream: &mut (impl Read + Write), path: &str, keep_alive: bool) 
     };
     let conn_header = if keep_alive { "keep-alive" } else { "close" };
     write!(stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: {conn_header}\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: {conn_header}\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)?;
