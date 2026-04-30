@@ -160,6 +160,8 @@ struct AppState {
     rtc2_video_el: Option<HtmlVideoElement>,
     rtc2_audio_el: Option<HtmlAudioElement>,
     rtc2_video_loop_generation: u32,
+    rtc_stats: Option<RtcBrowserStatsSnapshot>,
+    rtc_stats_log: bool,
 }
 
 fn update_debug_snapshot(state: &AppState) {
@@ -217,6 +219,43 @@ fn update_debug_snapshot(state: &AppState) {
     } else {
         let _ = js_sys::Reflect::set(&snapshot, &"stats".into(), &JsValue::NULL);
     }
+    if let Some(stats) = &state.rtc_stats {
+        let stats_obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"framesDecoded".into(),
+            &stats.video_frames_decoded.into(),
+        );
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"framesDropped".into(),
+            &stats.video_frames_dropped.into(),
+        );
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"packetsLost".into(),
+            &stats.video_packets_lost.into(),
+        );
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"packetsReceived".into(),
+            &stats.video_packets_received.into(),
+        );
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"jitterMs".into(),
+            &stats.video_jitter_ms.into(),
+        );
+        let _ = js_sys::Reflect::set(&stats_obj, &"rttMs".into(), &stats.rtt_ms.into());
+        let _ = js_sys::Reflect::set(
+            &stats_obj,
+            &"videoBitrateKbps".into(),
+            &stats.video_bitrate_kbps.into(),
+        );
+        let _ = js_sys::Reflect::set(&snapshot, &"rtcStats".into(), &stats_obj.into());
+    } else {
+        let _ = js_sys::Reflect::set(&snapshot, &"rtcStats".into(), &JsValue::NULL);
+    }
     let snapshot_js: JsValue = snapshot.into();
     let _ = js_sys::Reflect::set(&js_sys::global(), &"__phantom_debug".into(), &snapshot_js);
     if let Some(window) = web_sys::window() {
@@ -243,6 +282,19 @@ struct StatsSnapshot {
     fps: f32,
     bandwidth_kbps: f64,
     encode_ms: f64,
+}
+
+#[derive(Clone, Default)]
+struct RtcBrowserStatsSnapshot {
+    timestamp_ms: f64,
+    video_frames_decoded: f64,
+    video_frames_dropped: f64,
+    video_packets_lost: f64,
+    video_packets_received: f64,
+    video_jitter_ms: f64,
+    video_bytes_received: f64,
+    video_bitrate_kbps: f64,
+    rtt_ms: f64,
 }
 
 thread_local! {
@@ -280,6 +332,7 @@ pub fn main() {
     // DataChannels.
     let query = window.location().search().unwrap_or_default();
     let use_rtc = query_has_flag(&query, "rtc") || query_has_flag(&query, "rtc2");
+    let rtc_stats_log = query_has_flag(&query, "stats") || query_has_flag(&query, "rtcstats");
 
     // Extract ?token=<jwt> for authenticated connections
     let auth_token = query_token(&query);
@@ -321,6 +374,8 @@ pub fn main() {
         rtc2_video_el: None,
         rtc2_audio_el: None,
         rtc2_video_loop_generation: 0,
+        rtc_stats: None,
+        rtc_stats_log,
     }));
     {
         let st = state.borrow();
@@ -500,6 +555,7 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
         st.send_control_dc = Some(control_dc.clone());
         update_debug_snapshot(&st);
     }
+    start_rtc_stats_loop(pc.clone(), state.clone());
 
     {
         let s = state.clone();
@@ -566,6 +622,141 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
     });
 
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
+}
+
+fn js_field(obj: &JsValue, name: &str) -> Option<JsValue> {
+    js_sys::Reflect::get(obj, &name.into()).ok()
+}
+
+fn js_f64(obj: &JsValue, name: &str) -> Option<f64> {
+    js_field(obj, name).and_then(|v| v.as_f64())
+}
+
+fn js_bool(obj: &JsValue, name: &str) -> bool {
+    js_field(obj, name)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn js_string(obj: &JsValue, name: &str) -> Option<String> {
+    js_field(obj, name).and_then(|v| v.as_string())
+}
+
+fn collect_rtc_stats_report(report: &JsValue) -> Option<RtcBrowserStatsSnapshot> {
+    let snapshot = Rc::new(RefCell::new(RtcBrowserStatsSnapshot::default()));
+    let saw_video = Rc::new(RefCell::new(false));
+    let snapshot_for_cb = snapshot.clone();
+    let saw_video_for_cb = saw_video.clone();
+    let cb = Closure::<dyn FnMut(JsValue, JsValue)>::new(move |stat: JsValue, _key: JsValue| {
+        let stat_type = js_string(&stat, "type").unwrap_or_default();
+        match stat_type.as_str() {
+            "inbound-rtp" => {
+                let kind = js_string(&stat, "kind")
+                    .or_else(|| js_string(&stat, "mediaType"))
+                    .unwrap_or_default();
+                if kind != "video" {
+                    return;
+                }
+                let mut out = snapshot_for_cb.borrow_mut();
+                *saw_video_for_cb.borrow_mut() = true;
+                out.timestamp_ms = js_f64(&stat, "timestamp").unwrap_or(out.timestamp_ms);
+                out.video_frames_decoded =
+                    js_f64(&stat, "framesDecoded").unwrap_or(out.video_frames_decoded);
+                out.video_frames_dropped =
+                    js_f64(&stat, "framesDropped").unwrap_or(out.video_frames_dropped);
+                out.video_packets_lost =
+                    js_f64(&stat, "packetsLost").unwrap_or(out.video_packets_lost);
+                out.video_packets_received =
+                    js_f64(&stat, "packetsReceived").unwrap_or(out.video_packets_received);
+                out.video_jitter_ms =
+                    js_f64(&stat, "jitter").unwrap_or(out.video_jitter_ms) * 1000.0;
+                out.video_bytes_received =
+                    js_f64(&stat, "bytesReceived").unwrap_or(out.video_bytes_received);
+            }
+            "candidate-pair" => {
+                let selected = js_bool(&stat, "selected") || js_bool(&stat, "nominated");
+                let succeeded = js_string(&stat, "state").as_deref() == Some("succeeded");
+                if selected || succeeded {
+                    if let Some(rtt) = js_f64(&stat, "currentRoundTripTime") {
+                        snapshot_for_cb.borrow_mut().rtt_ms = rtt * 1000.0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+
+    let for_each = js_field(report, "forEach")?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    let _ = for_each.call1(report, cb.as_ref().unchecked_ref());
+    drop(cb);
+
+    if !*saw_video.borrow() {
+        return None;
+    }
+    let out = snapshot.borrow().clone();
+    Some(out)
+}
+
+fn start_rtc_stats_loop(pc: web_sys::RtcPeerConnection, state: Rc<RefCell<AppState>>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        let pc = pc.clone();
+        let state = state.clone();
+        let get_stats = js_sys::Reflect::get(pc.as_ref(), &"getStats".into())
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        let Some(get_stats) = get_stats else {
+            return;
+        };
+        let Ok(promise_value) = get_stats.call0(pc.as_ref()) else {
+            return;
+        };
+        let Ok(promise) = promise_value.dyn_into::<js_sys::Promise>() else {
+            return;
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(report) = wasm_bindgen_futures::JsFuture::from(promise).await else {
+                return;
+            };
+            let Some(mut snapshot) = collect_rtc_stats_report(&report) else {
+                return;
+            };
+            {
+                let mut st = state.borrow_mut();
+                if let Some(prev) = &st.rtc_stats {
+                    let delta_ms = snapshot.timestamp_ms - prev.timestamp_ms;
+                    let delta_bytes = snapshot.video_bytes_received - prev.video_bytes_received;
+                    if delta_ms > 0.0 && delta_bytes >= 0.0 {
+                        snapshot.video_bitrate_kbps = delta_bytes * 8.0 / delta_ms;
+                    }
+                }
+                if st.rtc_stats_log {
+                    console::log_1(
+                        &format!(
+                            "rtc-stats browser decoded={} dropped={} lost={} recv={} jitter={:.1}ms rtt={:.1}ms bitrate={:.0}kbps",
+                            snapshot.video_frames_decoded as u64,
+                            snapshot.video_frames_dropped as u64,
+                            snapshot.video_packets_lost as i64,
+                            snapshot.video_packets_received as u64,
+                            snapshot.video_jitter_ms,
+                            snapshot.rtt_ms,
+                            snapshot.video_bitrate_kbps
+                        )
+                        .into(),
+                    );
+                }
+                st.rtc_stats = Some(snapshot);
+                update_debug_snapshot(&st);
+            }
+        });
+    });
+    let _ = window
+        .set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 1000);
+    cb.forget();
 }
 
 fn draw_rtc2_video_to_canvas(state: &AppState, video: &HtmlVideoElement) {

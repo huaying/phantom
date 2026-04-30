@@ -19,7 +19,7 @@ use ring::hmac;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use stun_types::attribute::{Username, XorMappedAddress};
 use stun_types::message::{
     IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
@@ -37,6 +37,7 @@ const H264_SPS_NALU_TYPE: u8 = 7;
 const H264_PPS_NALU_TYPE: u8 = 8;
 const H264_IDR_NALU_TYPE: u8 = 5;
 const VIDEO_RTX_CACHE_SIZE: usize = 512;
+const RTC_STATS_INTERVAL: Duration = Duration::from_secs(5);
 // Fallback only. When the browser offer contains H.264 fmtp for the selected
 // payload, answer with the offered fmtp so Chrome's decoder path stays on the
 // exact negotiated profile. In-band SPS/PPS still carry the real bitstream
@@ -111,6 +112,7 @@ pub(super) struct PhantomClient {
     srtp_rx: Option<PhantomSrtpRxContext>,
     media_tx: MediaTxState,
     last_rtcp_report_at: Instant,
+    stats: RtcStatsWindow,
     video_rtx_cache: VecDeque<CachedRtpPacket>,
     logged_first_packet: bool,
     logged_first_stun: bool,
@@ -150,6 +152,7 @@ impl PhantomClient {
             srtp_rx: None,
             media_tx: MediaTxState::new(),
             last_rtcp_report_at: Instant::now(),
+            stats: RtcStatsWindow::new(),
             video_rtx_cache: VecDeque::with_capacity(VIDEO_RTX_CACHE_SIZE),
             logged_first_packet: false,
             logged_first_stun: false,
@@ -306,6 +309,8 @@ impl PhantomClient {
             .wrapping_add(packet_count as u32);
         self.media_tx.video_octet_count = self.media_tx.video_octet_count.wrapping_add(octet_count);
         self.media_tx.video_last_rtp_timestamp = video_timestamp;
+        self.stats
+            .note_video_frame(frame.is_keyframe, packet_count as u64, octet_count as u64);
     }
 
     fn send_audio_frame(&mut self, frame: &MediaAudioFrame) {
@@ -335,6 +340,7 @@ impl PhantomClient {
             .media_tx
             .audio_octet_count
             .wrapping_add(frame.data.len() as u32);
+        self.stats.note_audio_packet(frame.data.len() as u64);
         self.media_tx.audio_last_rtp_timestamp = self.media_tx.audio_timestamp;
         self.media_tx.audio_timestamp = self
             .media_tx
@@ -406,6 +412,7 @@ impl PhantomClient {
             return;
         };
         let mut resent = 0usize;
+        let mut resent_bytes = 0usize;
         for seq in nack_sequences {
             if let Some(pkt) = self
                 .video_rtx_cache
@@ -413,11 +420,13 @@ impl PhantomClient {
                 .rev()
                 .find(|pkt| pkt.sequence_number == *seq)
             {
+                resent_bytes += pkt.packet.len();
                 self.pending_transmits.push((source, pkt.packet.clone()));
                 resent += 1;
             }
         }
         if resent != 0 {
+            self.stats.note_rtx(resent as u64, resent_bytes as u64);
             tracing::debug!(
                 count = resent,
                 "phantom backend retransmitted NACKed RTP packets"
@@ -441,7 +450,10 @@ impl BackendClient for PhantomClient {
         session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
         notify_tx: &mpsc::Sender<()>,
     ) {
-        for (addr, packet) in self.pending_transmits.drain(..) {
+        let pending_transmits = std::mem::take(&mut self.pending_transmits);
+        self.stats.note_pending_udp(pending_transmits.len());
+        for (addr, packet) in pending_transmits {
+            self.stats.note_udp_packet(packet.len() as u64);
             if let Err(error) = socket.send_to(&packet, addr) {
                 tracing::warn!(%addr, len = packet.len(), %error, "phantom backend failed to send UDP packet");
             }
@@ -450,6 +462,8 @@ impl BackendClient for PhantomClient {
             match self.dtls.poll_output(&mut self.out_buf) {
                 DtlsOutput::Packet(packet) => {
                     if let Some(addr) = self.last_source {
+                        self.stats.note_udp_packet(packet.len() as u64);
+                        self.stats.note_dtls_packet(packet.len() as u64);
                         if let Err(error) = socket.send_to(packet, addr) {
                             tracing::warn!(%addr, len = packet.len(), %error, "phantom backend failed to send DTLS packet");
                         }
@@ -499,6 +513,7 @@ impl BackendClient for PhantomClient {
                 _ => {}
             }
         }
+        self.stats.maybe_log();
         self.poll_sctp(session_slot, notify_tx);
     }
 
@@ -514,6 +529,7 @@ impl BackendClient for PhantomClient {
                 video_frames.push(frame);
             }
         }
+        self.stats.note_video_drain(video_frames.len());
         if let Some(rx) = &self.media_audio_rx {
             audio_frames.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
@@ -582,6 +598,7 @@ impl BackendClient for PhantomClient {
                 if let Some(rtcp) = srtp.unprotect_rtcp(contents) {
                     let feedback = parse_rtcp_feedback(&rtcp);
                     if feedback.requests_keyframe {
+                        self.stats.note_pli();
                         tracing::debug!("phantom backend received RTCP PLI/FIR");
                         if let Some(tx) = &self.control_in_tx {
                             let _ = tx.send(
@@ -590,9 +607,11 @@ impl BackendClient for PhantomClient {
                         }
                     }
                     if !feedback.nack_sequences.is_empty() {
+                        self.stats.note_nacks(feedback.nack_sequences.len() as u64);
                         self.retransmit_nacked_video(&feedback.nack_sequences);
                     }
                     if let Some(report) = feedback.receiver_report {
+                        self.stats.note_receiver_report(report);
                         tracing::trace!(
                             fraction_lost = report.fraction_lost,
                             jitter = report.jitter,
@@ -734,6 +753,142 @@ struct RtcpFeedback {
 struct ReceiverReportSummary {
     fraction_lost: u8,
     jitter: u32,
+}
+
+#[derive(Debug)]
+struct RtcStatsWindow {
+    started_at: Instant,
+    video_frames: u64,
+    video_keyframes: u64,
+    video_payload_bytes: u64,
+    video_packets: u64,
+    audio_packets: u64,
+    audio_payload_bytes: u64,
+    udp_packets: u64,
+    udp_bytes: u64,
+    dtls_packets: u64,
+    dtls_bytes: u64,
+    nack_sequences: u64,
+    pli_requests: u64,
+    rtx_packets: u64,
+    rtx_bytes: u64,
+    rr_count: u64,
+    rr_fraction_lost_max: u8,
+    rr_jitter_max: u32,
+    max_video_drain: usize,
+    max_pending_udp: usize,
+}
+
+impl RtcStatsWindow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            video_frames: 0,
+            video_keyframes: 0,
+            video_payload_bytes: 0,
+            video_packets: 0,
+            audio_packets: 0,
+            audio_payload_bytes: 0,
+            udp_packets: 0,
+            udp_bytes: 0,
+            dtls_packets: 0,
+            dtls_bytes: 0,
+            nack_sequences: 0,
+            pli_requests: 0,
+            rtx_packets: 0,
+            rtx_bytes: 0,
+            rr_count: 0,
+            rr_fraction_lost_max: 0,
+            rr_jitter_max: 0,
+            max_video_drain: 0,
+            max_pending_udp: 0,
+        }
+    }
+
+    fn note_video_frame(&mut self, keyframe: bool, packets: u64, payload_bytes: u64) {
+        self.video_frames += 1;
+        self.video_keyframes += u64::from(keyframe);
+        self.video_packets += packets;
+        self.video_payload_bytes += payload_bytes;
+    }
+
+    fn note_audio_packet(&mut self, payload_bytes: u64) {
+        self.audio_packets += 1;
+        self.audio_payload_bytes += payload_bytes;
+    }
+
+    fn note_udp_packet(&mut self, bytes: u64) {
+        self.udp_packets += 1;
+        self.udp_bytes += bytes;
+    }
+
+    fn note_dtls_packet(&mut self, bytes: u64) {
+        self.dtls_packets += 1;
+        self.dtls_bytes += bytes;
+    }
+
+    fn note_nacks(&mut self, sequences: u64) {
+        self.nack_sequences += sequences;
+    }
+
+    fn note_pli(&mut self) {
+        self.pli_requests += 1;
+    }
+
+    fn note_rtx(&mut self, packets: u64, bytes: u64) {
+        self.rtx_packets += packets;
+        self.rtx_bytes += bytes;
+    }
+
+    fn note_receiver_report(&mut self, report: ReceiverReportSummary) {
+        self.rr_count += 1;
+        self.rr_fraction_lost_max = self.rr_fraction_lost_max.max(report.fraction_lost);
+        self.rr_jitter_max = self.rr_jitter_max.max(report.jitter);
+    }
+
+    fn note_video_drain(&mut self, frames: usize) {
+        self.max_video_drain = self.max_video_drain.max(frames);
+    }
+
+    fn note_pending_udp(&mut self, packets: usize) {
+        self.max_pending_udp = self.max_pending_udp.max(packets);
+    }
+
+    fn maybe_log(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        if elapsed < RTC_STATS_INTERVAL {
+            return;
+        }
+        let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+        let video_fps = self.video_frames as f64 / elapsed_secs;
+        let video_kbps = (self.video_payload_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
+        let udp_kbps = (self.udp_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
+        let dtls_kbps = (self.dtls_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
+        tracing::info!(
+            elapsed_ms = elapsed.as_millis() as u64,
+            video_frames = self.video_frames,
+            video_fps = format_args!("{video_fps:.1}"),
+            video_keyframes = self.video_keyframes,
+            video_packets = self.video_packets,
+            video_kbps = format_args!("{video_kbps:.1}"),
+            audio_packets = self.audio_packets,
+            udp_packets = self.udp_packets,
+            udp_kbps = format_args!("{udp_kbps:.1}"),
+            dtls_packets = self.dtls_packets,
+            dtls_kbps = format_args!("{dtls_kbps:.1}"),
+            nack_sequences = self.nack_sequences,
+            pli_requests = self.pli_requests,
+            rtx_packets = self.rtx_packets,
+            rtx_kb = self.rtx_bytes / 1024,
+            rr_count = self.rr_count,
+            rr_fraction_lost_max = self.rr_fraction_lost_max,
+            rr_jitter_max = self.rr_jitter_max,
+            max_video_drain = self.max_video_drain,
+            max_pending_udp = self.max_pending_udp,
+            "rtc-stats"
+        );
+        *self = Self::new();
+    }
 }
 
 struct PhantomSrtpTxContext {
