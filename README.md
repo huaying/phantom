@@ -5,7 +5,7 @@ A high-performance, open-source remote desktop in Rust. Browser and native acces
 ## Features
 
 - **H.264 / AV1 streaming** — OpenH264 CPU + NVENC GPU (NVIDIA); zero-copy GPU paths (NVFBC→NVENC on Linux, DXGI→NVENC on Windows)
-- **Browser client** — zero install, WebCodecs decode via WebSocket over HTTPS
+- **Browser client** — zero install, WebRTC media by default with WSS fallback
 - **Native client** — winit + softbuffer, with NVDEC / dav1d / VideoToolbox hardware decode where available
 - **Adaptive bitrate + congestion control** — RTT-based, per-session
 - **Audio** — PulseAudio (Linux) / WASAPI (Windows) → Opus → client playback
@@ -82,6 +82,27 @@ the script tells you how to finish with `phantom-server.exe --install`.
 | Remove autostart (Linux) | `rm ~/.config/autostart/phantom-server.desktop` |
 | Remove Windows Service | `phantom-server.exe --uninstall` (elevated) |
 
+### Installer asset overrides
+
+For installer iteration, keep the production script path but swap where binaries
+come from:
+
+```bash
+PHANTOM_SERVER_BIN=target/release/phantom-server ./install.sh server --no-doctor
+PHANTOM_LOCAL_ASSET_DIR=/tmp/phantom-assets ./install.sh server --no-doctor
+PHANTOM_ASSET_BASE_URL=http://10.0.0.1:8000 ./install.sh server --no-doctor
+```
+
+```powershell
+$env:PHANTOM_SERVER_EXE="C:\tmp\phantom-server.exe"; .\install.ps1
+$env:PHANTOM_LOCAL_ASSET_DIR="C:\tmp\phantom-assets"; .\install.ps1
+$env:PHANTOM_ASSET_BASE_URL="http://10.0.0.1:8000"; .\install.ps1
+```
+
+For parser/copy-only smoke tests on Windows, also set
+`$env:PHANTOM_NO_AUTOSTART=1`, `$env:PHANTOM_NO_DOCTOR=1`, and
+`$env:PHANTOM_NO_PATH=1`.
+
 ### Pre-built binaries (manual install)
 
 From [GitHub Releases](https://github.com/huaying/phantom/releases):
@@ -135,7 +156,7 @@ sudo apt-get install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
 wasm-pack build crates/web --target web --no-typescript
 
 cargo build --release
-cargo build --release --features webrtc   # +WebRTC (media tracks + data channels)
+cargo build --release                     # includes WSS + WebRTC browser transports
 cargo test --workspace                     # 136 tests
 cargo clippy --workspace -- -D warnings
 ```

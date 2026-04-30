@@ -22,8 +22,8 @@ video.
 
 Current shape:
 
-- WSS remains the default browser transport (most predictable baseline).
-- WebRTC is built into the default server binary; the browser opts in with `?rtc`.
+- WebRTC is the default browser transport.
+- WSS remains available with `?wss` / `?ws` for debugging or UDP-blocked environments.
 - Signaling stays on `POST /rtc` (same HTTPS endpoint family as WSS).
 - Backend is in-tree (`transport/webrtc/backend_phantom.rs`) using
   `dimpl` (DTLS), `phantom-sctp` (SCTP/DataChannel), and `stun-types`
@@ -44,13 +44,12 @@ The WebRTC transport loop and protocol wiring are Phantom-owned:
 - SRTP/SRTCP packetization for media tracks
 - SCTP DataChannel bridge for input/control messages
 
-### Dual web transport: WSS default + WebRTC optional
+### Dual web transport: WebRTC default + WSS fallback
 
-- **WSS** (default): WebSocket upgrade on the same HTTPS port 9900. No
-  message size limits. Reliable. Validated by Helix at scale.
-- **WebRTC** (feature `webrtc`, `?rtc` / `?rtc2` URL param): browser
-  media tracks for video/audio + DataChannels for input/control. POST
-  `/rtc` signaling.
+- **WebRTC** (default browser path, feature `webrtc`): browser media tracks
+  for video/audio + DataChannels for input/control. POST `/rtc` signaling.
+- **WSS** (`?wss` / `?ws`): WebSocket upgrade on the same HTTPS port 9900.
+  Reliable fallback for debugging or UDP-blocked environments.
 - **Native**: raw QUIC (no browser overhead) + raw TCP.
 - All produce same `Box<dyn MessageSender/Receiver>` → same session loop.
 

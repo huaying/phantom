@@ -16,9 +16,8 @@ you're making touches one of these areas, re-read the relevant entry first.
   `-e PHANTOM_HOST=127.0.0.1`.
 
 ## Networking
-- **WebRTC mode mismatch**: browser needs `?rtc` (or `?rtc2`) and server
-  must be built with feature `webrtc`; otherwise you'll silently exercise
-  WSS and think WebRTC is broken.
+- **WSS fallback mode**: browser defaults to WebRTC. Use `?wss` or `?ws`
+  to force the older WebSocket path when debugging or when UDP is blocked.
 - **WebRTC autoplay policy**: browser may reject media `play()` before
   user interaction (`NotAllowedError`). Keep the retry-on-gesture path
   wired, especially for audio.

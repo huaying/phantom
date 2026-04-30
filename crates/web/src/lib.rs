@@ -327,11 +327,12 @@ pub fn main() {
     let window = web_sys::window().unwrap();
     let document = window.document().unwrap();
 
-    // Default: WebSocket. `?rtc` enables the in-place WebRTC path, now moving
-    // toward media tracks for video/audio while keeping input/control on
-    // DataChannels.
+    // Default: WebRTC media tracks for video/audio with input/control on
+    // DataChannels. `?wss` / `?ws` keeps the older WebSocket transport as an
+    // escape hatch for debugging or environments where UDP is blocked.
     let query = window.location().search().unwrap_or_default();
-    let use_rtc = query_has_flag(&query, "rtc") || query_has_flag(&query, "rtc2");
+    let force_wss = query_has_flag(&query, "wss") || query_has_flag(&query, "ws");
+    let use_rtc = !force_wss;
     let rtc_stats_log = query_has_flag(&query, "stats") || query_has_flag(&query, "rtcstats");
 
     // Extract ?token=<jwt> for authenticated connections

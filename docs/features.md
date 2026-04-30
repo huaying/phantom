@@ -7,9 +7,9 @@ Accurate as of v0.5.3. Each entry points at the code that implements it.
 | Transport | Default | File | Notes |
 |---|---|---|---|
 | TCP (plain + ChaCha20-Poly1305) | ✅ | `server/src/transport/tcp.rs` | Native client; encryption on unless `--no-encrypt` |
-| WebSocket over HTTPS | ✅ | `server/src/transport/ws.rs` | Browser client, embedded WASM, same port as HTTPS static |
+| WebSocket over HTTPS | fallback `?wss` / `?ws` | `server/src/transport/ws.rs` | Browser fallback, embedded WASM, same port as HTTPS static |
 | QUIC | opt-in `--transport quic` | `server/src/transport/quic.rs` | Native client only; self-signed TLS, no head-of-line blocking |
-| WebRTC (media tracks + DataChannels) | feature `webrtc` | `server/src/transport/webrtc.rs` | Optional browser path (`?rtc` / `?rtc2`): video+audio over media tracks, input+control over DataChannels, signaling via `POST /rtc` |
+| WebRTC (media tracks + DataChannels) | ✅ browser default | `server/src/transport/webrtc.rs` | Video+audio over media tracks, input+control over DataChannels, signaling via `POST /rtc` |
 
 All implement `MessageSender` + `MessageReceiver` (`core/src/transport.rs`); session loop is transport-agnostic.
 
