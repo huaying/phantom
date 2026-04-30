@@ -37,6 +37,8 @@ const H264_SPS_NALU_TYPE: u8 = 7;
 const H264_PPS_NALU_TYPE: u8 = 8;
 const H264_IDR_NALU_TYPE: u8 = 5;
 const VIDEO_RTX_CACHE_SIZE: usize = 512;
+const RTC_MAX_UDP_PACKETS_PER_FLUSH: usize = 32;
+const RTC_MAX_VIDEO_FRAMES_PER_DRAIN: usize = 2;
 const RTC_STATS_INTERVAL: Duration = Duration::from_secs(5);
 // Fallback only. When the browser offer contains H.264 fmtp for the selected
 // payload, answer with the offered fmtp so Chrome's decoder path stays on the
@@ -98,7 +100,7 @@ pub(super) struct PhantomClient {
     alive: bool,
     disconnecting: bool,
     connected: bool,
-    pending_transmits: Vec<(SocketAddr, Vec<u8>)>,
+    pending_transmits: VecDeque<(SocketAddr, Vec<u8>)>,
     sctp: PhantomSctpStack,
     channels_ready: bool,
     input_stream: Option<u16>,
@@ -138,7 +140,7 @@ impl PhantomClient {
             alive: true,
             disconnecting: false,
             connected: false,
-            pending_transmits: Vec::new(),
+            pending_transmits: VecDeque::new(),
             sctp: PhantomSctpStack::new(),
             channels_ready: false,
             input_stream: None,
@@ -297,7 +299,7 @@ impl PhantomClient {
                 &payload,
             );
             cached_packets.push((sequence_number, packet.clone()));
-            self.pending_transmits.push((source, packet));
+            self.pending_transmits.push_back((source, packet));
             self.media_tx.video_seq = self.media_tx.video_seq.wrapping_add(1);
         }
         for (sequence_number, packet) in cached_packets {
@@ -333,7 +335,7 @@ impl PhantomClient {
             self.params.audio_mid.as_deref(),
             &frame.data,
         );
-        self.pending_transmits.push((source, packet));
+        self.pending_transmits.push_back((source, packet));
         self.media_tx.audio_seq = self.media_tx.audio_seq.wrapping_add(1);
         self.media_tx.audio_packet_count = self.media_tx.audio_packet_count.wrapping_add(1);
         self.media_tx.audio_octet_count = self
@@ -375,7 +377,7 @@ impl PhantomClient {
                 self.media_tx.video_ssrc,
                 self.media_tx.video_srtcp_index,
             );
-            self.pending_transmits.push((source, packet));
+            self.pending_transmits.push_back((source, packet));
             self.media_tx.video_srtcp_index = self.media_tx.video_srtcp_index.wrapping_add(1);
         }
         if self.media_tx.audio_packet_count != 0 {
@@ -392,7 +394,7 @@ impl PhantomClient {
                 self.media_tx.audio_ssrc,
                 self.media_tx.audio_srtcp_index,
             );
-            self.pending_transmits.push((source, packet));
+            self.pending_transmits.push_back((source, packet));
             self.media_tx.audio_srtcp_index = self.media_tx.audio_srtcp_index.wrapping_add(1);
         }
     }
@@ -413,6 +415,7 @@ impl PhantomClient {
         };
         let mut resent = 0usize;
         let mut resent_bytes = 0usize;
+        let mut packets = Vec::new();
         for seq in nack_sequences {
             if let Some(pkt) = self
                 .video_rtx_cache
@@ -421,9 +424,12 @@ impl PhantomClient {
                 .find(|pkt| pkt.sequence_number == *seq)
             {
                 resent_bytes += pkt.packet.len();
-                self.pending_transmits.push((source, pkt.packet.clone()));
+                packets.push(pkt.packet.clone());
                 resent += 1;
             }
+        }
+        for packet in packets.into_iter().rev() {
+            self.pending_transmits.push_front((source, packet));
         }
         if resent != 0 {
             self.stats.note_rtx(resent as u64, resent_bytes as u64);
@@ -450,9 +456,14 @@ impl BackendClient for PhantomClient {
         session_slot: &Arc<Mutex<Option<(WebRtcSender, WebRtcReceiver)>>>,
         notify_tx: &mpsc::Sender<()>,
     ) {
-        let pending_transmits = std::mem::take(&mut self.pending_transmits);
-        self.stats.note_pending_udp(pending_transmits.len());
-        for (addr, packet) in pending_transmits {
+        let pending_len = self.pending_transmits.len();
+        self.stats.note_pending_udp(pending_len);
+        let packets_to_send = pending_len.min(RTC_MAX_UDP_PACKETS_PER_FLUSH);
+        self.stats.note_udp_burst(packets_to_send);
+        for _ in 0..packets_to_send {
+            let Some((addr, packet)) = self.pending_transmits.pop_front() else {
+                break;
+            };
             self.stats.note_udp_packet(packet.len() as u64);
             if let Err(error) = socket.send_to(&packet, addr) {
                 tracing::warn!(%addr, len = packet.len(), %error, "phantom backend failed to send UDP packet");
@@ -525,8 +536,11 @@ impl BackendClient for PhantomClient {
             control_msgs.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
         if let Some(rx) = &self.media_video_rx {
-            for frame in std::iter::from_fn(|| rx.try_recv().ok()) {
-                video_frames.push(frame);
+            while video_frames.len() < RTC_MAX_VIDEO_FRAMES_PER_DRAIN {
+                match rx.try_recv() {
+                    Ok(frame) => video_frames.push(frame),
+                    Err(_) => break,
+                }
             }
         }
         self.stats.note_video_drain(video_frames.len());
@@ -572,7 +586,7 @@ impl BackendClient for PhantomClient {
             if request.username.as_deref() == Some(self.expected_stun_username().as_str()) {
                 if let Some(response) = build_stun_success_response(contents, source, &self.params)
                 {
-                    self.pending_transmits.push((source, response));
+                    self.pending_transmits.push_back((source, response));
                     tracing::debug!(source = %source, "phantom backend queued STUN success response");
                 } else {
                     tracing::warn!(source = %source, "phantom backend failed to build STUN success response");
@@ -777,6 +791,7 @@ struct RtcStatsWindow {
     rr_jitter_max: u32,
     max_video_drain: usize,
     max_pending_udp: usize,
+    max_udp_burst: usize,
 }
 
 impl RtcStatsWindow {
@@ -802,6 +817,7 @@ impl RtcStatsWindow {
             rr_jitter_max: 0,
             max_video_drain: 0,
             max_pending_udp: 0,
+            max_udp_burst: 0,
         }
     }
 
@@ -854,6 +870,10 @@ impl RtcStatsWindow {
         self.max_pending_udp = self.max_pending_udp.max(packets);
     }
 
+    fn note_udp_burst(&mut self, packets: usize) {
+        self.max_udp_burst = self.max_udp_burst.max(packets);
+    }
+
     fn maybe_log(&mut self) {
         let elapsed = self.started_at.elapsed();
         if elapsed < RTC_STATS_INTERVAL {
@@ -885,6 +905,7 @@ impl RtcStatsWindow {
             rr_jitter_max = self.rr_jitter_max,
             max_video_drain = self.max_video_drain,
             max_pending_udp = self.max_pending_udp,
+            max_udp_burst = self.max_udp_burst,
             "rtc-stats"
         );
         *self = Self::new();
