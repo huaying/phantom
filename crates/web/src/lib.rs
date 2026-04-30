@@ -14,7 +14,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
     console, HtmlAudioElement, HtmlCanvasElement, HtmlVideoElement, KeyboardEvent, MessageEvent,
-    MouseEvent, WebSocket, WheelEvent,
+    MouseEvent, PointerEvent, WebSocket, WheelEvent,
 };
 
 // -- WebCodecs bindings (not in web-sys yet) --
@@ -2034,7 +2034,12 @@ fn setup_input(
     }
     {
         let s = state.clone();
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+        let pending_mouse = Rc::new(RefCell::new(None::<(i32, i32)>));
+        let mouse_raf_pending = Rc::new(RefCell::new(false));
+        let dragging = Rc::new(RefCell::new(false));
+        let pending_mouse_for_move = pending_mouse.clone();
+        let dragging_for_move = dragging.clone();
+        let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
             let st = s.borrow();
             if st.server_width == 0 || st.server_height == 0 {
                 return;
@@ -2046,37 +2051,131 @@ fn setup_input(
                 st.server_width,
                 st.server_height,
             );
-            send_input(&st, InputEvent::MouseMove { x, y });
+            drop(st);
+
+            if *dragging_for_move.borrow() || e.buttons() != 0 {
+                e.prevent_default();
+                *pending_mouse_for_move.borrow_mut() = None;
+                let st = s.borrow();
+                send_input(&st, InputEvent::MouseMove { x, y });
+                return;
+            }
+
+            *pending_mouse_for_move.borrow_mut() = Some((x, y));
+            if !*mouse_raf_pending.borrow() {
+                *mouse_raf_pending.borrow_mut() = true;
+                let pending = pending_mouse_for_move.clone();
+                let pending_flag = mouse_raf_pending.clone();
+                let state = s.clone();
+                let flush = Closure::<dyn FnMut(f64)>::once(move |_: f64| {
+                    if let Some((x, y)) = pending.borrow_mut().take() {
+                        let st = state.borrow();
+                        send_input(&st, InputEvent::MouseMove { x, y });
+                    }
+                    *pending_flag.borrow_mut() = false;
+                });
+                let window = web_sys::window().unwrap();
+                let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
+                flush.forget();
+            }
         });
         canvas
-            .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
+            .add_event_listener_with_callback("pointermove", cb.as_ref().unchecked_ref())
             .unwrap();
         cb.forget();
-    }
-    for name in &["mousedown", "mouseup"] {
-        let s = state.clone();
-        let pressed = *name == "mousedown";
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            e.prevent_default();
-            let st = s.borrow();
-            let btn = match e.button() {
-                0 => MouseButton::Left,
-                1 => MouseButton::Middle,
-                2 => MouseButton::Right,
-                _ => return,
-            };
-            send_input(
-                &st,
-                InputEvent::MouseButton {
-                    button: btn,
-                    pressed,
-                },
-            );
-        });
-        canvas
-            .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget();
+
+        {
+            let s = state.clone();
+            let pending_mouse = pending_mouse.clone();
+            let dragging = dragging.clone();
+            let capture_canvas = canvas.clone();
+            let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+                e.prevent_default();
+                let _ = capture_canvas.set_pointer_capture(e.pointer_id());
+                *dragging.borrow_mut() = true;
+                let st = s.borrow();
+                let btn = match e.button() {
+                    0 => MouseButton::Left,
+                    1 => MouseButton::Middle,
+                    2 => MouseButton::Right,
+                    _ => return,
+                };
+                if st.server_width != 0 && st.server_height != 0 {
+                    let (x, y) = map_mouse(
+                        &st.canvas,
+                        e.client_x() as f64,
+                        e.client_y() as f64,
+                        st.server_width,
+                        st.server_height,
+                    );
+                    *pending_mouse.borrow_mut() = None;
+                    send_input(&st, InputEvent::MouseMove { x, y });
+                }
+                send_input(
+                    &st,
+                    InputEvent::MouseButton {
+                        button: btn,
+                        pressed: true,
+                    },
+                );
+            });
+            canvas
+                .add_event_listener_with_callback("pointerdown", cb.as_ref().unchecked_ref())
+                .unwrap();
+            cb.forget();
+        }
+
+        for name in &["pointerup", "pointercancel"] {
+            let s = state.clone();
+            let pending_mouse = pending_mouse.clone();
+            let dragging = dragging.clone();
+            let capture_canvas = canvas.clone();
+            let is_cancel = *name == "pointercancel";
+            let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+                e.prevent_default();
+                let _ = capture_canvas.release_pointer_capture(e.pointer_id());
+                *dragging.borrow_mut() = false;
+                let st = s.borrow();
+                if st.server_width != 0 && st.server_height != 0 {
+                    let (x, y) = map_mouse(
+                        &st.canvas,
+                        e.client_x() as f64,
+                        e.client_y() as f64,
+                        st.server_width,
+                        st.server_height,
+                    );
+                    *pending_mouse.borrow_mut() = None;
+                    send_input(&st, InputEvent::MouseMove { x, y });
+                }
+                if is_cancel {
+                    send_input(
+                        &st,
+                        InputEvent::MouseButton {
+                            button: MouseButton::Left,
+                            pressed: false,
+                        },
+                    );
+                    return;
+                }
+                let btn = match e.button() {
+                    0 => MouseButton::Left,
+                    1 => MouseButton::Middle,
+                    2 => MouseButton::Right,
+                    _ => return,
+                };
+                send_input(
+                    &st,
+                    InputEvent::MouseButton {
+                        button: btn,
+                        pressed: false,
+                    },
+                );
+            });
+            canvas
+                .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+                .unwrap();
+            cb.forget();
+        }
     }
     {
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(|e: MouseEvent| e.prevent_default());

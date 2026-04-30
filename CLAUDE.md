@@ -35,8 +35,8 @@ DISPLAY=:0 cargo run --release --example nvenc_bench -p phantom-gpu
 `crates/web/`, or the server will ship stale bytes.
 
 **Default feature set**: `phantom-server` defaults are
-`["web-client", "audio"]`. `--no-default-features` drops `web-client` and
-the browser receives a stub that prints `console.error` and stays black.
+`["web-client", "audio", "sso", "webrtc"]`. `--no-default-features` drops
+`web-client` and the browser receives a stub that prints `console.error` and stays black.
 Don't combine `--no-default-features` with anything that needs the web
 client.
 

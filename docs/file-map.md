@@ -153,8 +153,9 @@ Dockerfile + docker-entrypoint.sh XFCE desktop test environment
 README.md                         Public-facing
 CLAUDE.md                         AI-assistant guide, points at docs/
 docs/                             Reference documentation (this directory)
-install.sh / install.ps1          One-line installers (fetch from GitHub Releases;
-                                  install.sh --autologin configures Linux VM
-                                  auto-login + watchdog)
+install.sh / install.ps1          One-line installers (fetch from GitHub Releases
+                                  by default; env overrides support local
+                                  installer iteration; install.sh --autologin
+                                  configures Linux VM auto-login + watchdog)
 LICENSE                           MIT
 ```

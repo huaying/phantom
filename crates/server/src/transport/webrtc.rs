@@ -197,6 +197,7 @@ pub(crate) fn make_session_bridge(_mode: RtcMode) -> SessionBridge {
             media_video_tx,
             media_audio_tx,
             control_tx,
+            video_drop_until_keyframe: false,
         },
         receiver: WebRtcReceiver {
             input_rx,
@@ -214,19 +215,32 @@ pub struct WebRtcSender {
     media_video_tx: mpsc::SyncSender<EncodedFrame>,
     media_audio_tx: mpsc::SyncSender<MediaAudioFrame>,
     control_tx: mpsc::SyncSender<Vec<u8>>,
+    video_drop_until_keyframe: bool,
 }
 
 impl MessageSender for WebRtcSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
         match msg {
-            Message::VideoFrame { frame, .. } => self
-                .media_video_tx
-                .try_send((**frame).clone())
-                .map_err(|e| match e {
-                    mpsc::TrySendError::Disconnected(_) => anyhow::anyhow!("video track closed"),
-                    mpsc::TrySendError::Full(_) => anyhow::anyhow!(""),
-                })
-                .or(Ok(())),
+            Message::VideoFrame { frame, .. } => {
+                if self.video_drop_until_keyframe && !frame.is_keyframe {
+                    return Ok(());
+                }
+                match self.media_video_tx.try_send((**frame).clone()) {
+                    Ok(()) => {
+                        if frame.is_keyframe {
+                            self.video_drop_until_keyframe = false;
+                        }
+                        Ok(())
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        Err(anyhow::anyhow!("video track closed"))
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        self.video_drop_until_keyframe = true;
+                        Ok(())
+                    }
+                }
+            }
             Message::AudioFrame {
                 codec,
                 sample_rate,
@@ -328,6 +342,7 @@ mod tests {
                 media_video_tx,
                 media_audio_tx,
                 control_tx,
+                video_drop_until_keyframe: false,
             },
             media_video_rx,
             media_audio_rx,

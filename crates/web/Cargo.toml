@@ -28,7 +28,7 @@ features = [
     "CanvasRenderingContext2d", "ImageData",
     "Element", "DomRect", "MediaStream", "MediaStreamTrack",
     # Events
-    "MouseEvent", "KeyboardEvent", "WheelEvent",
+    "MouseEvent", "PointerEvent", "KeyboardEvent", "WheelEvent",
     "EventTarget", "Event", "AddEventListenerOptions",
     # WebRTC DataChannel
     "RtcPeerConnection", "RtcConfiguration",

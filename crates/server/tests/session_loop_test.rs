@@ -493,8 +493,19 @@ fn input_channel_does_not_block_session() {
         thread::sleep(Duration::from_millis(10));
     }
     let msgs_before = h.sent().len();
-    thread::sleep(Duration::from_millis(100));
-    let msgs_after = h.sent().len();
+    let start = Instant::now();
+    let mut msgs_after = msgs_before;
+    while start.elapsed() < Duration::from_millis(500) {
+        {
+            let mut f = fill.lock().unwrap();
+            *f = f.wrapping_add(1);
+        }
+        thread::sleep(Duration::from_millis(10));
+        msgs_after = h.sent().len();
+        if msgs_after > msgs_before {
+            break;
+        }
+    }
     h.stop();
 
     assert!(

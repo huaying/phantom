@@ -123,7 +123,7 @@ jobs:
       # Build server (cross-compile: without web client, with audio)
       - name: Build server (cross-compile, no web client)
         if: matrix.build_server && matrix.cross
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio
+        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio,webrtc
 
       # Build client (all platforms: without av1/dav1d for portability)
       - name: Build client

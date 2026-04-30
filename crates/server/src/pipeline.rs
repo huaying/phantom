@@ -81,6 +81,14 @@ pub trait Pipeline {
     fn prepare(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Whether the generic session loop should synthesize a tiny mouse move
+    /// before the first capture. This is useful for Desktop Duplication-style
+    /// pipelines that can otherwise sit idle, but it must be opt-in: OS input
+    /// initialization can be slow and should not delay CPU first-frame startup.
+    fn needs_startup_nudge(&self) -> bool {
+        false
+    }
 }
 
 // ── CpuPipeline ─────────────────────────────────────────────────────────────
@@ -92,7 +100,6 @@ pub struct CpuPipeline<'a> {
     encoder: &'a mut dyn FrameEncoder,
     differ: &'a mut TileDiffer,
     congestion: CongestionTracker,
-    sent_first_frame: bool,
     sent_first_frame_encoded: bool,
 }
 
@@ -110,7 +117,6 @@ impl<'a> CpuPipeline<'a> {
             encoder,
             differ,
             congestion: CongestionTracker::new(frame_interval),
-            sent_first_frame: false,
             sent_first_frame_encoded: false,
         })
     }
@@ -123,23 +129,23 @@ impl<'a> Pipeline for CpuPipeline<'a> {
             None => return Ok(None),
         };
 
-        let changed = !self.sent_first_frame || ctx.had_input || self.differ.has_changes(&frame);
+        let first_frame = !self.sent_first_frame_encoded;
+        let changed = first_frame || ctx.had_input || self.differ.has_changes(&frame);
         if !changed {
             return Ok(None);
         }
-        self.sent_first_frame = true;
 
         let dirty_tiles = self.differ.diff(&frame);
 
-        if self.congestion.should_skip_frame() {
+        if !first_frame && self.congestion.should_skip_frame() {
             return Ok(None);
         }
 
-        if dirty_tiles.is_empty() {
+        if dirty_tiles.is_empty() && !first_frame {
             return Ok(None);
         }
 
-        if ctx.needs_keyframe || !self.sent_first_frame_encoded {
+        if ctx.needs_keyframe || first_frame {
             self.encoder.force_keyframe();
         }
 
@@ -348,5 +354,9 @@ impl<'a> Pipeline for DxgiNvencPipelineAdapter<'a> {
 
     fn log_label(&self) -> &'static str {
         "stats (DXGI→NVENC)"
+    }
+
+    fn needs_startup_nudge(&self) -> bool {
+        true
     }
 }

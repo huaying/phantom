@@ -4,7 +4,7 @@ version = "0.5.6"
 edition = "2021"
 
 [features]
-default = ["web-client", "audio", "sso"]
+default = ["web-client", "audio", "sso", "webrtc"]
 web-client = []  # embed WASM web client (requires wasm-pack build first)
 webrtc = ["dep:dimpl", "dep:crc32fast", "dep:phantom-sctp", "dep:aes", "dep:aes-gcm", "dep:stun-types"]  # WebRTC transport workbench backed by Phantom's in-tree browser stack
 audio = ["audiopus", "audiopus_sys", "libpulse-binding", "libpulse-simple-binding", "windows"]  # Audio capture: PulseAudio on Linux, WASAPI on Windows

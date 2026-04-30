@@ -23,7 +23,7 @@ video.
 Current shape:
 
 - WSS remains the default browser transport (most predictable baseline).
-- WebRTC is optional (`--features webrtc`, browser `?rtc` / `?rtc2`).
+- WebRTC is built into the default server binary; the browser opts in with `?rtc`.
 - Signaling stays on `POST /rtc` (same HTTPS endpoint family as WSS).
 - Backend is in-tree (`transport/webrtc/backend_phantom.rs`) using
   `dimpl` (DTLS), `phantom-sctp` (SCTP/DataChannel), and `stun-types`

@@ -252,7 +252,12 @@ fn run_server_loop(
     std::thread::Builder::new()
         .name("svc-web-accept".into())
         .spawn(move || loop {
-            match ws_transport.accept_ws() {
+            #[cfg(feature = "webrtc")]
+            let accept_result = ws_transport.accept_any();
+            #[cfg(not(feature = "webrtc"))]
+            let accept_result = ws_transport.accept_ws();
+
+            match accept_result {
                 Ok(pair) => {
                     if tx.send(pair).is_err() {
                         break;
@@ -495,15 +500,54 @@ fn create_service_session(
     #[cfg(target_os = "windows")]
     {
         let ipc = session_mgr.ipc.as_ref().unwrap();
+        let _viewer_guard = IpcViewerActiveGuard::new(ipc);
 
-        // The agent keeps capturing even when no web/native session is active.
-        // Drop any queued frames from the previous client/mode before applying
+        // Drain queued frames from the previous client/mode before applying
         // this client's viewport hint; otherwise first-frame selection can see
         // a burst of stale old-resolution frames and start the session blurry.
-        let drained = ipc.recv_encoded_frames().len();
+        // Keep the latest matching keyframe, though: the agent may have already
+        // prewarmed Tier 1 while idle, and that is a valid startup frame.
+        let cached_keyframe = ipc.last_keyframe();
+        let drained_frames = ipc.recv_encoded_frames();
+        let drained = drained_frames.len();
+        let mut prewarmed_startup_frame = None;
+        let mut prewarmed_fallback_keyframe = None;
+        if let Some(ef) = cached_keyframe {
+            let matches_hint =
+                resolution_hint.is_none_or(|(hw, hh)| ef.width == hw && ef.height == hh);
+            if matches_hint {
+                prewarmed_startup_frame = Some(ef);
+            } else {
+                prewarmed_fallback_keyframe = Some(ef);
+            }
+        }
+        for ef in drained_frames {
+            let matches_hint =
+                resolution_hint.is_none_or(|(hw, hh)| ef.width == hw && ef.height == hh);
+            if ef.encoded.is_keyframe && matches_hint {
+                prewarmed_startup_frame = Some(ef);
+            } else if ef.encoded.is_keyframe {
+                prewarmed_fallback_keyframe = Some(ef);
+            }
+        }
         if drained > 0 {
             svc_log(&format!(
-                "create_service_session: dropped {drained} stale IPC frames before startup"
+                "create_service_session: drained {drained} queued IPC frames before startup"
+            ));
+        }
+        if let Some(ref ef) = prewarmed_startup_frame {
+            svc_log(&format!(
+                "create_service_session: found prewarmed startup keyframe {}x{} {} bytes",
+                ef.width,
+                ef.height,
+                ef.encoded.data.len()
+            ));
+        } else if let Some(ref ef) = prewarmed_fallback_keyframe {
+            svc_log(&format!(
+                "create_service_session: found prewarmed fallback keyframe {}x{} {} bytes",
+                ef.width,
+                ef.height,
+                ef.encoded.data.len()
             ));
         }
 
@@ -526,90 +570,129 @@ fn create_service_session(
         // agent produces a frame even on a static desktop.
         let _ = ipc.request_keyframe();
 
-        // Wait for first encoded frame from agent to get resolution. When a
-        // hint is set, skip any frames that don't match — those were captured
-        // before the agent applied the mode switch and would cause a visible
-        // resize on the client.
+        // Wait for a decodable startup keyframe from the agent. Starting a web
+        // session from a delta frame leaves the browser black until another
+        // keyframe happens to arrive, which is exactly the failure mode users
+        // perceive as "connected but screen is down".
         let mut attempts = 0;
         let mut last_keyframe_nudge = Instant::now();
-        svc_log("Waiting for first encoded frame from agent...");
-        let mut fallback_frame: Option<(u32, u32)> = None;
-        let mut fallback_since: Option<Instant> = None;
-        let (width, height) = 'wait: loop {
-            for ef in ipc.recv_encoded_frames() {
-                if let Some((hw, hh)) = resolution_hint {
-                    if ef.width != hw || ef.height != hh {
-                        svc_log(&format!(
-                            "Discarding stale frame {}x{} (waiting for {}x{})",
-                            ef.width, ef.height, hw, hh
+        svc_log("Waiting for first keyframe from agent...");
+        let mut fallback_keyframe: Option<crate::ipc_pipe::IpcEncodedFrame> =
+            prewarmed_fallback_keyframe;
+        let mut fallback_frame_size: Option<(u32, u32)> =
+            fallback_keyframe.as_ref().map(|ef| (ef.width, ef.height));
+        let mut fallback_since: Option<Instant> =
+            fallback_keyframe.as_ref().map(|_| Instant::now());
+        let mut stale_frame_logs = 0u32;
+        let startup_frame = if let Some(ef) = prewarmed_startup_frame {
+            svc_log(&format!(
+                "Using prewarmed startup keyframe: {}x{} {} bytes",
+                ef.width,
+                ef.height,
+                ef.encoded.data.len()
+            ));
+            ef
+        } else {
+            'wait: loop {
+                for ef in ipc.recv_encoded_frames() {
+                    if let Some((hw, hh)) = resolution_hint {
+                        if ef.width != hw || ef.height != hh {
+                            stale_frame_logs += 1;
+                            if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
+                                svc_log(&format!(
+                                "Discarding non-hinted frame {}x{} (waiting for {}x{}, count={})",
+                                ef.width, ef.height, hw, hh, stale_frame_logs
+                            ));
+                            }
+                            fallback_frame_size = Some((ef.width, ef.height));
+                            fallback_since.get_or_insert_with(Instant::now);
+                            if ef.encoded.is_keyframe {
+                                fallback_keyframe = Some(ef);
+                            }
+                            continue;
+                        }
+                    }
+                    if !ef.encoded.is_keyframe {
+                        stale_frame_logs += 1;
+                        if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
+                            svc_log(&format!(
+                            "Skipping startup delta frame {}x{} (waiting for keyframe, count={})",
+                            ef.width, ef.height, stale_frame_logs
                         ));
-                        fallback_frame = Some((ef.width, ef.height));
-                        fallback_since.get_or_insert_with(Instant::now);
+                        }
                         continue;
                     }
-                }
-                svc_log(&format!(
-                    "Got frame: {}x{} {} bytes kf={}",
-                    ef.width,
-                    ef.height,
-                    ef.encoded.data.len(),
-                    ef.encoded.is_keyframe
-                ));
-                tracing::info!(
-                    width = ef.width,
-                    height = ef.height,
-                    bytes = ef.encoded.data.len(),
-                    keyframe = ef.encoded.is_keyframe,
-                    "Got encoded frame from agent"
-                );
-                break 'wait (ef.width, ef.height);
-            }
-            if let Some((fw, fh)) = fallback_frame {
-                if fallback_since.is_some_and(|since| since.elapsed() > Duration::from_millis(3500))
-                {
                     svc_log(&format!(
-                        "No frame matched resolution hint quickly; accepting stable fallback {}x{}",
-                        fw, fh
+                        "Got startup keyframe: {}x{} {} bytes",
+                        ef.width,
+                        ef.height,
+                        ef.encoded.data.len()
                     ));
-                    break 'wait (fw, fh);
+                    tracing::info!(
+                        width = ef.width,
+                        height = ef.height,
+                        bytes = ef.encoded.data.len(),
+                        keyframe = ef.encoded.is_keyframe,
+                        "Got encoded frame from agent"
+                    );
+                    break 'wait ef;
                 }
-            }
-            attempts += 1;
-            if attempts % 10 == 0 {
-                tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
-            }
-            // Keep nudging the agent while waiting for the very first frame.
-            // Resolution switches can consume the initial keyframe request;
-            // repeated nudges avoid timing out into a black session.
-            if last_keyframe_nudge.elapsed() > Duration::from_millis(500) {
-                let _ = ipc.request_keyframe();
-                last_keyframe_nudge = Instant::now();
-            }
-            // With a resolution hint, the agent may be on the Winlogon
-            // desktop and forced into CPU/GDI fallback; that can take a few
-            // seconds after ScrapCapture stalls. Never start the session with
-            // a fake hinted size: the web client then has no real first frame
-            // and shows a gray surface. Wait for an actual frame or fail.
-            let cap = if resolution_hint.is_some() { 600 } else { 100 };
-            if attempts > cap {
-                if let Some((fw, fh)) = fallback_frame {
-                    svc_log(&format!(
-                        "No frame matched resolution hint in time; falling back to {}x{}",
-                        fw, fh
+                if let Some(ref ef) = fallback_keyframe {
+                    if fallback_since
+                        .is_some_and(|since| since.elapsed() > Duration::from_millis(750))
+                    {
+                        svc_log(&format!(
+                        "No keyframe matched resolution hint quickly; accepting live fallback keyframe {}x{}",
+                        ef.width, ef.height
                     ));
-                    break 'wait (fw, fh);
+                        break 'wait fallback_keyframe.take().expect("checked Some");
+                    }
                 }
-                if let Some((hw, hh)) = resolution_hint {
-                    svc_log(&format!(
-                        "No real first frame from agent within timeout for resolution hint {}x{}",
+                attempts += 1;
+                if attempts % 10 == 0 {
+                    tracing::debug!("Still waiting for agent frame... attempt {attempts}/100");
+                }
+                // Keep nudging the agent while waiting for the very first frame.
+                // Resolution switches can consume the initial keyframe request;
+                // repeated nudges avoid timing out into a black session.
+                if last_keyframe_nudge.elapsed() > Duration::from_millis(500) {
+                    let _ = ipc.request_keyframe();
+                    last_keyframe_nudge = Instant::now();
+                }
+                // With a resolution hint, the agent may be on the Winlogon
+                // desktop and forced into CPU/GDI fallback; that can take a few
+                // seconds after ScrapCapture stalls. Never start the session with
+                // a fake hinted size: the web client then has no real first frame
+                // and shows a gray surface. Wait for an actual frame or fail.
+                let cap = if resolution_hint.is_some() { 600 } else { 100 };
+                if attempts > cap {
+                    if let Some(ef) = fallback_keyframe {
+                        svc_log(&format!(
+                            "No keyframe matched resolution hint in time; falling back to {}x{}",
+                            ef.width, ef.height
+                        ));
+                        break 'wait ef;
+                    }
+                    if let Some((hw, hh)) = resolution_hint {
+                        svc_log(&format!(
+                        "No real startup keyframe from agent within timeout for resolution hint {}x{}",
                         hw, hh
                     ));
+                    }
+                    if let Some((fw, fh)) = fallback_frame_size {
+                        svc_log(&format!(
+                        "Only delta fallback frames arrived (latest {}x{}); refusing black startup",
+                        fw, fh
+                    ));
+                    }
+                    svc_log("No matching startup keyframe from agent within timeout");
+                    anyhow::bail!("agent connected but not producing startup keyframe in time");
                 }
-                svc_log("No matching frames from agent within timeout");
-                anyhow::bail!("agent connected but not producing frames in time");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
         };
+        let width = startup_frame.width;
+        let height = startup_frame.height;
 
         // Create input forwarder to send input events to agent via IPC
         let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
@@ -656,12 +739,33 @@ fn create_service_session(
             },
             width,
             height,
+            Some(startup_frame),
         );
         Ok(result)
     }
 
     #[cfg(not(target_os = "windows"))]
     unreachable!()
+}
+
+#[cfg(target_os = "windows")]
+struct IpcViewerActiveGuard<'a> {
+    ipc: &'a crate::ipc_pipe::IpcServer,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> IpcViewerActiveGuard<'a> {
+    fn new(ipc: &'a crate::ipc_pipe::IpcServer) -> Self {
+        ipc.acquire_viewer();
+        Self { ipc }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for IpcViewerActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.ipc.release_viewer();
+    }
 }
 
 /// An InputForwarder that sends input events to the agent via IPC.
@@ -958,9 +1062,10 @@ fn get_session_username(session_id: u32) -> Option<String> {
 
 /// Launch agent in the target session using SYSTEM token + CreateProcessAsUser.
 ///
-/// Uses the service's own SYSTEM token with the session ID set to the target
-/// session. This gives the agent SYSTEM privileges, allowing access to both
-/// user desktop and Winlogon desktop (lock screen).
+/// Prefer the active user's token for the normal desktop. A SYSTEM-token process
+/// in the interactive session can capture, but Windows rejects SendInput with
+/// access denied on some builds. If no logged-in user token exists yet, fall
+/// back to a SYSTEM token in the target session for pre-login/Winlogon capture.
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
@@ -971,12 +1076,59 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
     use windows::Win32::Security::{
         DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_QUERY,
     };
-    use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
-        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
-    };
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
+        let exe_path = std::env::current_exe().context("get current exe")?;
+        let cmd_line = format!(
+            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
+            exe_path.display(),
+            session_id,
+        );
+
+        match launch_agent_with_shell_token(session_id, &cmd_line) {
+            Ok(handle) => {
+                svc_log(&format!(
+                    "Agent launched with explorer shell token in session {session_id}"
+                ));
+                return Ok(handle);
+            }
+            Err(e) => {
+                svc_log(&format!(
+                    "Explorer shell token launch failed: {e:#}; trying WTS user token"
+                ));
+            }
+        }
+
+        let mut user_token = HANDLE::default();
+        if WTSQueryUserToken(session_id, &mut user_token).is_ok() {
+            match create_agent_process_with_token(
+                user_token,
+                &cmd_line,
+                &["winsta0\\default"],
+                "active user",
+            ) {
+                Ok(handle) => {
+                    let _ = CloseHandle(user_token);
+                    svc_log(&format!(
+                        "Agent launched with active user token in session {session_id}"
+                    ));
+                    return Ok(handle);
+                }
+                Err(e) => {
+                    let _ = CloseHandle(user_token);
+                    svc_log(&format!(
+                        "CreateProcessAsUserW with active user token failed: {e:#}; falling back to SYSTEM token"
+                    ));
+                }
+            }
+        } else {
+            svc_log(&format!(
+                "WTSQueryUserToken(session {session_id}) failed; falling back to SYSTEM token"
+            ));
+        }
+
         let mut service_token = HANDLE::default();
         OpenProcessToken(
             GetCurrentProcess(),
@@ -1010,28 +1162,143 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             anyhow::bail!("SetTokenInformation(TokenSessionId={session_id}) failed");
         }
 
-        // Build user's environment block
+        let result = create_agent_process_with_token(
+            dup_token,
+            &cmd_line,
+            &["winsta0\\default", "winsta0\\winlogon"],
+            "SYSTEM",
+        );
+        let _ = CloseHandle(dup_token);
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn launch_agent_with_shell_token(
+    session_id: u32,
+    cmd_line: &str,
+) -> anyhow::Result<WinProcessHandle> {
+    use anyhow::Context;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let explorer_pid = find_process_in_session("explorer.exe", session_id)
+        .ok_or_else(|| anyhow::anyhow!("no explorer.exe found in session {session_id}"))?;
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, explorer_pid)
+            .with_context(|| format!("OpenProcess(explorer pid={explorer_pid}) failed"))?;
+        let mut shell_token = HANDLE::default();
+        let token_result = OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_IMPERSONATE,
+            &mut shell_token,
+        );
+        let _ = CloseHandle(process);
+        token_result
+            .with_context(|| format!("OpenProcessToken(explorer pid={explorer_pid}) failed"))?;
+
+        let mut primary_token = HANDLE::default();
+        let dup_result = DuplicateTokenEx(
+            shell_token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_token,
+        );
+        let _ = CloseHandle(shell_token);
+        dup_result.context("DuplicateTokenEx(explorer token) failed")?;
+
+        let result = create_agent_process_with_token(
+            primary_token,
+            cmd_line,
+            &["winsta0\\default"],
+            "explorer shell",
+        );
+        let _ = CloseHandle(primary_token);
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_process_in_session(name: &str, session_id: u32) -> Option<u32> {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if exe.eq_ignore_ascii_case(name) {
+                let mut proc_session = 0u32;
+                if ProcessIdToSessionId(entry.th32ProcessID, &mut proc_session).is_ok()
+                    && proc_session == session_id
+                {
+                    found = Some(entry.th32ProcessID);
+                    break;
+                }
+            }
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_agent_process_with_token(
+    token: windows::Win32::Foundation::HANDLE,
+    cmd_line: &str,
+    desktop_names: &[&str],
+    token_label: &str,
+) -> anyhow::Result<WinProcessHandle> {
+    use anyhow::Context;
+    use std::mem;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    unsafe {
         let mut env_block: *mut std::ffi::c_void = std::ptr::null_mut();
         let _ = windows::Win32::System::Environment::CreateEnvironmentBlock(
             &mut env_block,
-            dup_token,
+            token,
             false,
-        );
-
-        let exe_path = std::env::current_exe().context("get current exe")?;
-        let cmd_line = format!(
-            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
-            exe_path.display(),
-            session_id,
         );
         let env: Option<*const std::ffi::c_void> = if env_block.is_null() {
             None
         } else {
             Some(env_block as *const std::ffi::c_void)
         };
-
         let mut last_error: Option<anyhow::Error> = None;
-        for desktop_name in ["winsta0\\default", "winsta0\\winlogon"] {
+        for desktop_name in desktop_names {
             let mut cmd_wide: Vec<u16> =
                 cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
             let mut desktop: Vec<u16> = desktop_name
@@ -1044,7 +1311,7 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             let mut pi: PROCESS_INFORMATION = mem::zeroed();
 
             let result = CreateProcessAsUserW(
-                dup_token,
+                token,
                 None,
                 windows::core::PWSTR(cmd_wide.as_mut_ptr()),
                 None,
@@ -1060,7 +1327,6 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
 
             match result {
                 Ok(()) => {
-                    let _ = CloseHandle(dup_token);
                     if !env_block.is_null() {
                         let _ =
                             windows::Win32::System::Environment::DestroyEnvironmentBlock(env_block);
@@ -1073,14 +1339,13 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
                 }
                 Err(e) => {
                     svc_log(&format!(
-                        "CreateProcessAsUserW on {desktop_name} failed: {e:#}"
+                        "CreateProcessAsUserW with {token_label} token on {desktop_name} failed: {e:#}"
                     ));
                     last_error = Some(e);
                 }
             }
         }
 
-        let _ = CloseHandle(dup_token);
         if !env_block.is_null() {
             let _ = windows::Win32::System::Environment::DestroyEnvironmentBlock(env_block);
         }

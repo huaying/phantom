@@ -12,7 +12,7 @@ use dimpl::{
     Config as DtlsConfig, Dtls, DtlsCertificate, KeyingMaterial, Output as DtlsOutput, SrtpProfile,
 };
 use phantom_core::encode::EncodedFrame;
-use phantom_core::protocol::Message;
+use phantom_core::protocol::{AudioCodec, Message};
 use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 use ring::digest;
 use ring::hmac;
@@ -37,6 +37,12 @@ const H264_SPS_NALU_TYPE: u8 = 7;
 const H264_PPS_NALU_TYPE: u8 = 8;
 const H264_IDR_NALU_TYPE: u8 = 5;
 const VIDEO_RTX_CACHE_SIZE: usize = 512;
+// Fallback only. When the browser offer contains H.264 fmtp for the selected
+// payload, answer with the offered fmtp so Chrome's decoder path stays on the
+// exact negotiated profile. In-band SPS/PPS still carry the real bitstream
+// profile/level for each encoder/platform.
+const PHANTOM_H264_FMTP_FALLBACK: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c028";
 /// Placeholder for the in-tree Phantom-owned WebRTC backend.
 ///
 /// This module intentionally starts as a compileable skeleton while the public
@@ -262,6 +268,7 @@ impl PhantomClient {
         let Some(source) = self.last_source else {
             return;
         };
+        let video_timestamp = self.media_tx.video_timestamp_now();
         let mut payloads = self
             .media_tx
             .h264
@@ -280,7 +287,7 @@ impl PhantomClient {
                 self.params.video_payload_type,
                 marker,
                 sequence_number,
-                self.media_tx.video_timestamp,
+                video_timestamp,
                 self.media_tx.video_ssrc,
                 self.params.video_mid_ext_id,
                 self.params.video_mid.as_deref(),
@@ -298,11 +305,13 @@ impl PhantomClient {
             .video_packet_count
             .wrapping_add(packet_count as u32);
         self.media_tx.video_octet_count = self.media_tx.video_octet_count.wrapping_add(octet_count);
-        self.media_tx.video_last_rtp_timestamp = self.media_tx.video_timestamp;
-        self.media_tx.video_timestamp = self.media_tx.video_timestamp.wrapping_add(3_000);
+        self.media_tx.video_last_rtp_timestamp = video_timestamp;
     }
 
     fn send_audio_frame(&mut self, frame: &MediaAudioFrame) {
+        if !matches!(frame.codec, AudioCodec::Opus) {
+            return;
+        }
         let Some(source) = self.last_source else {
             return;
         };
@@ -495,20 +504,14 @@ impl BackendClient for PhantomClient {
 
     fn drain_outgoing(&mut self) {
         let mut control_msgs = Vec::new();
-        let mut latest_video: Option<EncodedFrame> = None;
-        let mut latest_keyframe: Option<EncodedFrame> = None;
+        let mut video_frames = Vec::new();
         let mut audio_frames = Vec::new();
         if let Some(rx) = &self.control_out_rx {
             control_msgs.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         }
         if let Some(rx) = &self.media_video_rx {
             for frame in std::iter::from_fn(|| rx.try_recv().ok()) {
-                if frame.is_keyframe {
-                    latest_keyframe = Some(frame);
-                    latest_video = None;
-                } else if latest_keyframe.is_none() {
-                    latest_video = Some(frame);
-                }
+                video_frames.push(frame);
             }
         }
         if let Some(rx) = &self.media_audio_rx {
@@ -523,7 +526,7 @@ impl BackendClient for PhantomClient {
         for frame in &audio_frames {
             self.send_audio_frame(frame);
         }
-        if let Some(frame) = latest_keyframe.as_ref().or(latest_video.as_ref()) {
+        for frame in &video_frames {
             self.send_video_frame(frame);
         }
         self.maybe_send_sender_reports();
@@ -589,7 +592,13 @@ impl BackendClient for PhantomClient {
                     if !feedback.nack_sequences.is_empty() {
                         self.retransmit_nacked_video(&feedback.nack_sequences);
                     }
-                    let _ = feedback.receiver_report;
+                    if let Some(report) = feedback.receiver_report {
+                        tracing::trace!(
+                            fraction_lost = report.fraction_lost,
+                            jitter = report.jitter,
+                            "phantom backend received RTCP receiver report"
+                        );
+                    }
                 }
             }
             return;
@@ -650,6 +659,7 @@ struct MediaTxState {
     video_seq: u16,
     audio_seq: u16,
     video_timestamp: u32,
+    video_clock_started_at: Instant,
     audio_timestamp: u32,
     video_last_rtp_timestamp: u32,
     audio_last_rtp_timestamp: u32,
@@ -671,6 +681,7 @@ impl MediaTxState {
             video_seq: (seed >> 64) as u16,
             audio_seq: (seed >> 80) as u16,
             video_timestamp: (seed >> 96) as u32,
+            video_clock_started_at: Instant::now(),
             audio_timestamp: (seed >> 64) as u32,
             video_last_rtp_timestamp: (seed >> 96) as u32,
             audio_last_rtp_timestamp: (seed >> 64) as u32,
@@ -682,6 +693,21 @@ impl MediaTxState {
             audio_srtcp_index: 0,
             h264: H264PacketizerState::default(),
         }
+    }
+
+    fn video_timestamp_now(&mut self) -> u32 {
+        let elapsed_ticks =
+            (self.video_clock_started_at.elapsed().as_micros() as u64).saturating_mul(90) / 1000;
+        let timestamp = self.video_timestamp.wrapping_add(elapsed_ticks as u32);
+        // A single backend drain can flush several queued desktop frames faster
+        // than the 90 kHz RTP clock advances. Keep timestamps strictly
+        // increasing so browser jitter buffers never see a tiny backwards step.
+        if timestamp == self.video_last_rtp_timestamp
+            || timestamp.wrapping_sub(self.video_last_rtp_timestamp) > 0x8000_0000
+        {
+            return self.video_last_rtp_timestamp.wrapping_add(1);
+        }
+        timestamp
     }
 }
 
@@ -882,7 +908,11 @@ impl PhantomSrtpRxContext {
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
                 unprotect_rtcp_gcm(key, *salt, packet)
             }
-            PhantomSrtpCipher::Aes128CmSha1_80 { .. } => None,
+            PhantomSrtpCipher::Aes128CmSha1_80 {
+                enc_key,
+                auth_key,
+                salt,
+            } => unprotect_rtcp_aes_cm_sha1_80(enc_key, auth_key, *salt, packet),
         }
     }
 }
@@ -1228,6 +1258,50 @@ fn protect_rtcp_aes_cm_sha1_80(auth_key: &[u8; 20], packet: &[u8], srtcp_index: 
     out
 }
 
+fn unprotect_rtcp_aes_cm_sha1_80(
+    enc_key: &[u8; 16],
+    auth_key: &[u8; 20],
+    salt: [u8; 14],
+    packet: &[u8],
+) -> Option<Vec<u8>> {
+    if packet.len() < 8 + 4 + 10 {
+        return None;
+    }
+    let auth_tag_start = packet.len() - 10;
+    let index_start = auth_tag_start.checked_sub(4)?;
+    let auth_input = &packet[..auth_tag_start];
+    let auth_tag = &packet[auth_tag_start..];
+    let expected_tag = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, auth_key),
+        auth_input,
+    );
+    if !constant_time_eq(&expected_tag.as_ref()[..10], auth_tag) {
+        return None;
+    }
+
+    let e_and_si = u32::from_be_bytes(packet[index_start..auth_tag_start].try_into().ok()?);
+    let encrypted = (e_and_si & 0x8000_0000) != 0;
+    let srtcp_index = e_and_si & 0x7fff_ffff;
+    let mut out = packet[..index_start].to_vec();
+    if encrypted {
+        let ssrc = u32::from_be_bytes(out[4..8].try_into().ok()?);
+        let iv = rtcp_aes_cm_iv(salt, ssrc, srtcp_index);
+        aes_ctr_xor_in_place::<Aes128>(enc_key, &iv, &mut out[8..]);
+    }
+    Some(out)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn rtp_aes_cm_iv(salt: [u8; 14], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] {
     let mut iv = [0u8; 16];
     iv[..14].copy_from_slice(&salt);
@@ -1237,6 +1311,21 @@ fn rtp_aes_cm_iv(salt: [u8; 14], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] {
         .for_each(|(dst, src)| *dst ^= src);
     let index = ((roc as u64) << 16) | seq as u64;
     let index_bytes = index.to_be_bytes();
+    iv[8..14]
+        .iter_mut()
+        .zip(index_bytes[2..8].iter().copied())
+        .for_each(|(dst, src)| *dst ^= src);
+    iv
+}
+
+fn rtcp_aes_cm_iv(salt: [u8; 14], ssrc: u32, srtcp_index: u32) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[..14].copy_from_slice(&salt);
+    iv[4..8]
+        .iter_mut()
+        .zip(ssrc.to_be_bytes())
+        .for_each(|(dst, src)| *dst ^= src);
+    let index_bytes = (srtcp_index as u64).to_be_bytes();
     iv[8..14]
         .iter_mut()
         .zip(index_bytes[2..8].iter().copied())
@@ -1675,9 +1764,12 @@ impl<'a> AnswerBuilder<'a> {
                     sdp.push_str("a=fmtp:");
                     sdp.push_str(&pt.to_string());
                     sdp.push(' ');
-                    sdp.push_str(media.video_fmtp.as_deref().unwrap_or(
-                        "packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1",
-                    ));
+                    sdp.push_str(
+                        media
+                            .video_fmtp
+                            .as_deref()
+                            .unwrap_or(PHANTOM_H264_FMTP_FALLBACK),
+                    );
                     sdp.push_str("\r\n");
                 }
                 Some(MediaKind::Audio) => {
@@ -1902,7 +1994,8 @@ fn format_fingerprint(fingerprint: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stun_success_response, parse_stun_binding_request, AnswerBuilder, ParsedOffer,
+        build_stun_success_response, parse_stun_binding_request, protect_rtcp_aes_cm_sha1_80,
+        unprotect_rtcp_aes_cm_sha1_80, AnswerBuilder, MediaTxState, ParsedOffer,
         PhantomSessionParams,
     };
     use crate::transport::webrtc::sctp::{parse_dcep_open_label, DCEP_OPEN};
@@ -1979,6 +2072,9 @@ mod tests {
         assert!(answer.contains("a=ice-ufrag:"));
         assert!(answer.contains("a=ice-pwd:"));
         assert!(answer.contains("a=rtpmap:109 H264/90000"));
+        assert!(answer.contains(
+            "a=fmtp:109 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+        ));
         assert!(answer.contains(&format!(
             "a=fingerprint:sha-256 {}\r\n",
             params.fingerprint_sha256
@@ -2056,5 +2152,53 @@ mod tests {
         payload[10..12].copy_from_slice(&(0u16).to_be_bytes());
         payload.extend_from_slice(b"input");
         assert_eq!(parse_dcep_open_label(&payload).as_deref(), Some("input"));
+    }
+
+    #[test]
+    fn aes_cm_srtcp_unprotect_accepts_authentic_plain_rtcp() {
+        let enc_key = [0x11; 16];
+        let auth_key = [0x22; 20];
+        let salt = [0x33; 14];
+        let rtcp = vec![
+            0x81, 205, 0x00, 0x03, // RTPFB Generic NACK, 4 words
+            0x12, 0x34, 0x56, 0x78, // sender SSRC
+            0x87, 0x65, 0x43, 0x21, // media SSRC
+            0x00, 0x09, 0x00, 0x00, // one lost sequence
+        ];
+
+        let protected = protect_rtcp_aes_cm_sha1_80(&auth_key, &rtcp, 7);
+        let unprotected =
+            unprotect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &protected).unwrap();
+
+        assert_eq!(unprotected, rtcp);
+    }
+
+    #[test]
+    fn aes_cm_srtcp_unprotect_rejects_bad_auth_tag() {
+        let enc_key = [0x11; 16];
+        let auth_key = [0x22; 20];
+        let salt = [0x33; 14];
+        let rtcp = vec![
+            0x81, 205, 0x00, 0x03, 0x12, 0x34, 0x56, 0x78, 0x87, 0x65, 0x43, 0x21, 0x00, 0x09,
+            0x00, 0x00,
+        ];
+        let mut protected = protect_rtcp_aes_cm_sha1_80(&auth_key, &rtcp, 7);
+        let last = protected.last_mut().unwrap();
+        *last ^= 0x01;
+
+        assert!(unprotect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &protected).is_none());
+    }
+
+    #[test]
+    fn video_timestamp_now_never_moves_backwards() {
+        let mut tx = MediaTxState::new();
+        tx.video_last_rtp_timestamp = tx.video_timestamp.wrapping_add(100);
+
+        let first = tx.video_timestamp_now();
+        assert_eq!(first, tx.video_last_rtp_timestamp.wrapping_add(1));
+
+        tx.video_last_rtp_timestamp = first;
+        let second = tx.video_timestamp_now();
+        assert_eq!(second, first.wrapping_add(1));
     }
 }

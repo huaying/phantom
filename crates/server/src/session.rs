@@ -26,6 +26,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn instant_ago(duration: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(duration).unwrap_or(now)
+}
+
 // ── Input forwarding (for service mode IPC) ─────────────────────────────────
 
 /// Trait for forwarding input events to a remote agent instead of local injection.
@@ -404,6 +409,7 @@ pub struct SessionRunner {
     pub stats_bytes: u64,
     pub keepalive_time: Instant,
     pub had_input: bool,
+    pub mouse_buttons_down: u8,
     pub frame_interval: Duration,
     pub last_keyframe_time: Instant,
     /// Last time we sent a Ping (for RTT measurement).
@@ -512,8 +518,9 @@ impl SessionRunner {
             stats_bytes: 0,
             keepalive_time: Instant::now(),
             had_input: false,
+            mouse_buttons_down: 0,
             frame_interval,
-            last_keyframe_time: Instant::now() - Duration::from_secs(10),
+            last_keyframe_time: instant_ago(Duration::from_secs(10)),
             ping_sent_at: None,
             rtt_us: None,
             jitter_us: None,
@@ -552,7 +559,7 @@ impl SessionRunner {
                 "session resumed"
             );
             // Force keyframe on first frame (reset last_keyframe_time to epoch)
-            runner.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+            runner.last_keyframe_time = instant_ago(Duration::from_secs(3600));
         } else {
             runner.sender.send_msg(&Message::Hello {
                 width,
@@ -600,6 +607,22 @@ impl SessionRunner {
         Ok(())
     }
 
+    fn dispatch_input_event(&mut self, event: InputEvent) {
+        // If we have an input forwarder (e.g. IPC to agent), use it.
+        // Otherwise inject locally (console mode). Log failures — on Windows
+        // service mode a broken IPC pipe would otherwise silently drop input.
+        if let Some(ref fwd) = self.input_forwarder {
+            if let Err(e) = fwd.forward_input(&event) {
+                tracing::warn!("input forward failed: {e:#}");
+            }
+        } else if let Some(ref mut inj) = self.injector {
+            if let Err(e) = inj.inject(&event) {
+                tracing::warn!("input inject failed: {e:#}");
+            }
+        }
+        self.had_input = true;
+    }
+
     /// Drain all pending inbound events (input, clipboard, paste).
     /// Returns `Err` if the client disconnected.
     pub fn pump_events(&mut self) -> Result<()> {
@@ -612,33 +635,47 @@ impl SessionRunner {
             }
         }
 
+        let mut pending_mouse_move: Option<InputEvent> = None;
         loop {
-            match self.event_rx.try_recv() {
-                Ok(InboundEvent::Input(event)) => {
-                    // If we have an input forwarder (e.g. IPC to agent), use it.
-                    // Otherwise inject locally (console mode). Log failures —
-                    // on Windows Service mode a broken IPC pipe (agent crashed)
-                    // would otherwise silently drop keystrokes forever with
-                    // no signal that input isn't reaching the user session.
-                    if let Some(ref fwd) = self.input_forwarder {
-                        if let Err(e) = fwd.forward_input(&event) {
-                            tracing::warn!("input forward failed: {e:#}");
-                        }
-                    } else if let Some(ref mut inj) = self.injector {
-                        if let Err(e) = inj.inject(&event) {
-                            tracing::warn!("input inject failed: {e:#}");
+            let event = match self.event_rx.try_recv() {
+                Ok(InboundEvent::Input(event @ InputEvent::MouseMove { .. })) => {
+                    if self.mouse_buttons_down > 0 {
+                        self.dispatch_input_event(event);
+                    } else {
+                        pending_mouse_move = Some(event);
+                    }
+                    continue;
+                }
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("client disconnected");
+                }
+            };
+
+            if let Some(event) = pending_mouse_move.take() {
+                self.dispatch_input_event(event);
+            }
+
+            match event {
+                InboundEvent::Input(event) => {
+                    if let InputEvent::MouseButton { pressed, .. } = event {
+                        if pressed {
+                            self.mouse_buttons_down = self.mouse_buttons_down.saturating_add(1);
+                        } else {
+                            self.mouse_buttons_down = self.mouse_buttons_down.saturating_sub(1);
                         }
                     }
-                    self.had_input = true;
+                    self.dispatch_input_event(event);
                 }
-                Ok(InboundEvent::Clipboard(text)) => {
+                InboundEvent::Clipboard(text) => {
                     if self.clipboard.on_remote_update(&text) {
                         if let Some(ref mut ab) = self.arboard {
                             let _ = ab.set_text(&text);
                         }
                     }
                 }
-                Ok(InboundEvent::PasteText(text)) => {
+                InboundEvent::PasteText(text) => {
                     if let Some(ref mut ab) = self.arboard {
                         let _ = ab.set_text(&text);
                     }
@@ -653,7 +690,7 @@ impl SessionRunner {
                     self.had_input = true;
                     tracing::debug!("paste: {} chars", text.len());
                 }
-                Ok(InboundEvent::Pong) => {
+                InboundEvent::Pong => {
                     if let Some(sent_at) = self.ping_sent_at.take() {
                         let rtt = sent_at.elapsed().as_micros() as u64;
                         // RTT EMA (α = 0.2)
@@ -673,11 +710,11 @@ impl SessionRunner {
                         }
                     }
                 }
-                Ok(InboundEvent::FileOffer {
+                InboundEvent::FileOffer {
                     transfer_id,
                     name,
                     size,
-                }) => match self.file_transfer.on_file_offer(transfer_id, &name, size) {
+                } => match self.file_transfer.on_file_offer(transfer_id, &name, size) {
                     Ok(reply) => {
                         tracing::info!(transfer_id, name, size, "file offer accepted");
                         let _ = self.sender.send_msg(&reply);
@@ -690,28 +727,28 @@ impl SessionRunner {
                         });
                     }
                 },
-                Ok(InboundEvent::FileAccept { transfer_id }) => {
+                InboundEvent::FileAccept { transfer_id } => {
                     self.file_transfer.on_file_accept(transfer_id);
                 }
-                Ok(InboundEvent::FileCancel {
+                InboundEvent::FileCancel {
                     transfer_id,
                     reason,
-                }) => {
+                } => {
                     self.file_transfer.on_file_cancel(transfer_id, &reason);
                 }
-                Ok(InboundEvent::FileChunk {
+                InboundEvent::FileChunk {
                     transfer_id,
                     offset,
                     data,
-                }) => {
+                } => {
                     if let Err(e) = self.file_transfer.on_file_chunk(transfer_id, offset, &data) {
                         tracing::error!(transfer_id, "file chunk error: {e}");
                     }
                 }
-                Ok(InboundEvent::FileDone {
+                InboundEvent::FileDone {
                     transfer_id,
                     sha256,
-                }) => match self.file_transfer.on_file_done(transfer_id, &sha256) {
+                } => match self.file_transfer.on_file_done(transfer_id, &sha256) {
                     Ok(Some(ref path)) => {
                         #[cfg(target_os = "windows")]
                         crate::service_win::svc_log(&format!("FileSaved: {path}"));
@@ -729,44 +766,43 @@ impl SessionRunner {
                         crate::service_win::svc_log(&format!("FileDone error: {_e}"));
                     }
                 },
-                Ok(InboundEvent::Resume {
+                InboundEvent::Resume {
                     session_token,
                     last_sequence,
-                }) => {
+                } => {
                     if session_token == self.session_token {
                         tracing::info!(last_sequence, "client resume accepted, forcing keyframe");
                         // Send ResumeOk so client knows it can reuse its decoder
                         let _ = self.sender.send_msg(&Message::ResumeOk);
                         // Force keyframe by resetting the timer
-                        self.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+                        self.last_keyframe_time = instant_ago(Duration::from_secs(3600));
                         // Reset sequence to sync with client
                         self.sequence = last_sequence;
                     } else {
                         tracing::warn!("client sent Resume with invalid token");
                     }
                 }
-                Ok(InboundEvent::ResolutionChange { width, height }) => {
+                InboundEvent::ResolutionChange { width, height } => {
                     tracing::info!(width, height, "Client requested resolution change");
                     if let Some(ref f) = self.resolution_change_fn {
                         f(width, height);
                     }
                 }
-                Ok(InboundEvent::RequestKeyframe) => {
+                InboundEvent::RequestKeyframe => {
                     let _ = self.sender.send_msg(&Message::KeyframeFence);
                     // Force `needs_keyframe()` to return true on the next tick.
                     // Pipeline::tick honors it via `ctx.needs_keyframe` and
                     // calls force_keyframe() on the encoder.
-                    self.last_keyframe_time = Instant::now() - Duration::from_secs(3600);
+                    self.last_keyframe_time = instant_ago(Duration::from_secs(3600));
                     tracing::debug!("client requested keyframe");
                 }
-                Ok(InboundEvent::Disconnected) => {
-                    anyhow::bail!("client disconnected");
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
+                InboundEvent::Disconnected => {
                     anyhow::bail!("client disconnected");
                 }
             }
+        }
+        if let Some(event) = pending_mouse_move.take() {
+            self.dispatch_input_event(event);
         }
         Ok(())
     }
@@ -1222,10 +1258,14 @@ fn run_session_inner(
         }
     }
 
-    // Nudge the screen — harmless for CPU capture, matters for DXGI on Windows.
-    if let Some(ref mut inj) = runner.injector {
-        let _ = inj.inject(&InputEvent::MouseMove { x: 0, y: 0 });
-        let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
+    // Desktop Duplication-style pipelines can need a tiny nudge to produce a
+    // fresh frame, but keep it opt-in so CPU first-frame startup is not delayed
+    // by OS input initialization.
+    if pipeline.needs_startup_nudge() {
+        if let Some(ref mut inj) = runner.injector {
+            let _ = inj.inject(&InputEvent::MouseMove { x: 0, y: 0 });
+            let _ = inj.inject(&InputEvent::MouseMove { x: 1, y: 1 });
+        }
     }
 
     let mut abr = AdaptiveBitrate::new(pipeline.bitrate_kbps());
@@ -1309,10 +1349,18 @@ pub fn run_session_ipc(
     cfg: SessionConfig<'_>,
     initial_width: u32,
     initial_height: u32,
+    startup_frame: Option<crate::ipc_pipe::IpcEncodedFrame>,
 ) -> SessionResult {
     let cancel = Arc::clone(&cfg.cancel);
     let mut session_id = String::new();
-    let result = run_session_ipc_inner(ipc, cfg, initial_width, initial_height, &mut session_id);
+    let result = run_session_ipc_inner(
+        ipc,
+        cfg,
+        initial_width,
+        initial_height,
+        startup_frame,
+        &mut session_id,
+    );
     make_session_result(result, session_id, cancel.load(Ordering::Relaxed))
 }
 
@@ -1322,6 +1370,7 @@ fn run_session_ipc_inner(
     cfg: SessionConfig<'_>,
     initial_width: u32,
     initial_height: u32,
+    startup_frame: Option<crate::ipc_pipe::IpcEncodedFrame>,
     session_id_out: &mut String,
 ) -> Result<Vec<u8>> {
     let mut runner = SessionRunner::new(
@@ -1342,6 +1391,22 @@ fn run_session_ipc_inner(
     runner.paste_fn = cfg.paste_fn;
     runner.audio_ws_rx = cfg.audio_ws_rx;
 
+    let mut wait_for_live_keyframe = startup_frame.is_some();
+    if let Some(ipc_frame) = startup_frame {
+        if ipc_frame.width != runner.current_width || ipc_frame.height != runner.current_height {
+            tracing::info!(
+                old_w = runner.current_width,
+                old_h = runner.current_height,
+                new_w = ipc_frame.width,
+                new_h = ipc_frame.height,
+                "Startup frame resolution changed"
+            );
+            runner.current_width = ipc_frame.width;
+            runner.current_height = ipc_frame.height;
+        }
+        runner.send_video_frame(ipc_frame.encoded, None)?;
+    }
+
     // Request keyframe from agent for the new client. If the IPC pipe is
     // dead (agent crashed, service/agent race during startup) there's
     // nothing to do from here — the service's SessionManager will relaunch
@@ -1359,10 +1424,27 @@ fn run_session_ipc_inner(
         runner.poll_clipboard()?;
         runner.drain_audio()?;
 
-        // Forward ALL queued encoded frames from agent (H.264 must be sequential).
+        // Forward queued encoded frames from agent (H.264 must be sequential).
+        // If we sent a prewarmed startup frame, skip any queued delta frames
+        // until the agent emits a fresh keyframe for this live client. This
+        // avoids mixing pre-login / old-display deltas into the browser decoder.
         // Resolution changes are handled naturally: H.264 SPS/PPS in keyframes
         // contains the new resolution, and WebCodecs adapts automatically.
         for ipc_frame in ipc.recv_encoded_frames() {
+            if wait_for_live_keyframe {
+                if ipc_frame.encoded.is_keyframe {
+                    wait_for_live_keyframe = false;
+                    tracing::info!(
+                        width = ipc_frame.width,
+                        height = ipc_frame.height,
+                        "Forwarding first live keyframe after startup frame"
+                    );
+                } else {
+                    tracing::debug!("dropping queued delta frame after startup frame");
+                    continue;
+                }
+            }
+
             if ipc_frame.width != runner.current_width || ipc_frame.height != runner.current_height
             {
                 tracing::info!(

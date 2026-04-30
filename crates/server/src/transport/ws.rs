@@ -4,6 +4,8 @@ use phantom_core::transport::{MessageReceiver, MessageSender};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "webrtc")]
+use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
 use tungstenite::WebSocket;
 
@@ -505,6 +507,18 @@ fn wants_close(request: &str) -> bool {
     })
 }
 
+#[cfg(feature = "webrtc")]
+fn extract_content_length(request: &str) -> Option<usize> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// HTTP handler WITHOUT WebRTC (no POST /rtc).
 #[cfg(not(feature = "webrtc"))]
 fn handle_http_rw(
@@ -692,16 +706,21 @@ fn spawn_ws_connection(
     let _ = stream
         .sock
         .set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let _ = stream
+        .sock
+        .set_write_timeout(Some(std::time::Duration::from_millis(150)));
+    let _ = stream.sock.set_nodelay(true);
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("WebSocket client connected via HTTPS port");
-    let (send_tx, send_rx) = mpsc::sync_channel(WS_SEND_QUEUE_DEPTH);
+    let (send_tx, send_rx) = mpsc::sync_channel(WS_VIDEO_SEND_QUEUE_DEPTH);
     let (recv_tx, recv_rx) = mpsc::channel();
     std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let _ = ws_tx.send(WsConnection {
         data_sender: WsSender {
             tx: send_tx,
+            consecutive_video_full_drops: 0,
             dropped,
         },
         data_receiver: WsReceiver { rx: recv_rx },
@@ -716,15 +735,20 @@ fn spawn_audio_ws_connection(
     let _ = stream
         .sock
         .set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let _ = stream
+        .sock
+        .set_write_timeout(Some(std::time::Duration::from_millis(250)));
+    let _ = stream.sock.set_nodelay(true);
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("audio WebSocket connected");
-    let (send_tx, send_rx) = mpsc::sync_channel(WS_SEND_QUEUE_DEPTH);
+    let (send_tx, send_rx) = mpsc::sync_channel(WS_AUDIO_SEND_QUEUE_DEPTH);
     let (recv_tx, _recv_rx) = mpsc::channel();
     std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let _ = audio_ws_tx.send(WsSender {
         tx: send_tx,
+        consecutive_video_full_drops: 0,
         dropped,
     });
 }
@@ -744,14 +768,19 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
     recv_tx: mpsc::Sender<Vec<u8>>,
 ) {
     loop {
-        // Drain pending outgoing messages. If the sender end was dropped
+        // Drain a bounded number of pending outgoing messages. If we drain the
+        // whole queue under video load, WSS reads are starved and input/pong
+        // packets sit behind outbound frames on the same thread.
+        let mut writes = 0usize;
+        // If the sender end was dropped
         // (session ended, replaced, cancelled by watcher, etc.), exit so
         // the TCP stream drops, the client's onclose fires, and the web
         // client can auto-reconnect. Without this, the io loop idle-loops
         // on ws.read() forever and the client sees a hung connection.
-        loop {
+        while writes < WS_MAX_WRITES_PER_READ {
             match send_rx.try_recv() {
                 Ok(data) => {
+                    writes += 1;
                     if ws.send(tungstenite::Message::Binary(data)).is_err() {
                         return;
                     }
@@ -780,16 +809,24 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
     }
 }
 
-/// Bound on the WebSocket send queue. ~1.5s at 30fps video, ~1s at
-/// 20ms audio. Sized to absorb normal jitter (TCP scheduling, brief
-/// network hiccups) but small enough that a stalled receiver — the
-/// classic case being a laptop that sleeps with the tab open — won't
-/// accumulate hours of frames that all replay at line rate when the
-/// client wakes back up.
-const WS_SEND_QUEUE_DEPTH: usize = 50;
+/// Bound on the main WebSocket send queue. Keep this intentionally small:
+/// stale video frames are worse than dropped frames for an interactive desktop.
+const WS_VIDEO_SEND_QUEUE_DEPTH: usize = 8;
+
+/// Audio uses its own WSS channel and benefits from a deeper jitter buffer.
+const WS_AUDIO_SEND_QUEUE_DEPTH: usize = 50;
+
+/// Interleave writes with reads so client input/pong is not starved by video.
+const WS_MAX_WRITES_PER_READ: usize = 4;
+
+/// If the video queue is full for about a second at 30fps, close the session.
+/// Browser reconnect will get a fresh keyframe instead of replaying stale TCP
+/// backlog at line rate.
+const WS_VIDEO_FULL_DROPS_BEFORE_CLOSE: u32 = 30;
 
 pub struct WsSender {
     tx: mpsc::SyncSender<Vec<u8>>,
+    consecutive_video_full_drops: u32,
     /// Counts payloads we couldn't push because the IO loop was too far
     /// behind (client TCP receive buffer full → IO loop blocked on write
     /// → channel full). Logged occasionally; never panics.
@@ -807,15 +844,15 @@ impl WsSender {
 
 impl MessageSender for WsSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
+        let is_video = matches!(msg, Message::VideoFrame { .. });
         let payload = bincode::serialize(msg).context("serialize")?;
-        if matches!(msg, Message::KeyframeFence) {
-            return self
-                .tx
-                .send(payload)
-                .map_err(|_| anyhow::anyhow!("ws closed"));
-        }
         match self.tx.try_send(payload) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if is_video {
+                    self.consecutive_video_full_drops = 0;
+                }
+                Ok(())
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 // IO loop is far behind — client's TCP receive side is
                 // stalled (laptop asleep, network frozen). Drop this
@@ -824,6 +861,13 @@ impl MessageSender for WsSender {
                 // the client catches up.
                 self.dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if is_video {
+                    self.consecutive_video_full_drops =
+                        self.consecutive_video_full_drops.saturating_add(1);
+                    if self.consecutive_video_full_drops >= WS_VIDEO_FULL_DROPS_BEFORE_CLOSE {
+                        return Err(anyhow::anyhow!("ws video backlog exceeded"));
+                    }
+                }
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => Err(anyhow::anyhow!("ws closed")),
