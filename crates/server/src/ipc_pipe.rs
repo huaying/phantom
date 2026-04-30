@@ -19,13 +19,14 @@
 //! - 0x03 Heartbeat (bidirectional): empty payload
 //! - 0x04 Shutdown (service → agent): empty payload
 //! - 0x05 ForceKeyframe (service → agent): empty payload
+//! - 0x09 ViewerState (service → agent): \[u8 active\]
 
 #[cfg(target_os = "windows")]
 mod platform {
     use anyhow::{Context, Result};
     use phantom_core::encode::{EncodedFrame, VideoCodec};
     use phantom_core::input::InputEvent;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -66,6 +67,7 @@ mod platform {
     const MSG_RESOLUTION_CHANGE: u8 = 0x06;
     const MSG_PASTE_TEXT: u8 = 0x07;
     const MSG_CLIPBOARD_SYNC: u8 = 0x08; // agent → service (clipboard changed)
+    const MSG_VIEWER_STATE: u8 = 0x09;
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -242,6 +244,7 @@ mod platform {
     // ── IPC Server (Service side) ───────────────────────────────────────────
 
     /// Received encoded frame with resolution info.
+    #[derive(Clone)]
     pub struct IpcEncodedFrame {
         pub encoded: EncodedFrame,
         pub width: u32,
@@ -253,6 +256,7 @@ mod platform {
         down_handle: HANDLE,
         connected: bool,
         frame_rx: Option<mpsc::Receiver<IpcEncodedFrame>>,
+        last_keyframe: Arc<std::sync::Mutex<Option<IpcEncodedFrame>>>,
         clipboard_rx: Option<mpsc::Receiver<String>>,
         input_tx: Option<mpsc::Sender<InputEvent>>,
         shutdown: Arc<AtomicBool>,
@@ -264,6 +268,9 @@ mod platform {
         resolution_change: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
         /// Pending paste text. Write thread picks it up.
         paste_text: Arc<std::sync::Mutex<Option<String>>>,
+        /// Pending viewer active/idle transition. Write thread picks it up.
+        viewer_state: Arc<std::sync::Mutex<Option<bool>>>,
+        viewer_count: Arc<AtomicUsize>,
         _read_thread: Option<std::thread::JoinHandle<()>>,
         _write_thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -281,6 +288,7 @@ mod platform {
                 down_handle,
                 connected: false,
                 frame_rx: None,
+                last_keyframe: Arc::new(std::sync::Mutex::new(None)),
                 clipboard_rx: None,
                 input_tx: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
@@ -288,6 +296,8 @@ mod platform {
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
                 resolution_change: Arc::new(std::sync::Mutex::new(None)),
                 paste_text: Arc::new(std::sync::Mutex::new(None)),
+                viewer_state: Arc::new(std::sync::Mutex::new(None)),
+                viewer_count: Arc::new(AtomicUsize::new(0)),
                 _read_thread: None,
                 _write_thread: None,
             })
@@ -318,10 +328,12 @@ mod platform {
             self.frame_rx = Some(frame_rx);
             self.clipboard_rx = Some(clipboard_rx);
             self.input_tx = Some(input_tx);
+            *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
             // Read thread: reads encoded H.264 frames from upstream pipe
             let up = SendHandle(self.up_handle);
             let shutdown = Arc::clone(&self.shutdown);
+            let last_keyframe = Arc::clone(&self.last_keyframe);
             let read_thread =
                 std::thread::Builder::new()
                     .name("ipc-read".into())
@@ -332,12 +344,19 @@ mod platform {
                                 Ok((MSG_ENCODED_FRAME, payload)) => {
                                     match decode_ipc_frame(&payload) {
                                         Ok((encoded, w, h)) => {
-                                            // try_send: drop frame if buffer full (backpressure).
-                                            let _ = frame_tx.try_send(IpcEncodedFrame {
+                                            let frame = IpcEncodedFrame {
                                                 encoded,
                                                 width: w,
                                                 height: h,
-                                            });
+                                            };
+                                            if frame.encoded.is_keyframe {
+                                                *last_keyframe
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some(frame.clone());
+                                            }
+                                            // try_send: drop frame if buffer full (backpressure).
+                                            let _ = frame_tx.try_send(frame);
                                         }
                                         Err(e) => tracing::warn!("IPC: bad encoded frame: {e}"),
                                     }
@@ -368,6 +387,7 @@ mod platform {
             let shutdown_flag = Arc::clone(&self.shutdown_requested);
             let res_change = Arc::clone(&self.resolution_change);
             let paste_text = Arc::clone(&self.paste_text);
+            let viewer_state = Arc::clone(&self.viewer_state);
             let write_thread =
                 std::thread::Builder::new()
                     .name("ipc-write".into())
@@ -379,6 +399,22 @@ mod platform {
                             if shutdown_flag.swap(false, Ordering::SeqCst) {
                                 let _ = unsafe { send_message(handle, MSG_SHUTDOWN, &[]) };
                                 break;
+                            }
+
+                            if let Some(active) = viewer_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                            {
+                                let payload = [u8::from(active)];
+                                if let Err(e) =
+                                    unsafe { send_message(handle, MSG_VIEWER_STATE, &payload) }
+                                {
+                                    if !shutdown2.load(Ordering::Relaxed) {
+                                        tracing::warn!("IPC viewer-state write error: {e}");
+                                    }
+                                    break;
+                                }
                             }
 
                             // Send resize before keyframe when both are pending.
@@ -503,6 +539,15 @@ mod platform {
             frames
         }
 
+        /// Return the latest keyframe seen from the agent, even if the normal
+        /// frame queue has already been drained by a previous viewer.
+        pub fn last_keyframe(&self) -> Option<IpcEncodedFrame> {
+            self.last_keyframe
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
         /// Send an input event to the agent for injection.
         #[allow(dead_code)]
         pub fn send_input(&self, event: InputEvent) -> Result<()> {
@@ -555,6 +600,30 @@ mod platform {
             }
         }
 
+        pub fn set_viewer_active(&self, active: bool) {
+            if self.connected {
+                *self.viewer_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
+            }
+        }
+
+        pub fn acquire_viewer(&self) {
+            if self.viewer_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.set_viewer_active(true);
+            }
+        }
+
+        pub fn release_viewer(&self) {
+            let prev = self
+                .viewer_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    Some(count.saturating_sub(1))
+                })
+                .unwrap_or(0);
+            if prev <= 1 {
+                self.set_viewer_active(false);
+            }
+        }
+
         /// Request orderly shutdown of the agent.
         /// Sets a flag that the write thread picks up (avoids concurrent pipe writes).
         pub fn send_shutdown(&self) -> Result<()> {
@@ -594,6 +663,7 @@ mod platform {
                 self.connected = false;
             }
             self.frame_rx = None;
+            *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.clipboard_rx = None;
             self.input_tx = None;
         }
@@ -616,6 +686,7 @@ mod platform {
         down_handle: HANDLE,
         shutdown: Arc<AtomicBool>,
         keyframe_requested: Arc<AtomicBool>,
+        viewer_active: Arc<AtomicBool>,
         resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
         paste_requested: Arc<std::sync::Mutex<Option<String>>>,
         input_rx: Option<mpsc::Receiver<InputEvent>>,
@@ -653,6 +724,7 @@ mod platform {
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let keyframe_requested = Arc::new(AtomicBool::new(false));
+            let viewer_active = Arc::new(AtomicBool::new(false));
             let resolution_requested: Arc<std::sync::Mutex<Option<(u32, u32)>>> =
                 Arc::new(std::sync::Mutex::new(None));
             let paste_requested: Arc<std::sync::Mutex<Option<String>>> =
@@ -662,6 +734,7 @@ mod platform {
             let down = SendHandle(down_handle);
             let read_shutdown = Arc::clone(&shutdown);
             let read_kf = Arc::clone(&keyframe_requested);
+            let read_viewer = Arc::clone(&viewer_active);
             let read_res = Arc::clone(&resolution_requested);
             let read_paste = Arc::clone(&paste_requested);
 
@@ -686,6 +759,10 @@ mod platform {
                             }
                             Ok((MSG_FORCE_KEYFRAME, _)) => {
                                 read_kf.store(true, Ordering::SeqCst);
+                            }
+                            Ok((MSG_VIEWER_STATE, payload)) => {
+                                let active = payload.first().copied().unwrap_or(0) != 0;
+                                read_viewer.store(active, Ordering::SeqCst);
                             }
                             Ok((MSG_PASTE_TEXT, payload)) => {
                                 if let Ok(text) = String::from_utf8(payload) {
@@ -723,6 +800,7 @@ mod platform {
                 down_handle,
                 shutdown,
                 keyframe_requested,
+                viewer_active,
                 resolution_requested,
                 paste_requested,
                 input_rx: Some(input_rx),
@@ -749,6 +827,10 @@ mod platform {
         /// Check and clear the keyframe request flag.
         pub fn take_keyframe_request(&self) -> bool {
             self.keyframe_requested.swap(false, Ordering::SeqCst)
+        }
+
+        pub fn viewer_active(&self) -> bool {
+            self.viewer_active.load(Ordering::Relaxed)
         }
 
         /// Take pending paste text (if any).
