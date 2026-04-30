@@ -693,6 +693,99 @@ EOF
     echo "  Edit Exec= in that file to change transport / encryption / auth flags."
 }
 
+linux_resolve_xauthority_for_display() {
+    _display="$1"
+    _uid=""
+    if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        _uid="$(id -u "$TARGET_USER" 2>/dev/null || true)"
+    fi
+
+    for _auth in \
+        "$USER_HOME/.Xauthority" \
+        "/run/user/$_uid/gdm/Xauthority" \
+        "/run/user/$_uid/lightdm/Xauthority"
+    do
+        [ -n "$_auth" ] && [ -f "$_auth" ] || continue
+        if have_cmd xrandr && have_cmd sudo; then
+            if sudo -u "$TARGET_USER" env DISPLAY="$_display" XAUTHORITY="$_auth" xrandr --query >/dev/null 2>&1; then
+                echo "$_auth"
+                return 0
+            fi
+        else
+            echo "$_auth"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+linux_start_server_now() {
+    if [ "$OS" != "linux" ] || [ "$INSTALL_SERVER" != true ] || [ "$NO_AUTOSTART" = true ]; then
+        return 0
+    fi
+    if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ] || [ -z "$USER_HOME" ]; then
+        echo ""
+        echo "WARN: cannot resolve non-root graphical user; skipping immediate phantom-server start."
+        return 0
+    fi
+
+    _bin="$(linux_phantom_server_bin || true)"
+    if [ -z "$_bin" ] || [ ! -x "$_bin" ]; then
+        echo ""
+        echo "WARN: phantom-server binary not found; skipping immediate start."
+        return 0
+    fi
+
+    _display="${PHANTOM_SERVER_DISPLAY:-:0}"
+    if [ ! -S "/tmp/.X11-unix/X${_display#:}" ]; then
+        echo ""
+        echo "WARN: DISPLAY=$_display is not available yet; phantom-server will start at next graphical login."
+        return 0
+    fi
+
+    _xauth="$(linux_resolve_xauthority_for_display "$_display" || true)"
+    if [ -z "$_xauth" ]; then
+        echo ""
+        echo "WARN: could not find a working Xauthority for $TARGET_USER on DISPLAY=$_display."
+        echo "      phantom-server will start at next graphical login."
+        return 0
+    fi
+
+    _uid="$(id -u "$TARGET_USER" 2>/dev/null || true)"
+    _runtime="/run/user/$_uid"
+    _log_dir="$USER_HOME/.local/state/phantom"
+    _log="$_log_dir/phantom-server.log"
+
+    echo ""
+    echo "Starting phantom-server in the current graphical session..."
+    sudo -u "$TARGET_USER" mkdir -p "$_log_dir"
+    sudo -u "$TARGET_USER" env \
+        HOME="$USER_HOME" \
+        DISPLAY="$_display" \
+        XAUTHORITY="$_xauth" \
+        XDG_RUNTIME_DIR="$_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$_runtime/bus" \
+        sh -c '
+            pkill -x phantom-server 2>/dev/null || true
+            for i in 1 2 3 4 5; do
+                pgrep -x phantom-server >/dev/null 2>&1 || break
+                sleep 1
+            done
+            nohup "$1" --no-encrypt --transport tcp,web >> "$2" 2>&1 &
+        ' sh "$_bin" "$_log"
+
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        if pgrep -u "$_uid" -x phantom-server >/dev/null 2>&1 && linux_doctor_port_listening 9901; then
+            echo "  phantom-server started (log: $_log)"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "  WARN: phantom-server did not become ready immediately; check $_log"
+}
+
 # ===========================================================================
 # Linux server --autologin: GDM autologin + disable screen lock
 # + auto-unlock keyring. Target use case is remote VMs where the phantom
@@ -1522,6 +1615,7 @@ main() {
         if [ "$SSO" = true ]; then
             linux_install_sso
         fi
+        linux_start_server_now
     fi
 
     DOCTOR_STATUS=0
