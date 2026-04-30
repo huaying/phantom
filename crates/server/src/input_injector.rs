@@ -1,12 +1,14 @@
 use anyhow::Result;
-#[cfg(not(target_os = "windows"))]
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::POINT;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 /// Injects input events into the OS.
@@ -15,7 +17,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// desktop/window initialization path. Linux uses uinput for keyboard when
 /// available, falling back to enigo/XTest; other platforms use enigo.
 pub struct InputInjector {
-    #[cfg(not(target_os = "windows"))]
     enigo: Enigo,
     #[cfg(target_os = "linux")]
     uinput: Option<crate::input_uinput::UinputKeyboard>,
@@ -23,18 +24,24 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn new() -> Result<Self> {
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| anyhow::anyhow!("failed to init enigo: {e}"))?;
+
         #[cfg(target_os = "windows")]
         {
+            for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
+                let _ = enigo.key(key, Direction::Release);
+            }
             windows_release_modifiers();
-            tracing::info!("InputInjector initialized (Windows SendInput)");
-            Ok(Self {})
+            tracing::info!(
+                backend = %windows_backend_name(),
+                "InputInjector initialized (Windows hybrid input)"
+            );
+            return Ok(Self { enigo });
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            let mut enigo = Enigo::new(&Settings::default())
-                .map_err(|e| anyhow::anyhow!("failed to init enigo: {e}"))?;
-
             // Release all modifier keys to clear any stuck state from previous sessions
             for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
                 let _ = enigo.key(key, Direction::Release);
@@ -73,7 +80,14 @@ impl InputInjector {
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            windows_type_text(text)
+            if windows_use_enigo_for_current_desktop() {
+                self.enigo
+                    .text(text)
+                    .map_err(|e| anyhow::anyhow!("type text: {e}"))?;
+                Ok(())
+            } else {
+                windows_type_text(text)
+            }
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -88,82 +102,87 @@ impl InputInjector {
     pub fn inject(&mut self, event: &InputEvent) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            windows_inject(event)
+            if windows_use_enigo_for_current_desktop() {
+                self.inject_enigo(event)
+            } else {
+                windows_inject(event)
+            }
         }
 
         #[cfg(not(target_os = "windows"))]
         {
-            match event {
-                InputEvent::MouseMove { x, y } => {
-                    tracing::trace!(x, y, "mouse move");
+            self.inject_enigo(event)
+        }
+    }
+
+    fn inject_enigo(&mut self, event: &InputEvent) -> Result<()> {
+        match event {
+            InputEvent::MouseMove { x, y } => {
+                tracing::trace!(x, y, "mouse move");
+                self.enigo
+                    .move_mouse(*x, *y, Coordinate::Abs)
+                    .map_err(|e| anyhow::anyhow!("mouse move: {e}"))?;
+            }
+            InputEvent::MouseButton { button, pressed } => {
+                let btn = match button {
+                    MouseButton::Left => Button::Left,
+                    MouseButton::Right => Button::Right,
+                    MouseButton::Middle => Button::Middle,
+                };
+                let dir = if *pressed {
+                    Direction::Press
+                } else {
+                    Direction::Release
+                };
+                self.enigo
+                    .button(btn, dir)
+                    .map_err(|e| anyhow::anyhow!("mouse button: {e}"))?;
+            }
+            InputEvent::MouseScroll { dx, dy } => {
+                // dx/dy are line counts (1.0 = one scroll notch).
+                // enigo scroll(N) sends N button clicks (ScrollUp/Down/Left/Right).
+                if *dy != 0.0 {
                     self.enigo
-                        .move_mouse(*x, *y, Coordinate::Abs)
-                        .map_err(|e| anyhow::anyhow!("mouse move: {e}"))?;
+                        .scroll(*dy as i32, enigo::Axis::Vertical)
+                        .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
                 }
-                InputEvent::MouseButton { button, pressed } => {
-                    let btn = match button {
-                        MouseButton::Left => Button::Left,
-                        MouseButton::Right => Button::Right,
-                        MouseButton::Middle => Button::Middle,
-                    };
+                if *dx != 0.0 {
+                    self.enigo
+                        .scroll(*dx as i32, enigo::Axis::Horizontal)
+                        .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
+                }
+            }
+            InputEvent::Key { key, pressed } => {
+                #[cfg(target_os = "linux")]
+                if let Some(ref mut u) = self.uinput {
+                    tracing::trace!(?key, pressed, "key inject (uinput)");
+                    match u.inject_key(*key, *pressed) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            // Device died unexpectedly (e.g. module unloaded).
+                            // Drop to enigo path for this call and future ones.
+                            tracing::warn!("uinput inject failed: {e:#}; dropping uinput backend");
+                            self.uinput = None;
+                        }
+                    }
+                }
+                if let Some(enigo_key) = keycode_to_enigo(*key) {
                     let dir = if *pressed {
                         Direction::Press
                     } else {
                         Direction::Release
                     };
+                    tracing::trace!(?key, ?enigo_key, ?dir, "key inject (enigo)");
                     self.enigo
-                        .button(btn, dir)
-                        .map_err(|e| anyhow::anyhow!("mouse button: {e}"))?;
-                }
-                InputEvent::MouseScroll { dx, dy } => {
-                    // dx/dy are line counts (1.0 = one scroll notch).
-                    // enigo scroll(N) sends N button clicks (ScrollUp/Down/Left/Right).
-                    if *dy != 0.0 {
-                        self.enigo
-                            .scroll(*dy as i32, enigo::Axis::Vertical)
-                            .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
-                    }
-                    if *dx != 0.0 {
-                        self.enigo
-                            .scroll(*dx as i32, enigo::Axis::Horizontal)
-                            .map_err(|e| anyhow::anyhow!("scroll: {e}"))?;
-                    }
-                }
-                InputEvent::Key { key, pressed } => {
-                    #[cfg(target_os = "linux")]
-                    if let Some(ref mut u) = self.uinput {
-                        tracing::trace!(?key, pressed, "key inject (uinput)");
-                        match u.inject_key(*key, *pressed) {
-                            Ok(()) => return Ok(()),
-                            Err(e) => {
-                                // Device died unexpectedly (e.g. module unloaded).
-                                // Drop to enigo path for this call and future ones.
-                                tracing::warn!(
-                                    "uinput inject failed: {e:#}; dropping uinput backend"
-                                );
-                                self.uinput = None;
-                            }
-                        }
-                    }
-                    if let Some(enigo_key) = keycode_to_enigo(*key) {
-                        let dir = if *pressed {
-                            Direction::Press
-                        } else {
-                            Direction::Release
-                        };
-                        tracing::trace!(?key, ?enigo_key, ?dir, "key inject (enigo)");
-                        self.enigo
-                            .key(enigo_key, dir)
-                            .map_err(|e| anyhow::anyhow!("key: {e}"))?;
-                    }
+                        .key(enigo_key, dir)
+                        .map_err(|e| anyhow::anyhow!("key: {e}"))?;
                 }
             }
-            Ok(())
         }
+        Ok(())
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn keycode_to_enigo(key: KeyCode) -> Option<Key> {
     Some(match key {
         // Letters → Unicode
@@ -336,14 +355,7 @@ fn windows_type_text(text: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn windows_mouse_move(x: i32, y: i32) -> Result<()> {
-    let (vx, vy, vw, vh) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
-        )
-    };
+    let (vx, vy, vw, vh) = windows_virtual_screen();
     let nx = normalize_abs(x, vx, vw);
     let ny = normalize_abs(y, vy, vh);
     windows_send_input(&[mouse_input(
@@ -362,6 +374,18 @@ fn normalize_abs(value: i32, origin: i32, size: i32) -> i32 {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_virtual_screen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn windows_key(vk: VIRTUAL_KEY, pressed: bool, extended: bool) -> Result<()> {
     let mut flags = 0;
     if !pressed {
@@ -370,7 +394,8 @@ fn windows_key(vk: VIRTUAL_KEY, pressed: bool, extended: bool) -> Result<()> {
     if extended {
         flags |= KEYEVENTF_EXTENDEDKEY.0;
     }
-    windows_send_input(&[key_input(vk, 0, KEYBD_EVENT_FLAGS(flags))])
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC_EX) as u16 };
+    windows_send_input(&[key_input(vk, scan, KEYBD_EVENT_FLAGS(flags))])
 }
 
 #[cfg(target_os = "windows")]
@@ -434,6 +459,44 @@ fn windows_send_input(inputs: &[INPUT]) -> Result<()> {
             windows::core::Error::from_win32()
         ))
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_cursor_diagnostics() -> Option<((i32, i32), (i32, i32, i32, i32))> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }
+        .ok()
+        .map(|()| ((pt.x, pt.y), windows_virtual_screen()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_backend_name() -> &'static str {
+    match std::env::var("PHANTOM_WINDOWS_INPUT_BACKEND") {
+        Ok(v) if v.eq_ignore_ascii_case("enigo") => "enigo-forced",
+        Ok(v) if v.eq_ignore_ascii_case("native") || v.eq_ignore_ascii_case("sendinput") => {
+            "native-forced"
+        }
+        _ => "auto",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_use_enigo_for_current_desktop() -> bool {
+    match std::env::var("PHANTOM_WINDOWS_INPUT_BACKEND") {
+        Ok(v) if v.eq_ignore_ascii_case("enigo") => return true,
+        Ok(v) if v.eq_ignore_ascii_case("native") || v.eq_ignore_ascii_case("sendinput") => {
+            return false;
+        }
+        _ => {}
+    }
+
+    // v0.5.5 validated enigo's SendInput path on the normal user desktop.
+    // Keep the custom backend for Winlogon/secure desktops where enigo was
+    // historically unreliable.
+    crate::capture::gdi::current_input_desktop_name()
+        .as_deref()
+        .map(|name| name.eq_ignore_ascii_case("Default"))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]

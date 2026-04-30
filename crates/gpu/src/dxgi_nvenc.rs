@@ -312,9 +312,9 @@ impl DxgiNvencPipeline {
         self.force_idr = true;
     }
 
-    /// Force keyframe AND reset DXGI capture — use only for new session requests,
-    /// not for periodic keyframes. Resetting the duplicator is expensive and can
-    /// fail, causing the pipeline to die and reinit in a loop.
+    /// Force keyframe AND reset DXGI capture. Use only after display/topology
+    /// changes or explicit recovery; static-desktop timeouts are normal and a
+    /// new-session keyframe should usually only call `force_keyframe()`.
     pub fn force_keyframe_with_capture_reset(&mut self) {
         self.force_idr = true;
         match self.capture.reset() {

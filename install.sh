@@ -2,14 +2,21 @@
 # Phantom Remote Desktop — install script
 # Usage: curl -fsSL https://raw.githubusercontent.com/huaying/phantom/main/install.sh | sh
 #
-# Installs phantom-server and/or phantom-client to /usr/local/bin.
+# Installs phantom-server and/or phantom-client to /usr/local/bin by default.
 # On Linux, also installs required runtime libraries.
 
 set -e
 
 REPO="huaying/phantom"
-INSTALL_DIR="/usr/local/bin"
-BASE_URL="https://github.com/${REPO}/releases/latest/download"
+INSTALL_DIR="${PHANTOM_INSTALL_DIR:-/usr/local/bin}"
+# Test/CI can override the source without changing installer behavior:
+#   PHANTOM_SERVER_BIN=/tmp/phantom-server
+#   PHANTOM_CLIENT_BIN=/tmp/phantom-client
+#   PHANTOM_LOCAL_ASSET_DIR=/tmp/phantom-assets
+#   PHANTOM_ASSET_BASE_URL=http://10.0.0.1:8000
+#   PHANTOM_INSTALL_DIR=/tmp/phantom-bin
+BASE_URL="${PHANTOM_ASSET_BASE_URL:-https://github.com/${REPO}/releases/latest/download}"
+BASE_URL="${BASE_URL%/}"
 
 # ===========================================================================
 # Generic helpers
@@ -159,25 +166,53 @@ get_target_user() {
 
 download_and_install() {
     _name="$1"
-    _url="${BASE_URL}/${_name}-${OS}-${ARCH}"
+    _tmp="$(mktemp "/tmp/${_name}.XXXXXX")"
+    _asset="${_name}-${OS}-${ARCH}"
+    _url="${BASE_URL}/${_asset}"
 
-    echo "Downloading ${_name}..."
-    if have_cmd curl; then
-        curl -fsSL "$_url" -o "/tmp/${_name}"
-    elif have_cmd wget; then
-        wget -qO "/tmp/${_name}" "$_url"
+    _direct=""
+    case "$_name" in
+        phantom-server) _direct="${PHANTOM_SERVER_BIN:-}" ;;
+        phantom-client) _direct="${PHANTOM_CLIENT_BIN:-}" ;;
+    esac
+
+    if [ -n "$_direct" ]; then
+        if [ ! -f "$_direct" ]; then
+            echo "Error: local Phantom binary not found: $_direct"
+            exit 1
+        fi
+        echo "Using local ${_name}: $_direct"
+        cp "$_direct" "$_tmp"
+    elif [ -n "${PHANTOM_LOCAL_ASSET_DIR:-}" ]; then
+        if [ -f "${PHANTOM_LOCAL_ASSET_DIR}/${_asset}" ]; then
+            echo "Using local asset: ${PHANTOM_LOCAL_ASSET_DIR}/${_asset}"
+            cp "${PHANTOM_LOCAL_ASSET_DIR}/${_asset}" "$_tmp"
+        elif [ -f "${PHANTOM_LOCAL_ASSET_DIR}/${_name}" ]; then
+            echo "Using local asset: ${PHANTOM_LOCAL_ASSET_DIR}/${_name}"
+            cp "${PHANTOM_LOCAL_ASSET_DIR}/${_name}" "$_tmp"
+        else
+            echo "Error: ${_asset} not found in PHANTOM_LOCAL_ASSET_DIR=${PHANTOM_LOCAL_ASSET_DIR}"
+            exit 1
+        fi
     else
-        echo "Error: curl or wget required"; exit 1
+        echo "Downloading ${_name}..."
+        if have_cmd curl; then
+            curl -fsSL "$_url" -o "$_tmp"
+        elif have_cmd wget; then
+            wget -qO "$_tmp" "$_url"
+        else
+            echo "Error: curl or wget required"; exit 1
+        fi
     fi
 
-    chmod +x "/tmp/${_name}"
+    chmod +x "$_tmp"
 
     # Install — use sudo if needed
     if [ -w "$INSTALL_DIR" ]; then
-        mv "/tmp/${_name}" "${INSTALL_DIR}/${_name}"
+        mv "$_tmp" "${INSTALL_DIR}/${_name}"
     else
         echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "/tmp/${_name}" "${INSTALL_DIR}/${_name}"
+        sudo mv "$_tmp" "${INSTALL_DIR}/${_name}"
     fi
 
     echo "Installed: ${INSTALL_DIR}/${_name}"

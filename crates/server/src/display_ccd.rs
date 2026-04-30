@@ -133,6 +133,34 @@ pub fn is_vdd_primary(vdd_gdi_name: &str) -> bool {
     }
 }
 
+/// Human-readable active topology summary for Windows capture diagnostics.
+pub fn active_config_summary() -> Result<Vec<String>> {
+    let topo = query_active_config()?;
+    let mut lines = Vec::with_capacity(topo.paths.len());
+    for (idx, path) in topo.paths.iter().enumerate() {
+        let active = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+        let source_name = gdi_name_for_path(path).unwrap_or_else(|e| format!("<source-name: {e}>"));
+        let src_idx = source_mode_idx(path);
+        let source_mode = if src_idx < topo.modes.len()
+            && topo.modes[src_idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+        {
+            unsafe {
+                let src = topo.modes[src_idx].Anonymous.sourceMode;
+                format!(
+                    "{}x{} pos=({},{})",
+                    src.width, src.height, src.position.x, src.position.y
+                )
+            }
+        } else {
+            format!("source-mode-missing idx={src_idx}")
+        };
+        lines.push(format!(
+            "path[{idx}] active={active} source={source_name} {source_mode}"
+        ));
+    }
+    Ok(lines)
+}
+
 /// Make VDD the primary display by shifting all source-mode positions so VDD
 /// lands at (0,0). Physical displays stay active — they just move to positive
 /// coordinates (Windows treats the monitor at (0,0) as primary).

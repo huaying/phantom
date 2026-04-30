@@ -14,6 +14,7 @@ use anyhow::Result;
 use phantom_core::capture::FrameCapture;
 use phantom_core::frame::{Frame, PixelFormat};
 use std::time::Instant;
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     RedrawWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -96,7 +97,9 @@ pub fn nudge_desktop_repaint() {
 
 fn input_desktop_access() -> DESKTOP_ACCESS_FLAGS {
     DESKTOP_ACCESS_FLAGS(
-        DESKTOP_CREATEWINDOW.0
+        GENERIC_READ.0
+            | GENERIC_WRITE.0
+            | DESKTOP_CREATEWINDOW.0
             | DESKTOP_READOBJECTS.0
             | DESKTOP_WRITEOBJECTS.0
             | DESKTOP_SWITCHDESKTOP.0,

@@ -1,6 +1,8 @@
 //! DXGI Desktop Duplication capture — returns GPU-resident ID3D11Texture2D.
 //! Windows only. Zero CPU readback.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{bail, Context, Result};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -15,9 +17,16 @@ pub struct DxgiCapture {
     staging: ID3D11Texture2D,
     adapter: IDXGIAdapter1,
     output_idx: u32,
+    adapter_name: String,
+    output_device_name: String,
+    output_is_nvidia: bool,
+    output_matches_target: bool,
     pub width: u32,
     pub height: u32,
     frame_acquired: bool,
+    last_no_frame_log: Instant,
+    timeouts_since_log: u32,
+    zero_present_since_log: u32,
     #[allow(dead_code)]
     target_device: Option<String>,
 }
@@ -47,18 +56,20 @@ impl DxgiCapture {
     /// Create a new capture, optionally targeting a specific display device by name.
     /// When `target_device` is set (e.g. `\\.\DISPLAY10`), only that output is selected.
     /// This is how DCV/Parsec target their own VDD — by device name, not by resolution.
-    /// Falls back to highest-resolution NVIDIA output if target not found.
+    /// Falls back to highest-resolution NVIDIA output only when no explicit
+    /// target is requested. Explicit targets fail hard if they are not active.
     pub fn with_target_device(target_device: Option<&str>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
             // Enumerate ALL adapters and ALL outputs to find the best one.
-            // Strategy: if target set, prefer output matching target resolution.
-            // Otherwise pick the output with the highest resolution.
+            // Strategy: if target is set, it must match by GDI device name.
+            // Otherwise pick the highest-resolution NVIDIA output.
             struct Candidate {
                 adapter: IDXGIAdapter1,
                 adapter_name: String,
                 output_idx: u32,
+                device_name: String,
                 width: u32,
                 height: u32,
                 is_nvidia: bool,
@@ -66,6 +77,7 @@ impl DxgiCapture {
             }
 
             let mut best: Option<Candidate> = None;
+            let mut seen_outputs: Vec<String> = Vec::new();
 
             let mut adapter_idx = 0u32;
             while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
@@ -92,6 +104,10 @@ impl DxgiCapture {
                             .position(|&c| c == 0)
                             .unwrap_or(out_desc.DeviceName.len())],
                     );
+                    seen_outputs.push(format!(
+                        "adapter={} '{}' output={} device='{}' {}x{} nvidia={}",
+                        adapter_idx, adapter_name, output_idx, device_name, w, h, is_nvidia
+                    ));
                     tracing::info!(
                         adapter = adapter_idx,
                         output = output_idx,
@@ -127,6 +143,7 @@ impl DxgiCapture {
                             adapter: adapter.clone(),
                             adapter_name: adapter_name.clone(),
                             output_idx,
+                            device_name,
                             width: w,
                             height: h,
                             is_nvidia,
@@ -139,12 +156,24 @@ impl DxgiCapture {
             }
 
             let c = best.context("no DXGI adapter with active output found")?;
+            if let Some(target) = target_device {
+                if !c.matches_device {
+                    bail!(
+                        "DXGI target output '{}' was not found among active outputs: {}",
+                        target,
+                        seen_outputs.join("; ")
+                    );
+                }
+            }
             tracing::info!(
-                "Selected DXGI: {} output {} ({}x{})",
+                "Selected DXGI: {} output {} device {} ({}x{}, nvidia={}, target_match={})",
                 c.adapter_name,
                 c.output_idx,
+                c.device_name,
                 c.width,
-                c.height
+                c.height,
+                c.is_nvidia,
+                c.matches_device
             );
 
             let mut device = None;
@@ -207,9 +236,16 @@ impl DxgiCapture {
                 staging,
                 adapter: c.adapter,
                 output_idx: c.output_idx,
+                adapter_name: c.adapter_name,
+                output_device_name: c.device_name,
+                output_is_nvidia: c.is_nvidia,
+                output_matches_target: c.matches_device,
                 width,
                 height,
                 frame_acquired: false,
+                last_no_frame_log: Instant::now() - Duration::from_secs(10),
+                timeouts_since_log: 0,
+                zero_present_since_log: 0,
                 target_device: target_device.map(|s| s.to_string()),
             })
         }
@@ -222,7 +258,8 @@ impl DxgiCapture {
             let dup = self
                 .duplication
                 .as_ref()
-                .context("DXGI duplication not initialized")?;
+                .context("DXGI duplication not initialized")?
+                .clone();
 
             if self.frame_acquired {
                 dup.ReleaseFrame()?;
@@ -235,10 +272,15 @@ impl DxgiCapture {
             match dup.AcquireNextFrame(33, &mut frame_info, &mut resource) {
                 Ok(_) => {}
                 Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT => {
-                    return Ok(false)
+                    self.record_no_frame("timeout", None);
+                    return Ok(false);
                 }
-                Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST => {
-                    tracing::warn!("DXGI_ERROR_ACCESS_LOST — recreating");
+                Err(e)
+                    if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST
+                        || e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_DENIED =>
+                {
+                    tracing::warn!("DXGI duplication access lost/denied — recreating");
+                    drop(dup);
                     self.recreate()?;
                     return Ok(false);
                 }
@@ -247,19 +289,87 @@ impl DxgiCapture {
 
             self.frame_acquired = true;
 
-            if let Some(resource) = resource {
-                let texture: ID3D11Texture2D = resource.cast()?;
-                // GPU-to-GPU copy (~0.3ms)
-                self.context.CopyResource(&self.staging, &texture);
+            // Desktop Duplication can return S_OK for pointer-only/no-present
+            // updates. Encoding our staging texture in that case re-sends stale
+            // or initial black content. Treat it like WAIT_TIMEOUT and keep the
+            // last valid frame, matching WebRTC/RustDesk behavior.
+            if frame_info.AccumulatedFrames == 0
+                || frame_info.LastPresentTime == 0
+                || resource.is_none()
+            {
+                dup.ReleaseFrame()?;
+                self.frame_acquired = false;
+                self.record_no_frame("zero_present", Some(frame_info));
+                return Ok(false);
             }
+
+            let texture: ID3D11Texture2D = resource
+                .context("AcquireNextFrame returned no resource")?
+                .cast()?;
+            // GPU-to-GPU copy (~0.3ms)
+            self.context.CopyResource(&self.staging, &texture);
 
             Ok(true)
         }
     }
 
+    fn record_no_frame(&mut self, reason: &'static str, info: Option<DXGI_OUTDUPL_FRAME_INFO>) {
+        match reason {
+            "timeout" => self.timeouts_since_log = self.timeouts_since_log.saturating_add(1),
+            "zero_present" => {
+                self.zero_present_since_log = self.zero_present_since_log.saturating_add(1)
+            }
+            _ => {}
+        }
+
+        if self.last_no_frame_log.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+
+        match info {
+            Some(info) => tracing::info!(
+                target = %self.target_summary(),
+                reason,
+                timeouts = self.timeouts_since_log,
+                zero_present = self.zero_present_since_log,
+                accumulated_frames = info.AccumulatedFrames,
+                last_present_time = info.LastPresentTime,
+                last_mouse_update_time = info.LastMouseUpdateTime,
+                pointer_visible = info.PointerPosition.Visible.as_bool(),
+                pointer_x = info.PointerPosition.Position.x,
+                pointer_y = info.PointerPosition.Position.y,
+                "DXGI no present frame yet"
+            ),
+            None => tracing::info!(
+                target = %self.target_summary(),
+                reason,
+                timeouts = self.timeouts_since_log,
+                zero_present = self.zero_present_since_log,
+                "DXGI no present frame yet"
+            ),
+        }
+
+        self.timeouts_since_log = 0;
+        self.zero_present_since_log = 0;
+        self.last_no_frame_log = Instant::now();
+    }
+
     /// Get the staging texture pointer for NVENC registration.
     pub fn texture_ptr(&self) -> *mut std::ffi::c_void {
         unsafe { std::mem::transmute_copy(&self.staging) }
+    }
+
+    pub fn target_summary(&self) -> String {
+        format!(
+            "adapter='{}' output_device='{}' output={} size={}x{} nvidia={} target_match={}",
+            self.adapter_name,
+            self.output_device_name,
+            self.output_idx,
+            self.width,
+            self.height,
+            self.output_is_nvidia,
+            self.output_matches_target
+        )
     }
 
     /// Copy the latest GPU staging texture to a CPU-readable texture and sample

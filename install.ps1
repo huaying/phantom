@@ -4,17 +4,88 @@
 $ErrorActionPreference = "Stop"
 
 $repo = "huaying/phantom"
-$installDir = "$env:LOCALAPPDATA\phantom"
+$installDir = if ($env:PHANTOM_INSTALL_DIR) {
+    $env:PHANTOM_INSTALL_DIR
+} else {
+    "$env:LOCALAPPDATA\phantom"
+}
 
 # Create install directory
 if (!(Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-# Download binaries via `/releases/latest/download/NAME` redirect.
-# This avoids the GitHub API rate limit (60 unauthenticated req/hr/IP)
-# that `/repos/:owner/:repo/releases/latest` imposes.
-$baseUrl = "https://github.com/$repo/releases/latest/download"
+# Download binaries via `/releases/latest/download/NAME` redirect by default.
+# Test/CI can override the source without changing installer behavior:
+#   $env:PHANTOM_SERVER_EXE="C:\tmp\phantom-server.exe"
+#   $env:PHANTOM_CLIENT_EXE="C:\tmp\phantom-client.exe"
+#   $env:PHANTOM_LOCAL_ASSET_DIR="C:\tmp\phantom-assets"
+#   $env:PHANTOM_ASSET_BASE_URL="http://10.0.0.1:8000"
+#   $env:PHANTOM_INSTALL_DIR="C:\tmp\phantom-bin"
+#   $env:PHANTOM_NO_PATH=1
+$baseUrl = if ($env:PHANTOM_ASSET_BASE_URL) {
+    $env:PHANTOM_ASSET_BASE_URL.TrimEnd("/")
+} else {
+    "https://github.com/$repo/releases/latest/download"
+}
+
+function Copy-PhantomAsset {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [string]$Label
+    )
+
+    if (!(Test-Path $Source)) {
+        throw "local Phantom asset not found: $Source"
+    }
+
+    Write-Host "Using local $Label..." -ForegroundColor Cyan
+    Copy-Item -Path $Source -Destination $Destination -Force
+    Write-Host "  -> $Destination" -ForegroundColor Green
+}
+
+function Copy-PhantomAssetOverride {
+    param(
+        [string]$File,
+        [string]$LocalName,
+        [string]$Destination,
+        [bool]$Required
+    )
+
+    $direct = $null
+    if ($LocalName -eq "phantom-server.exe") {
+        $direct = $env:PHANTOM_SERVER_EXE
+    } elseif ($LocalName -eq "phantom-client.exe") {
+        $direct = $env:PHANTOM_CLIENT_EXE
+    }
+
+    if ($direct) {
+        Copy-PhantomAsset -Source $direct -Destination $Destination -Label $LocalName
+        return $true
+    }
+
+    if ($env:PHANTOM_LOCAL_ASSET_DIR) {
+        $candidates = @(
+            (Join-Path $env:PHANTOM_LOCAL_ASSET_DIR $File),
+            (Join-Path $env:PHANTOM_LOCAL_ASSET_DIR $LocalName)
+        )
+        foreach ($candidate in $candidates) {
+            if (Test-Path $candidate) {
+                Copy-PhantomAsset -Source $candidate -Destination $Destination -Label $File
+                return $true
+            }
+        }
+
+        if ($Required) {
+            throw "required Phantom asset not found in PHANTOM_LOCAL_ASSET_DIR: $File"
+        }
+        Write-Host "  -> Skipped optional local asset ($File not found in PHANTOM_LOCAL_ASSET_DIR)" -ForegroundColor Yellow
+        return $true
+    }
+
+    return $false
+}
 
 function Invoke-DownloadPhantomAsset {
     param(
@@ -23,8 +94,13 @@ function Invoke-DownloadPhantomAsset {
     )
 
     $localName = $File -replace "-windows-x86_64", ""
-    $url = "$baseUrl/$File"
     $dest = Join-Path $installDir $localName
+
+    if (Copy-PhantomAssetOverride -File $File -LocalName $localName -Destination $dest -Required $Required) {
+        return $true
+    }
+
+    $url = "$baseUrl/$File"
     Write-Host "Downloading $File..." -ForegroundColor Cyan
     try {
         Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -43,13 +119,20 @@ function Invoke-DownloadPhantomAsset {
 Invoke-DownloadPhantomAsset -File "phantom-server-windows-x86_64.exe" -Required $true | Out-Null
 Invoke-DownloadPhantomAsset -File "phantom-client-windows-x86_64.exe" -Required $false | Out-Null
 
-# Add to PATH if not already there
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$installDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
+$noPath = $env:PHANTOM_NO_PATH -eq "1"
+
+if ($noPath) {
     Write-Host ""
-    Write-Host "Added $installDir to your PATH." -ForegroundColor Green
-    Write-Host "Restart your terminal for PATH changes to take effect." -ForegroundColor Yellow
+    Write-Host "Skipping PATH update (PHANTOM_NO_PATH=1)." -ForegroundColor Yellow
+} else {
+    # Add to PATH if not already there
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($userPath -notlike "*$installDir*") {
+        [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
+        Write-Host ""
+        Write-Host "Added $installDir to your PATH." -ForegroundColor Green
+        Write-Host "Restart your terminal for PATH changes to take effect." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""
@@ -307,7 +390,7 @@ function Invoke-PhantomDoctor {
                 $probeCode = 1
             }
 
-            $interesting = $probeOutput | Select-String -Pattern "Phantom capture probe:|resolved:|gpu_probe:|zero_copy:|dxgi_nvenc:|fallback:|frame:|encode:|Capture probe result:|Error:|Caused by:"
+            $interesting = $probeOutput | Select-String -Pattern "Phantom capture probe:|resolved:|gpu_probe:|windows:|ccd:|display\[|zero_copy:|dxgi_nvenc:|fallback:|frame:|encode:|Capture probe result:|Error:|Caused by:"
             foreach ($line in $interesting) {
                 Write-Host "    $line" -ForegroundColor DarkGray
             }
@@ -368,14 +451,24 @@ function Invoke-PhantomDoctor {
 }
 
 $serverExe = Join-Path $installDir "phantom-server.exe"
+$serverExeExists = Test-Path $serverExe
 if ($noAutostart) {
     Write-Host ""
     Write-Host "Skipping service registration (PHANTOM_NO_AUTOSTART=1)." -ForegroundColor Yellow
     Write-Host "Register later with: phantom-server.exe --install" -ForegroundColor Cyan
-} elseif (-not (Test-Path $serverExe)) {
+} elseif (-not $serverExeExists) {
     Write-Host ""
-    Write-Host "phantom-server.exe not installed — skipping service registration." -ForegroundColor Yellow
-} elseif ($isAdmin) {
+    Write-Host "phantom-server.exe not installed - skipping service registration." -ForegroundColor Yellow
+} elseif (-not $isAdmin) {
+    Write-Host ""
+    Write-Host "Not running as Administrator - skipping service registration." -ForegroundColor Yellow
+    Write-Host "To finish the install (auto-start on boot, pre-login access), re-run in an" -ForegroundColor Yellow
+    Write-Host "elevated PowerShell, or run:" -ForegroundColor Yellow
+    Write-Host "  phantom-server.exe --install" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Or start the server ad-hoc (current user session only):" -ForegroundColor Yellow
+    Write-Host "  phantom-server.exe" -ForegroundColor Cyan
+} else {
     Write-Host ""
     Write-Host "Registering Windows Service + installing Virtual Display Driver..." -ForegroundColor Cyan
     & $serverExe --install
@@ -392,15 +485,6 @@ if ($noAutostart) {
         Write-Host "Re-run manually to see the error: phantom-server.exe --install" -ForegroundColor Cyan
         throw "phantom-server.exe --install failed with exit code $LASTEXITCODE"
     }
-} else {
-    Write-Host ""
-    Write-Host "Not running as Administrator — skipping service registration." -ForegroundColor Yellow
-    Write-Host "To finish the install (auto-start on boot, pre-login access), re-run in an" -ForegroundColor Yellow
-    Write-Host "elevated PowerShell, or run:" -ForegroundColor Yellow
-    Write-Host "  phantom-server.exe --install" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "Or start the server ad-hoc (current user session only):" -ForegroundColor Yellow
-    Write-Host "  phantom-server.exe" -ForegroundColor Cyan
 }
 
 if ($noDoctor) {
