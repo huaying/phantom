@@ -238,6 +238,13 @@ linux_install_deps() {
     fi
 }
 
+linux_apt_update_best_effort() {
+    if ! sudo apt-get update -qq; then
+        echo "Warning: apt-get update failed; continuing with existing package indexes."
+        echo "         Check /etc/apt/sources.list.d if package installation fails below."
+    fi
+}
+
 linux_install_deps_apt() {
     # Debian / Ubuntu
     _pkgs=""
@@ -250,7 +257,7 @@ linux_install_deps_apt() {
         _pkgs="$_pkgs libxcb1 libxcb-shm0 libxcb-randr0 libasound2"
     fi
     if [ -n "$_pkgs" ]; then
-        sudo apt-get update -qq
+        linux_apt_update_best_effort
         # shellcheck disable=SC2086 # package list must split into separate args
         sudo apt-get install -y --no-install-recommends $_pkgs || true
     fi
@@ -523,7 +530,7 @@ linux_setup_headless_display_profile() {
 linux_install_light_gui_apt() {
     echo ""
     echo "Installing lightweight GUI stack (XFCE + LightDM)..."
-    sudo apt-get update -qq
+    linux_apt_update_best_effort
     echo "lightdm shared/default-x-display-manager select lightdm" | sudo debconf-set-selections || true
     echo "/etc/X11/default-display-manager string /usr/sbin/lightdm" | sudo debconf-set-selections || true
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -561,7 +568,7 @@ EOF
 linux_setup_headless_dummy_apt() {
     echo ""
     echo "Installing headless X fallback (dummy screen)..."
-    sudo apt-get update -qq
+    linux_apt_update_best_effort
     sudo apt-get install -y --no-install-recommends xserver-xorg-video-dummy || true
     linux_install_dummy_xorg_conf
 }
