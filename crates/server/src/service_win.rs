@@ -1208,14 +1208,39 @@ fn is_valid_console_session_id(session_id: u32) -> bool {
 
 #[cfg(target_os = "windows")]
 fn detect_agent_desktop_kind(session_id: u32) -> AgentDesktopKind {
-    if session_is_locked(session_id).unwrap_or(false) {
-        return AgentDesktopKind::Winlogon;
+    // WTS lock state and explorer.exe can lead the real desktop during login:
+    // Windows may report "unlocked" and create explorer while Winlogon is still
+    // the visible/input desktop showing the login spinner. Follow the actual
+    // input desktop first, like VNC-style Windows services do.
+    if let Some(kind) = active_input_desktop_kind() {
+        return match kind {
+            AgentDesktopKind::Default => {
+                if find_process_in_session("explorer.exe", session_id).is_some() {
+                    AgentDesktopKind::Default
+                } else {
+                    AgentDesktopKind::Winlogon
+                }
+            }
+            AgentDesktopKind::Winlogon => AgentDesktopKind::Winlogon,
+        };
     }
 
     if find_process_in_session("explorer.exe", session_id).is_none() {
         AgentDesktopKind::Winlogon
+    } else if session_is_locked(session_id).unwrap_or(false) {
+        AgentDesktopKind::Winlogon
     } else {
         AgentDesktopKind::Default
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn active_input_desktop_kind() -> Option<AgentDesktopKind> {
+    let name = crate::capture::gdi::current_input_desktop_name()?;
+    if name.eq_ignore_ascii_case("Default") {
+        Some(AgentDesktopKind::Default)
+    } else {
+        Some(AgentDesktopKind::Winlogon)
     }
 }
 

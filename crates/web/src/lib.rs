@@ -165,6 +165,7 @@ struct AppState {
     rtc2_video_loop_generation: u32,
     rtc_generation: u32,
     rtc_reconnect_scheduled: bool,
+    ws_reconnect_delay_override_ms: Option<u32>,
     rtc_stats: Option<RtcBrowserStatsSnapshot>,
     rtc_stats_log: bool,
 }
@@ -385,6 +386,7 @@ pub fn main() {
         rtc2_video_loop_generation: 0,
         rtc_generation: 0,
         rtc_reconnect_scheduled: false,
+        ws_reconnect_delay_override_ms: None,
         rtc_stats: None,
         rtc_stats_log,
     }));
@@ -634,6 +636,16 @@ fn schedule_webrtc_reconnect(
     reason: &str,
 ) {
     let next_retry = (retry_ms * 2).min(5000);
+    schedule_webrtc_reconnect_after(state, generation, next_retry, next_retry, reason);
+}
+
+fn schedule_webrtc_reconnect_after(
+    state: &Rc<RefCell<AppState>>,
+    generation: u32,
+    delay_ms: u32,
+    next_retry_ms: u32,
+    reason: &str,
+) {
     let should_schedule = {
         let mut st = state.borrow_mut();
         if st.page_unloading || st.rtc_generation != generation || st.rtc_reconnect_scheduled {
@@ -650,7 +662,7 @@ fn schedule_webrtc_reconnect(
     }
 
     console::warn_1(
-        &format!("WebRTC disconnected ({reason}). Reconnecting in {next_retry}ms...").into(),
+        &format!("WebRTC disconnected ({reason}). Reconnecting in {delay_ms}ms...").into(),
     );
     let s = state.clone();
     let cb = Closure::<dyn FnMut()>::once(move || {
@@ -660,12 +672,12 @@ fn schedule_webrtc_reconnect(
                 return;
             }
         }
-        setup_webrtc(&s, next_retry);
+        setup_webrtc(&s, next_retry_ms);
     });
     let window = web_sys::window().unwrap();
     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
         cb.as_ref().unchecked_ref(),
-        next_retry as i32,
+        delay_ms as i32,
     );
     cb.forget();
 }
@@ -1342,7 +1354,7 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
         let s = state.clone();
         let next_retry = (retry_ms * 2).min(5000); // cap at 5s
         let cb = Closure::<dyn FnMut()>::new(move || {
-            let should_reconnect = {
+            let (should_reconnect, reconnect_delay, reconnect_retry) = {
                 let mut st = s.borrow_mut();
                 st.frame_count = 0;
                 st.got_keyframe = false;
@@ -1352,13 +1364,20 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
                 st.send_input_dc = None;
                 st.send_control_dc = None;
                 st.send_ws = None;
-                !st.page_unloading
+                let override_delay = st.ws_reconnect_delay_override_ms.take();
+                let delay = override_delay.unwrap_or(next_retry);
+                let retry = if override_delay.is_some() {
+                    retry_ms
+                } else {
+                    next_retry
+                };
+                (!st.page_unloading, delay, retry)
             };
             if should_reconnect {
                 console::warn_1(
-                    &format!("WebSocket closed. Reconnecting in {}ms...", next_retry).into(),
+                    &format!("WebSocket closed. Reconnecting in {}ms...", reconnect_delay).into(),
                 );
-                schedule_reconnect(&s, next_retry);
+                schedule_reconnect_after(&s, reconnect_delay, reconnect_retry);
             } else {
                 console::log_1(&"WebSocket closed during page unload; not reconnecting".into());
             }
@@ -1380,6 +1399,10 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
 }
 
 fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
+    schedule_reconnect_after(state, delay_ms, delay_ms);
+}
+
+fn schedule_reconnect_after(state: &Rc<RefCell<AppState>>, delay_ms: u32, retry_ms: u32) {
     let s = state.clone();
     let cb = Closure::<dyn FnMut()>::once(move || {
         // Re-extract token from page URL for reconnect
@@ -1397,7 +1420,7 @@ fn schedule_reconnect(state: &Rc<RefCell<AppState>>, delay_ms: u32) {
             }
         });
         let url = ws_url(&token);
-        connect_ws(&s, &url, delay_ms);
+        connect_ws(&s, &url, retry_ms);
     });
     let window = web_sys::window().unwrap();
     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -1569,6 +1592,12 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
                     // Ghost disconnects are intentional. Do not let an old tab
                     // auto-reconnect forever and keep stealing/resetting sessions.
                     s.page_unloading = true;
+                } else if !use_rtc {
+                    // Server-initiated disconnects usually mean the Windows
+                    // service is moving between Winlogon and Default desktops.
+                    // Reconnect immediately instead of applying network-error
+                    // backoff, otherwise the login spinner looks frozen.
+                    s.ws_reconnect_delay_override_ms = Some(0);
                 }
                 if let Some(ws) = s.send_ws.take() {
                     let _ = ws.close();
@@ -1584,9 +1613,10 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             }
             if use_rtc && !terminal {
                 let generation = state.borrow().rtc_generation;
-                schedule_webrtc_reconnect(
+                schedule_webrtc_reconnect_after(
                     state,
                     generation,
+                    0,
                     1000,
                     &format!("server disconnect: {reason}"),
                 );
