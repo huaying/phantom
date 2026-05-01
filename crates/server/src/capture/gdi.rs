@@ -13,21 +13,48 @@
 use anyhow::Result;
 use phantom_core::capture::FrameCapture;
 use phantom_core::frame::{Frame, PixelFormat};
+use std::cell::RefCell;
 use std::time::Instant;
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     RedrawWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
-    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS,
-    DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, UOI_NAME,
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_CREATEMENU, DESKTOP_CREATEWINDOW,
+    DESKTOP_ENUMERATE, DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
+    DESKTOP_WRITEOBJECTS, HDESK, UOI_NAME,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
 };
+
+thread_local! {
+    static SELECTED_INPUT_DESKTOP: RefCell<Option<HDESK>> = RefCell::new(None);
+}
+
+fn desktop_name(hdesk: HDESK) -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 256];
+        let mut needed: u32 = 0;
+        let ok = GetUserObjectInformationW(
+            HANDLE(hdesk.0),
+            UOI_NAME,
+            Some(buf.as_mut_ptr() as *mut _),
+            (buf.len() * 2) as u32,
+            Some(&mut needed),
+        )
+        .is_ok();
+        if !ok {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..end]))
+    }
+}
 
 /// Switch the current thread to whichever desktop is receiving input.
 /// Used by both GdiCapture and the agent loop to follow desktop switches
@@ -44,9 +71,43 @@ pub fn switch_to_input_desktop() -> bool {
             Ok(d) => d,
             Err(_) => return false,
         };
-        let ok = SetThreadDesktop(hdesk).is_ok();
-        let _ = CloseDesktop(hdesk);
-        ok
+        let current = GetThreadDesktop(GetCurrentThreadId()).ok();
+        if current
+            .and_then(desktop_name)
+            .zip(desktop_name(hdesk))
+            .is_some_and(|(cur, input)| cur == input)
+        {
+            let _ = CloseDesktop(hdesk);
+            return true;
+        }
+
+        if SetThreadDesktop(hdesk).is_err() {
+            let _ = CloseDesktop(hdesk);
+            return false;
+        }
+
+        // Keep the newly-selected input desktop handle open for the thread.
+        // Closing it immediately can leave later GDI/input calls attached to a
+        // desktop handle we just invalidated during lock/unlock transitions.
+        SELECTED_INPUT_DESKTOP.with(|selected| {
+            if let Some(old) = selected.replace(Some(hdesk)) {
+                if old.0 != hdesk.0 {
+                    let _ = CloseDesktop(old);
+                }
+            }
+        });
+        true
+    }
+}
+
+/// Get the desktop currently selected on this thread. This is distinct from
+/// the active input desktop during lock/logout transitions and is useful for
+/// diagnosing SetThreadDesktop failures.
+pub fn current_thread_desktop_name() -> Option<String> {
+    unsafe {
+        GetThreadDesktop(GetCurrentThreadId())
+            .ok()
+            .and_then(desktop_name)
     }
 }
 
@@ -57,23 +118,11 @@ pub fn switch_to_input_desktop() -> bool {
 /// keep returning stale frames from the wrong desktop after a switch.
 pub fn current_input_desktop_name() -> Option<String> {
     unsafe {
-        let hdesk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
-        let mut buf = [0u16; 256];
-        let mut needed: u32 = 0;
-        let ok = GetUserObjectInformationW(
-            windows::Win32::Foundation::HANDLE(hdesk.0),
-            UOI_NAME,
-            Some(buf.as_mut_ptr() as *mut _),
-            (buf.len() * 2) as u32,
-            Some(&mut needed),
-        )
-        .is_ok();
+        let hdesk =
+            OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, input_desktop_access()).ok()?;
+        let name = desktop_name(hdesk);
         let _ = CloseDesktop(hdesk);
-        if !ok {
-            return None;
-        }
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        Some(String::from_utf16_lossy(&buf[..end]))
+        name
     }
 }
 
@@ -99,7 +148,10 @@ fn input_desktop_access() -> DESKTOP_ACCESS_FLAGS {
     DESKTOP_ACCESS_FLAGS(
         GENERIC_READ.0
             | GENERIC_WRITE.0
+            | DESKTOP_CREATEMENU.0
             | DESKTOP_CREATEWINDOW.0
+            | DESKTOP_ENUMERATE.0
+            | DESKTOP_HOOKCONTROL.0
             | DESKTOP_READOBJECTS.0
             | DESKTOP_WRITEOBJECTS.0
             | DESKTOP_SWITCHDESKTOP.0,

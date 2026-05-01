@@ -653,14 +653,21 @@ mod platform {
         }
 
         pub fn disconnect(&mut self) {
-            self.shutdown.store(true, Ordering::SeqCst);
             if self.connected {
+                // Ask the agent to exit before breaking the pipe. The write
+                // thread checks `shutdown_requested` inside its loop; setting
+                // `shutdown` first makes it exit before the shutdown message
+                // can be sent.
                 let _ = self.send_shutdown();
+                std::thread::sleep(Duration::from_millis(250));
+                self.shutdown.store(true, Ordering::SeqCst);
                 unsafe {
                     let _ = DisconnectNamedPipe(self.up_handle);
                     let _ = DisconnectNamedPipe(self.down_handle);
                 }
                 self.connected = false;
+            } else {
+                self.shutdown.store(true, Ordering::SeqCst);
             }
             self.frame_rx = None;
             *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;

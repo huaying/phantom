@@ -138,6 +138,7 @@ struct AppState {
     send_input_dc: Option<web_sys::RtcDataChannel>,
     /// For reliable control/file-transfer traffic in WebRTC mode.
     send_control_dc: Option<web_sys::RtcDataChannel>,
+    rtc_pc: Option<web_sys::RtcPeerConnection>,
     send_ws: Option<WebSocket>,
     /// Latest stats from server (for overlay display).
     last_stats: Option<StatsSnapshot>,
@@ -150,6 +151,8 @@ struct AppState {
     /// Set during page unload/navigation so old sockets don't auto-reconnect
     /// and race the replacement page.
     page_unloading: bool,
+    use_rtc: bool,
+    auth_token: Option<String>,
     /// Stable per-tab client id. Server uses this to distinguish an
     /// auto-reconnect (same id → accepted) from a fresh client (different
     /// id → takes over). Page reload yields a new id because we keep it
@@ -160,6 +163,8 @@ struct AppState {
     rtc2_video_el: Option<HtmlVideoElement>,
     rtc2_audio_el: Option<HtmlAudioElement>,
     rtc2_video_loop_generation: u32,
+    rtc_generation: u32,
+    rtc_reconnect_scheduled: bool,
     rtc_stats: Option<RtcBrowserStatsSnapshot>,
     rtc_stats_log: bool,
 }
@@ -363,18 +368,23 @@ pub fn main() {
         control_assembler: ChunkAssembler::new(),
         send_input_dc: None,
         send_control_dc: None,
+        rtc_pc: None,
         send_ws: None,
         last_stats: None,
         audio_decoder: None,
         audio_ctx: None,
         audio_timestamp_us: 0,
         page_unloading: false,
+        use_rtc,
+        auth_token: auth_token.clone(),
         client_id: gen_client_id(),
         user_gesture_seen: false,
         rtc2_media_active: false,
         rtc2_video_el: None,
         rtc2_audio_el: None,
         rtc2_video_loop_generation: 0,
+        rtc_generation: 0,
+        rtc_reconnect_scheduled: false,
         rtc_stats: None,
         rtc_stats_log,
     }));
@@ -389,7 +399,7 @@ pub fn main() {
     setup_input(&canvas, &document, &state);
 
     if use_rtc {
-        setup_webrtc(&state, &auth_token);
+        setup_webrtc(&state, 1000);
     } else {
         setup_ws(&state, &auth_token);
     }
@@ -397,8 +407,10 @@ pub fn main() {
 
 async fn complete_rtc_offer(
     pc: web_sys::RtcPeerConnection,
-    auth_token: Option<String>,
+    state: Rc<RefCell<AppState>>,
     transport_mode: &str,
+    generation: u32,
+    retry_ms: u32,
 ) {
     use web_sys::{RtcSdpType, RtcSessionDescriptionInit};
 
@@ -406,6 +418,7 @@ async fn complete_rtc_offer(
         Ok(o) => o,
         Err(e) => {
             console::error_1(&format!("createOffer: {:?}", e).into());
+            schedule_webrtc_reconnect(&state, generation, retry_ms, "createOffer failed");
             return;
         }
     };
@@ -416,6 +429,7 @@ async fn complete_rtc_offer(
     desc.set_sdp(&sdp_str);
     if let Err(e) = wasm_bindgen_futures::JsFuture::from(pc.set_local_description(&desc)).await {
         console::error_1(&format!("setLocalDescription: {:?}", e).into());
+        schedule_webrtc_reconnect(&state, generation, retry_ms, "setLocalDescription failed");
         return;
     }
 
@@ -446,6 +460,7 @@ async fn complete_rtc_offer(
     headers.set("Content-Type", "application/json").unwrap();
     request_init.set_headers(&headers);
 
+    let auth_token = state.borrow().auth_token.clone();
     let rtc_url = match auth_token {
         Some(token) => format!("/rtc?token={token}"),
         None => "/rtc".to_string(),
@@ -458,6 +473,7 @@ async fn complete_rtc_offer(
         Ok(r) => r,
         Err(e) => {
             console::error_1(&format!("POST /rtc failed: {:?}", e).into());
+            schedule_webrtc_reconnect(&state, generation, retry_ms, "POST /rtc failed");
             return;
         }
     };
@@ -465,6 +481,7 @@ async fn complete_rtc_offer(
     let resp: web_sys::Response = resp.dyn_into().unwrap();
     if !resp.ok() {
         console::error_1(&format!("POST /rtc status: {}", resp.status()).into());
+        schedule_webrtc_reconnect(&state, generation, retry_ms, "POST /rtc bad status");
         return;
     }
 
@@ -472,6 +489,7 @@ async fn complete_rtc_offer(
         Ok(j) => j,
         Err(e) => {
             console::error_1(&format!("parse answer: {:?}", e).into());
+            schedule_webrtc_reconnect(&state, generation, retry_ms, "parse RTC answer failed");
             return;
         }
     };
@@ -484,6 +502,7 @@ async fn complete_rtc_offer(
         wasm_bindgen_futures::JsFuture::from(pc.set_remote_description(&answer_desc)).await
     {
         console::error_1(&format!("setRemoteDescription: {:?}", e).into());
+        schedule_webrtc_reconnect(&state, generation, retry_ms, "setRemoteDescription failed");
         return;
     }
 
@@ -521,10 +540,96 @@ async fn wait_for_ice_complete(pc: &web_sys::RtcPeerConnection, timeout_ms: i32)
     }
 }
 
-fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
+fn remove_rtc_media_element<T>(element: Option<T>)
+where
+    T: AsRef<web_sys::Node>,
+{
+    if let Some(element) = element {
+        if let Some(parent) = element.as_ref().parent_node() {
+            let _ = parent.remove_child(element.as_ref());
+        }
+    }
+}
+
+fn reset_rtc_runtime(st: &mut AppState) {
+    if let Some(pc) = st.rtc_pc.take() {
+        pc.close();
+    }
+    if let Some(dc) = st.send_input_dc.take() {
+        dc.close();
+    }
+    if let Some(dc) = st.send_control_dc.take() {
+        dc.close();
+    }
+    remove_rtc_media_element(st.rtc2_video_el.take());
+    remove_rtc_media_element(st.rtc2_audio_el.take());
+    st.frame_count = 0;
+    st.got_keyframe = false;
+    st.waiting_for_keyframe_fence = false;
+    st.drop_until_keyframe = false;
+    st.decoder = None;
+    st.control_assembler = ChunkAssembler::new();
+    st.rtc2_media_active = false;
+    st.rtc2_video_loop_generation = st.rtc2_video_loop_generation.wrapping_add(1);
+    st.rtc_stats = None;
+}
+
+fn schedule_webrtc_reconnect(
+    state: &Rc<RefCell<AppState>>,
+    generation: u32,
+    retry_ms: u32,
+    reason: &str,
+) {
+    let next_retry = (retry_ms * 2).min(5000);
+    let should_schedule = {
+        let mut st = state.borrow_mut();
+        if st.page_unloading || st.rtc_generation != generation || st.rtc_reconnect_scheduled {
+            false
+        } else {
+            st.rtc_reconnect_scheduled = true;
+            reset_rtc_runtime(&mut st);
+            update_debug_snapshot(&st);
+            true
+        }
+    };
+    if !should_schedule {
+        return;
+    }
+
+    console::warn_1(
+        &format!("WebRTC disconnected ({reason}). Reconnecting in {next_retry}ms...").into(),
+    );
+    let s = state.clone();
+    let cb = Closure::<dyn FnMut()>::once(move || {
+        {
+            let st = s.borrow();
+            if st.page_unloading || st.rtc_generation != generation || !st.rtc_reconnect_scheduled {
+                return;
+            }
+        }
+        setup_webrtc(&s, next_retry);
+    });
+    let window = web_sys::window().unwrap();
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        cb.as_ref().unchecked_ref(),
+        next_retry as i32,
+    );
+    cb.forget();
+}
+
+fn setup_webrtc(state: &Rc<RefCell<AppState>>, retry_ms: u32) {
     use web_sys::{
         RtcConfiguration, RtcDataChannelInit, RtcPeerConnection, RtcRtpTransceiverDirection,
         RtcRtpTransceiverInit,
+    };
+
+    let generation = {
+        let mut st = state.borrow_mut();
+        st.rtc_generation = st.rtc_generation.wrapping_add(1);
+        st.rtc_reconnect_scheduled = false;
+        reset_rtc_runtime(&mut st);
+        update_debug_snapshot(&st);
+        st.rtc_generation
     };
 
     let config = RtcConfiguration::new();
@@ -532,6 +637,7 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
         Ok(pc) => pc,
         Err(e) => {
             console::error_1(&format!("WebRTC not available: {:?}", e).into());
+            schedule_webrtc_reconnect(state, generation, retry_ms, "PeerConnection unavailable");
             return;
         }
     };
@@ -552,11 +658,61 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
 
     {
         let mut st = state.borrow_mut();
+        st.rtc_pc = Some(pc.clone());
         st.send_input_dc = Some(input_dc.clone());
         st.send_control_dc = Some(control_dc.clone());
         update_debug_snapshot(&st);
     }
     start_rtc_stats_loop(pc.clone(), state.clone());
+
+    {
+        let s = state.clone();
+        let pc_for_close = pc.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let state_name = js_sys::Reflect::get(pc_for_close.as_ref(), &"connectionState".into())
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            if matches!(state_name.as_str(), "failed" | "closed" | "disconnected") {
+                pc_for_close.close();
+                schedule_webrtc_reconnect(
+                    &s,
+                    generation,
+                    retry_ms,
+                    &format!("connectionState={state_name}"),
+                );
+            }
+        });
+        let _ = pc
+            .add_event_listener_with_callback("connectionstatechange", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    {
+        let s = state.clone();
+        let pc_for_close = pc.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let state_name =
+                js_sys::Reflect::get(pc_for_close.as_ref(), &"iceConnectionState".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+            if matches!(state_name.as_str(), "failed" | "closed" | "disconnected") {
+                pc_for_close.close();
+                schedule_webrtc_reconnect(
+                    &s,
+                    generation,
+                    retry_ms,
+                    &format!("iceConnectionState={state_name}"),
+                );
+            }
+        });
+        let _ = pc.add_event_listener_with_callback(
+            "iceconnectionstatechange",
+            cb.as_ref().unchecked_ref(),
+        );
+        cb.forget();
+    }
 
     {
         let s = state.clone();
@@ -575,8 +731,30 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
 
     {
         let s = state.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            schedule_webrtc_reconnect(&s, generation, retry_ms, "control data channel closed");
+        });
+        control_dc.set_onclose(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    {
+        let s = state.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            schedule_webrtc_reconnect(&s, generation, retry_ms, "input data channel closed");
+        });
+        input_dc.set_onclose(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+
+    {
+        let s = state.clone();
         let dc = control_dc.clone();
         let cb = Closure::<dyn FnMut()>::new(move || {
+            {
+                let mut st = s.borrow_mut();
+                st.rtc_reconnect_scheduled = false;
+            }
             let id = s.borrow().client_id;
             let (pw, ph) = preferred_viewport();
             let msg = Message::ClientHello {
@@ -617,9 +795,9 @@ fn setup_webrtc(state: &Rc<RefCell<AppState>>, auth_token: &Option<String>) {
     }
 
     let pc2 = pc.clone();
-    let auth_token = auth_token.clone();
+    let s = state.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        complete_rtc_offer(pc2, auth_token, "media_tracks_v1_compat").await;
+        complete_rtc_offer(pc2, s, "media_tracks_v1_compat", generation, retry_ms).await;
     });
 
     js_sys::Reflect::set(&js_sys::global(), &"__phantom_pc".into(), &pc).unwrap();
@@ -1293,12 +1471,35 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
         }
         Message::Disconnect { reason } => {
             console::warn_1(&format!("server disconnected this client: {reason}").into());
-            let mut s = state.borrow_mut();
-            // Replacement/ghost disconnects are intentional. Do not let an old
-            // tab auto-reconnect forever and keep stealing/resetting sessions.
-            s.page_unloading = true;
-            if let Some(ws) = s.send_ws.take() {
-                let _ = ws.close();
+            let terminal = reason.contains("ghost client rejected");
+            let use_rtc = state.borrow().use_rtc;
+            {
+                let mut s = state.borrow_mut();
+                if terminal {
+                    // Ghost disconnects are intentional. Do not let an old tab
+                    // auto-reconnect forever and keep stealing/resetting sessions.
+                    s.page_unloading = true;
+                }
+                if let Some(ws) = s.send_ws.take() {
+                    let _ = ws.close();
+                }
+                if use_rtc {
+                    if let Some(dc) = s.send_control_dc.take() {
+                        dc.close();
+                    }
+                    if let Some(dc) = s.send_input_dc.take() {
+                        dc.close();
+                    }
+                }
+            }
+            if use_rtc && !terminal {
+                let generation = state.borrow().rtc_generation;
+                schedule_webrtc_reconnect(
+                    state,
+                    generation,
+                    1000,
+                    &format!("server disconnect: {reason}"),
+                );
             }
         }
         Message::ClipboardSync(text) => {

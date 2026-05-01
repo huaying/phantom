@@ -1738,8 +1738,10 @@ fn run_agent_mode(ipc_session: Option<u32>) -> Result<()> {
 
     // Agent has no console (spawned by the service). Set up tracing to write
     // to a log file in the system temp directory instead of stdout.
-    let log_file = std::env::temp_dir().join("phantom-agent.log");
-    if let Ok(file) = std::fs::File::create(&log_file) {
+    let log_file = std::path::PathBuf::from(r"C:\Windows\Temp\phantom-agent.log");
+    let file = std::fs::File::create(&log_file)
+        .or_else(|_| std::fs::File::create(std::env::temp_dir().join("phantom-agent.log")));
+    if let Ok(file) = file {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -2418,7 +2420,9 @@ impl Drop for TopologyGuard {
 #[cfg(target_os = "windows")]
 struct DesktopState {
     on_winlogon: bool,
+    transition_unavailable: bool,
     changed_after_initial: bool,
+    desktop_name: Option<String>,
 }
 
 #[cfg(target_os = "windows")]
@@ -2427,6 +2431,8 @@ struct WindowsDisplayState {
     vdd_primary_active: bool,
     topology_guard: TopologyGuard,
     last_desktop_name: Option<String>,
+    desktop_sample_seen: bool,
+    last_desktop_transition_log: Instant,
 }
 
 #[cfg(target_os = "windows")]
@@ -2459,6 +2465,8 @@ impl WindowsDisplayState {
             vdd_primary_active: false,
             topology_guard: TopologyGuard(None),
             last_desktop_name: None,
+            desktop_sample_seen: false,
+            last_desktop_transition_log: instant_ago(Duration::from_secs(10)),
         }
     }
 
@@ -2467,22 +2475,42 @@ impl WindowsDisplayState {
     }
 
     fn refresh_desktop(&mut self) -> DesktopState {
-        let cur_desktop = capture::gdi::current_input_desktop_name();
+        let input_desktop = capture::gdi::current_input_desktop_name();
+        let switch_ok = input_desktop.is_some() && capture::gdi::switch_to_input_desktop();
+        let thread_desktop = capture::gdi::current_thread_desktop_name();
+        let effective_desktop = input_desktop.clone().or_else(|| thread_desktop.clone());
         let changed_after_initial =
-            cur_desktop != self.last_desktop_name && self.last_desktop_name.is_some();
-        if changed_after_initial {
+            self.desktop_sample_seen && effective_desktop != self.last_desktop_name;
+        let transition_unavailable = effective_desktop.is_none()
+            || (input_desktop.is_some() && !switch_ok && input_desktop != thread_desktop);
+        if changed_after_initial
+            || (transition_unavailable
+                && self.last_desktop_transition_log.elapsed() >= Duration::from_secs(2))
+        {
             crate::service_win::svc_log(&format!(
-                "Input desktop changed: {:?} → {:?} — resetting capture",
-                self.last_desktop_name, cur_desktop
+                "Input desktop state: input={:?} thread={:?} switch_ok={} previous={:?} - {}",
+                input_desktop,
+                thread_desktop,
+                switch_ok,
+                self.last_desktop_name,
+                if transition_unavailable {
+                    "holding capture during desktop transition"
+                } else {
+                    "resetting capture"
+                }
             ));
+            self.last_desktop_transition_log = Instant::now();
         }
-        let on_winlogon = cur_desktop
+        let on_winlogon = effective_desktop
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case("Winlogon"));
-        self.last_desktop_name = cur_desktop;
+        self.last_desktop_name = effective_desktop.clone();
+        self.desktop_sample_seen = true;
         DesktopState {
             on_winlogon,
+            transition_unavailable,
             changed_after_initial,
+            desktop_name: effective_desktop,
         }
     }
 
@@ -2789,6 +2817,24 @@ fn run_agent_loop(
                     && gpu_recovery.can_try_tier1());
 
             if should_prewarm_gpu {
+                let idle_desktop = capture::gdi::current_input_desktop_name()
+                    .or_else(capture::gdi::current_thread_desktop_name);
+                if idle_desktop
+                    .as_deref()
+                    .is_none_or(|name| !name.eq_ignore_ascii_case("Default"))
+                {
+                    idle_gpu_prewarm_suspended = true;
+                    gpu_prewarm_started_at = None;
+                    if last_gpu_prewarm_log.elapsed() >= Duration::from_secs(5) {
+                        crate::service_win::svc_log(&format!(
+                            "viewer idle: skipping Tier 1 prewarm on desktop {:?}",
+                            idle_desktop
+                        ));
+                        last_gpu_prewarm_log = Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
                 let prewarm_started = gpu_prewarm_started_at.get_or_insert_with(Instant::now);
                 if last_gpu_prewarm_log.elapsed() >= Duration::from_secs(5) {
                     crate::service_win::svc_log(
@@ -2844,7 +2890,6 @@ fn run_agent_loop(
             }
         }
 
-        capture::gdi::switch_to_input_desktop();
         // Detect desktop switch (Winlogon ↔ Default): if changed, force reset
         // of all capture pipelines so the new duplication targets the right
         // desktop. Without this, after lock→unlock the client keeps seeing
@@ -2861,6 +2906,11 @@ fn run_agent_loop(
             idle_gpu_prewarm_suspended = false;
             gpu_recovery.reset();
             last_init_attempt = instant_ago(Duration::from_secs(10));
+        }
+
+        if desktop_state.transition_unavailable {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
 
         // Handle resolution change requests before capture init. A new viewer
@@ -3024,6 +3074,14 @@ fn run_agent_loop(
                 Err(e) => {
                     gpu_prewarm_ready = false;
                     gpu_prewarm_started_at = None;
+                    if !viewer_active {
+                        idle_gpu_prewarm_suspended = true;
+                        crate::service_win::svc_log(&format!(
+                            "viewer idle: Tier 1 prewarm unavailable on desktop {:?}: {e:#}",
+                            desktop_state.desktop_name
+                        ));
+                        continue;
+                    }
                     activate_cpu_fallback(
                         &format!("Tier 1 DXGI/NVENC unavailable: {e:#}"),
                         &mut cpu_encoder,
@@ -3332,6 +3390,15 @@ fn run_agent_loop(
                                 mode = capture_mode,
                                 "DXGI CPU frame"
                             );
+                            crate::service_win::svc_log(&format!(
+                                "{} frame {}: {}x{} keyframe={} bytes={}",
+                                capture_mode,
+                                frame_count,
+                                width,
+                                height,
+                                encoded.is_keyframe,
+                                encoded.data.len()
+                            ));
                         }
                         if encoded.is_keyframe {
                             last_keyframe = Instant::now();
@@ -3342,7 +3409,10 @@ fn run_agent_loop(
                         }
                         scrap_waiting_for_frame_since = None;
                     }
-                    Err(e) => tracing::warn!("ScrapCapture encode error: {e}"),
+                    Err(e) => {
+                        crate::service_win::svc_log(&format!("ScrapCapture encode error: {e:#}"));
+                        tracing::warn!("ScrapCapture encode error: {e}");
+                    }
                 },
                 Ok(None) => {
                     if scrap_waiting_for_frame_since
@@ -3374,6 +3444,9 @@ fn run_agent_loop(
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
+                    crate::service_win::svc_log(&format!(
+                        "ScrapCapture error: {e:#}; switching to GDI"
+                    ));
                     tracing::warn!("ScrapCapture error: {e}, switching to GDI");
                     scrap_capture = None;
                     cpu_encoder = None;
@@ -3407,21 +3480,34 @@ fn run_agent_loop(
                                 keyframe = encoded.is_keyframe,
                                 "GDI frame"
                             );
+                            crate::service_win::svc_log(&format!(
+                                "GDI frame {}: {}x{} keyframe={} bytes={}",
+                                frame_count,
+                                width,
+                                height,
+                                encoded.is_keyframe,
+                                encoded.data.len()
+                            ));
                         }
                         if encoded.is_keyframe {
                             last_keyframe = Instant::now();
                         }
                         if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                            crate::service_win::svc_log(&format!("GDI IPC send failed: {e:#}"));
                             tracing::error!("IPC send failed: {e}");
                             break;
                         }
                     }
-                    Err(e) => tracing::warn!("GDI encode error: {e}"),
+                    Err(e) => {
+                        crate::service_win::svc_log(&format!("GDI encode error: {e:#}"));
+                        tracing::warn!("GDI encode error: {e}");
+                    }
                 },
                 Ok(None) => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
+                    crate::service_win::svc_log(&format!("GDI capture error: {e:#}"));
                     tracing::warn!("GDI capture error: {e}");
                     gdi_capture = None;
                     cpu_encoder = None;
@@ -3460,7 +3546,7 @@ fn run_agent_loop(
             );
             if last_input_summary_log.elapsed() > Duration::from_secs(2) {
                 crate::service_win::svc_log(&format!(
-                    "agent received {} raw input events (coalesced current batch {}→{}) on desktop {:?}",
+                    "agent received {} raw input events (coalesced current batch {}->{}) on desktop {:?}",
                     input_events_since_log,
                     raw_input_count,
                     inputs.len(),

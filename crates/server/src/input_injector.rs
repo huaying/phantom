@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(not(target_os = "windows"))]
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 #[cfg(target_os = "windows")]
@@ -17,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// desktop/window initialization path. Linux uses uinput for keyboard when
 /// available, falling back to enigo/XTest; other platforms use enigo.
 pub struct InputInjector {
+    #[cfg(not(target_os = "windows"))]
     enigo: Enigo,
     #[cfg(target_os = "linux")]
     uinput: Option<crate::input_uinput::UinputKeyboard>,
@@ -24,24 +26,18 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn new() -> Result<Self> {
-        let mut enigo = Enigo::new(&Settings::default())
-            .map_err(|e| anyhow::anyhow!("failed to init enigo: {e}"))?;
-
         #[cfg(target_os = "windows")]
         {
-            for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
-                let _ = enigo.key(key, Direction::Release);
-            }
             windows_release_modifiers();
-            tracing::info!(
-                backend = %windows_backend_name(),
-                "InputInjector initialized (Windows hybrid input)"
-            );
-            return Ok(Self { enigo });
+            tracing::info!("InputInjector initialized (Windows native SendInput)");
+            return Ok(Self {});
         }
 
         #[cfg(not(target_os = "windows"))]
         {
+            let mut enigo = Enigo::new(&Settings::default())
+                .map_err(|e| anyhow::anyhow!("failed to init enigo: {e}"))?;
+
             // Release all modifier keys to clear any stuck state from previous sessions
             for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
                 let _ = enigo.key(key, Direction::Release);
@@ -80,14 +76,7 @@ impl InputInjector {
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            if windows_use_enigo_for_current_desktop() {
-                self.enigo
-                    .text(text)
-                    .map_err(|e| anyhow::anyhow!("type text: {e}"))?;
-                Ok(())
-            } else {
-                windows_type_text(text)
-            }
+            windows_type_text(text)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -102,11 +91,7 @@ impl InputInjector {
     pub fn inject(&mut self, event: &InputEvent) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            if windows_use_enigo_for_current_desktop() {
-                self.inject_enigo(event)
-            } else {
-                windows_inject(event)
-            }
+            windows_inject(event)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -115,6 +100,7 @@ impl InputInjector {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn inject_enigo(&mut self, event: &InputEvent) -> Result<()> {
         match event {
             InputEvent::MouseMove { x, y } => {
@@ -183,6 +169,7 @@ impl InputInjector {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn keycode_to_enigo(key: KeyCode) -> Option<Key> {
     Some(match key {
         // Letters → Unicode
@@ -467,36 +454,6 @@ pub fn windows_cursor_diagnostics() -> Option<((i32, i32), (i32, i32, i32, i32))
     unsafe { GetCursorPos(&mut pt) }
         .ok()
         .map(|()| ((pt.x, pt.y), windows_virtual_screen()))
-}
-
-#[cfg(target_os = "windows")]
-fn windows_backend_name() -> &'static str {
-    match std::env::var("PHANTOM_WINDOWS_INPUT_BACKEND") {
-        Ok(v) if v.eq_ignore_ascii_case("enigo") => "enigo-forced",
-        Ok(v) if v.eq_ignore_ascii_case("native") || v.eq_ignore_ascii_case("sendinput") => {
-            "native-forced"
-        }
-        _ => "auto",
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_use_enigo_for_current_desktop() -> bool {
-    match std::env::var("PHANTOM_WINDOWS_INPUT_BACKEND") {
-        Ok(v) if v.eq_ignore_ascii_case("enigo") => return true,
-        Ok(v) if v.eq_ignore_ascii_case("native") || v.eq_ignore_ascii_case("sendinput") => {
-            return false;
-        }
-        _ => {}
-    }
-
-    // v0.5.5 validated enigo's SendInput path on the normal user desktop.
-    // Keep the custom backend for Winlogon/secure desktops where enigo was
-    // historically unreliable.
-    crate::capture::gdi::current_input_desktop_name()
-        .as_deref()
-        .map(|name| name.eq_ignore_ascii_case("Default"))
-        .unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]

@@ -210,12 +210,70 @@ function Test-VddPresent {
 
 function Test-ActiveUserSession {
     try {
-        $text = query user 2>$null
-        if ($LASTEXITCODE -eq 0 -and ($text -match "\s+Active\s+")) {
+        $text = @(query user 2>&1)
+        # On some OpenSSH/Windows builds, `query user` prints valid session
+        # rows but still exits non-zero. Treat the output as authoritative.
+        if ($text -match "\s+Active\s+") {
             return $true
         }
     } catch {}
     return $false
+}
+
+function Test-ConsoleSessionAvailable {
+    try {
+        $text = @(qwinsta 2>&1)
+        foreach ($line in $text) {
+            if (($line -match "^\s*>?\s*console\s+") -and ($line -match "\s+(Active|Conn)\s+")) {
+                return $true
+            }
+        }
+    } catch {}
+    return $false
+}
+
+function Get-PhantomRuntimeEvidence {
+    param([int]$FreshMinutes = 15)
+
+    $cutoff = (Get-Date).AddMinutes(-1 * $FreshMinutes)
+    $svcLog = Join-Path $env:WINDIR "Temp\phantom-debug.log"
+    $agentLog = Join-Path $env:WINDIR "Temp\phantom-agent.log"
+    $evidence = [ordered]@{
+        ServiceLogPath = $svcLog
+        AgentLogPath = $agentLog
+        ServiceLogExists = $false
+        AgentLogExists = $false
+        ServiceLogRecent = $false
+        AgentLogRecent = $false
+        AgentConnected = $false
+        CaptureEvidence = $false
+    }
+
+    if (Test-Path $svcLog) {
+        $evidence.ServiceLogExists = $true
+        $evidence.ServiceLogRecent = (Get-Item $svcLog).LastWriteTime -gt $cutoff
+        $tail = @(Get-Content $svcLog -Tail 250 -ErrorAction SilentlyContinue)
+        $evidence.AgentConnected = [bool]($tail -match "IPC: agent connected")
+        $evidence.CaptureEvidence = [bool]($tail -match "capture=|Tier 1:|Tier 2:|Tier 3:|dxgi_nvenc|gdi")
+    }
+
+    if (Test-Path $agentLog) {
+        $evidence.AgentLogExists = $true
+        $evidence.AgentLogRecent = (Get-Item $agentLog).LastWriteTime -gt $cutoff
+        $tail = @(Get-Content $agentLog -Tail 250 -ErrorAction SilentlyContinue)
+        if ($tail -match "Tier 1:|Tier 2:|Tier 3:|capture=|dxgi_nvenc|gdi") {
+            $evidence.CaptureEvidence = $true
+        }
+    }
+
+    return [pscustomobject]$evidence
+}
+
+function Test-ExpectedLocalProbeIsolationFailure {
+    param([object[]]$ProbeOutput)
+
+    $text = ($ProbeOutput | Out-String)
+    return [bool]($text -match "no displays found|No displays found|Session 0|cannot capture screen from Session 0")
 }
 
 function Enable-PhantomServiceRecovery {
@@ -268,6 +326,65 @@ function Test-PhantomCrashDumps {
     }
 }
 
+function Stop-ExistingPhantomProcessesForInstall {
+    param([string]$ProgramFilesServer)
+
+    $service = Get-Service -Name "PhantomServer" -ErrorAction SilentlyContinue
+    if (($null -ne $service) -and ($service.Status -eq "Running")) {
+        Write-Host "Stopping existing PhantomServer before update..." -ForegroundColor Cyan
+        & sc.exe stop PhantomServer | Out-Null
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 500
+            $service = Get-Service -Name "PhantomServer" -ErrorAction SilentlyContinue
+            if (($null -eq $service) -or ($service.Status -ne "Running")) {
+                break
+            }
+        }
+    }
+
+    if (-not (Test-Path $ProgramFilesServer)) {
+        return
+    }
+
+    $procs = @()
+    try {
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name='phantom-server.exe'" -ErrorAction Stop |
+            Where-Object {
+                $_.ExecutablePath -and
+                $_.ExecutablePath.Equals($ProgramFilesServer, [StringComparison]::OrdinalIgnoreCase)
+            })
+    } catch {}
+
+    if ($procs.Count -eq 0) {
+        return
+    }
+
+    Write-Host "Stopping stale Phantom service/agent processes before update..." -ForegroundColor Cyan
+    foreach ($proc in $procs) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        } catch {}
+    }
+
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        try {
+            $remaining = @(Get-CimInstance Win32_Process -Filter "Name='phantom-server.exe'" -ErrorAction Stop |
+                Where-Object {
+                    $_.ExecutablePath -and
+                    $_.ExecutablePath.Equals($ProgramFilesServer, [StringComparison]::OrdinalIgnoreCase)
+                })
+            if ($remaining.Count -eq 0) {
+                return
+            }
+        } catch {
+            return
+        }
+    }
+
+    Write-Host "  Warning: stale Phantom process may still be running; continuing install attempt." -ForegroundColor Yellow
+}
+
 function Invoke-PhantomDoctor {
     param(
         [string]$ServerExe,
@@ -279,6 +396,7 @@ function Invoke-PhantomDoctor {
 
     Write-Host ""
     Write-Host "Running Phantom Windows doctor..." -ForegroundColor Cyan
+    $runtimeEvidence = Get-PhantomRuntimeEvidence
 
     if (Test-Path $ServerExe) {
         Add-DoctorResult "OK" "phantom-server.exe found at $ServerExe"
@@ -352,19 +470,32 @@ function Invoke-PhantomDoctor {
         Add-DoctorResult "WARN" "Virtual Display Driver was not detected; headless Windows may black-screen until VDD installs/reboot completes"
     }
 
-    if (Test-ActiveUserSession) {
+    $activeUserSession = Test-ActiveUserSession
+    $consoleSessionAvailable = Test-ConsoleSessionAvailable
+    if ($activeUserSession) {
         Add-DoctorResult "OK" "active interactive user session detected"
+    } elseif ($consoleSessionAvailable) {
+        Add-DoctorResult "OK" "console session detected; service agent can capture pre-login/Winlogon desktop"
     } else {
-        Add-DoctorResult "WARN" "no active interactive user session detected; service agent cannot capture until a console session exists"
+        Add-DoctorResult "WARN" "no console session detected; service agent cannot capture until Windows creates a console session"
     }
 
-    if (Test-ListeningPort 9901) {
+    $browserPortListening = Test-ListeningPort 9901
+    if ($browserPortListening) {
         Add-DoctorResult "OK" "browser port 9901 is listening"
     } elseif ($null -ne $service -and $service.Status -eq "Running") {
         Add-DoctorResult "WARN" "service is running but browser port 9901 is not listening yet"
     } else {
         Add-DoctorResult "WARN" "browser port 9901 is not listening"
     }
+
+    $serviceAgentUsable = (
+        ($null -ne $service) -and
+        ($service.Status -eq "Running") -and
+        $browserPortListening -and
+        $runtimeEvidence.ServiceLogRecent -and
+        $runtimeEvidence.AgentConnected
+    )
 
     $probeExe = $ServerExe
     if (Test-Path $programFilesServer) {
@@ -399,6 +530,8 @@ function Invoke-PhantomDoctor {
                 Add-DoctorResult "OK" "capture probe produced an encoded frame"
             } elseif ($probeOutput -match "Capture probe result: mostly-black") {
                 Add-DoctorResult "FAIL" "capture probe produced a mostly black frame"
+            } elseif ($serviceAgentUsable -and (Test-ExpectedLocalProbeIsolationFailure -ProbeOutput $probeOutput)) {
+                Add-DoctorResult "WARN" "local capture probe cannot see displays from this installer/SSH context; service agent is connected and browser port is listening"
             } else {
                 $firstError = ($probeOutput | Select-String -Pattern "Error:|Caused by:" | Select-Object -First 1)
                 if ($null -ne $firstError) {
@@ -413,29 +546,25 @@ function Invoke-PhantomDoctor {
     }
 
     if ($null -ne $service -and $service.Status -eq "Running") {
-        $svcLog = Join-Path $env:WINDIR "Temp\phantom-debug.log"
-        $agentLog = Join-Path $env:WINDIR "Temp\phantom-agent.log"
-        if (Test-Path $svcLog) {
-            $recent = (Get-Item $svcLog).LastWriteTime -gt (Get-Date).AddMinutes(-15)
-            $tail = Get-Content $svcLog -Tail 200 -ErrorAction SilentlyContinue
-            if ($recent -and ($tail -match "IPC: agent connected")) {
+        if ($runtimeEvidence.ServiceLogExists) {
+            if ($runtimeEvidence.ServiceLogRecent -and $runtimeEvidence.AgentConnected) {
                 Add-DoctorResult "OK" "service recently connected to a session agent"
             } else {
                 Add-DoctorResult "WARN" "service log does not show a recent agent IPC connection"
             }
         } else {
-            Add-DoctorResult "WARN" "service debug log not found at $svcLog"
+            Add-DoctorResult "WARN" "service debug log not found at $($runtimeEvidence.ServiceLogPath)"
         }
-        if (Test-Path $agentLog) {
-            $recent = (Get-Item $agentLog).LastWriteTime -gt (Get-Date).AddMinutes(-15)
-            $tail = Get-Content $agentLog -Tail 200 -ErrorAction SilentlyContinue
-            if ($recent -and ($tail -match "Tier 1:|Tier 2:|Tier 3:")) {
+        if ($runtimeEvidence.CaptureEvidence) {
+            if ($runtimeEvidence.AgentLogExists) {
                 Add-DoctorResult "OK" "agent recently selected a capture tier"
             } else {
-                Add-DoctorResult "WARN" "agent log does not show a recent capture tier"
+                Add-DoctorResult "OK" "service log shows recent agent capture activity"
             }
+        } elseif ($runtimeEvidence.AgentLogExists -or $runtimeEvidence.ServiceLogExists) {
+            Add-DoctorResult "WARN" "recent logs do not show agent capture activity"
         } else {
-            Add-DoctorResult "WARN" "agent log not found at $agentLog"
+            Add-DoctorResult "WARN" "agent log not found at $($runtimeEvidence.AgentLogPath)"
         }
     }
 
@@ -471,6 +600,8 @@ if ($noAutostart) {
 } else {
     Write-Host ""
     Write-Host "Registering Windows Service + installing Virtual Display Driver..." -ForegroundColor Cyan
+    $programFilesServerForInstall = Join-Path $env:ProgramFiles "Phantom\phantom-server.exe"
+    Stop-ExistingPhantomProcessesForInstall -ProgramFilesServer $programFilesServerForInstall
     & $serverExe --install
     if ($LASTEXITCODE -eq 0) {
         Enable-PhantomServiceRecovery

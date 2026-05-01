@@ -9,9 +9,10 @@
 //!   Polls `WTSGetActiveConsoleSessionId()` until a console session appears
 //!   (Session 1+ is created by winlogon a few seconds after boot).
 //! - Agent (User Session): launched via CreateProcessAsUser into the active
-//!   console session. Uses `OpenInputDesktop()` + `SetThreadDesktop()` each
-//!   frame to follow desktop switches (user desktop ↔ Winlogon lock screen).
-//!   Handles DXGI capture + input injection in the interactive desktop.
+//!   console session and the currently-visible desktop (`Default` or
+//!   `Winlogon`). The service relaunches the agent when Windows reports
+//!   lock/unlock/logout transitions instead of expecting one process to cross
+//!   secure desktop boundaries.
 //! - No Session 0 capture: GDI/DXGI cannot capture cross-session desktops.
 //!   The service waits for the agent to be ready before serving frames.
 
@@ -128,8 +129,11 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 ServiceControl::SessionChange(_) => {
-                    // A user logged in/out — wake the session manager
+                    // A user logged in/out/locked/unlocked. Cancel any active
+                    // viewer so the main loop can relaunch the agent on the
+                    // correct desktop.
                     session_changed_clone.store(true, Ordering::Relaxed);
+                    cancel_clone.store(true, Ordering::Relaxed);
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -386,46 +390,88 @@ fn run_server_loop(
             .name("svc-session-watch".into())
             .spawn(move || {
                 let mut last_seen = get_active_console_session_id();
+                let mut last_desktop_kind = if is_valid_console_session_id(last_seen) {
+                    Some(detect_agent_desktop_kind(last_seen))
+                } else {
+                    None
+                };
                 while !shutdown.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(500));
                     let cur = get_active_console_session_id();
-                    if cur != 0 && cur != 0xFFFFFFFF && cur != last_seen {
+                    let cur_desktop_kind = if is_valid_console_session_id(cur) {
+                        Some(detect_agent_desktop_kind(cur))
+                    } else {
+                        None
+                    };
+                    if cur != last_seen || cur_desktop_kind != last_desktop_kind {
                         svc_log(&format!(
-                            "Watcher: session ID changed {last_seen} -> {cur}, cancelling current session"
+                            "Watcher: session/desktop changed {last_seen:?}/{last_desktop_kind:?} -> {cur:?}/{cur_desktop_kind:?}, cancelling current session"
                         ));
                         session_changed.store(true, Ordering::Relaxed);
                         cancel.store(true, Ordering::Relaxed);
                         last_seen = cur;
+                        last_desktop_kind = cur_desktop_kind;
                     }
                 }
             })?;
     }
 
+    let mut last_active_desktop_probe: Option<(u32, Option<AgentDesktopKind>)> = None;
+    let mut last_active_desktop_probe_at = Instant::now() - Duration::from_secs(1);
+
     while !shutdown.load(Ordering::Relaxed) {
         // Check for session changes (driven by SCM SESSION_CHANGE events).
-        // Also poll every iteration because SCM events are not 100% reliable:
+        // Also poll periodically because SCM events are not 100% reliable:
         // - User-switch ("Switch user") may not fire CONSOLE_DISCONNECT reliably
         // - Event may fire before WTSGetActiveConsoleSessionId reflects new state
         // - Agent may be alive + IPC connected but in a now-Disconnected session
         //   (pipe stays open across sessions, so ipc_alive is a lie here)
         //
-        // So check three conditions that require update():
+        // So check four conditions that require update():
         //  1. Explicit SCM event fired
         //  2. Missing agent/IPC (first-launch, crash, or we killed it)
         //  3. Active console session ID changed since last update
+        //  4. Active desktop kind changed (Default <-> Winlogon)
         let active_session = get_active_console_session_id();
-        let session_drift = active_session != 0
-            && active_session != 0xFFFFFFFF
+        let active_desktop_kind = if is_valid_console_session_id(active_session) {
+            let should_probe = last_active_desktop_probe_at.elapsed() >= Duration::from_secs(1)
+                || last_active_desktop_probe.is_none_or(|(sid, _)| sid != active_session);
+            if should_probe {
+                let kind = Some(detect_agent_desktop_kind(active_session));
+                last_active_desktop_probe = Some((active_session, kind));
+                last_active_desktop_probe_at = Instant::now();
+                kind
+            } else {
+                last_active_desktop_probe
+                    .and_then(|(sid, kind)| (sid == active_session).then_some(kind))
+                    .flatten()
+            }
+        } else {
+            last_active_desktop_probe = None;
+            None
+        };
+        let session_drift = is_valid_console_session_id(active_session)
             && active_session != session_mgr.current_session_id;
+        let desktop_drift = is_valid_console_session_id(active_session)
+            && session_mgr.current_session_id == active_session
+            && session_mgr.agent.is_some()
+            && session_mgr.current_desktop_kind != active_desktop_kind;
         if session_changed.swap(false, Ordering::Relaxed)
             || session_mgr.agent.is_none()
             || session_mgr.ipc().is_none()
             || session_drift
+            || desktop_drift
         {
             if session_drift {
                 svc_log(&format!(
                     "Session drift detected: active={active_session} current={}",
                     session_mgr.current_session_id
+                ));
+            }
+            if desktop_drift {
+                svc_log(&format!(
+                    "Desktop drift detected: active={active_desktop_kind:?} current={:?}",
+                    session_mgr.current_desktop_kind
                 ));
             }
             session_mgr.update();
@@ -499,6 +545,18 @@ fn create_service_session(
 
     #[cfg(target_os = "windows")]
     {
+        let resolution_hint = if session_mgr.current_desktop_kind
+            == Some(AgentDesktopKind::Winlogon)
+        {
+            if let Some((hw, hh)) = resolution_hint {
+                svc_log(&format!(
+                        "create_service_session: ignoring resolution hint {hw}x{hh} on Winlogon desktop"
+                    ));
+            }
+            None
+        } else {
+            resolution_hint
+        };
         let ipc = session_mgr.ipc.as_ref().unwrap();
         let _viewer_guard = IpcViewerActiveGuard::new(ipc);
 
@@ -594,15 +652,18 @@ fn create_service_session(
             ef
         } else {
             'wait: loop {
+                if cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("service session cancelled while waiting for startup keyframe");
+                }
                 for ef in ipc.recv_encoded_frames() {
                     if let Some((hw, hh)) = resolution_hint {
                         if ef.width != hw || ef.height != hh {
                             stale_frame_logs += 1;
                             if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
                                 svc_log(&format!(
-                                "Discarding non-hinted frame {}x{} (waiting for {}x{}, count={})",
-                                ef.width, ef.height, hw, hh, stale_frame_logs
-                            ));
+                                    "Discarding non-hinted frame {}x{} (waiting for {}x{}, count={})",
+                                    ef.width, ef.height, hw, hh, stale_frame_logs
+                                ));
                             }
                             fallback_frame_size = Some((ef.width, ef.height));
                             fallback_since.get_or_insert_with(Instant::now);
@@ -797,10 +858,63 @@ struct WinProcessHandle {
 
 #[cfg(target_os = "windows")]
 impl WinProcessHandle {
-    /// Terminate the process.
-    fn kill(&self) {
+    fn wait(&self, timeout: Duration) -> bool {
+        if self.handle.is_invalid() || self.pid == 0 {
+            return false;
+        }
+
         unsafe {
-            let _ = windows::Win32::System::Threading::TerminateProcess(self.handle, 1);
+            use windows::Win32::Foundation::WAIT_OBJECT_0;
+            use windows::Win32::System::Threading::WaitForSingleObject;
+
+            let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            WaitForSingleObject(self.handle, wait_ms) == WAIT_OBJECT_0
+        }
+    }
+
+    /// Terminate the process.
+    fn terminate_and_wait(&self, timeout: Duration) -> bool {
+        if self.handle.is_invalid() || self.pid == 0 {
+            svc_log(&format!(
+                "Agent PID={} has invalid handle; cannot terminate by handle",
+                self.pid
+            ));
+            return false;
+        }
+
+        unsafe {
+            use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+            match TerminateProcess(self.handle, 1) {
+                Ok(()) => {}
+                Err(e) => {
+                    svc_log(&format!(
+                        "TerminateProcess(agent PID={}) failed: {e:#}",
+                        self.pid
+                    ));
+                    return false;
+                }
+            }
+
+            let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            match WaitForSingleObject(self.handle, wait_ms) {
+                WAIT_OBJECT_0 => true,
+                WAIT_TIMEOUT => {
+                    svc_log(&format!(
+                        "Agent PID={} did not exit within {}ms after terminate",
+                        self.pid, wait_ms
+                    ));
+                    false
+                }
+                other => {
+                    svc_log(&format!(
+                        "WaitForSingleObject(agent PID={}) returned {:?}",
+                        self.pid, other
+                    ));
+                    false
+                }
+            }
         }
     }
 
@@ -835,6 +949,13 @@ impl Drop for WinProcessHandle {
 
 // ── Session Manager ─────────────────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentDesktopKind {
+    Default,
+    Winlogon,
+}
+
 /// Monitors Windows user sessions and manages the agent process lifecycle.
 /// When a user logs in, it launches a phantom agent in their session
 /// and establishes an IPC pipe for frame/input proxying.
@@ -843,6 +964,8 @@ struct SessionManager {
     agent: Option<WinProcessHandle>,
     #[cfg(target_os = "windows")]
     current_session_id: u32,
+    #[cfg(target_os = "windows")]
+    current_desktop_kind: Option<AgentDesktopKind>,
     #[cfg(target_os = "windows")]
     ipc: Option<crate::ipc_pipe::IpcServer>,
 }
@@ -854,6 +977,8 @@ impl SessionManager {
             agent: None,
             #[cfg(target_os = "windows")]
             current_session_id: 0,
+            #[cfg(target_os = "windows")]
+            current_desktop_kind: None,
             #[cfg(target_os = "windows")]
             ipc: None,
         }
@@ -870,10 +995,17 @@ impl SessionManager {
         #[cfg(target_os = "windows")]
         {
             let session_id = get_active_console_session_id();
+            let desired_desktop_kind = if is_valid_console_session_id(session_id) {
+                Some(detect_agent_desktop_kind(session_id))
+            } else {
+                None
+            };
             svc_log(&format!(
-                "update: current={} detected={} agent={} ipc={}",
+                "update: current={}/{:?} detected={}/{:?} agent={} ipc={}",
                 self.current_session_id,
+                self.current_desktop_kind,
                 session_id,
+                desired_desktop_kind,
                 self.agent.is_some(),
                 self.ipc.is_some()
             ));
@@ -887,23 +1019,44 @@ impl SessionManager {
                 }
             }
 
-            if session_id == self.current_session_id && self.agent.is_some() && ipc_alive {
+            if session_id == self.current_session_id
+                && desired_desktop_kind == self.current_desktop_kind
+                && self.agent.is_some()
+                && ipc_alive
+            {
                 return; // Session unchanged and agent is healthy — nothing to do
             }
 
-            // Session changed — kill old agent before launching new one
-            if session_id != self.current_session_id {
-                svc_log(&format!(
-                    "Session changed: {} -> {}",
-                    self.current_session_id, session_id
-                ));
+            // No valid session yet (boot race: winlogon hasn't created Session 1)
+            if !is_valid_console_session_id(session_id) {
+                if self.agent.is_some() || self.ipc.is_some() {
+                    svc_log(&format!(
+                        "No valid console session ({session_id}); killing current agent"
+                    ));
+                    self.kill_agent();
+                }
                 self.current_session_id = session_id;
-                self.kill_agent();
+                self.current_desktop_kind = None;
+                return;
             }
 
-            // No valid session yet (boot race: winlogon hasn't created Session 1)
-            if session_id == 0xFFFFFFFF || session_id == 0 {
-                return;
+            let desired_desktop_kind =
+                desired_desktop_kind.expect("valid session has desktop kind");
+
+            // Session or desktop changed — kill old agent before launching new one.
+            if session_id != self.current_session_id
+                || self.current_desktop_kind != Some(desired_desktop_kind)
+            {
+                svc_log(&format!(
+                    "Session/desktop changed: {}/{:?} -> {}/{:?}",
+                    self.current_session_id,
+                    self.current_desktop_kind,
+                    session_id,
+                    desired_desktop_kind
+                ));
+                self.current_session_id = session_id;
+                self.current_desktop_kind = Some(desired_desktop_kind);
+                self.kill_agent();
             }
 
             // Already have a working agent — nothing to do
@@ -917,13 +1070,16 @@ impl SessionManager {
                 svc_log("Agent exists but IPC disconnected, relaunching");
                 self.kill_agent();
             }
+            kill_lingering_agents_for_other_sessions(session_id);
 
             {
                 svc_log(&format!("Creating IPC pipe for session {session_id}"));
                 match crate::ipc_pipe::IpcServer::new(session_id) {
                     Ok(mut ipc_server) => {
-                        svc_log("IPC pipe created, launching agent");
-                        match launch_agent_in_session(session_id) {
+                        svc_log(&format!(
+                            "IPC pipe created, launching {desired_desktop_kind:?} agent"
+                        ));
+                        match launch_agent_in_session(session_id, desired_desktop_kind) {
                             Ok(proc) => {
                                 svc_log(&format!("Agent launched PID={}", proc.pid));
                                 self.agent = Some(proc);
@@ -954,7 +1110,7 @@ impl SessionManager {
                     Err(e) => {
                         tracing::error!("Failed to create IPC pipe: {e}");
                         // Still try to launch agent (it will fail to connect but that's OK)
-                        match launch_agent_in_session(session_id) {
+                        match launch_agent_in_session(session_id, desired_desktop_kind) {
                             Ok(proc) => {
                                 tracing::info!(
                                     session_id,
@@ -1007,9 +1163,22 @@ impl SessionManager {
             self.ipc = None;
 
             if let Some(agent) = self.agent.take() {
-                tracing::info!(pid = agent.pid, "Killing agent");
-                agent.kill();
-                // Handle is closed on drop
+                tracing::info!(pid = agent.pid, "Stopping agent");
+                if agent.wait(Duration::from_secs(3)) {
+                    svc_log(&format!(
+                        "Agent PID={} exited after IPC shutdown",
+                        agent.pid
+                    ));
+                } else {
+                    svc_log(&format!(
+                        "Agent PID={} did not exit after IPC shutdown; terminating",
+                        agent.pid
+                    ));
+                    if !agent.terminate_and_wait(Duration::from_secs(3)) {
+                        force_kill_process(agent.pid);
+                    }
+                }
+                // Handle is closed on drop.
             }
         }
     }
@@ -1030,6 +1199,68 @@ fn get_active_console_session_id() -> u32 {
         fn WTSGetActiveConsoleSessionId() -> u32;
     }
     unsafe { WTSGetActiveConsoleSessionId() }
+}
+
+#[cfg(target_os = "windows")]
+fn is_valid_console_session_id(session_id: u32) -> bool {
+    session_id != 0 && session_id != 0xFFFFFFFF
+}
+
+#[cfg(target_os = "windows")]
+fn detect_agent_desktop_kind(session_id: u32) -> AgentDesktopKind {
+    if session_is_locked(session_id).unwrap_or(false) {
+        return AgentDesktopKind::Winlogon;
+    }
+
+    if find_process_in_session("explorer.exe", session_id).is_none() {
+        AgentDesktopKind::Winlogon
+    } else {
+        AgentDesktopKind::Default
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn session_is_locked(session_id: u32) -> Option<bool> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_SESSIONSTATE_LOCK,
+    };
+
+    unsafe {
+        let mut buffer = PWSTR::null();
+        let mut bytes_returned = 0u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes_returned,
+        )
+        .is_err()
+        {
+            return None;
+        }
+
+        let result = if !buffer.0.is_null()
+            && bytes_returned as usize >= std::mem::size_of::<WTSINFOEXW>()
+        {
+            let info = &*(buffer.0 as *const WTSINFOEXW);
+            if info.Level == 1 {
+                let level1 = info.Data.WTSInfoExLevel1;
+                Some(level1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if !buffer.0.is_null() {
+            WTSFreeMemory(buffer.0 as *mut std::ffi::c_void);
+        }
+        result
+    }
 }
 
 /// Launch the phantom agent process in a specific user session.
@@ -1069,7 +1300,10 @@ fn get_session_username(session_id: u32) -> Option<String> {
 ///
 /// Returns a WinProcessHandle that owns the process handle for lifecycle management.
 #[cfg(target_os = "windows")]
-fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> {
+fn launch_agent_in_session(
+    session_id: u32,
+    desktop_kind: AgentDesktopKind,
+) -> anyhow::Result<WinProcessHandle> {
     use anyhow::Context;
     use std::mem;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -1087,45 +1321,51 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             session_id,
         );
 
-        match launch_agent_with_shell_token(session_id, &cmd_line) {
-            Ok(handle) => {
-                svc_log(&format!(
-                    "Agent launched with explorer shell token in session {session_id}"
-                ));
-                return Ok(handle);
-            }
-            Err(e) => {
-                svc_log(&format!(
-                    "Explorer shell token launch failed: {e:#}; trying WTS user token"
-                ));
-            }
-        }
-
-        let mut user_token = HANDLE::default();
-        if WTSQueryUserToken(session_id, &mut user_token).is_ok() {
-            match create_agent_process_with_token(
-                user_token,
-                &cmd_line,
-                &["winsta0\\default"],
-                "active user",
-            ) {
+        if desktop_kind == AgentDesktopKind::Default {
+            match launch_agent_with_shell_token(session_id, &cmd_line) {
                 Ok(handle) => {
-                    let _ = CloseHandle(user_token);
                     svc_log(&format!(
-                        "Agent launched with active user token in session {session_id}"
+                        "Agent launched with explorer shell token in session {session_id}"
                     ));
                     return Ok(handle);
                 }
                 Err(e) => {
-                    let _ = CloseHandle(user_token);
                     svc_log(&format!(
-                        "CreateProcessAsUserW with active user token failed: {e:#}; falling back to SYSTEM token"
+                        "Explorer shell token launch failed: {e:#}; trying WTS user token"
                     ));
                 }
             }
+
+            let mut user_token = HANDLE::default();
+            if WTSQueryUserToken(session_id, &mut user_token).is_ok() {
+                match create_agent_process_with_token(
+                    user_token,
+                    &cmd_line,
+                    &["winsta0\\default"],
+                    "active user",
+                ) {
+                    Ok(handle) => {
+                        let _ = CloseHandle(user_token);
+                        svc_log(&format!(
+                            "Agent launched with active user token in session {session_id}"
+                        ));
+                        return Ok(handle);
+                    }
+                    Err(e) => {
+                        let _ = CloseHandle(user_token);
+                        svc_log(&format!(
+                            "CreateProcessAsUserW with active user token failed: {e:#}; falling back to SYSTEM token"
+                        ));
+                    }
+                }
+            } else {
+                svc_log(&format!(
+                    "WTSQueryUserToken(session {session_id}) failed; falling back to SYSTEM token"
+                ));
+            }
         } else {
             svc_log(&format!(
-                "WTSQueryUserToken(session {session_id}) failed; falling back to SYSTEM token"
+                "Session {session_id} targets Winlogon; using SYSTEM token launch"
             ));
         }
 
@@ -1162,12 +1402,11 @@ fn launch_agent_in_session(session_id: u32) -> anyhow::Result<WinProcessHandle> 
             anyhow::bail!("SetTokenInformation(TokenSessionId={session_id}) failed");
         }
 
-        let result = create_agent_process_with_token(
-            dup_token,
-            &cmd_line,
-            &["winsta0\\default", "winsta0\\winlogon"],
-            "SYSTEM",
-        );
+        let desktop_names: &[&str] = match desktop_kind {
+            AgentDesktopKind::Default => &["winsta0\\default"],
+            AgentDesktopKind::Winlogon => &["winsta0\\winlogon", "winsta0\\default"],
+        };
+        let result = create_agent_process_with_token(dup_token, &cmd_line, desktop_names, "SYSTEM");
         let _ = CloseHandle(dup_token);
         result
     }
@@ -1267,6 +1506,95 @@ fn find_process_in_session(name: &str, session_id: u32) -> Option<u32> {
         }
         let _ = CloseHandle(snapshot);
         found
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn force_kill_process(pid: u32) {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    if pid == 0 {
+        return;
+    }
+
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) else {
+            svc_log(&format!("OpenProcess(PROCESS_TERMINATE, pid={pid}) failed"));
+            return;
+        };
+        if let Err(e) = TerminateProcess(process, 1) {
+            svc_log(&format!(
+                "TerminateProcess(pid={pid}) fallback failed: {e:#}"
+            ));
+            let _ = windows::Win32::Foundation::CloseHandle(process);
+            return;
+        }
+        match WaitForSingleObject(process, 3000) {
+            WAIT_OBJECT_0 => svc_log(&format!("Force-killed stale agent PID={pid}")),
+            WAIT_TIMEOUT => svc_log(&format!(
+                "Stale agent PID={pid} survived force kill timeout"
+            )),
+            other => svc_log(&format!(
+                "WaitForSingleObject(stale PID={pid}) returned {:?}",
+                other
+            )),
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn kill_lingering_agents_for_other_sessions(target_session_id: u32) {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    let current_pid = std::process::id();
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return;
+        };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return;
+        }
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if exe.eq_ignore_ascii_case("phantom-server.exe")
+                && entry.th32ProcessID != current_pid
+                && entry.th32ParentProcessID == current_pid
+            {
+                let mut proc_session = 0u32;
+                if ProcessIdToSessionId(entry.th32ProcessID, &mut proc_session).is_ok()
+                    && proc_session != 0
+                    && proc_session != target_session_id
+                {
+                    svc_log(&format!(
+                        "Killing lingering phantom agent PID={} session={} before launching session {}",
+                        entry.th32ProcessID, proc_session, target_session_id
+                    ));
+                    force_kill_process(entry.th32ProcessID);
+                }
+            }
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
     }
 }
 
@@ -1890,6 +2218,20 @@ fn stop_service_for_update() -> anyhow::Result<()> {
     anyhow::bail!("existing {SERVICE_NAME} service is still running after stop/kill")
 }
 
+fn kill_other_phantom_server_processes() {
+    let my_pid = std::process::id();
+    let _ = std::process::Command::new("taskkill")
+        .args([
+            "/F",
+            "/FI",
+            "IMAGENAME eq phantom-server.exe",
+            "/FI",
+            &format!("PID ne {my_pid}"),
+        ])
+        .status();
+    std::thread::sleep(Duration::from_secs(1));
+}
+
 fn configure_crash_dumps() {
     let program_data = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
     let dump_dir = std::path::Path::new(&program_data)
@@ -1962,6 +2304,7 @@ pub fn install_service() -> anyhow::Result<()> {
 
     if service_already_exists {
         stop_service_for_update()?;
+        kill_other_phantom_server_processes();
     }
 
     let src_exe = std::env::current_exe().context("get current exe path")?;
