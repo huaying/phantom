@@ -551,7 +551,60 @@ where
     }
 }
 
+fn clear_rtc_canvas_overlay(st: &AppState) {
+    if let Ok(Some(ctx)) = st.canvas.get_context("2d") {
+        if let Ok(ctx2d) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
+            ctx2d.clear_rect(
+                0.0,
+                0.0,
+                st.canvas.width() as f64,
+                st.canvas.height() as f64,
+            );
+        }
+    }
+    st.canvas
+        .style()
+        .set_property("background", "transparent")
+        .ok();
+}
+
+fn freeze_rtc_video_frame(st: &mut AppState) {
+    let Some(video) = st.rtc2_video_el.as_ref() else {
+        return;
+    };
+    if video.ready_state() < 2 {
+        return;
+    }
+
+    let width = if st.server_width > 0 {
+        st.server_width
+    } else {
+        video.video_width()
+    };
+    let height = if st.server_height > 0 {
+        st.server_height
+    } else {
+        video.video_height()
+    };
+    if width == 0 || height == 0 {
+        return;
+    }
+    if st.canvas.width() != width {
+        st.canvas.set_width(width);
+    }
+    if st.canvas.height() != height {
+        st.canvas.set_height(height);
+    }
+    if let Ok(Some(ctx)) = st.canvas.get_context("2d") {
+        if let Ok(ctx2d) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
+            let _ = ctx2d.draw_image_with_html_video_element(video, 0.0, 0.0);
+            st.canvas.style().set_property("background", "black").ok();
+        }
+    }
+}
+
 fn reset_rtc_runtime(st: &mut AppState) {
+    freeze_rtc_video_frame(st);
     if let Some(pc) = st.rtc_pc.take() {
         pc.close();
     }
@@ -949,6 +1002,55 @@ fn draw_rtc2_video_to_canvas(state: &AppState, video: &HtmlVideoElement) {
     }
 }
 
+fn reveal_rtc2_video_if_ready(state: &Rc<RefCell<AppState>>, video: &HtmlVideoElement) -> bool {
+    if video.ready_state() < 2 {
+        return false;
+    }
+    let st = state.borrow();
+    let is_current = st
+        .rtc2_video_el
+        .as_ref()
+        .map(|current| js_sys::Object::is(current.as_ref(), video.as_ref()))
+        .unwrap_or(false);
+    if !is_current {
+        return false;
+    }
+    clear_rtc_canvas_overlay(&st);
+    video.style().set_property("opacity", "1").ok();
+    update_debug_snapshot(&st);
+    true
+}
+
+fn install_rtc2_video_reveal_handlers(state: &Rc<RefCell<AppState>>, video: &HtmlVideoElement) {
+    if reveal_rtc2_video_if_ready(state, video) {
+        return;
+    }
+
+    for event_name in ["loadeddata", "playing", "resize"] {
+        let s = state.clone();
+        let video_for_cb = video.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let _ = reveal_rtc2_video_if_ready(&s, &video_for_cb);
+        });
+        let _ = video.add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+
+    let request_vfc = js_sys::Reflect::get(video.as_ref(), &"requestVideoFrameCallback".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+    if let Some(request_vfc) = request_vfc {
+        let s = state.clone();
+        let video_for_cb = video.clone();
+        let cb =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_ts: JsValue, _meta: JsValue| {
+                let _ = reveal_rtc2_video_if_ready(&s, &video_for_cb);
+            });
+        let _ = request_vfc.call1(video.as_ref(), cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
+}
+
 type VideoFrameCallbackSlot = Rc<RefCell<Option<Closure<dyn FnMut(JsValue, JsValue)>>>>;
 type AnimationFrameCallbackSlot = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -1093,7 +1195,7 @@ fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event
                 video.style().set_property("object-fit", "contain").ok();
                 video.style().set_property("background", "black").ok();
                 video.style().set_property("z-index", "1").ok();
-                video.style().set_property("opacity", "1").ok();
+                video.style().set_property("opacity", "0").ok();
             } else {
                 // Keep the element technically visible so browser playback quality
                 // stats reflect presented frames; `display:none` reports almost every
@@ -1114,7 +1216,7 @@ fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event
             {
                 let mut st = state.borrow_mut();
                 st.rtc2_media_active = true;
-                st.rtc2_video_el = Some(video);
+                st.rtc2_video_el = Some(video.clone());
                 st.rtc2_video_loop_generation = st.rtc2_video_loop_generation.wrapping_add(1);
                 if direct_video {
                     st.canvas.style().set_property("position", "fixed").ok();
@@ -1123,24 +1225,12 @@ fn attach_rtc2_media_track(state: &Rc<RefCell<AppState>>, event: &web_sys::Event
                     st.canvas.style().set_property("width", "100vw").ok();
                     st.canvas.style().set_property("height", "100vh").ok();
                     st.canvas.style().set_property("z-index", "2").ok();
-                    st.canvas
-                        .style()
-                        .set_property("background", "transparent")
-                        .ok();
-                    if let Ok(Some(ctx)) = st.canvas.get_context("2d") {
-                        if let Ok(ctx2d) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
-                            ctx2d.clear_rect(
-                                0.0,
-                                0.0,
-                                st.canvas.width() as f64,
-                                st.canvas.height() as f64,
-                            );
-                        }
-                    }
                 }
                 update_debug_snapshot(&st);
             }
-            if !direct_video {
+            if direct_video {
+                install_rtc2_video_reveal_handlers(state, &video);
+            } else {
                 let generation = state.borrow().rtc2_video_loop_generation;
                 if let Some(video) = state.borrow().rtc2_video_el.clone() {
                     ensure_rtc2_video_canvas_loop(state, &video, generation);

@@ -31,15 +31,19 @@ mod platform {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{
+        CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     #[derive(Clone, Copy)]
     struct SendHandle(HANDLE);
@@ -51,6 +55,48 @@ mod platform {
     }
 
     const PIPE_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
+    const ERROR_IO_PENDING_CODE: u32 = 997;
+    const ERROR_NO_DATA_CODE: u32 = 232;
+    const ERROR_PIPE_CONNECTED_CODE: u32 = 535;
+
+    fn is_win32_error(error: &windows::core::Error, code: u32) -> bool {
+        let hresult = (0x8007_0000u32 | code) as i32;
+        error.code().0 == hresult || error.code().0 == code as i32
+    }
+
+    fn duration_to_wait_ms(timeout: Option<Duration>) -> u32 {
+        timeout
+            .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
+            .unwrap_or(INFINITE)
+    }
+
+    unsafe fn create_overlapped_event() -> Result<HANDLE> {
+        CreateEventW(None, true, false, None).context("CreateEventW for pipe overlapped I/O")
+    }
+
+    unsafe fn wait_overlapped(
+        handle: HANDLE,
+        overlapped: &mut OVERLAPPED,
+        timeout: Option<Duration>,
+        context: &str,
+    ) -> Result<Option<u32>> {
+        match WaitForSingleObject(overlapped.hEvent, duration_to_wait_ms(timeout)) {
+            WAIT_OBJECT_0 => {
+                let mut transferred = 0u32;
+                GetOverlappedResult(handle, overlapped, &mut transferred, false)
+                    .with_context(|| format!("{context}: GetOverlappedResult"))?;
+                Ok(Some(transferred))
+            }
+            WAIT_TIMEOUT => {
+                let _ = CancelIoEx(handle, Some(overlapped as *const _));
+                let mut transferred = 0u32;
+                let _ = GetOverlappedResult(handle, overlapped, &mut transferred, true);
+                Ok(None)
+            }
+            WAIT_FAILED => Err(windows::core::Error::from_win32()).context(context.to_string()),
+            other => anyhow::bail!("{context}: unexpected WaitForSingleObject result {other:?}"),
+        }
+    }
 
     /// Build session-isolated pipe names.
     fn pipe_names(session_id: u32) -> (String, String) {
@@ -71,12 +117,49 @@ mod platform {
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
+    unsafe fn pipe_write_once(handle: HANDLE, buf: &[u8]) -> Result<u32> {
+        let event = create_overlapped_event()?;
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.hEvent = event;
+        let mut written = 0u32;
+        let result = WriteFile(handle, Some(buf), Some(&mut written), Some(&mut overlapped));
+        let outcome = match result {
+            Ok(()) => Ok(written),
+            Err(e) if is_win32_error(&e, ERROR_IO_PENDING_CODE) => {
+                wait_overlapped(handle, &mut overlapped, None, "pipe write")?
+                    .ok_or_else(|| anyhow::anyhow!("pipe write unexpectedly timed out"))
+            }
+            Err(e) => Err(e).context("pipe write"),
+        };
+        let _ = CloseHandle(event);
+        outcome
+    }
+
+    unsafe fn pipe_read_once(handle: HANDLE, buf: &mut [u8]) -> Result<u32> {
+        let event = create_overlapped_event()?;
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.hEvent = event;
+        let mut read = 0u32;
+        let result = ReadFile(handle, Some(buf), Some(&mut read), Some(&mut overlapped));
+        let outcome = match result {
+            Ok(()) => Ok(read),
+            Err(e) if is_win32_error(&e, ERROR_IO_PENDING_CODE) => {
+                wait_overlapped(handle, &mut overlapped, None, "pipe read")?
+                    .ok_or_else(|| anyhow::anyhow!("pipe read unexpectedly timed out"))
+            }
+            Err(e) => Err(e).context("pipe read"),
+        };
+        let _ = CloseHandle(event);
+        outcome
+    }
+
     unsafe fn pipe_write_all(handle: HANDLE, buf: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < buf.len() {
-            let mut written = 0u32;
-            WriteFile(handle, Some(&buf[offset..]), Some(&mut written), None)
-                .context("pipe write")?;
+            let written = pipe_write_once(handle, &buf[offset..])?;
+            if written == 0 {
+                anyhow::bail!("pipe disconnected (wrote 0 bytes)");
+            }
             offset += written as usize;
         }
         Ok(())
@@ -86,9 +169,7 @@ mod platform {
         let mut buf = vec![0u8; len];
         let mut offset = 0;
         while offset < len {
-            let mut read = 0u32;
-            ReadFile(handle, Some(&mut buf[offset..]), Some(&mut read), None)
-                .context("pipe read")?;
+            let read = pipe_read_once(handle, &mut buf[offset..])?;
             if read == 0 {
                 anyhow::bail!("pipe disconnected (read 0 bytes)");
             }
@@ -166,7 +247,7 @@ mod platform {
         unsafe {
             let h = CreateNamedPipeW(
                 &HSTRING::from(name),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_SIZE,
@@ -185,31 +266,33 @@ mod platform {
     }
 
     fn wait_connect(handle: HANDLE, name: &str, timeout: Duration) -> Result<bool> {
-        let start = Instant::now();
-        // ConnectNamedPipe is blocking (no OVERLAPPED), so every branch below
-        // returns — the `loop {}` is kept as a style bookmark for a future
-        // async version that would actually retry.
-        #[allow(clippy::never_loop)]
-        loop {
-            if start.elapsed() > timeout {
-                tracing::warn!("IPC: {name} connection timed out");
-                return Ok(false);
-            }
-            let result = unsafe { ConnectNamedPipe(handle, None) };
-            match result {
-                Ok(()) => return Ok(true),
-                Err(e) => {
-                    let code = e.code().0;
-                    if code == 0x80070217u32 as i32 || code == 535 {
-                        return Ok(true);
-                    }
-                    if code == 0x800700E8u32 as i32 || code == 232 {
-                        return Ok(false);
-                    }
-                    return Err(e).context(format!("ConnectNamedPipe({name})"));
+        let event = unsafe { create_overlapped_event()? };
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.hEvent = event;
+        let result = unsafe { ConnectNamedPipe(handle, Some(&mut overlapped)) };
+        let outcome = match result {
+            Ok(()) => Ok(true),
+            Err(e) if is_win32_error(&e, ERROR_PIPE_CONNECTED_CODE) => Ok(true),
+            Err(e) if is_win32_error(&e, ERROR_NO_DATA_CODE) => Ok(false),
+            Err(e) if is_win32_error(&e, ERROR_IO_PENDING_CODE) => {
+                let connected = unsafe {
+                    wait_overlapped(
+                        handle,
+                        &mut overlapped,
+                        Some(timeout),
+                        &format!("ConnectNamedPipe({name})"),
+                    )?
                 }
+                .is_some();
+                if !connected {
+                    tracing::warn!("IPC: {name} connection timed out");
+                }
+                Ok(connected)
             }
-        }
+            Err(e) => Err(e).context(format!("ConnectNamedPipe({name})")),
+        };
+        let _ = unsafe { CloseHandle(event) };
+        outcome
     }
 
     fn open_pipe(name: &str, max_attempts: u32) -> Result<HANDLE> {
@@ -308,10 +391,15 @@ mod platform {
                 "IPC: waiting for agent on both pipes (timeout {:?})",
                 timeout
             );
+            let start = Instant::now();
             if !wait_connect(self.up_handle, "up", timeout)? {
                 return Ok(false);
             }
-            if !wait_connect(self.down_handle, "down", timeout)? {
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                tracing::warn!("IPC: down connection timed out before wait");
+                return Ok(false);
+            };
+            if !wait_connect(self.down_handle, "down", remaining)? {
                 return Ok(false);
             }
             self.connected = true;
