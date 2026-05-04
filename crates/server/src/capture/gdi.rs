@@ -15,11 +15,11 @@ use phantom_core::capture::FrameCapture;
 use phantom_core::frame::{Frame, PixelFormat};
 use std::cell::RefCell;
 use std::time::Instant;
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    RedrawWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject, GetDC,
+    GetDIBits, RedrawWindow, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CAPTUREBLT, DIB_RGB_COLORS, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
@@ -29,7 +29,8 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    GetDesktopWindow, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 thread_local! {
@@ -162,15 +163,81 @@ fn input_desktop_access() -> DESKTOP_ACCESS_FLAGS {
 pub struct GdiCapture {
     width: u32,
     height: u32,
+    origin_x: i32,
+    origin_y: i32,
+    region: GdiCaptureRegion,
+}
+
+#[derive(Clone, Debug)]
+pub enum GdiCaptureRegion {
+    PrimaryMonitor,
+    VirtualScreen,
+    Rect {
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+    },
+    DisplayDevice {
+        device_name: String,
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl GdiCapture {
     pub fn new() -> Result<Self> {
-        let (width, height) = unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN) as u32,
-                GetSystemMetrics(SM_CYSCREEN) as u32,
-            )
+        Self::new_for_region(GdiCaptureRegion::VirtualScreen)
+    }
+
+    pub fn new_primary_monitor() -> Result<Self> {
+        Self::new_for_region(GdiCaptureRegion::PrimaryMonitor)
+    }
+
+    pub fn new_for_rect(origin_x: i32, origin_y: i32, width: u32, height: u32) -> Result<Self> {
+        Self::new_for_region(GdiCaptureRegion::Rect {
+            origin_x,
+            origin_y,
+            width,
+            height,
+        })
+    }
+
+    pub fn new_for_display_device(
+        device_name: String,
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        Self::new_for_region(GdiCaptureRegion::DisplayDevice {
+            device_name,
+            origin_x,
+            origin_y,
+            width,
+            height,
+        })
+    }
+
+    fn new_for_region(region: GdiCaptureRegion) -> Result<Self> {
+        let (origin_x, origin_y, width, height) = match &region {
+            GdiCaptureRegion::PrimaryMonitor => current_primary_screen(),
+            GdiCaptureRegion::VirtualScreen => current_virtual_screen(),
+            GdiCaptureRegion::Rect {
+                origin_x,
+                origin_y,
+                width,
+                height,
+            }
+            | GdiCaptureRegion::DisplayDevice {
+                origin_x,
+                origin_y,
+                width,
+                height,
+                ..
+            } => (*origin_x, *origin_y, *width, *height),
         };
 
         if width == 0 || height == 0 {
@@ -179,8 +246,21 @@ impl GdiCapture {
             );
         }
 
-        tracing::info!(width, height, "GdiCapture initialized (Session 0 fallback)");
-        Ok(Self { width, height })
+        tracing::info!(
+            origin_x,
+            origin_y,
+            width,
+            height,
+            region = ?region,
+            "GdiCapture initialized (Session 0 fallback)"
+        );
+        Ok(Self {
+            width,
+            height,
+            origin_x,
+            origin_y,
+            region,
+        })
     }
 
     /// Switch the current thread to whichever desktop is receiving input.
@@ -197,22 +277,56 @@ impl FrameCapture for GdiCapture {
         let _ = self.switch_to_active_desktop();
 
         unsafe {
-            let hwnd = GetDesktopWindow();
-            let hdc_screen = GetDC(hwnd);
+            // A null HWND gets the DC for the entire virtual screen. For
+            // primary-monitor fallback prefer the desktop window DC; on some
+            // VDD/Default topologies BitBlt from the null screen DC can hang.
+            let hwnd = match &self.region {
+                GdiCaptureRegion::PrimaryMonitor => GetDesktopWindow(),
+                GdiCaptureRegion::VirtualScreen
+                | GdiCaptureRegion::Rect { .. }
+                | GdiCaptureRegion::DisplayDevice { .. } => HWND(std::ptr::null_mut()),
+            };
+            let (hdc_screen, delete_screen_dc, source_x, source_y) = match &self.region {
+                GdiCaptureRegion::DisplayDevice { device_name, .. } => {
+                    let device_name_w: Vec<u16> = device_name
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    (
+                        CreateDCW(
+                            windows::core::PCWSTR(device_name_w.as_ptr()),
+                            windows::core::PCWSTR(std::ptr::null()),
+                            windows::core::PCWSTR(std::ptr::null()),
+                            None,
+                        ),
+                        true,
+                        0,
+                        0,
+                    )
+                }
+                _ => (GetDC(hwnd), false, self.origin_x, self.origin_y),
+            };
             if hdc_screen.is_invalid() {
-                anyhow::bail!("GetDC failed for desktop window");
+                anyhow::bail!("GDI source DC acquisition failed");
             }
+            let release_source_dc = |hdc_screen| {
+                if delete_screen_dc {
+                    let _ = DeleteDC(hdc_screen);
+                } else {
+                    ReleaseDC(hwnd, hdc_screen);
+                }
+            };
 
             let hdc_mem = CreateCompatibleDC(hdc_screen);
             if hdc_mem.is_invalid() {
-                ReleaseDC(hwnd, hdc_screen);
+                release_source_dc(hdc_screen);
                 anyhow::bail!("CreateCompatibleDC failed");
             }
 
             let hbm = CreateCompatibleBitmap(hdc_screen, self.width as i32, self.height as i32);
             if hbm.is_invalid() {
                 let _ = DeleteDC(hdc_mem);
-                ReleaseDC(hwnd, hdc_screen);
+                release_source_dc(hdc_screen);
                 anyhow::bail!("CreateCompatibleBitmap failed");
             }
 
@@ -226,16 +340,16 @@ impl FrameCapture for GdiCapture {
                 self.width as i32,
                 self.height as i32,
                 hdc_screen,
-                0,
-                0,
-                SRCCOPY,
+                source_x,
+                source_y,
+                SRCCOPY | CAPTUREBLT,
             );
 
             if result.is_err() {
                 SelectObject(hdc_mem, old_bm);
                 let _ = DeleteObject(hbm);
                 let _ = DeleteDC(hdc_mem);
-                ReleaseDC(hwnd, hdc_screen);
+                release_source_dc(hdc_screen);
                 anyhow::bail!("BitBlt failed");
             }
 
@@ -275,7 +389,7 @@ impl FrameCapture for GdiCapture {
             SelectObject(hdc_mem, old_bm);
             let _ = DeleteObject(hbm);
             let _ = DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_screen);
+            release_source_dc(hdc_screen);
 
             if lines == 0 {
                 anyhow::bail!("GetDIBits failed (0 lines copied)");
@@ -297,14 +411,68 @@ impl FrameCapture for GdiCapture {
 
     fn reset(&mut self) -> Result<()> {
         // Re-read screen dimensions in case resolution changed
-        unsafe {
-            let w = GetSystemMetrics(SM_CXSCREEN) as u32;
-            let h = GetSystemMetrics(SM_CYSCREEN) as u32;
-            if w > 0 && h > 0 {
-                self.width = w;
-                self.height = h;
+        let (x, y, w, h) = match &self.region {
+            GdiCaptureRegion::PrimaryMonitor => current_primary_screen(),
+            GdiCaptureRegion::VirtualScreen => current_virtual_screen(),
+            GdiCaptureRegion::Rect {
+                origin_x,
+                origin_y,
+                width,
+                height,
             }
+            | GdiCaptureRegion::DisplayDevice {
+                origin_x,
+                origin_y,
+                width,
+                height,
+                ..
+            } => (*origin_x, *origin_y, *width, *height),
+        };
+        if w > 0 && h > 0 {
+            self.origin_x = x;
+            self.origin_y = y;
+            self.width = w;
+            self.height = h;
         }
         Ok(())
+    }
+}
+
+impl GdiCapture {
+    pub fn origin(&self) -> (i32, i32) {
+        (self.origin_x, self.origin_y)
+    }
+}
+
+fn current_primary_screen() -> (i32, i32, u32, u32) {
+    unsafe {
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
+            GetSystemMetrics(SM_CYSCREEN).max(0) as u32,
+        )
+    }
+}
+
+fn current_virtual_screen() -> (i32, i32, u32, u32) {
+    unsafe {
+        let virtual_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let virtual_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if virtual_w > 0 && virtual_h > 0 {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                virtual_w as u32,
+                virtual_h as u32,
+            )
+        } else {
+            (
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
+                GetSystemMetrics(SM_CYSCREEN).max(0) as u32,
+            )
+        }
     }
 }

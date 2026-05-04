@@ -1469,8 +1469,6 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             let mut s = state.borrow_mut();
             s.server_width = width;
             s.server_height = height;
-            s.canvas.set_width(width);
-            s.canvas.set_height(height);
             let rtc_media_active = s.rtc2_media_active;
             update_debug_snapshot(&s);
             drop(s);
@@ -1798,9 +1796,16 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
 
         let w = st.server_width;
         let h = st.server_height;
+        let canvas = st.canvas.clone();
         drop(st);
 
         js_sys::Reflect::set(&js_sys::global(), &"__phantom_frame".into(), &frame).unwrap();
+        if canvas.width() != w {
+            canvas.set_width(w);
+        }
+        if canvas.height() != h {
+            canvas.set_height(h);
+        }
         let js_code = format!(
             "var c=document.getElementById('screen').getContext('2d'); c.drawImage(__phantom_frame, 0, 0, {w}, {h}); __phantom_frame.close();"
         );

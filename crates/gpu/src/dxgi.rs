@@ -54,10 +54,16 @@ impl DxgiCapture {
     }
 
     /// Create a new capture, optionally targeting a specific display device by name.
-    /// When `target_device` is set (e.g. `\\.\DISPLAY10`), only that output is selected.
+    /// When `target_device` is set (e.g. `\\.\DISPLAY10`), that output is selected
+    /// if it is active. Windows can remap GDI display names across Winlogon ->
+    /// Default transitions, so an explicit but stale target falls back to the
+    /// best active NVIDIA output instead of failing into a wrong low-res GDI path.
     /// This is how DCV/Parsec target their own VDD — by device name, not by resolution.
-    /// Falls back to highest-resolution NVIDIA output only when no explicit
-    /// target is requested. Explicit targets fail hard if they are not active.
+    /// Falls back to the highest-resolution NVIDIA output when no explicit
+    /// target is requested. If an explicit target became stale during a
+    /// Winlogon/Default transition, a usable NVIDIA output may be selected and
+    /// reported as `output_matches_target=false` so the caller can decide
+    /// whether to retarget or reject it.
     pub fn with_target_device(target_device: Option<&str>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
@@ -158,10 +164,20 @@ impl DxgiCapture {
             let c = best.context("no DXGI adapter with active output found")?;
             if let Some(target) = target_device {
                 if !c.matches_device {
-                    bail!(
-                        "DXGI target output '{}' was not found among active outputs: {}",
+                    if !c.is_nvidia || c.width < 1024 || c.height < 720 {
+                        bail!(
+                            "DXGI target output '{}' was not found among usable active outputs: {}",
+                            target,
+                            seen_outputs.join("; ")
+                        );
+                    }
+                    tracing::warn!(
                         target,
-                        seen_outputs.join("; ")
+                        selected_device = %c.device_name,
+                        selected_width = c.width,
+                        selected_height = c.height,
+                        seen = %seen_outputs.join("; "),
+                        "DXGI target output was not active; using best active NVIDIA output"
                     );
                 }
             }
@@ -289,14 +305,12 @@ impl DxgiCapture {
 
             self.frame_acquired = true;
 
-            // Desktop Duplication can return S_OK for pointer-only/no-present
-            // updates. Encoding our staging texture in that case re-sends stale
-            // or initial black content. Treat it like WAIT_TIMEOUT and keep the
-            // last valid frame, matching WebRTC/RustDesk behavior.
-            if frame_info.AccumulatedFrames == 0
-                || frame_info.LastPresentTime == 0
-                || resource.is_none()
-            {
+            // Desktop Duplication can return S_OK with zero present metadata
+            // during static-desktop transitions. If a resource is present, copy
+            // it anyway: startup black-frame validation will reject genuinely
+            // black/stale textures, while a valid static desktop can finally
+            // produce the first keyframe.
+            if resource.is_none() {
                 dup.ReleaseFrame()?;
                 self.frame_acquired = false;
                 self.record_no_frame("zero_present", Some(frame_info));
@@ -372,6 +386,14 @@ impl DxgiCapture {
         )
     }
 
+    pub fn output_device_name(&self) -> &str {
+        &self.output_device_name
+    }
+
+    pub fn output_matches_target(&self) -> bool {
+        self.output_matches_target
+    }
+
     /// Copy the latest GPU staging texture to a CPU-readable texture and sample
     /// BGRA pixels. Used by install doctor/probes to catch encoded black frames.
     pub fn sample_bgra_stats(&self, max_samples: usize) -> Result<BgraSampleStats> {
@@ -432,6 +454,52 @@ impl DxgiCapture {
             }
             // Drop old duplication BEFORE creating new one — only one allowed per output.
             self.duplication = None;
+
+            if let Some(target) = self.target_device.clone() {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+                let mut adapter_idx = 0u32;
+                let mut found = None;
+                while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+                    let desc = adapter.GetDesc1()?;
+                    let adapter_name = String::from_utf16_lossy(
+                        &desc.Description[..desc
+                            .Description
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len())],
+                    );
+                    let is_nvidia = adapter_name.to_uppercase().contains("NVIDIA");
+                    let mut output_idx = 0u32;
+                    while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                        let out_desc = output.GetDesc()?;
+                        let device_name = String::from_utf16_lossy(
+                            &out_desc.DeviceName[..out_desc
+                                .DeviceName
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(out_desc.DeviceName.len())],
+                        );
+                        if device_name == target {
+                            found =
+                                Some((adapter, adapter_name, output_idx, device_name, is_nvidia));
+                            break;
+                        }
+                        output_idx += 1;
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                    adapter_idx += 1;
+                }
+                if let Some((adapter, adapter_name, output_idx, device_name, is_nvidia)) = found {
+                    self.adapter = adapter;
+                    self.adapter_name = adapter_name;
+                    self.output_idx = output_idx;
+                    self.output_device_name = device_name;
+                    self.output_is_nvidia = is_nvidia;
+                    self.output_matches_target = true;
+                }
+            }
 
             let output: IDXGIOutput = self.adapter.EnumOutputs(self.output_idx)?;
             let output1: IDXGIOutput1 = output.cast()?;

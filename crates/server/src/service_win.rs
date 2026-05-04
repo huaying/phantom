@@ -18,7 +18,7 @@
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Debug logger for Windows Service (no stderr available).
 pub fn svc_log(msg: &str) {
@@ -129,11 +129,12 @@ fn run_service(_arguments: Vec<OsString>) -> anyhow::Result<()> {
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 ServiceControl::SessionChange(_) => {
-                    // A user logged in/out/locked/unlocked. Cancel any active
-                    // viewer so the main loop can relaunch the agent on the
-                    // correct desktop.
+                    // A user logged in/out/locked/unlocked. Keep the active
+                    // viewer socket alive; the service-mode relay will swap
+                    // the user-session agent/IPC underneath it and wait for a
+                    // fresh keyframe. Only real shutdown/new-client takeover
+                    // should flip `cancel`.
                     session_changed_clone.store(true, Ordering::Relaxed);
-                    cancel_clone.store(true, Ordering::Relaxed);
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -373,17 +374,12 @@ fn run_server_loop(
             })?;
     }
 
-    // Session-change watcher thread. The main loop can be stuck inside
-    // `create_service_session()` relaying frames for a connected client —
-    // during that time it can't poll for session drift. When the user signs
-    // out, the agent's session becomes invalid and stops producing frames,
-    // but the client stays connected (socket OK) so the relay loop doesn't
-    // exit. This thread breaks the standoff: every 500ms it checks the
-    // active console session ID; if it changed, it trips the `cancel` flag
-    // so the current service session exits, then main loop picks up drift
-    // on next iteration and relaunches the agent in the new session.
+    // Session-change watcher thread. The active viewer may be inside
+    // `create_service_session()` for a long time, so the outer accept loop
+    // cannot be the only place that notices Windows desktop/session drift.
+    // The watcher only marks drift; the relay keeps the viewer connected and
+    // swaps to a freshly launched agent/IPC in-place.
     {
-        let cancel = Arc::clone(&cancel);
         let shutdown = Arc::clone(&shutdown);
         let session_changed = Arc::clone(&session_changed);
         std::thread::Builder::new()
@@ -405,10 +401,9 @@ fn run_server_loop(
                     };
                     if cur != last_seen || cur_desktop_kind != last_desktop_kind {
                         svc_log(&format!(
-                            "Watcher: session/desktop changed {last_seen:?}/{last_desktop_kind:?} -> {cur:?}/{cur_desktop_kind:?}, cancelling current session"
+                            "Watcher: session/desktop changed {last_seen:?}/{last_desktop_kind:?} -> {cur:?}/{cur_desktop_kind:?}, refreshing agent"
                         ));
                         session_changed.store(true, Ordering::Relaxed);
-                        cancel.store(true, Ordering::Relaxed);
                         last_seen = cur;
                         last_desktop_kind = cur_desktop_kind;
                     }
@@ -492,6 +487,7 @@ fn run_server_loop(
                 sender,
                 receiver,
                 session_cancel,
+                Arc::clone(&session_changed),
                 resolution_hint,
             ) {
                 Ok(result) => {
@@ -525,6 +521,7 @@ fn create_service_session(
     sender: Box<dyn phantom_core::transport::MessageSender>,
     receiver: Box<dyn phantom_core::transport::MessageReceiver>,
     cancel: Arc<AtomicBool>,
+    session_changed: Arc<AtomicBool>,
     resolution_hint: Option<(u32, u32)>,
 ) -> anyhow::Result<crate::session::SessionResult> {
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
@@ -554,11 +551,20 @@ fn create_service_session(
                     ));
             }
             None
+        } else if windows_tier1_fixed_resolution_enabled() {
+            if let Some((hw, hh)) = resolution_hint {
+                svc_log(&format!(
+                    "create_service_session: ignoring resolution hint {hw}x{hh} while Windows Tier 1 fixed-resolution mode is enabled"
+                ));
+            }
+            None
         } else {
             resolution_hint
         };
         let ipc = session_mgr.ipc.as_ref().unwrap();
-        let _viewer_guard = IpcViewerActiveGuard::new(ipc);
+        let startup_viewer_guard = IpcViewerActiveGuard::new(ipc);
+        let controls = DynamicAgentControls::default();
+        sync_controls_to_current_ipc(session_mgr, &controls);
 
         // Drain queued frames from the previous client/mode before applying
         // this client's viewport hint; otherwise first-frame selection can see
@@ -616,9 +622,7 @@ fn create_service_session(
         // resumes producing frames. We then discard any stale frames still
         // in the IPC pipe that don't match the hint.
         if let Some((hw, hh)) = resolution_hint {
-            *ipc.resolution_change_arc()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some((hw, hh));
+            controls.request_resolution_change(hw, hh);
             svc_log(&format!(
                 "create_service_session: resolution hint {hw}x{hh} applied"
             ));
@@ -641,6 +645,7 @@ fn create_service_session(
             fallback_keyframe.as_ref().map(|ef| (ef.width, ef.height));
         let mut fallback_since: Option<Instant> =
             fallback_keyframe.as_ref().map(|_| Instant::now());
+        let mut suspicious_keyframe_since: Option<Instant> = None;
         let mut stale_frame_logs = 0u32;
         let startup_frame = if let Some(ef) = prewarmed_startup_frame {
             svc_log(&format!(
@@ -683,6 +688,35 @@ fn create_service_session(
                         }
                         continue;
                     }
+                    if is_suspicious_transition_keyframe(&ef) {
+                        stale_frame_logs += 1;
+                        let suspicious_since =
+                            suspicious_keyframe_since.get_or_insert_with(Instant::now);
+                        if suspicious_since.elapsed() < Duration::from_millis(750) {
+                            if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
+                                svc_log(&format!(
+                                    "Skipping suspicious startup keyframe {}x{} {} bytes (count={})",
+                                    ef.width,
+                                    ef.height,
+                                    ef.encoded.data.len(),
+                                    stale_frame_logs
+                                ));
+                            }
+                            fallback_frame_size = Some((ef.width, ef.height));
+                            fallback_since.get_or_insert_with(Instant::now);
+                            let _ = ipc.request_keyframe();
+                            continue;
+                        }
+                        if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
+                            svc_log(&format!(
+                                "Accepting suspicious startup keyframe after transition wait {}x{} {} bytes (count={})",
+                                ef.width,
+                                ef.height,
+                                ef.encoded.data.len(),
+                                stale_frame_logs
+                            ));
+                        }
+                    }
                     svc_log(&format!(
                         "Got startup keyframe: {}x{} {} bytes",
                         ef.width,
@@ -720,12 +754,11 @@ fn create_service_session(
                     let _ = ipc.request_keyframe();
                     last_keyframe_nudge = Instant::now();
                 }
-                // With a resolution hint, the agent may be on the Winlogon
-                // desktop and forced into CPU/GDI fallback; that can take a few
-                // seconds after ScrapCapture stalls. Never start the session with
-                // a fake hinted size: the web client then has no real first frame
-                // and shows a gray surface. Wait for an actual frame or fail.
-                let cap = if resolution_hint.is_some() { 600 } else { 100 };
+                // Windows session transitions can take several seconds before
+                // Desktop Duplication or the same-desktop GDI bootstrap returns
+                // a real keyframe. Do not fail early into a black 300x150 web
+                // canvas; keep the viewer attached and let the agent recover.
+                let cap = 1000;
                 if attempts > cap {
                     if let Some(ef) = fallback_keyframe {
                         svc_log(&format!(
@@ -754,60 +787,70 @@ fn create_service_session(
         };
         let width = startup_frame.width;
         let height = startup_frame.height;
+        let mut viewer_attached_to = None;
+        attach_viewer_to_current_ipc(session_mgr, &mut viewer_attached_to);
+        drop(startup_viewer_guard);
 
-        // Create input forwarder to send input events to agent via IPC
-        let input_forwarder: Option<Box<dyn crate::session::InputForwarder>> =
-            ipc.input_sender().map(|tx| {
-                Box::new(IpcInputForwarder { tx }) as Box<dyn crate::session::InputForwarder>
-            });
-
-        // Resolution change callback — forwards to agent via IPC
-        let resolution_change_fn: Option<crate::session::ResolutionChangeFn> = {
-            let ipc_ref = session_mgr.ipc.as_ref();
-            ipc_ref.map(|ipc| {
-                let res_arc = Arc::clone(&ipc.resolution_change_arc());
-                Box::new(move |w: u32, h: u32| {
-                    *res_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
-                }) as Box<dyn Fn(u32, u32) + Send>
-            })
-        };
-
-        // Paste callback — forwards to agent via IPC
-        let paste_fn: Option<crate::session::PasteFn> = {
-            let ipc_ref = session_mgr.ipc.as_ref();
-            ipc_ref.map(|ipc| {
-                let paste_arc = Arc::clone(&ipc.paste_arc());
-                Box::new(move |text: &str| {
-                    *paste_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
-                }) as Box<dyn Fn(&str) + Send>
-            })
-        };
-
-        let result = crate::session::run_session_ipc(
-            ipc,
-            crate::session::SessionConfig {
-                sender,
-                receiver,
-                frame_interval,
-                cancel,
-                send_file: None,
-                video_codec: phantom_core::encode::VideoCodec::H264,
-                is_resume: false,
-                input_forwarder,
-                audio_ws_rx: None,
-                resolution_change_fn,
-                paste_fn,
-            },
+        let mut runner = crate::session::SessionRunner::new(
+            sender,
+            receiver,
             width,
             height,
-            Some(startup_frame),
+            frame_interval,
+            Arc::clone(&cancel),
+            phantom_core::encode::VideoCodec::H264,
+            false,
+            false,
+            false,
+        )?;
+        let session_id = runner.session_id.clone();
+        runner.input_forwarder =
+            Some(Box::new(controls.clone()) as Box<dyn crate::session::InputForwarder>);
+        {
+            let controls = controls.clone();
+            runner.resolution_change_fn = Some(Box::new(move |w: u32, h: u32| {
+                controls.request_resolution_change(w, h);
+            }));
+        }
+        {
+            let controls = controls.clone();
+            runner.paste_fn = Some(Box::new(move |text: &str| {
+                controls.request_paste(text);
+            }));
+        }
+
+        let result = run_dynamic_ipc_relay(
+            session_mgr,
+            &mut runner,
+            controls,
+            session_changed,
+            &mut viewer_attached_to,
+            startup_frame,
         );
-        Ok(result)
+        release_viewer_from_current_ipc(session_mgr, &mut viewer_attached_to);
+        Ok(crate::session::make_session_result(
+            result,
+            session_id,
+            cancel.load(Ordering::Relaxed),
+        ))
     }
 
     #[cfg(not(target_os = "windows"))]
     unreachable!()
 }
+
+#[cfg(target_os = "windows")]
+fn windows_tier1_fixed_resolution_enabled() -> bool {
+    !matches!(
+        std::env::var("PHANTOM_WINDOWS_TIER1_ADAPTIVE")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+#[cfg(target_os = "windows")]
+type ViewerAttachKey = (u32, Option<AgentDesktopKind>);
 
 #[cfg(target_os = "windows")]
 struct IpcViewerActiveGuard<'a> {
@@ -829,19 +872,298 @@ impl Drop for IpcViewerActiveGuard<'_> {
     }
 }
 
-/// An InputForwarder that sends input events to the agent via IPC.
 #[cfg(target_os = "windows")]
-struct IpcInputForwarder {
-    tx: std::sync::mpsc::Sender<phantom_core::input::InputEvent>,
+#[derive(Clone, Default)]
+struct DynamicAgentControls {
+    input_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<phantom_core::input::InputEvent>>>>,
+    resolution_arc: Arc<Mutex<Option<Arc<Mutex<Option<(u32, u32)>>>>>>,
+    paste_arc: Arc<Mutex<Option<Arc<Mutex<Option<String>>>>>>,
+    desired_resolution: Arc<Mutex<Option<(u32, u32)>>>,
 }
 
 #[cfg(target_os = "windows")]
-impl crate::session::InputForwarder for IpcInputForwarder {
-    fn forward_input(&self, event: &phantom_core::input::InputEvent) -> anyhow::Result<()> {
-        self.tx
-            .send(event.clone())
-            .map_err(|e| anyhow::anyhow!("IPC input forward failed: {e}"))
+impl DynamicAgentControls {
+    fn update_from_ipc(
+        &self,
+        ipc: Option<&crate::ipc_pipe::IpcServer>,
+        allow_resolution_changes: bool,
+    ) {
+        let input_tx = ipc.and_then(|ipc| ipc.input_sender());
+        let resolution_arc = ipc
+            .filter(|_| allow_resolution_changes)
+            .map(|ipc| ipc.resolution_change_arc());
+        let paste_arc = ipc.map(|ipc| ipc.paste_arc());
+
+        *self.input_tx.lock().unwrap_or_else(|e| e.into_inner()) = input_tx;
+        *self
+            .resolution_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = resolution_arc.clone();
+        *self.paste_arc.lock().unwrap_or_else(|e| e.into_inner()) = paste_arc;
+
+        if let (Some(arc), Some((w, h))) = (
+            resolution_arc,
+            *self
+                .desired_resolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ) {
+            *arc.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, h));
+        }
     }
+
+    fn request_resolution_change(&self, width: u32, height: u32) {
+        *self
+            .desired_resolution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((width, height));
+        if let Some(arc) = self
+            .resolution_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            *arc.lock().unwrap_or_else(|e| e.into_inner()) = Some((width, height));
+        }
+    }
+
+    fn request_paste(&self, text: &str) {
+        if let Some(arc) = self
+            .paste_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            *arc.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl crate::session::InputForwarder for DynamicAgentControls {
+    fn forward_input(&self, event: &phantom_core::input::InputEvent) -> anyhow::Result<()> {
+        let tx = self
+            .input_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            tx.send(event.clone())
+                .map_err(|e| anyhow::anyhow!("IPC input forward failed: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sync_controls_to_current_ipc(session_mgr: &SessionManager, controls: &DynamicAgentControls) {
+    let allow_resolution_changes =
+        session_mgr.current_desktop_kind != Some(AgentDesktopKind::Winlogon);
+    controls.update_from_ipc(session_mgr.ipc(), allow_resolution_changes);
+}
+
+#[cfg(target_os = "windows")]
+fn attach_viewer_to_current_ipc(
+    session_mgr: &SessionManager,
+    attached_to: &mut Option<ViewerAttachKey>,
+) {
+    let key = (
+        session_mgr.current_session_id,
+        session_mgr.current_desktop_kind,
+    );
+    if attached_to.as_ref() == Some(&key) {
+        return;
+    }
+    if let Some(ipc) = session_mgr.ipc() {
+        ipc.acquire_viewer();
+        *attached_to = Some(key);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn release_viewer_from_current_ipc(
+    session_mgr: &SessionManager,
+    attached_to: &mut Option<ViewerAttachKey>,
+) {
+    let key = (
+        session_mgr.current_session_id,
+        session_mgr.current_desktop_kind,
+    );
+    if attached_to.as_ref() == Some(&key) {
+        if let Some(ipc) = session_mgr.ipc() {
+            ipc.release_viewer();
+        }
+    }
+    *attached_to = None;
+}
+
+#[cfg(target_os = "windows")]
+fn service_ipc_refresh_needed(session_mgr: &SessionManager, session_changed: &AtomicBool) -> bool {
+    let active_session = get_active_console_session_id();
+    let active_desktop_kind = if is_valid_console_session_id(active_session) {
+        Some(detect_agent_desktop_kind(active_session))
+    } else {
+        None
+    };
+    let session_drift = is_valid_console_session_id(active_session)
+        && active_session != session_mgr.current_session_id;
+    let desktop_drift = is_valid_console_session_id(active_session)
+        && session_mgr.current_session_id == active_session
+        && session_mgr.current_desktop_kind != active_desktop_kind;
+
+    if session_drift {
+        svc_log(&format!(
+            "Relay session drift: active={active_session} current={}",
+            session_mgr.current_session_id
+        ));
+    }
+    if desktop_drift {
+        svc_log(&format!(
+            "Relay desktop drift: active={active_desktop_kind:?} current={:?}",
+            session_mgr.current_desktop_kind
+        ));
+    }
+
+    session_changed.swap(false, Ordering::Relaxed)
+        || session_mgr.agent.is_none()
+        || session_mgr.ipc().is_none()
+        || session_drift
+        || desktop_drift
+}
+
+#[cfg(target_os = "windows")]
+fn run_dynamic_ipc_relay(
+    session_mgr: &mut SessionManager,
+    runner: &mut crate::session::SessionRunner,
+    controls: DynamicAgentControls,
+    session_changed: Arc<AtomicBool>,
+    viewer_attached_to: &mut Option<ViewerAttachKey>,
+    startup_frame: crate::ipc_pipe::IpcEncodedFrame,
+) -> anyhow::Result<Vec<u8>> {
+    if startup_frame.width != runner.current_width || startup_frame.height != runner.current_height
+    {
+        tracing::info!(
+            old_w = runner.current_width,
+            old_h = runner.current_height,
+            new_w = startup_frame.width,
+            new_h = startup_frame.height,
+            "Startup frame resolution changed"
+        );
+        runner.current_width = startup_frame.width;
+        runner.current_height = startup_frame.height;
+    }
+    runner.send_video_frame(startup_frame.encoded, None)?;
+
+    let mut wait_for_live_keyframe = true;
+    let mut skipped_suspicious_transition_keyframe = false;
+    let mut last_keyframe_nudge = Instant::now() - Duration::from_secs(1);
+    let mut last_agent_refresh = Instant::now() - Duration::from_secs(1);
+    let mut last_no_ipc_log = Instant::now() - Duration::from_secs(5);
+
+    if let Some(ipc) = session_mgr.ipc() {
+        let _ = ipc.request_keyframe();
+    }
+
+    loop {
+        runner.check_cancelled()?;
+        let loop_start = Instant::now();
+
+        session_mgr.check_agent_health();
+        if last_agent_refresh.elapsed() >= Duration::from_millis(250)
+            && service_ipc_refresh_needed(session_mgr, &session_changed)
+        {
+            last_agent_refresh = Instant::now();
+            svc_log("Relay: refreshing Windows agent/IPC without dropping viewer");
+            release_viewer_from_current_ipc(session_mgr, viewer_attached_to);
+            session_mgr.update();
+            sync_controls_to_current_ipc(session_mgr, &controls);
+            attach_viewer_to_current_ipc(session_mgr, viewer_attached_to);
+            wait_for_live_keyframe = true;
+            skipped_suspicious_transition_keyframe = false;
+            last_keyframe_nudge = Instant::now() - Duration::from_secs(1);
+            if let Some(ipc) = session_mgr.ipc() {
+                let _ = ipc.request_keyframe();
+            }
+        }
+
+        runner.pump_events()?;
+        runner.poll_clipboard()?;
+        runner.drain_audio()?;
+
+        if let Some(ipc) = session_mgr.ipc() {
+            let should_request_keyframe = wait_for_live_keyframe || runner.needs_keyframe();
+            if should_request_keyframe && last_keyframe_nudge.elapsed() > Duration::from_millis(500)
+            {
+                let _ = ipc.request_keyframe();
+                last_keyframe_nudge = Instant::now();
+            }
+
+            for ipc_frame in ipc.recv_encoded_frames() {
+                if wait_for_live_keyframe {
+                    if ipc_frame.encoded.is_keyframe {
+                        if !skipped_suspicious_transition_keyframe
+                            && is_suspicious_transition_keyframe(&ipc_frame)
+                        {
+                            skipped_suspicious_transition_keyframe = true;
+                            svc_log(&format!(
+                                "Relay: skipped suspicious tiny transition keyframe {}x{} {} bytes",
+                                ipc_frame.width,
+                                ipc_frame.height,
+                                ipc_frame.encoded.data.len()
+                            ));
+                            let _ = ipc.request_keyframe();
+                            continue;
+                        }
+                        wait_for_live_keyframe = false;
+                        svc_log(&format!(
+                            "Relay: forwarding first live keyframe {}x{} after agent refresh",
+                            ipc_frame.width, ipc_frame.height
+                        ));
+                    } else {
+                        continue;
+                    }
+                }
+
+                if ipc_frame.width != runner.current_width
+                    || ipc_frame.height != runner.current_height
+                {
+                    tracing::info!(
+                        old_w = runner.current_width,
+                        old_h = runner.current_height,
+                        new_w = ipc_frame.width,
+                        new_h = ipc_frame.height,
+                        "Frame resolution changed"
+                    );
+                    runner.current_width = ipc_frame.width;
+                    runner.current_height = ipc_frame.height;
+                }
+                runner.send_video_frame(ipc_frame.encoded, None)?;
+            }
+
+            if let Some(text) = ipc.recv_clipboard() {
+                let _ = runner
+                    .sender
+                    .send_msg(&phantom_core::protocol::Message::ClipboardSync(text));
+            }
+        } else if last_no_ipc_log.elapsed() >= Duration::from_secs(2) {
+            svc_log("Relay: waiting for Windows agent IPC while keeping viewer connected");
+            last_no_ipc_log = Instant::now();
+        }
+
+        runner.drain_file_transfers()?;
+        runner.log_stats("stats-ipc");
+        runner.keepalive_tick()?;
+        runner.frame_pace(loop_start)?;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_suspicious_transition_keyframe(frame: &crate::ipc_pipe::IpcEncodedFrame) -> bool {
+    let pixels = (frame.width as usize).saturating_mul(frame.height as usize);
+    let min_expected_bytes = (pixels / 250).clamp(4096, 32 * 1024);
+    frame.encoded.data.len() < min_expected_bytes
 }
 
 // ── Process Handle Wrapper ──────────────────────────────────────────────────
@@ -956,6 +1278,29 @@ enum AgentDesktopKind {
     Winlogon,
 }
 
+#[cfg(target_os = "windows")]
+const DESKTOP_KIND_STABLE_FOR: Duration = Duration::from_millis(1000);
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+struct DesktopDetectDebounce {
+    last_confirmed_session: Option<u32>,
+    last_confirmed_kind: Option<AgentDesktopKind>,
+    candidate_session: Option<u32>,
+    candidate_kind: Option<AgentDesktopKind>,
+    candidate_since: Option<Instant>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+struct DesktopKindObservation {
+    kind: AgentDesktopKind,
+    force: bool,
+}
+
+#[cfg(target_os = "windows")]
+static DESKTOP_DETECT_DEBOUNCE: OnceLock<Mutex<DesktopDetectDebounce>> = OnceLock::new();
+
 /// Monitors Windows user sessions and manages the agent process lifecycle.
 /// When a user logs in, it launches a phantom agent in their session
 /// and establishes an IPC pipe for frame/input proxying.
@@ -994,7 +1339,7 @@ impl SessionManager {
     fn update(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            let session_id = get_active_console_session_id();
+            let mut session_id = get_active_console_session_id();
             let desired_desktop_kind = if is_valid_console_session_id(session_id) {
                 Some(detect_agent_desktop_kind(session_id))
             } else {
@@ -1040,7 +1385,7 @@ impl SessionManager {
                 return;
             }
 
-            let desired_desktop_kind =
+            let mut desired_desktop_kind =
                 desired_desktop_kind.expect("valid session has desktop kind");
 
             // Session or desktop changed — kill old agent before launching new one.
@@ -1057,6 +1402,34 @@ impl SessionManager {
                 self.current_session_id = session_id;
                 self.current_desktop_kind = Some(desired_desktop_kind);
                 self.kill_agent();
+
+                // Stopping the old agent can take several seconds. During
+                // Windows login/logout transitions the visible desktop often
+                // changes again in that window (Winlogon spinner -> Default,
+                // or Default -> Winlogon). Re-read the target before creating
+                // the new process so we never launch an agent for a stale
+                // desktop decision.
+                let refreshed_session_id = get_active_console_session_id();
+                if !is_valid_console_session_id(refreshed_session_id) {
+                    svc_log(&format!(
+                        "Console session became invalid ({refreshed_session_id}) while stopping agent; deferring relaunch"
+                    ));
+                    self.current_session_id = refreshed_session_id;
+                    self.current_desktop_kind = None;
+                    return;
+                }
+                let refreshed_desktop_kind = detect_agent_desktop_kind(refreshed_session_id);
+                if refreshed_session_id != session_id
+                    || refreshed_desktop_kind != desired_desktop_kind
+                {
+                    svc_log(&format!(
+                        "Retargeting agent launch after stop: {session_id}/{desired_desktop_kind:?} -> {refreshed_session_id}/{refreshed_desktop_kind:?}"
+                    ));
+                    session_id = refreshed_session_id;
+                    desired_desktop_kind = refreshed_desktop_kind;
+                    self.current_session_id = session_id;
+                    self.current_desktop_kind = Some(desired_desktop_kind);
+                }
             }
 
             // Already have a working agent — nothing to do
@@ -1208,29 +1581,121 @@ fn is_valid_console_session_id(session_id: u32) -> bool {
 
 #[cfg(target_os = "windows")]
 fn detect_agent_desktop_kind(session_id: u32) -> AgentDesktopKind {
+    debounce_desktop_kind(session_id, detect_agent_desktop_kind_raw(session_id))
+}
+
+#[cfg(target_os = "windows")]
+fn detect_agent_desktop_kind_raw(session_id: u32) -> DesktopKindObservation {
     // WTS lock state and explorer.exe can lead the real desktop during login:
     // Windows may report "unlocked" and create explorer while Winlogon is still
     // the visible/input desktop showing the login spinner. Follow the actual
-    // input desktop first, like VNC-style Windows services do.
+    // input desktop first, like VNC-style Windows services do, but force only
+    // hard state changes (locked/no shell) to avoid login-transition flapping.
+    let locked = session_is_locked(session_id).unwrap_or(false);
+    let shell_ready = find_process_in_session("explorer.exe", session_id).is_some();
+
     if let Some(kind) = active_input_desktop_kind() {
         return match kind {
             AgentDesktopKind::Default => {
-                if find_process_in_session("explorer.exe", session_id).is_some() {
-                    AgentDesktopKind::Default
+                if shell_ready && !locked {
+                    DesktopKindObservation {
+                        kind: AgentDesktopKind::Default,
+                        // This is the same signal open-source Windows hosts
+                        // ultimately trust: the input desktop is Default and
+                        // the user's shell exists. Do not keep showing
+                        // Winlogon for the generic debounce window.
+                        force: true,
+                    }
                 } else {
-                    AgentDesktopKind::Winlogon
+                    DesktopKindObservation {
+                        kind: AgentDesktopKind::Winlogon,
+                        force: true,
+                    }
                 }
             }
-            AgentDesktopKind::Winlogon => AgentDesktopKind::Winlogon,
+            AgentDesktopKind::Winlogon => DesktopKindObservation {
+                kind: AgentDesktopKind::Winlogon,
+                force: locked || !shell_ready,
+            },
         };
     }
 
-    if find_process_in_session("explorer.exe", session_id).is_none() {
-        AgentDesktopKind::Winlogon
-    } else if session_is_locked(session_id).unwrap_or(false) {
-        AgentDesktopKind::Winlogon
+    if !shell_ready || locked {
+        DesktopKindObservation {
+            kind: AgentDesktopKind::Winlogon,
+            force: true,
+        }
     } else {
-        AgentDesktopKind::Default
+        DesktopKindObservation {
+            kind: AgentDesktopKind::Default,
+            force: false,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn debounce_desktop_kind(session_id: u32, observed: DesktopKindObservation) -> AgentDesktopKind {
+    let state =
+        DESKTOP_DETECT_DEBOUNCE.get_or_init(|| Mutex::new(DesktopDetectDebounce::default()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if state.last_confirmed_session != Some(session_id) || state.last_confirmed_kind.is_none() {
+        state.last_confirmed_session = Some(session_id);
+        state.last_confirmed_kind = Some(observed.kind);
+        state.candidate_session = None;
+        state.candidate_kind = None;
+        state.candidate_since = None;
+        return observed.kind;
+    }
+
+    if observed.force || state.last_confirmed_kind == Some(observed.kind) {
+        state.last_confirmed_session = Some(session_id);
+        state.last_confirmed_kind = Some(observed.kind);
+        state.candidate_session = None;
+        state.candidate_kind = None;
+        state.candidate_since = None;
+        return observed.kind;
+    }
+
+    let now = Instant::now();
+    match (
+        state.candidate_session,
+        state.candidate_kind,
+        state.candidate_since,
+    ) {
+        (Some(candidate_session), Some(candidate_kind), Some(since))
+            if candidate_session == session_id && candidate_kind == observed.kind =>
+        {
+            if now.duration_since(since) >= DESKTOP_KIND_STABLE_FOR {
+                let previous_kind = state.last_confirmed_kind;
+                state.last_confirmed_session = Some(session_id);
+                state.last_confirmed_kind = Some(observed.kind);
+                state.candidate_session = None;
+                state.candidate_kind = None;
+                state.candidate_since = None;
+                svc_log(&format!(
+                    "{:?} desktop stable for {}ms; switching from {:?}",
+                    observed.kind,
+                    DESKTOP_KIND_STABLE_FOR.as_millis(),
+                    previous_kind
+                ));
+                observed.kind
+            } else {
+                state.last_confirmed_kind.unwrap_or(observed.kind)
+            }
+        }
+        _ => {
+            state.candidate_session = Some(session_id);
+            state.candidate_kind = Some(observed.kind);
+            state.candidate_since = Some(now);
+            svc_log(&format!(
+                "{:?} desktop candidate detected after {:?}; waiting {}ms for stability",
+                observed.kind,
+                state.last_confirmed_kind,
+                DESKTOP_KIND_STABLE_FOR.as_millis()
+            ));
+            state.last_confirmed_kind.unwrap_or(observed.kind)
+        }
     }
 }
 

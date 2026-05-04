@@ -809,6 +809,7 @@ linux_configure_autologin() {
 
     linux_autologin_configure_display_manager
     linux_autologin_disable_screenlock
+    linux_autologin_disable_suspend
     linux_autologin_reset_keyring
     linux_autologin_install_keyring_unlock
     # Autostart entry is already installed by the default path; --autologin
@@ -901,6 +902,18 @@ EOF
     fi
 }
 
+linux_dconf_ensure_local_profile() {
+    sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
+    if [ ! -f /etc/dconf/profile/user ]; then
+        sudo tee /etc/dconf/profile/user > /dev/null <<EOF
+user-db:user
+system-db:local
+EOF
+    elif ! grep -qx 'system-db:local' /etc/dconf/profile/user 2>/dev/null; then
+        echo 'system-db:local' | sudo tee -a /etc/dconf/profile/user > /dev/null
+    fi
+}
+
 linux_autologin_disable_screenlock() {
     # 2. Disable GNOME screen lock + idle + user switching (system-wide dconf
     #    override so it applies before the user ever logs in and picks it up
@@ -912,13 +925,7 @@ linux_autologin_disable_screenlock() {
     #    VT. phantom stays pinned to DISPLAY=:0 (the backgrounded session)
     #    and keeps streaming a black screen; autologin can't recover because
     #    the original session isn't technically dead.
-    sudo mkdir -p /etc/dconf/profile /etc/dconf/db/local.d
-    if [ ! -f /etc/dconf/profile/user ]; then
-        sudo tee /etc/dconf/profile/user > /dev/null <<EOF
-user-db:user
-system-db:local
-EOF
-    fi
+    linux_dconf_ensure_local_profile
     sudo tee /etc/dconf/db/local.d/00-phantom-no-lock > /dev/null <<'EOF'
 [org/gnome/desktop/screensaver]
 lock-enabled=false
@@ -962,6 +969,64 @@ EOF
     sudo pkill -x xfce4-screensav 2>/dev/null || true
     sudo pkill -x gnome-screensav 2>/dev/null || true
     echo "  Disabled GNOME/XFCE screen lock + idle timeout + user switching"
+}
+
+linux_autologin_disable_suspend() {
+    # A remote desktop host must never enter system suspend: once the guest OS
+    # suspends, SSH, Phantom, network, and display-manager all stop, so there is
+    # no daemon left to show a login screen or wake the VM. This is intentionally
+    # scoped to --autologin / dedicated remote-access installs.
+    linux_dconf_ensure_local_profile
+    sudo mkdir -p /etc/systemd/logind.conf.d
+    sudo tee /etc/dconf/db/local.d/01-phantom-no-suspend > /dev/null <<'EOF'
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-ac-timeout=0
+sleep-inactive-battery-type='nothing'
+sleep-inactive-battery-timeout=0
+lid-close-ac-action='nothing'
+lid-close-battery-action='nothing'
+EOF
+    sudo dconf update 2>/dev/null || true
+
+    sudo tee /etc/systemd/logind.conf.d/90-phantom-no-suspend.conf > /dev/null <<'EOF'
+# Written by phantom install.sh --autologin
+[Login]
+IdleAction=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+
+    if have_cmd systemctl; then
+        sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target > /dev/null 2>&1 || true
+    fi
+
+    # Apply immediately for the current autologin session when possible; the
+    # system dconf/logind files above are the durable boot-time source of truth.
+    _uid="$(id -u "$TARGET_USER" 2>/dev/null || true)"
+    if [ -n "$_uid" ]; then
+        sudo -u "$TARGET_USER" env \
+            HOME="$USER_HOME" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" \
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || true
+        sudo -u "$TARGET_USER" env \
+            HOME="$USER_HOME" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" \
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 0 2>/dev/null || true
+        sudo -u "$TARGET_USER" env \
+            HOME="$USER_HOME" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" \
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null || true
+        sudo -u "$TARGET_USER" env \
+            HOME="$USER_HOME" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" \
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout 0 2>/dev/null || true
+    fi
+
+    echo "  Disabled system suspend for dedicated remote access"
 }
 
 linux_autologin_reset_keyring() {
@@ -1369,6 +1434,45 @@ linux_doctor_screenlock() {
     fi
 }
 
+linux_doctor_suspend() {
+    if [ "$AUTOLOGIN" != true ]; then
+        return 0
+    fi
+
+    _suspend_bad=false
+    if have_cmd systemctl; then
+        for _target in sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target; do
+            _state="$(systemctl is-enabled "$_target" 2>/dev/null || true)"
+            case "$_state" in
+                masked|not-found) ;;
+                *) _suspend_bad=true ;;
+            esac
+        done
+    fi
+
+    if [ "$_suspend_bad" = true ]; then
+        doctor_warn "system sleep targets are not fully masked; rerun install.sh --autologin"
+    else
+        doctor_ok "system sleep targets are masked or unavailable"
+    fi
+
+    if [ -f /etc/systemd/logind.conf.d/90-phantom-no-suspend.conf ]; then
+        doctor_ok "logind suspend prevention config exists"
+    else
+        doctor_warn "logind suspend prevention config is missing; rerun install.sh --autologin"
+    fi
+
+    if have_cmd gsettings && [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+        _uid="$(id -u "$TARGET_USER" 2>/dev/null || true)"
+        _sleep_type="$(sudo -u "$TARGET_USER" env HOME="$USER_HOME" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 2>/dev/null || true)"
+        if [ "$_sleep_type" = "'nothing'" ]; then
+            doctor_ok "GNOME AC idle suspend is disabled"
+        elif [ -n "$_sleep_type" ]; then
+            doctor_warn "GNOME AC idle suspend is $_sleep_type; rerun install.sh --autologin"
+        fi
+    fi
+}
+
 linux_doctor_gpu() {
     if linux_has_nvidia_gpu; then
         _gpu_line="$(nvidia-smi -L 2>/dev/null | head -n1 || true)"
@@ -1559,6 +1663,7 @@ linux_run_doctor() {
     linux_doctor_input
     linux_doctor_autostart
     linux_doctor_screenlock
+    linux_doctor_suspend
     if [ -n "$_server_bin" ]; then
         linux_doctor_capture_probe "$_server_bin"
     fi

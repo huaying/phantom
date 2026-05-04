@@ -288,16 +288,16 @@ impl PhantomClient {
             let marker = i + 1 == packet_count;
             octet_count = octet_count.wrapping_add(payload.len() as u32);
             let sequence_number = self.media_tx.video_seq;
-            let packet = srtp.protect_rtp(
-                self.params.video_payload_type,
+            let packet = srtp.protect_rtp(RtpProtectParams {
+                payload_type: self.params.video_payload_type,
                 marker,
                 sequence_number,
-                video_timestamp,
-                self.media_tx.video_ssrc,
-                self.params.video_mid_ext_id,
-                self.params.video_mid.as_deref(),
-                &payload,
-            );
+                timestamp: video_timestamp,
+                ssrc: self.media_tx.video_ssrc,
+                mid_ext_id: self.params.video_mid_ext_id,
+                mid: self.params.video_mid.as_deref(),
+                payload: &payload,
+            });
             cached_packets.push((sequence_number, packet.clone()));
             self.pending_transmits.push_back((source, packet));
             self.media_tx.video_seq = self.media_tx.video_seq.wrapping_add(1);
@@ -325,16 +325,16 @@ impl PhantomClient {
         let Some(srtp) = self.srtp_tx.as_mut() else {
             return;
         };
-        let packet = srtp.protect_rtp(
-            self.params.audio_payload_type,
-            false,
-            self.media_tx.audio_seq,
-            self.media_tx.audio_timestamp,
-            self.media_tx.audio_ssrc,
-            self.params.audio_mid_ext_id,
-            self.params.audio_mid.as_deref(),
-            &frame.data,
-        );
+        let packet = srtp.protect_rtp(RtpProtectParams {
+            payload_type: self.params.audio_payload_type,
+            marker: false,
+            sequence_number: self.media_tx.audio_seq,
+            timestamp: self.media_tx.audio_timestamp,
+            ssrc: self.media_tx.audio_ssrc,
+            mid_ext_id: self.params.audio_mid_ext_id,
+            mid: self.params.audio_mid.as_deref(),
+            payload: &frame.data,
+        });
         self.pending_transmits.push_back((source, packet));
         self.media_tx.audio_seq = self.media_tx.audio_seq.wrapping_add(1);
         self.media_tx.audio_packet_count = self.media_tx.audio_packet_count.wrapping_add(1);
@@ -481,12 +481,11 @@ impl BackendClient for PhantomClient {
                     }
                 }
                 DtlsOutput::Timeout(_) => break,
-                DtlsOutput::Connected => {
-                    if !self.connected {
-                        self.connected = true;
-                        tracing::info!("phantom backend DTLS connected");
-                    }
+                DtlsOutput::Connected if !self.connected => {
+                    self.connected = true;
+                    tracing::info!("phantom backend DTLS connected");
                 }
+                DtlsOutput::Connected => {}
                 DtlsOutput::PeerCert(cert_der) => {
                     let actual = format_fingerprint(&calculate_fingerprint(cert_der));
                     let expected = &self.params.remote_fingerprint_sha256;
@@ -920,13 +919,24 @@ struct PhantomSrtpRxContext {
     rtcp: PhantomSrtpCipher,
 }
 
+struct RtpProtectParams<'a> {
+    payload_type: u8,
+    marker: bool,
+    sequence_number: u16,
+    timestamp: u32,
+    ssrc: u32,
+    mid_ext_id: Option<u8>,
+    mid: Option<&'a str>,
+    payload: &'a [u8],
+}
+
 enum PhantomSrtpCipher {
     AeadAes128Gcm {
-        key: Aes128Gcm,
+        key: Box<Aes128Gcm>,
         salt: [u8; 12],
     },
     AeadAes256Gcm {
-        key: Aes256Gcm,
+        key: Box<Aes256Gcm>,
         salt: [u8; 12],
     },
     Aes128CmSha1_80 {
@@ -943,16 +953,20 @@ impl PhantomSrtpTxContext {
             SrtpProfile::AEAD_AES_128_GCM => {
                 let (key, salt) = derive_gcm_material_128(material, left)?;
                 PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Aes128Gcm::new_from_slice(&key)
-                        .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    key: Box::new(
+                        Aes128Gcm::new_from_slice(&key)
+                            .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    ),
                     salt,
                 }
             }
             SrtpProfile::AEAD_AES_256_GCM => {
                 let (key, salt) = derive_gcm_material_256(material, left)?;
                 PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Aes256Gcm::new_from_slice(&key)
-                        .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    key: Box::new(
+                        Aes256Gcm::new_from_slice(&key)
+                            .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    ),
                     salt,
                 }
             }
@@ -971,44 +985,34 @@ impl PhantomSrtpTxContext {
         Ok(Self { rtp })
     }
 
-    fn protect_rtp(
-        &mut self,
-        payload_type: u8,
-        marker: bool,
-        sequence_number: u16,
-        timestamp: u32,
-        ssrc: u32,
-        mid_ext_id: Option<u8>,
-        mid: Option<&str>,
-        payload: &[u8],
-    ) -> Vec<u8> {
+    fn protect_rtp(&mut self, params: RtpProtectParams<'_>) -> Vec<u8> {
         let header = build_rtp_header(
-            payload_type,
-            marker,
-            sequence_number,
-            timestamp,
-            ssrc,
-            mid_ext_id,
-            mid,
+            params.payload_type,
+            params.marker,
+            params.sequence_number,
+            params.timestamp,
+            params.ssrc,
+            params.mid_ext_id,
+            params.mid,
         );
         match &mut self.rtp {
             PhantomSrtpCipher::AeadAes128Gcm { key, salt } => protect_rtp_gcm(
-                key,
+                key.as_ref(),
                 *salt,
                 &header,
-                sequence_number,
-                timestamp,
-                ssrc,
-                payload,
+                params.sequence_number,
+                params.timestamp,
+                params.ssrc,
+                params.payload,
             ),
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => protect_rtp_gcm(
-                key,
+                key.as_ref(),
                 *salt,
                 &header,
-                sequence_number,
-                timestamp,
-                ssrc,
-                payload,
+                params.sequence_number,
+                params.timestamp,
+                params.ssrc,
+                params.payload,
             ),
             PhantomSrtpCipher::Aes128CmSha1_80 {
                 enc_key,
@@ -1019,9 +1023,9 @@ impl PhantomSrtpTxContext {
                 auth_key,
                 *salt,
                 &header,
-                sequence_number,
-                ssrc,
-                payload,
+                params.sequence_number,
+                params.ssrc,
+                params.payload,
             ),
         }
     }
@@ -1029,10 +1033,10 @@ impl PhantomSrtpTxContext {
     fn protect_rtcp(&mut self, packet: &[u8], ssrc: u32, srtcp_index: u32) -> Vec<u8> {
         match &mut self.rtp {
             PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
-                protect_rtcp_gcm(key, *salt, packet, ssrc, srtcp_index)
+                protect_rtcp_gcm(key.as_ref(), *salt, packet, ssrc, srtcp_index)
             }
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
-                protect_rtcp_gcm(key, *salt, packet, ssrc, srtcp_index)
+                protect_rtcp_gcm(key.as_ref(), *salt, packet, ssrc, srtcp_index)
             }
             PhantomSrtpCipher::Aes128CmSha1_80 { auth_key, .. } => {
                 protect_rtcp_aes_cm_sha1_80(auth_key, packet, srtcp_index)
@@ -1048,16 +1052,20 @@ impl PhantomSrtpRxContext {
             SrtpProfile::AEAD_AES_128_GCM => {
                 let (key, salt) = derive_gcm_material_128(material, left)?;
                 PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Aes128Gcm::new_from_slice(&key)
-                        .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    key: Box::new(
+                        Aes128Gcm::new_from_slice(&key)
+                            .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                    ),
                     salt,
                 }
             }
             SrtpProfile::AEAD_AES_256_GCM => {
                 let (key, salt) = derive_gcm_material_256(material, left)?;
                 PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Aes256Gcm::new_from_slice(&key)
-                        .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    key: Box::new(
+                        Aes256Gcm::new_from_slice(&key)
+                            .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                    ),
                     salt,
                 }
             }
@@ -1079,10 +1087,10 @@ impl PhantomSrtpRxContext {
     fn unprotect_rtcp(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         match &mut self.rtcp {
             PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
-                unprotect_rtcp_gcm(key, *salt, packet)
+                unprotect_rtcp_gcm(key.as_ref(), *salt, packet)
             }
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
-                unprotect_rtcp_gcm(key, *salt, packet)
+                unprotect_rtcp_gcm(key.as_ref(), *salt, packet)
             }
             PhantomSrtpCipher::Aes128CmSha1_80 {
                 enc_key,

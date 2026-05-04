@@ -8,8 +8,8 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN,
+    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 /// Injects input events into the OS.
@@ -354,6 +354,11 @@ fn windows_mouse_move(x: i32, y: i32) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_set_cursor_pos(x: i32, y: i32) -> Result<()> {
+    unsafe { SetCursorPos(x, y) }.map_err(|e| anyhow::anyhow!("SetCursorPos({x}, {y}) failed: {e}"))
+}
+
+#[cfg(target_os = "windows")]
 fn normalize_abs(value: i32, origin: i32, size: i32) -> i32 {
     let denom = (size - 1).max(1) as i64;
     let raw = ((value - origin) as i64 * 65_535) / denom;
@@ -454,6 +459,60 @@ pub fn windows_cursor_diagnostics() -> Option<((i32, i32), (i32, i32, i32, i32))
     unsafe { GetCursorPos(&mut pt) }
         .ok()
         .map(|()| ((pt.x, pt.y), windows_virtual_screen()))
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_nudge_cursor_for_capture() {
+    let Some(((x, y), (vx, _vy, vw, _vh))) = windows_cursor_diagnostics() else {
+        return;
+    };
+    let nudged_x = if x + 1 < vx + vw { x + 1 } else { x - 1 };
+    let _ = windows_set_cursor_pos(nudged_x, y).or_else(|_| windows_mouse_move(nudged_x, y));
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let _ = windows_set_cursor_pos(x, y).or_else(|_| windows_mouse_move(x, y));
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_nudge_cursor_in_rect(origin_x: i32, origin_y: i32, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        windows_nudge_cursor_for_capture();
+        return;
+    }
+
+    let Some(((x, y), _)) = windows_cursor_diagnostics() else {
+        return;
+    };
+    let right = origin_x.saturating_add(width.saturating_sub(1) as i32);
+    let bottom = origin_y.saturating_add(height.saturating_sub(1) as i32);
+    let inside = x >= origin_x && x <= right && y >= origin_y && y <= bottom;
+
+    if inside {
+        let nudged_x = if x < right {
+            x + 1
+        } else {
+            x.saturating_sub(1)
+        };
+        let _ = windows_set_cursor_pos(nudged_x, y).or_else(|_| windows_mouse_move(nudged_x, y));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let _ = windows_set_cursor_pos(x, y).or_else(|_| windows_mouse_move(x, y));
+        return;
+    }
+
+    let center_x = origin_x.saturating_add((width / 2) as i32);
+    let center_y = origin_y.saturating_add((height / 2) as i32);
+    let nudged_x = if center_x < right {
+        center_x + 1
+    } else {
+        center_x.saturating_sub(1)
+    };
+    let _ = windows_set_cursor_pos(center_x, center_y)
+        .or_else(|_| windows_mouse_move(center_x, center_y));
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let _ = windows_set_cursor_pos(nudged_x, center_y)
+        .or_else(|_| windows_mouse_move(nudged_x, center_y));
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let _ = windows_set_cursor_pos(center_x, center_y)
+        .or_else(|_| windows_mouse_move(center_x, center_y));
 }
 
 #[cfg(target_os = "windows")]

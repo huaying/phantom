@@ -1909,45 +1909,11 @@ fn find_vdd_device_name() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_attached_non_vdd_device_name() -> Option<String> {
-    use windows::Win32::Graphics::Gdi::*;
-    unsafe {
-        let mut device_idx = 0u32;
-        loop {
-            let mut dd = DISPLAY_DEVICEW::default();
-            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            if !EnumDisplayDevicesW(None, device_idx, &mut dd, 0).as_bool() {
-                break;
-            }
-            device_idx += 1;
-            if (dd.StateFlags & 0x1) == 0 {
-                continue;
-            }
-            let name = String::from_utf16_lossy(
-                &dd.DeviceName[..dd
-                    .DeviceName
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(dd.DeviceName.len())],
-            );
-            let desc = String::from_utf16_lossy(
-                &dd.DeviceString[..dd
-                    .DeviceString
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(dd.DeviceString.len())],
-            );
-            if desc != "Virtual Display Driver" {
-                tracing::info!(name, desc, "Found attached non-VDD display");
-                return Some(name);
-            }
-        }
-        None
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn current_display_resolution(device_name: &str) -> Option<(u32, u32)> {
+    if let Some((_, _, width, height)) = display_ccd::active_source_rect(device_name) {
+        return Some((width, height));
+    }
+
     use windows::Win32::Graphics::Gdi::*;
 
     unsafe {
@@ -1962,6 +1928,100 @@ fn current_display_resolution(device_name: &str) -> Option<(u32, u32)> {
             Some((dm.dmPelsWidth, dm.dmPelsHeight))
         } else {
             None
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_display_rect_for_device(device_name: &str) -> Option<(i32, i32, u32, u32)> {
+    if let Some(rect) = display_ccd::active_source_rect(device_name) {
+        return Some(rect);
+    }
+
+    use windows::Win32::Graphics::Gdi::*;
+
+    unsafe {
+        let device_name_w: Vec<u16> = device_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let pcwstr = windows::core::PCWSTR(device_name_w.as_ptr());
+        let mut dm = DEVMODEW::default();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(pcwstr, ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
+            && dm.dmPelsWidth > 0
+            && dm.dmPelsHeight > 0
+        {
+            let position = dm.Anonymous1.Anonymous2.dmPosition;
+            Some((position.x, position.y, dm.dmPelsWidth, dm.dmPelsHeight))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn nudge_windows_capture_target(
+    target_device: Option<&str>,
+    target_rect: Option<(i32, i32, u32, u32)>,
+) {
+    if let Some((x, y, width, height)) =
+        target_rect.or_else(|| target_device.and_then(current_display_rect_for_device))
+    {
+        input_injector::windows_nudge_cursor_in_rect(x, y, width, height);
+    } else {
+        input_injector::windows_nudge_cursor_for_capture();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn change_display_resolution_for_device(device_name: &str, width: u32, height: u32) -> bool {
+    use windows::Win32::Graphics::Gdi::*;
+
+    unsafe {
+        let device_name_w: Vec<u16> = device_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let pcwstr = windows::core::PCWSTR(device_name_w.as_ptr());
+        let mut dm = DEVMODEW::default();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        if !EnumDisplaySettingsW(pcwstr, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            tracing::warn!("EnumDisplaySettingsW failed for {device_name}");
+            return false;
+        }
+
+        dm.dmPelsWidth = width;
+        dm.dmPelsHeight = height;
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+
+        let result = ChangeDisplaySettingsExW(
+            pcwstr,
+            Some(&dm),
+            None,
+            CDS_UPDATEREGISTRY | CDS_NORESET,
+            None,
+        );
+
+        if result == DISP_CHANGE_SUCCESSFUL {
+            let _ = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
+            tracing::info!(
+                width,
+                height,
+                device = device_name,
+                "Display resolution changed"
+            );
+            true
+        } else {
+            tracing::warn!(
+                ?result,
+                width,
+                height,
+                device = device_name,
+                "ChangeDisplaySettingsExW failed"
+            );
+            false
         }
     }
 }
@@ -2018,183 +2078,7 @@ fn change_display_resolution(width: u32, height: u32) -> bool {
             }
         };
 
-        // Get current settings
-        let device_name_w: Vec<u16> = device_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let pcwstr = windows::core::PCWSTR(device_name_w.as_ptr());
-        let mut dm = DEVMODEW::default();
-        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-
-        if !EnumDisplaySettingsW(pcwstr, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
-            tracing::warn!("EnumDisplaySettingsW failed for {device_name}");
-            return false;
-        }
-
-        // Set new resolution
-        dm.dmPelsWidth = width;
-        dm.dmPelsHeight = height;
-        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
-
-        let result = ChangeDisplaySettingsExW(
-            pcwstr,
-            Some(&dm),
-            None,
-            CDS_UPDATEREGISTRY | CDS_NORESET,
-            None,
-        );
-
-        if result == DISP_CHANGE_SUCCESSFUL {
-            // Apply the change
-            let _ = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
-            tracing::info!(
-                width,
-                height,
-                device = device_name,
-                "Display resolution changed"
-            );
-            true
-        } else {
-            tracing::warn!(?result, width, height, "ChangeDisplaySettingsExW failed");
-            false
-        }
-    }
-}
-
-/// Make the MTT VDD the primary display so all windows open on it.
-///
-/// On VMs where another display (e.g. NVIDIA L40 with a CLB2770 EDID emulator,
-/// or DCV's IDD with a connected client) is primary, new windows open there
-/// and our VDD stays empty → Phantom captures a black screen. Setting VDD
-/// primary forces new windows onto VDD; existing windows can be moved by user.
-///
-/// Same approach as Sunshine: position VDD at (0,0) and set CDS_SET_PRIMARY.
-/// Windows automatically repositions other displays to negative coordinates.
-/// Idempotent — calling on an already-primary VDD is a no-op.
-/// Deprecated — the legacy `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` path.
-/// Windows 11 24H2+ returns `DISP_CHANGE_FAILED` for IDD drivers. Kept around
-/// but unused; real work is in `display_ccd::set_vdd_primary`.
-#[cfg(target_os = "windows")]
-#[allow(dead_code)]
-fn set_vdd_primary_legacy(vdd_device: &str) -> bool {
-    use windows::Win32::Graphics::Gdi::*;
-
-    unsafe {
-        // Step 1: enumerate all active displays. Get VDD's current width to know
-        // where to place other displays.
-        let mut vdd_w: u32 = 0;
-        let mut others: Vec<(String, i32, i32, u32, u32)> = Vec::new();
-        let mut idx = 0u32;
-        loop {
-            let mut dd = DISPLAY_DEVICEW::default();
-            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            if !EnumDisplayDevicesW(None, idx, &mut dd, 0).as_bool() {
-                break;
-            }
-            idx += 1;
-            // Only attached (active) displays matter
-            // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1
-            if (dd.StateFlags & 0x1) == 0 {
-                continue;
-            }
-            let name = String::from_utf16_lossy(
-                &dd.DeviceName[..dd.DeviceName.iter().position(|&c| c == 0).unwrap_or(32)],
-            );
-            let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut dm = DEVMODEW::default();
-            dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-            if !EnumDisplaySettingsW(
-                windows::core::PCWSTR(name_w.as_ptr()),
-                ENUM_CURRENT_SETTINGS,
-                &mut dm,
-            )
-            .as_bool()
-            {
-                continue;
-            }
-            let x = dm.Anonymous1.Anonymous2.dmPosition.x;
-            let y = dm.Anonymous1.Anonymous2.dmPosition.y;
-            if name == vdd_device {
-                vdd_w = dm.dmPelsWidth;
-            } else {
-                others.push((name, x, y, dm.dmPelsWidth, dm.dmPelsHeight));
-            }
-        }
-        if vdd_w == 0 {
-            crate::service_win::svc_log(&format!(
-                "set_vdd_primary: VDD {vdd_device} not found among attached displays"
-            ));
-            return false;
-        }
-
-        // Step 2: queue moves for all non-VDD displays. Place them sequentially
-        // to the right of VDD: first at x=vdd_w, next at vdd_w+w1, etc.
-        let mut x_offset = vdd_w as i32;
-        for (name, ox, oy, w, h) in &others {
-            let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let pc = windows::core::PCWSTR(name_w.as_ptr());
-            let mut dm = DEVMODEW::default();
-            dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-            if !EnumDisplaySettingsW(pc, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
-                continue;
-            }
-            dm.Anonymous1.Anonymous2.dmPosition.x = x_offset;
-            dm.Anonymous1.Anonymous2.dmPosition.y = 0;
-            dm.dmFields = DM_POSITION;
-            let r = ChangeDisplaySettingsExW(
-                pc,
-                Some(&dm),
-                None,
-                CDS_UPDATEREGISTRY | CDS_NORESET,
-                None,
-            );
-            crate::service_win::svc_log(&format!(
-                "set_vdd_primary: queue move {name} ({ox},{oy})->({x_offset},0) size={w}x{h} = {}",
-                r.0
-            ));
-            x_offset += *w as i32;
-        }
-
-        // Step 3: queue VDD at (0,0) as primary.
-        let vdd_w_str: Vec<u16> = vdd_device
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let vdd_pc = windows::core::PCWSTR(vdd_w_str.as_ptr());
-        let mut dm = DEVMODEW::default();
-        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        if !EnumDisplaySettingsW(vdd_pc, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
-            crate::service_win::svc_log(&format!(
-                "set_vdd_primary({vdd_device}): EnumDisplaySettingsW failed"
-            ));
-            return false;
-        }
-        dm.Anonymous1.Anonymous2.dmPosition.x = 0;
-        dm.Anonymous1.Anonymous2.dmPosition.y = 0;
-        dm.dmFields = DM_POSITION;
-        let r = ChangeDisplaySettingsExW(
-            vdd_pc,
-            Some(&dm),
-            None,
-            CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET,
-            None,
-        );
-        crate::service_win::svc_log(&format!(
-            "set_vdd_primary({vdd_device}): queue primary = {}",
-            r.0
-        ));
-        if r != DISP_CHANGE_SUCCESSFUL {
-            return false;
-        }
-
-        // Step 4: apply all queued changes atomically.
-        let apply = ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None);
-        crate::service_win::svc_log(&format!(
-            "set_vdd_primary({vdd_device}): apply = {}",
-            apply.0
-        ));
-        apply == DISP_CHANGE_SUCCESSFUL
+        change_display_resolution_for_device(&device_name, width, height)
     }
 }
 
@@ -2244,8 +2128,116 @@ fn activate_gdi_fallback(
     display_x: &mut i32,
     display_y: &mut i32,
     capture_mode: &mut &'static str,
+    target_device: Option<&str>,
     prefer_nvenc: bool,
-) {
+) -> bool {
+    if let Some(device) = target_device {
+        let mut target_rect = current_display_rect_for_device(device);
+        if target_rect.is_none() {
+            crate::service_win::svc_log(&format!(
+                "GDI fallback: target {device} has no active rect; attempting to activate same target"
+            ));
+            let _ = display_ccd::ensure_vdd_active(device);
+            target_rect = current_display_rect_for_device(device);
+        }
+        if target_rect.is_some_and(|(origin_x, origin_y, _, _)| origin_x != 0 || origin_y != 0) {
+            crate::service_win::svc_log(&format!(
+                "GDI fallback: target {device} is not primary ({target_rect:?}); re-applying VDD primary before same-target GDI"
+            ));
+            match display_ccd::set_vdd_primary(device) {
+                Ok(topo) => {
+                    target_rect = display_ccd::source_rect_from_topology(&topo, device)
+                        .or_else(|| current_display_rect_for_device(device));
+                    capture::gdi::nudge_desktop_repaint();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    crate::service_win::svc_log(&format!(
+                        "GDI fallback: failed to re-apply VDD primary for {device}: {e:#}"
+                    ));
+                }
+            }
+        }
+        if let Some((origin_x, origin_y, rect_w, rect_h)) = target_rect {
+            crate::service_win::svc_log(&format!(
+                "GDI fallback: targeting display DC {device} rect=({}, {}) {}x{}",
+                origin_x, origin_y, rect_w, rect_h
+            ));
+            return activate_gdi_fallback_region(
+                cpu_encoder,
+                gdi_capture,
+                width,
+                height,
+                display_x,
+                display_y,
+                capture_mode,
+                prefer_nvenc,
+                capture::gdi::GdiCaptureRegion::DisplayDevice {
+                    device_name: device.to_string(),
+                    origin_x,
+                    origin_y,
+                    width: rect_w,
+                    height: rect_h,
+                },
+            );
+        }
+        crate::service_win::svc_log(&format!(
+            "GDI fallback: target {device} unavailable; refusing to switch to another display"
+        ));
+        return false;
+    }
+
+    crate::service_win::svc_log(
+        "GDI fallback: no managed display target; using primary monitor as the target",
+    );
+    activate_gdi_primary_fallback(
+        cpu_encoder,
+        gdi_capture,
+        width,
+        height,
+        display_x,
+        display_y,
+        capture_mode,
+        prefer_nvenc,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn activate_gdi_primary_fallback(
+    cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
+    gdi_capture: &mut Option<capture::gdi::GdiCapture>,
+    width: &mut u32,
+    height: &mut u32,
+    display_x: &mut i32,
+    display_y: &mut i32,
+    capture_mode: &mut &'static str,
+    prefer_nvenc: bool,
+) -> bool {
+    activate_gdi_fallback_region(
+        cpu_encoder,
+        gdi_capture,
+        width,
+        height,
+        display_x,
+        display_y,
+        capture_mode,
+        prefer_nvenc,
+        capture::gdi::GdiCaptureRegion::PrimaryMonitor,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn activate_gdi_fallback_region(
+    cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
+    gdi_capture: &mut Option<capture::gdi::GdiCapture>,
+    width: &mut u32,
+    height: &mut u32,
+    display_x: &mut i32,
+    display_y: &mut i32,
+    capture_mode: &mut &'static str,
+    prefer_nvenc: bool,
+    region: capture::gdi::GdiCaptureRegion,
+) -> bool {
     let (fps, bitrate_kbps) = if prefer_nvenc {
         // Logged-in desktop fallback is user-interactive. Keep it at the same
         // target as Scrap/DXGI so dragging windows does not feel capped at 15fps.
@@ -2254,19 +2246,48 @@ fn activate_gdi_fallback(
         // Login screen is mostly static and should avoid exercising NVENC/VDD.
         (15.0, 2000)
     };
-    match capture::gdi::GdiCapture::new() {
+    let gdi_result = match &region {
+        capture::gdi::GdiCaptureRegion::PrimaryMonitor => {
+            capture::gdi::GdiCapture::new_primary_monitor()
+        }
+        capture::gdi::GdiCaptureRegion::VirtualScreen => capture::gdi::GdiCapture::new(),
+        capture::gdi::GdiCaptureRegion::Rect {
+            origin_x,
+            origin_y,
+            width,
+            height,
+        } => capture::gdi::GdiCapture::new_for_rect(*origin_x, *origin_y, *width, *height),
+        capture::gdi::GdiCaptureRegion::DisplayDevice {
+            device_name,
+            origin_x,
+            origin_y,
+            width,
+            height,
+        } => capture::gdi::GdiCapture::new_for_display_device(
+            device_name.clone(),
+            *origin_x,
+            *origin_y,
+            *width,
+            *height,
+        ),
+    };
+    match gdi_result {
         Ok(gdi) => {
             let (w, h) = phantom_core::capture::FrameCapture::resolution(&gdi);
+            let (origin_x, origin_y) = gdi.origin();
             *width = w;
             *height = h;
-            *display_x = 0;
-            *display_y = 0;
+            *display_x = origin_x;
+            *display_y = origin_y;
+            // GDI is the safety/bootstrap path for lock/login/transition
+            // states. Keep it independent from NVENC because D3D/NVENC can be
+            // exactly the subsystem that is wedged during those transitions.
             if let Some((enc, encoder_name)) =
-                create_windows_agent_encoder(w, h, fps, bitrate_kbps, prefer_nvenc)
+                create_windows_agent_encoder(w, h, fps, bitrate_kbps, false)
             {
                 crate::service_win::svc_log(&format!(
-                    "Tier 3: GDI+{} {}x{} fps={:.0} bitrate={}kbps",
-                    encoder_name, *width, *height, fps, bitrate_kbps
+                    "Tier 3: GDI+{} {}x{} origin=({}, {}) region={:?} fps={:.0} bitrate={}kbps",
+                    encoder_name, *width, *height, origin_x, origin_y, region, fps, bitrate_kbps
                 ));
                 *cpu_encoder = Some(enc);
                 *gdi_capture = Some(gdi);
@@ -2275,9 +2296,15 @@ fn activate_gdi_fallback(
                 } else {
                     "gdi_h264"
                 };
+                true
+            } else {
+                false
             }
         }
-        Err(e) => tracing::warn!("GDI fallback init failed: {e}"),
+        Err(e) => {
+            tracing::warn!("GDI fallback init failed: {e}");
+            false
+        }
     }
 }
 
@@ -2293,38 +2320,140 @@ fn activate_cpu_fallback(
     display_y: &mut i32,
     capture_mode: &mut &'static str,
     scrap_waiting_for_frame_since: &mut Option<std::time::Instant>,
+    target_device: Option<&str>,
+    target_rect: Option<(i32, i32, u32, u32)>,
+    allow_gdi: bool,
 ) {
     use phantom_core::capture::FrameCapture;
 
     crate::service_win::svc_log(reason);
 
     let displays = capture::scrap::ScrapCapture::list_displays().unwrap_or_default();
-    let best_idx = displays
-        .iter()
-        .find(|d| d.is_primary)
-        .or_else(|| displays.first())
-        .map(|d| d.index)
-        .unwrap_or(0);
+    let best_idx = if let Some(device) = target_device {
+        match capture::scrap::ScrapCapture::windows_display_index_for_device_name(device) {
+            Ok(Some(index)) => Some(index),
+            Ok(None) => {
+                crate::service_win::svc_log(&format!(
+                    "ScrapCapture fallback: target {device} not found in DXGI display list; skipping Scrap"
+                ));
+                None
+            }
+            Err(e) => {
+                crate::service_win::svc_log(&format!(
+                    "ScrapCapture fallback: failed to enumerate target {device}: {e:#}; skipping Scrap"
+                ));
+                None
+            }
+        }
+    } else {
+        displays
+            .iter()
+            .find(|d| d.is_primary)
+            .or_else(|| displays.first())
+            .map(|d| d.index)
+    };
     tracing::info!(
-        best_idx,
+        ?best_idx,
+        target_device = ?target_device,
         displays = ?displays.iter().map(|d| format!("{}:{}x{}", d.index, d.width, d.height)).collect::<Vec<_>>(),
         "ScrapCapture fallback display selection"
     );
 
+    let Some(best_idx) = best_idx else {
+        if !allow_gdi {
+            crate::service_win::svc_log(
+                "ScrapCapture fallback had no matching display; refusing GDI on managed Default desktop",
+            );
+            return;
+        }
+        if activate_gdi_fallback(
+            cpu_encoder,
+            gdi_capture,
+            width,
+            height,
+            display_x,
+            display_y,
+            capture_mode,
+            target_device,
+            true,
+        ) {
+            tracing::info!(width, height, "Tier 3: same-target GDI fallback");
+            *scrap_waiting_for_frame_since = None;
+        }
+        return;
+    };
+
     match capture::scrap::ScrapCapture::with_display(best_idx) {
         Ok(scrap) => {
             let (w, h) = scrap.resolution();
+            let (dx, dy) = if let Some(device) = target_device {
+                match target_rect.or_else(|| current_display_rect_for_device(device)) {
+                    Some((x, y, rect_w, rect_h)) if rect_w == w && rect_h == h => (x, y),
+                    Some((x, y, rect_w, rect_h)) => {
+                        crate::service_win::svc_log(&format!(
+                            "ScrapCapture fallback: target {device} rect=({}, {}) {}x{} but Scrap index {} is {}x{}; refusing to switch target",
+                            x, y, rect_w, rect_h, best_idx, w, h
+                        ));
+                        if !allow_gdi {
+                            crate::service_win::svc_log(
+                                "ScrapCapture fallback target mismatch; refusing GDI on managed Default desktop",
+                            );
+                            return;
+                        }
+                        if activate_gdi_fallback(
+                            cpu_encoder,
+                            gdi_capture,
+                            width,
+                            height,
+                            display_x,
+                            display_y,
+                            capture_mode,
+                            target_device,
+                            true,
+                        ) {
+                            *scrap_waiting_for_frame_since = None;
+                        }
+                        return;
+                    }
+                    None => {
+                        crate::service_win::svc_log(&format!(
+                            "ScrapCapture fallback: target {device} has no active rect; refusing to switch target"
+                        ));
+                        if !allow_gdi {
+                            crate::service_win::svc_log(
+                                "ScrapCapture fallback target inactive; refusing GDI on managed Default desktop",
+                            );
+                            return;
+                        }
+                        if activate_gdi_fallback(
+                            cpu_encoder,
+                            gdi_capture,
+                            width,
+                            height,
+                            display_x,
+                            display_y,
+                            capture_mode,
+                            target_device,
+                            true,
+                        ) {
+                            *scrap_waiting_for_frame_since = None;
+                        }
+                        return;
+                    }
+                }
+            } else {
+                get_display_origin(w, h, scrap.display_index())
+            };
             *width = w;
             *height = h;
-            let (dx, dy) = get_display_origin(w, h, scrap.display_index());
             *display_x = dx;
             *display_y = dy;
             if let Some((enc, encoder_name)) =
                 create_windows_agent_encoder(*width, *height, 30.0, 5000, true)
             {
                 crate::service_win::svc_log(&format!(
-                    "Tier 2: ScrapCapture+{} {}x{} (CPU capture path)",
-                    encoder_name, *width, *height
+                    "Tier 2: ScrapCapture+{} {}x{} origin=({}, {}) target={:?} (CPU capture path)",
+                    encoder_name, *width, *height, dx, dy, target_device
                 ));
                 *scrap_capture = Some(scrap);
                 *cpu_encoder = Some(enc);
@@ -2334,11 +2463,18 @@ fn activate_cpu_fallback(
                 } else {
                     "scrap_h264"
                 };
+                nudge_windows_capture_target(target_device, target_rect);
             }
         }
         Err(e) => {
             tracing::debug!("ScrapCapture unavailable: {e}");
-            activate_gdi_fallback(
+            if !allow_gdi {
+                crate::service_win::svc_log(&format!(
+                    "ScrapCapture unavailable and GDI is disabled on managed Default desktop: {e:#}"
+                ));
+                return;
+            }
+            if activate_gdi_fallback(
                 cpu_encoder,
                 gdi_capture,
                 width,
@@ -2346,10 +2482,10 @@ fn activate_cpu_fallback(
                 display_x,
                 display_y,
                 capture_mode,
+                target_device,
                 true,
-            );
-            if gdi_capture.is_some() {
-                tracing::info!(width, height, "Tier 3: GDI fallback");
+            ) {
+                tracing::info!(width, height, "Tier 3: same-target GDI fallback");
                 *scrap_waiting_for_frame_since = None;
             }
         }
@@ -2403,22 +2539,8 @@ fn coalesce_mouse_moves(
 }
 
 #[cfg(target_os = "windows")]
-struct TopologyGuard(Option<display_ccd::Topology>);
-
-#[cfg(target_os = "windows")]
-impl Drop for TopologyGuard {
-    fn drop(&mut self) {
-        if let Some(topo) = self.0.take() {
-            match display_ccd::restore(&topo) {
-                Ok(()) => crate::service_win::svc_log("agent: topology restored"),
-                Err(e) => crate::service_win::svc_log(&format!("agent: restore failed: {e:#}")),
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 struct DesktopState {
+    on_default: bool,
     on_winlogon: bool,
     transition_unavailable: bool,
     changed_after_initial: bool,
@@ -2428,8 +2550,9 @@ struct DesktopState {
 #[cfg(target_os = "windows")]
 struct WindowsDisplayState {
     vdd_device: Option<String>,
+    vdd_rect: Option<(i32, i32, u32, u32)>,
     vdd_primary_active: bool,
-    topology_guard: TopologyGuard,
+    winlogon_vdd_prepared: bool,
     last_desktop_name: Option<String>,
     desktop_sample_seen: bool,
     last_desktop_transition_log: Instant,
@@ -2443,9 +2566,9 @@ impl WindowsDisplayState {
         // an interactive desktop. Same reason capture calls need this.
         capture::gdi::switch_to_input_desktop();
 
-        // Find VDD device name (e.g. \\.\DISPLAY10). We try it only for the
-        // post-login DXGI/NVENC path; Winlogon stays on the physical/basic
-        // display because secure desktop + VDD has been unstable on VMs.
+        // Find VDD device name (e.g. \\.\DISPLAY10). We keep it as the
+        // managed primary display across Winlogon and Default so repeated
+        // lock/logon transitions do not fall back to low-res physical outputs.
         let vdd_device = find_vdd_device_name();
         crate::service_win::svc_log(&format!("agent: vdd_device = {:?}", vdd_device));
 
@@ -2461,9 +2584,12 @@ impl WindowsDisplayState {
         }
 
         Self {
+            vdd_rect: vdd_device
+                .as_deref()
+                .and_then(display_ccd::active_source_rect),
             vdd_device,
             vdd_primary_active: false,
-            topology_guard: TopologyGuard(None),
+            winlogon_vdd_prepared: false,
             last_desktop_name: None,
             desktop_sample_seen: false,
             last_desktop_transition_log: instant_ago(Duration::from_secs(10)),
@@ -2472,6 +2598,27 @@ impl WindowsDisplayState {
 
     fn vdd_device(&self) -> Option<&str> {
         self.vdd_device.as_deref()
+    }
+
+    fn vdd_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        self.vdd_rect
+    }
+
+    fn retarget_vdd_device(&mut self, device: String) {
+        if self
+            .vdd_device
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(&device))
+        {
+            return;
+        }
+        crate::service_win::svc_log(&format!(
+            "agent: retargeting managed display from {:?} to {} after DXGI remap",
+            self.vdd_device, device
+        ));
+        self.vdd_device = Some(device);
+        self.vdd_rect = None;
+        self.vdd_primary_active = false;
     }
 
     fn refresh_desktop(&mut self) -> DesktopState {
@@ -2501,53 +2648,21 @@ impl WindowsDisplayState {
             ));
             self.last_desktop_transition_log = Instant::now();
         }
+        let on_default = effective_desktop
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Default"));
         let on_winlogon = effective_desktop
             .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("Winlogon"));
+            .is_some_and(|name| !name.eq_ignore_ascii_case("Default"));
         self.last_desktop_name = effective_desktop.clone();
         self.desktop_sample_seen = true;
         DesktopState {
+            on_default,
             on_winlogon,
             transition_unavailable,
             changed_after_initial,
             desktop_name: effective_desktop,
         }
-    }
-
-    fn restore_attached_non_vdd_primary(&mut self, reason: &str) -> bool {
-        if let Some(ref topo) = self.topology_guard.0 {
-            match display_ccd::restore(topo) {
-                Ok(()) => {
-                    crate::service_win::svc_log(&format!(
-                        "{reason}: restored saved display topology"
-                    ));
-                    self.vdd_primary_active = false;
-                    capture::gdi::nudge_desktop_repaint();
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    if self
-                        .vdd_device
-                        .as_deref()
-                        .is_none_or(|dev| !display_ccd::is_vdd_primary(dev))
-                    {
-                        return true;
-                    }
-                }
-                Err(e) => crate::service_win::svc_log(&format!(
-                    "{reason}: saved topology restore failed: {e:#}"
-                )),
-            }
-        }
-
-        if let Some(ref dev) = find_attached_non_vdd_device_name() {
-            if set_vdd_primary_legacy(dev) {
-                crate::service_win::svc_log(&format!("{reason}: restored non-VDD primary {dev}"));
-                self.vdd_primary_active = false;
-                capture::gdi::nudge_desktop_repaint();
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                return true;
-            }
-        }
-        false
     }
 
     fn activate_vdd_primary_after_tier1_init(&mut self) -> bool {
@@ -2559,15 +2674,15 @@ impl WindowsDisplayState {
         }
         match display_ccd::set_vdd_primary(dev) {
             Ok(topo) => {
+                self.vdd_rect = display_ccd::source_rect_from_topology(&topo, dev);
                 crate::service_win::svc_log(&format!(
-                    "agent: set_vdd_primary({dev}) OK after Tier 1 init — saved {} paths, {} modes",
+                    "agent: set_vdd_primary({dev}) OK after Tier 1 init - observed {} paths, {} modes, rect={:?}",
                     topo.paths.len(),
-                    topo.modes.len()
+                    topo.modes.len(),
+                    self.vdd_rect
                 ));
-                if self.topology_guard.0.is_none() {
-                    self.topology_guard.0 = Some(topo);
-                }
-                self.vdd_primary_active = true;
+                self.vdd_primary_active =
+                    self.vdd_rect.is_some_and(|(x, y, _, _)| x == 0 && y == 0);
                 capture::gdi::nudge_desktop_repaint();
                 std::thread::sleep(Duration::from_millis(500));
                 capture::gdi::nudge_desktop_repaint();
@@ -2582,6 +2697,63 @@ impl WindowsDisplayState {
         }
     }
 
+    fn prepare_vdd_primary_on_winlogon(&mut self) {
+        if self.winlogon_vdd_prepared {
+            return;
+        }
+        let Some(ref dev) = self.vdd_device else {
+            return;
+        };
+        crate::service_win::svc_log(&format!(
+            "Winlogon desktop: preparing VDD {dev} as primary before Default session capture"
+        ));
+        match display_ccd::set_vdd_primary(dev) {
+            Ok(topo) => {
+                self.vdd_rect = display_ccd::source_rect_from_topology(&topo, dev);
+                self.vdd_primary_active =
+                    self.vdd_rect.is_some_and(|(x, y, _, _)| x == 0 && y == 0);
+                self.winlogon_vdd_prepared = true;
+                crate::service_win::svc_log(&format!(
+                    "Winlogon desktop: VDD prepare complete primary={} rect={:?}",
+                    self.vdd_primary_active, self.vdd_rect
+                ));
+                capture::gdi::nudge_desktop_repaint();
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => {
+                crate::service_win::svc_log(&format!(
+                    "Winlogon desktop: VDD prepare failed: {e:#}"
+                ));
+            }
+        }
+    }
+
+    fn ensure_vdd_active_for_tier1(&mut self) -> bool {
+        let Some(ref dev) = self.vdd_device else {
+            return false;
+        };
+        match display_ccd::ensure_vdd_active(dev) {
+            Ok(topo) => {
+                self.vdd_primary_active = display_ccd::is_vdd_primary(dev);
+                self.vdd_rect = display_ccd::source_rect_from_topology(&topo, dev);
+                crate::service_win::svc_log(&format!(
+                    "agent: VDD {dev} active for Tier 1 - observed {} paths, {} modes, primary={}, rect={:?}",
+                    topo.paths.len(),
+                    topo.modes.len(),
+                    self.vdd_primary_active,
+                    self.vdd_rect
+                ));
+                true
+            }
+            Err(e) => {
+                crate::service_win::svc_log(&format!(
+                    "agent: failed to activate VDD {dev} for Tier 1: {e:#}"
+                ));
+                false
+            }
+        }
+    }
+
     fn repair_vdd_primary_after_resize(&mut self) {
         let Some(ref dev) = self.vdd_device else {
             return;
@@ -2590,22 +2762,14 @@ impl WindowsDisplayState {
             return;
         }
         match display_ccd::set_vdd_primary(dev) {
-            Ok(_) => {
+            Ok(topo) => {
+                self.vdd_rect = display_ccd::source_rect_from_topology(&topo, dev);
                 crate::service_win::svc_log("agent: re-applied CCD after resize (was broken)");
                 capture::gdi::nudge_desktop_repaint();
             }
             Err(e) => crate::service_win::svc_log(&format!(
                 "agent: re-apply CCD failed after resize: {e:#}"
             )),
-        }
-    }
-
-    fn repair_vdd_primary_for_keyframe(&mut self) {
-        let Some(ref dev) = self.vdd_device else {
-            return;
-        };
-        if self.vdd_primary_active && !display_ccd::is_vdd_primary(dev) {
-            let _ = display_ccd::set_vdd_primary(dev);
         }
     }
 }
@@ -2687,7 +2851,81 @@ impl GpuRecoveryState {
 }
 
 #[cfg(target_os = "windows")]
+struct DefaultDesktopGate {
+    candidate_since: Option<Instant>,
+    access_denied_since: Option<Instant>,
+    last_log: Instant,
+}
+
+#[cfg(target_os = "windows")]
+impl DefaultDesktopGate {
+    fn new() -> Self {
+        Self {
+            candidate_since: None,
+            access_denied_since: None,
+            last_log: instant_ago(Duration::from_secs(10)),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.candidate_since = None;
+        self.access_denied_since = None;
+    }
+
+    fn ready_to_capture(&mut self, desktop_state: &DesktopState) -> bool {
+        if !desktop_state.on_default || desktop_state.transition_unavailable {
+            self.reset();
+            return false;
+        }
+
+        let since = *self.candidate_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < DEFAULT_DESKTOP_CAPTURE_STABLE_FOR {
+            if self.last_log.elapsed() >= Duration::from_secs(2) {
+                crate::service_win::svc_log(&format!(
+                    "Default desktop candidate {:?}; waiting for capture readiness",
+                    desktop_state.desktop_name
+                ));
+                self.last_log = Instant::now();
+            }
+            return false;
+        }
+        true
+    }
+
+    fn hold_after_access_denied(&mut self, reason: &str) -> bool {
+        let since = *self.access_denied_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(6) {
+            if self.last_log.elapsed() >= Duration::from_secs(1) {
+                crate::service_win::svc_log(&format!(
+                    "{reason}; treating as Default desktop not ready, retrying before fallback"
+                ));
+                self.last_log = Instant::now();
+            }
+            return true;
+        }
+        crate::service_win::svc_log(&format!(
+            "{reason}; Default readiness retry window expired, allowing same-target fallback"
+        ));
+        self.access_denied_since = None;
+        false
+    }
+
+    fn mark_capture_ready(&mut self) {
+        self.access_denied_since = None;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_access_denied(error: &anyhow::Error) -> bool {
+    let msg = format!("{error:#}");
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("0x80070005") || lower.contains("access is denied")
+}
+
+#[cfg(target_os = "windows")]
 const WINDOWS_TIER1_BASELINE_RESOLUTION: (u32, u32) = (1920, 1080);
+#[cfg(target_os = "windows")]
+const DEFAULT_DESKTOP_CAPTURE_STABLE_FOR: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "windows")]
 fn windows_tier1_fixed_resolution_enabled() -> bool {
@@ -2706,6 +2944,12 @@ fn ensure_windows_tier1_baseline_resolution(
     height: &mut u32,
 ) {
     if !windows_tier1_fixed_resolution_enabled() {
+        return;
+    }
+    if display_state.vdd_device().is_none() {
+        return;
+    }
+    if !display_state.ensure_vdd_active_for_tier1() {
         return;
     }
     let Some(vdd_device) = display_state.vdd_device() else {
@@ -2787,6 +3031,8 @@ fn run_agent_loop(
     let mut idle_gpu_prewarm_suspended = false;
     let mut last_gpu_prewarm_log = instant_ago(Duration::from_secs(10));
     let mut last_pending_gpu_probe = instant_ago(Duration::from_secs(10));
+    let mut gdi_probe_count = 0u64;
+    let mut default_desktop_gate = DefaultDesktopGate::new();
     tracing::info!("Starting agent loop");
 
     while !shutdown.load(Ordering::Relaxed) && !ipc.should_shutdown() {
@@ -2905,10 +3151,16 @@ fn run_agent_loop(
             gpu_prewarm_started_at = None;
             idle_gpu_prewarm_suspended = false;
             gpu_recovery.reset();
+            default_desktop_gate.reset();
+            display_state.winlogon_vdd_prepared = false;
             last_init_attempt = instant_ago(Duration::from_secs(10));
         }
 
         if desktop_state.transition_unavailable {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if !desktop_state.on_winlogon && !default_desktop_gate.ready_to_capture(&desktop_state) {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -2982,15 +3234,15 @@ fn run_agent_loop(
             && last_init_attempt.elapsed() > Duration::from_secs(1);
         if needs_capture_init && desktop_state.on_winlogon {
             last_init_attempt = Instant::now();
-            display_state.restore_attached_non_vdd_primary("Winlogon desktop");
             crate::service_win::svc_log(
-                "Winlogon desktop: using GDI+OpenH264 fallback instead of VDD/NVENC",
+                "Winlogon desktop: using primary-monitor GDI+OpenH264 fallback",
             );
+            display_state.prepare_vdd_primary_on_winlogon();
             scrap_capture = None;
             scrap_waiting_for_frame_since = None;
             gpu_prewarm_ready = false;
             gpu_prewarm_started_at = None;
-            activate_gdi_fallback(
+            activate_gdi_primary_fallback(
                 &mut cpu_encoder,
                 &mut gdi_capture,
                 &mut width,
@@ -3005,53 +3257,97 @@ fn run_agent_loop(
 
             if !gpu_recovery.can_try_tier1() {
                 crate::service_win::svc_log(
-                    "Tier 1 disabled after startup failure; using GDI fallback without changing display topology",
+                    "Tier 1 disabled after startup failure; trying same-target CPU fallback",
                 );
                 scrap_capture = None;
                 scrap_waiting_for_frame_since = None;
                 gpu_prewarm_ready = false;
                 gpu_prewarm_started_at = None;
-                activate_gdi_fallback(
+                let allow_gdi = display_state.vdd_device().is_none();
+                activate_cpu_fallback(
+                    "Tier 1 disabled; same-target CPU fallback",
                     &mut cpu_encoder,
+                    &mut scrap_capture,
                     &mut gdi_capture,
                     &mut width,
                     &mut height,
                     &mut display_x,
                     &mut display_y,
                     &mut capture_mode,
-                    true,
+                    &mut scrap_waiting_for_frame_since,
+                    display_state.vdd_device(),
+                    display_state.vdd_rect(),
+                    allow_gdi,
                 );
                 continue;
             }
 
             ensure_windows_tier1_baseline_resolution(&mut display_state, &mut width, &mut height);
 
-            // Tier 1: DXGI(VDD)→NVENC zero-copy. Create the DXGI target first,
-            // then move the desktop onto VDD and reset duplication. This keeps
-            // the stable v0.5.5 ordering while still restoring through CCD when
-            // a later fallback needs it.
-            match phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_device(
-                30,
-                5000,
-                display_state.vdd_device(),
-            ) {
-                Ok(mut gpu) => {
-                    crate::service_win::svc_log(&format!(
-                        "Tier 1 DXGI target before VDD primary: {}",
-                        gpu.capture.target_summary()
-                    ));
-                    let _vdd_primary_ready = display_state.activate_vdd_primary_after_tier1_init();
-                    width = gpu.width;
-                    height = gpu.height;
+            // Tier 1: DXGI(VDD)→NVENC zero-copy. First prove that the target
+            // output + NVENC can initialize without changing topology. Only then
+            // make VDD primary and create the real capture pipeline on the
+            // settled Default desktop. This matches Sunshine/CRD's pattern of
+            // syncing to the current input desktop immediately before
+            // DuplicateOutput, and avoids carrying a duplication object across
+            // the VDD primary transition.
+            let tier1_init = (|| -> anyhow::Result<phantom_gpu::dxgi_nvenc::DxgiNvencPipeline> {
+                let probe = phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_device(
+                    30,
+                    5000,
+                    display_state.vdd_device(),
+                )?;
+                crate::service_win::svc_log(&format!(
+                    "Tier 1 DXGI target before VDD primary: {}",
+                    probe.capture.target_summary()
+                ));
+                if display_state.vdd_device().is_some() && !probe.capture.output_matches_target() {
+                    display_state
+                        .retarget_vdd_device(probe.capture.output_device_name().to_string());
+                }
+
+                if display_state.vdd_device().is_some() {
+                    drop(probe);
+                    if !display_state.activate_vdd_primary_after_tier1_init() {
+                        anyhow::bail!("failed to make managed VDD primary after Tier 1 probe");
+                    }
+                    let gpu = phantom_gpu::dxgi_nvenc::DxgiNvencPipeline::with_target_device(
+                        30,
+                        5000,
+                        display_state.vdd_device(),
+                    )?;
                     crate::service_win::svc_log(&format!(
                         "Tier 1 DXGI target after VDD primary: {}",
                         gpu.capture.target_summary()
                     ));
-                    // On static desktops, a plain keyframe flag may not emit
-                    // a frame immediately after DXGI pipeline init. Force a
-                    // capture reset so the service receives a first frame
-                    // promptly (avoids black screen on session start).
-                    gpu.force_keyframe_with_capture_reset();
+                    Ok(gpu)
+                } else {
+                    Ok(probe)
+                }
+            })();
+
+            match tier1_init {
+                Ok(mut gpu) => {
+                    width = gpu.width;
+                    height = gpu.height;
+                    let need_startup_frame = frame_count == 0 && !gpu_prewarm_ready;
+                    if need_startup_frame {
+                        // On static desktops, a plain keyframe flag may not
+                        // emit a frame immediately after DXGI pipeline init.
+                        // Force a capture reset so the service receives the
+                        // first frame promptly.
+                        gpu.force_keyframe_with_capture_reset();
+                        nudge_windows_capture_target(
+                            display_state.vdd_device(),
+                            display_state.vdd_rect(),
+                        );
+                    } else {
+                        // We already delivered a valid startup frame. A later
+                        // DXGI reinit can legitimately see no desktop changes;
+                        // keep the last frame instead of treating static
+                        // desktop as a failure and falling into unsafe GDI.
+                        gpu.force_keyframe();
+                    }
                     crate::service_win::svc_log(&format!(
                         "Tier 1: DXGI→NVENC ready {}x{}",
                         width, height
@@ -3064,7 +3360,11 @@ fn run_agent_loop(
                     gpu_prewarm_ready = false;
                     gpu_prewarm_started_at = None;
                     scrap_waiting_for_frame_since = None;
-                    if viewer_active {
+                    if need_startup_frame {
+                        // Validate startup frames even during idle prewarm.
+                        // Without this, a Winlogon -> Default transition can
+                        // enqueue a black prewarmed keyframe that the next
+                        // viewer accepts as live.
                         gpu_recovery.wait_for_frame();
                     } else {
                         gpu_recovery.clear_startup_wait();
@@ -3082,8 +3382,15 @@ fn run_agent_loop(
                         ));
                         continue;
                     }
+                    let reason = format!("Tier 1 DXGI/NVENC unavailable: {e:#}");
+                    if is_windows_access_denied(&e)
+                        && default_desktop_gate.hold_after_access_denied(&reason)
+                    {
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
                     activate_cpu_fallback(
-                        &format!("Tier 1 DXGI/NVENC unavailable: {e:#}"),
+                        &reason,
                         &mut cpu_encoder,
                         &mut scrap_capture,
                         &mut gdi_capture,
@@ -3093,6 +3400,9 @@ fn run_agent_loop(
                         &mut display_y,
                         &mut capture_mode,
                         &mut scrap_waiting_for_frame_since,
+                        display_state.vdd_device(),
+                        display_state.vdd_rect(),
+                        display_state.vdd_device().is_none(),
                     );
                     if scrap_capture.is_none() && gdi_capture.is_none() && frame_count == 0 {
                         tracing::warn!("All capture methods failed");
@@ -3104,10 +3414,11 @@ fn run_agent_loop(
         // Handle keyframe requests from service (new session).
         if ipc.take_keyframe_request() {
             tracing::info!("Agent: received keyframe request from service");
-            // Keyframe request fires on new client session. Re-apply CCD
-            // exclusive only if state got broken — saves ~150ms per session
-            // start on the common case.
-            display_state.repair_vdd_primary_for_keyframe();
+            // Keep keyframe requests side-effect-free with respect to display
+            // topology. Service/viewer retries can arrive while Tier 1 is
+            // still initializing; reapplying CCD here invalidates Desktop
+            // Duplication/Scrap and causes black startup loops. Display state
+            // repair belongs to desktop/resize/init transitions above.
             if let Some(ref mut gpu) = gpu_pipeline {
                 if gpu_prewarm_ready {
                     // DXGI only returns frames when the desktop/cursor changes.
@@ -3118,16 +3429,23 @@ fn run_agent_loop(
                     gpu_recovery.clear_startup_wait();
                 } else {
                     gpu.force_keyframe_with_capture_reset();
+                    nudge_windows_capture_target(
+                        display_state.vdd_device(),
+                        display_state.vdd_rect(),
+                    );
                     gpu_recovery.wait_for_frame();
                 }
             }
             if let Some(ref mut gpu) = pending_gpu_pipeline {
                 gpu.force_keyframe();
             }
-            if let Some(ref mut scrap) = scrap_capture {
-                // Reset ScrapCapture so DXGI returns a frame on static desktop
-                let _ = scrap.reset();
-                scrap_waiting_for_frame_since = Some(Instant::now());
+            if scrap_capture.is_some() {
+                // Do not reset Scrap/DXGI on every viewer keyframe nudge.
+                // Service retries every 500ms during startup; repeated reset
+                // invalidates the duplication object before it can emit the
+                // first frame. Nudge the desktop instead and let the encoder
+                // keyframe flag below apply to the next captured frame.
+                nudge_windows_capture_target(display_state.vdd_device(), display_state.vdd_rect());
             }
             if let Some(ref mut enc) = cpu_encoder {
                 enc.force_keyframe();
@@ -3248,19 +3566,24 @@ fn run_agent_loop(
                                     } else {
                                         gpu_recovery.disable_tier1();
                                         crate::service_win::svc_log(
-                                            "Tier 1 DXGI/NVENC stayed black after startup; switching to GDI fallback without changing display topology",
+                                            "Tier 1 DXGI/NVENC stayed black after startup; trying same-target Scrap fallback without Default GDI",
                                         );
                                         scrap_capture = None;
                                         scrap_waiting_for_frame_since = None;
-                                        activate_gdi_fallback(
+                                        activate_cpu_fallback(
+                                            "Tier 1 DXGI/NVENC black startup; same-target CPU fallback",
                                             &mut cpu_encoder,
+                                            &mut scrap_capture,
                                             &mut gdi_capture,
                                             &mut width,
                                             &mut height,
                                             &mut display_x,
                                             &mut display_y,
                                             &mut capture_mode,
-                                            true,
+                                            &mut scrap_waiting_for_frame_since,
+                                            display_state.vdd_device(),
+                                            display_state.vdd_rect(),
+                                            display_state.vdd_device().is_none(),
                                         );
                                     }
                                 } else {
@@ -3271,12 +3594,14 @@ fn run_agent_loop(
                             }
                             Ok(_) => {
                                 gpu_recovery.mark_frame_ready();
+                                default_desktop_gate.mark_capture_ready();
                             }
                             Err(e) => {
                                 crate::service_win::svc_log(&format!(
                                     "Tier 1 DXGI/NVENC startup frame sample failed: {e:#}"
                                 ));
                                 gpu_recovery.mark_frame_ready();
+                                default_desktop_gate.mark_capture_ready();
                             }
                         }
                     }
@@ -3315,45 +3640,48 @@ fn run_agent_loop(
                 }
                 Ok(None) => {
                     if gpu_recovery.startup_wait_timed_out() {
-                        if gpu_recovery.consume_startup_retry() {
-                            crate::service_win::svc_log(
-                                "Tier 1 DXGI/NVENC produced no frame after startup/reset; reinitializing Tier 1 before CPU fallback",
-                            );
-                            gpu_pipeline = None;
-                            pending_gpu_pipeline = None;
-                            gpu_prewarm_ready = false;
-                            gpu_prewarm_started_at = None;
-                            last_init_attempt = instant_ago(Duration::from_secs(10));
-                            continue;
-                        }
-                        pending_gpu_pipeline = gpu_pipeline.take();
+                        gpu_pipeline = None;
+                        pending_gpu_pipeline = None;
                         gpu_prewarm_ready = false;
-                        gpu_recovery.clear_startup_wait();
-                        crate::service_win::svc_log(
-                            "Tier 1 DXGI/NVENC produced no frame during startup; using GDI bootstrap while keeping DXGI alive",
-                        );
                         scrap_capture = None;
                         scrap_waiting_for_frame_since = None;
                         gpu_prewarm_started_at = None;
-                        if let Some(ref mut pending_gpu) = pending_gpu_pipeline {
-                            pending_gpu.force_keyframe();
-                        }
-                        activate_gdi_fallback(
-                            &mut cpu_encoder,
-                            &mut gdi_capture,
-                            &mut width,
-                            &mut height,
-                            &mut display_x,
-                            &mut display_y,
-                            &mut capture_mode,
-                            true,
+                        nudge_windows_capture_target(
+                            display_state.vdd_device(),
+                            display_state.vdd_rect(),
                         );
+                        if gpu_recovery.consume_startup_retry() {
+                            crate::service_win::svc_log(
+                                "Tier 1 DXGI/NVENC produced no frame during startup; reinitializing DXGI on settled Default desktop",
+                            );
+                            last_init_attempt = instant_ago(Duration::from_secs(10));
+                        } else {
+                            gpu_recovery.disable_tier1();
+                            crate::service_win::svc_log(
+                                "Tier 1 DXGI/NVENC produced no frame during startup; trying same-target Scrap fallback without Default GDI",
+                            );
+                            activate_cpu_fallback(
+                                "Tier 1 DXGI/NVENC no startup frame; same-target CPU fallback",
+                                &mut cpu_encoder,
+                                &mut scrap_capture,
+                                &mut gdi_capture,
+                                &mut width,
+                                &mut height,
+                                &mut display_x,
+                                &mut display_y,
+                                &mut capture_mode,
+                                &mut scrap_waiting_for_frame_since,
+                                display_state.vdd_device(),
+                                display_state.vdd_rect(),
+                                display_state.vdd_device().is_none(),
+                            );
+                        }
                         continue;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
-                    tracing::warn!("DXGI→NVENC error: {e:#}, falling back");
+                    tracing::warn!("DXGI→NVENC error: {e:#}, resetting pipeline");
                     gpu_pipeline = None;
                     pending_gpu_pipeline = None;
                     gpu_prewarm_ready = false;
@@ -3363,6 +3691,10 @@ fn run_agent_loop(
                     // Without this, ACCESS_LOST on lock screen causes infinite
                     // Tier 1 init→fail loop that never reaches Tier 2/3.
                     last_init_attempt = Instant::now();
+                    if is_windows_access_denied(&e) {
+                        let reason = format!("Tier 1 DXGI/NVENC runtime access denied: {e:#}");
+                        let _ = default_desktop_gate.hold_after_access_denied(&reason);
+                    }
                 }
             }
         }
@@ -3418,17 +3750,26 @@ fn run_agent_loop(
                     if scrap_waiting_for_frame_since
                         .is_some_and(|since| since.elapsed() > Duration::from_millis(750))
                     {
-                        tracing::warn!(
-                            width,
-                            height,
-                            "ScrapCapture produced no frame after reset/init, switching to GDI"
-                        );
-                        crate::service_win::svc_log(
-                            "ScrapCapture stalled after reset/init; switching to GDI",
-                        );
                         scrap_capture = None;
                         cpu_encoder = None;
                         scrap_waiting_for_frame_since = None;
+                        if display_state.vdd_device().is_some() && desktop_state.on_default {
+                            crate::service_win::svc_log(
+                                "ScrapCapture stalled on managed Default VDD; parking CPU fallback and retrying Tier 1 (GDI disabled)",
+                            );
+                            gpu_recovery.reset();
+                            last_init_attempt = instant_ago(Duration::from_secs(10));
+                            capture_mode = "none";
+                            continue;
+                        }
+                        tracing::warn!(
+                            width,
+                            height,
+                            "ScrapCapture produced no frame after reset/init, switching to same-target GDI"
+                        );
+                        crate::service_win::svc_log(
+                            "ScrapCapture stalled after reset/init; switching to same-target GDI",
+                        );
                         activate_gdi_fallback(
                             &mut cpu_encoder,
                             &mut gdi_capture,
@@ -3437,6 +3778,7 @@ fn run_agent_loop(
                             &mut display_x,
                             &mut display_y,
                             &mut capture_mode,
+                            display_state.vdd_device(),
                             true,
                         );
                         continue;
@@ -3444,13 +3786,22 @@ fn run_agent_loop(
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
-                    crate::service_win::svc_log(&format!(
-                        "ScrapCapture error: {e:#}; switching to GDI"
-                    ));
-                    tracing::warn!("ScrapCapture error: {e}, switching to GDI");
                     scrap_capture = None;
                     cpu_encoder = None;
                     scrap_waiting_for_frame_since = None;
+                    if display_state.vdd_device().is_some() && desktop_state.on_default {
+                        crate::service_win::svc_log(&format!(
+                            "ScrapCapture error: {e:#}; parking CPU fallback and retrying Tier 1 (Default VDD GDI disabled)"
+                        ));
+                        gpu_recovery.reset();
+                        last_init_attempt = instant_ago(Duration::from_secs(10));
+                        capture_mode = "none";
+                        continue;
+                    }
+                    crate::service_win::svc_log(&format!(
+                        "ScrapCapture error: {e:#}; switching to same-target GDI"
+                    ));
+                    tracing::warn!("ScrapCapture error: {e}, switching to same-target GDI");
                     activate_gdi_fallback(
                         &mut cpu_encoder,
                         &mut gdi_capture,
@@ -3459,6 +3810,7 @@ fn run_agent_loop(
                         &mut display_x,
                         &mut display_y,
                         &mut capture_mode,
+                        display_state.vdd_device(),
                         true,
                     );
                 }
@@ -3467,47 +3819,89 @@ fn run_agent_loop(
         // Capture + encode: Tier 3 — GDI fallback (lock screen, no display)
         else if let (Some(ref mut gdi), Some(ref mut enc)) = (&mut gdi_capture, &mut cpu_encoder)
         {
+            gdi_probe_count += 1;
+            if gdi_probe_count <= 3 {
+                crate::service_win::svc_log(&format!(
+                    "GDI capture attempt {}: {}x{} mode={}",
+                    gdi_probe_count, width, height, capture_mode
+                ));
+            }
+            let capture_started = Instant::now();
             match gdi.capture() {
-                Ok(Some(frame)) => match enc.encode_frame(&frame) {
-                    Ok(encoded) => {
-                        frame_count += 1;
-                        if frame_count <= 3 || frame_count.is_multiple_of(300) {
-                            tracing::info!(
-                                frame = frame_count,
-                                width,
-                                height,
-                                bytes = encoded.data.len(),
-                                keyframe = encoded.is_keyframe,
-                                "GDI frame"
-                            );
-                            crate::service_win::svc_log(&format!(
-                                "GDI frame {}: {}x{} keyframe={} bytes={}",
+                Ok(Some(frame)) => {
+                    let capture_elapsed = capture_started.elapsed();
+                    if gdi_probe_count <= 3 || capture_elapsed > Duration::from_millis(250) {
+                        crate::service_win::svc_log(&format!(
+                            "GDI capture produced frame: attempt={} capture_ms={}",
+                            gdi_probe_count,
+                            capture_elapsed.as_millis()
+                        ));
+                    }
+                    let encode_started = Instant::now();
+                    match enc.encode_frame(&frame) {
+                        Ok(encoded) => {
+                            let encode_elapsed = encode_started.elapsed();
+                            frame_count += 1;
+                            if frame_count <= 3 || frame_count.is_multiple_of(300) {
+                                tracing::info!(
+                                    frame = frame_count,
+                                    width,
+                                    height,
+                                    bytes = encoded.data.len(),
+                                    keyframe = encoded.is_keyframe,
+                                    "GDI frame"
+                                );
+                                crate::service_win::svc_log(&format!(
+                                "GDI frame {}: {}x{} keyframe={} bytes={} capture_ms={} encode_ms={}",
                                 frame_count,
                                 width,
                                 height,
                                 encoded.is_keyframe,
-                                encoded.data.len()
+                                encoded.data.len(),
+                                capture_elapsed.as_millis(),
+                                encode_elapsed.as_millis()
                             ));
+                            }
+                            if encoded.is_keyframe {
+                                last_keyframe = Instant::now();
+                            }
+                            if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
+                                crate::service_win::svc_log(&format!("GDI IPC send failed: {e:#}"));
+                                tracing::error!("IPC send failed: {e}");
+                                break;
+                            }
                         }
-                        if encoded.is_keyframe {
-                            last_keyframe = Instant::now();
-                        }
-                        if let Err(e) = ipc.send_encoded_frame(&encoded, width, height) {
-                            crate::service_win::svc_log(&format!("GDI IPC send failed: {e:#}"));
-                            tracing::error!("IPC send failed: {e}");
-                            break;
+                        Err(e) => {
+                            crate::service_win::svc_log(&format!("GDI encode error: {e:#}"));
+                            crate::service_win::svc_log(&format!(
+                                "GDI encode error timing: attempt={} capture_ms={} encode_ms={}",
+                                gdi_probe_count,
+                                capture_elapsed.as_millis(),
+                                encode_started.elapsed().as_millis()
+                            ));
+                            tracing::warn!("GDI encode error: {e}");
                         }
                     }
-                    Err(e) => {
-                        crate::service_win::svc_log(&format!("GDI encode error: {e:#}"));
-                        tracing::warn!("GDI encode error: {e}");
-                    }
-                },
+                }
                 Ok(None) => {
+                    let capture_elapsed = capture_started.elapsed();
+                    if gdi_probe_count <= 3 || capture_elapsed > Duration::from_millis(250) {
+                        crate::service_win::svc_log(&format!(
+                            "GDI capture returned no frame: attempt={} capture_ms={}",
+                            gdi_probe_count,
+                            capture_elapsed.as_millis()
+                        ));
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
+                    let capture_elapsed = capture_started.elapsed();
                     crate::service_win::svc_log(&format!("GDI capture error: {e:#}"));
+                    crate::service_win::svc_log(&format!(
+                        "GDI capture error timing: attempt={} capture_ms={}",
+                        gdi_probe_count,
+                        capture_elapsed.as_millis()
+                    ));
                     tracing::warn!("GDI capture error: {e}");
                     gdi_capture = None;
                     cpu_encoder = None;

@@ -121,6 +121,25 @@ impl ScrapCapture {
             .collect())
     }
 
+    /// Find the `scrap` display index whose DXGI device name matches a GDI
+    /// display name such as `\\.\DISPLAY10`.
+    ///
+    /// RustDesk's Windows fallback preserves display identity by creating the
+    /// fallback capturer for the same display object. The public `scrap`
+    /// wrapper does not expose that name, so we query the Windows DXGI layer
+    /// directly and reuse the same enumeration order as `Display::all()`.
+    #[cfg(target_os = "windows")]
+    pub fn windows_display_index_for_device_name(device_name: &str) -> Result<Option<usize>> {
+        let displays = scrap::dxgi::Displays::new().context("failed to enumerate dxgi displays")?;
+        for (index, display) in displays.enumerate() {
+            let name = String::from_utf16_lossy(display.name());
+            if name.eq_ignore_ascii_case(device_name) {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn display_index(&self) -> usize {
         self.display_index
     }
