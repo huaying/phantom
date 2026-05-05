@@ -7,15 +7,19 @@
 
 use phantom_core::encode::VideoCodec;
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
-use phantom_core::protocol::Message;
+use phantom_core::protocol::{CursorShape, CursorState, Message};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::Clamped;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    console, HtmlAudioElement, HtmlCanvasElement, HtmlVideoElement, KeyboardEvent, MessageEvent,
-    MouseEvent, PointerEvent, WebSocket, WheelEvent,
+    console, HtmlAudioElement, HtmlCanvasElement, HtmlElement, HtmlVideoElement, KeyboardEvent,
+    MessageEvent, MouseEvent, PointerEvent, WebSocket, WheelEvent,
 };
+
+const CURSOR_CSS_SCALE: f64 = 1.0;
 
 // -- WebCodecs bindings (not in web-sys yet) --
 
@@ -168,6 +172,21 @@ struct AppState {
     ws_reconnect_delay_override_ms: Option<u32>,
     rtc_stats: Option<RtcBrowserStatsSnapshot>,
     rtc_stats_log: bool,
+    cursor_overlay: Option<HtmlElement>,
+    cursor_state_enabled: bool,
+    cursor_shape_enabled: bool,
+    cursor_shapes: HashMap<u64, CursorShape>,
+    cursor_shape_id: u64,
+    cursor_applied_shape_id: u64,
+    cursor_hotspot_x: f64,
+    cursor_hotspot_y: f64,
+    cursor_css_width: f64,
+    cursor_css_height: f64,
+    cursor_client_x: f64,
+    cursor_client_y: f64,
+    cursor_client_visible: bool,
+    cursor_raf_pending: bool,
+    cursor_local_until_ms: f64,
 }
 
 fn update_debug_snapshot(state: &AppState) {
@@ -210,6 +229,31 @@ fn update_debug_snapshot(state: &AppState) {
         &snapshot,
         &"rtc2MediaActive".into(),
         &JsValue::from_bool(state.rtc2_media_active),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"cursorShapeId".into(),
+        &JsValue::from_f64(state.cursor_shape_id as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"cursorShapeCount".into(),
+        &JsValue::from_f64(state.cursor_shapes.len() as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"cursorAppliedShapeId".into(),
+        &JsValue::from_f64(state.cursor_applied_shape_id as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"cursorCssWidth".into(),
+        &JsValue::from_f64(state.cursor_css_width),
+    );
+    let _ = js_sys::Reflect::set(
+        &snapshot,
+        &"cursorCssHeight".into(),
+        &JsValue::from_f64(state.cursor_css_height),
     );
     if let Some(stats) = &state.last_stats {
         let stats_obj = js_sys::Object::new();
@@ -389,6 +433,21 @@ pub fn main() {
         ws_reconnect_delay_override_ms: None,
         rtc_stats: None,
         rtc_stats_log,
+        cursor_overlay: None,
+        cursor_state_enabled: false,
+        cursor_shape_enabled: false,
+        cursor_shapes: HashMap::new(),
+        cursor_shape_id: 0,
+        cursor_applied_shape_id: 0,
+        cursor_hotspot_x: 2.0,
+        cursor_hotspot_y: 2.0,
+        cursor_css_width: 22.0,
+        cursor_css_height: 30.0,
+        cursor_client_x: 0.0,
+        cursor_client_y: 0.0,
+        cursor_client_visible: false,
+        cursor_raf_pending: false,
+        cursor_local_until_ms: 0.0,
     }));
     {
         let st = state.borrow();
@@ -1480,7 +1539,11 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             }
             // Send viewport size so server can match resolution (adaptive, like DCV)
             send_resolution_change(state);
+            enable_cursor_state_if_supported(state, protocol_version);
+            enable_cursor_shape_if_supported(state, protocol_version);
         }
+        Message::CursorUpdate(cursor) => handle_cursor_update(state, cursor),
+        Message::CursorShape(shape) => handle_cursor_shape(state, shape),
         Message::VideoFrame { sequence: _, frame } => {
             if frame.data.is_empty() {
                 return;
@@ -2558,6 +2621,7 @@ fn setup_input(
         let pending_mouse_for_move = pending_mouse.clone();
         let dragging_for_move = dragging.clone();
         let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+            update_local_cursor_from_event(&s, &e);
             let st = s.borrow();
             if st.server_width == 0 || st.server_height == 0 {
                 return;
@@ -2609,6 +2673,7 @@ fn setup_input(
             let capture_canvas = canvas.clone();
             let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
                 e.prevent_default();
+                update_local_cursor_from_event(&s, &e);
                 let _ = capture_canvas.set_pointer_capture(e.pointer_id());
                 *dragging.borrow_mut() = true;
                 let st = s.borrow();
@@ -2651,6 +2716,7 @@ fn setup_input(
             let is_cancel = *name == "pointercancel";
             let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
                 e.prevent_default();
+                update_local_cursor_from_event(&s, &e);
                 let _ = capture_canvas.release_pointer_capture(e.pointer_id());
                 *dragging.borrow_mut() = false;
                 let st = s.borrow();
@@ -3224,6 +3290,321 @@ fn send_message(state: &AppState, msg: &Message) {
         if let Some(ref ws) = state.send_ws {
             let _ = ws.send_with_u8_array(&data);
         }
+    }
+}
+
+fn ensure_cursor_overlay(state: &mut AppState) -> Option<HtmlElement> {
+    if let Some(ref el) = state.cursor_overlay {
+        return Some(el.clone());
+    }
+
+    let document = web_sys::window()?.document()?;
+    let el: HtmlElement = document.create_element("div").ok()?.dyn_into().ok()?;
+    el.set_id("phantom-cursor");
+    let style = el.style();
+    let _ = style.set_property("position", "fixed");
+    let _ = style.set_property("left", "0");
+    let _ = style.set_property("top", "0");
+    let _ = style.set_property("z-index", "2147483647");
+    let _ = style.set_property("pointer-events", "none");
+    let _ = style.set_property("transform", "translate3d(-100px, -100px, 0)");
+    let _ = style.set_property("will-change", "transform");
+    let _ = style.set_property("contain", "layout paint style");
+    let _ = style.set_property("display", "none");
+    set_default_cursor_overlay(&el);
+    document.body()?.append_child(&el).ok()?;
+    state.cursor_overlay = Some(el.clone());
+    Some(el)
+}
+
+fn set_default_cursor_overlay(el: &HtmlElement) {
+    el.set_inner_html(
+        r#"<svg width="22" height="30" viewBox="0 0 22 30" aria-hidden="true">
+<path d="M2 2 L2 24 L8.2 17.7 L12.2 28 L16.2 26.5 L12.2 16.5 L21 16.5 Z"
+      fill="white" stroke="black" stroke-width="2" stroke-linejoin="round"/>
+</svg>"#,
+    );
+    let style = el.style();
+    let _ = style.set_property("width", "22px");
+    let _ = style.set_property("height", "30px");
+}
+
+fn cursor_css_px(value: f64) -> String {
+    format!("{value:.2}px")
+}
+
+fn position_cursor_overlay_element(
+    el: &HtmlElement,
+    client_x: f64,
+    client_y: f64,
+    hotspot_x: f64,
+    hotspot_y: f64,
+    visible: bool,
+) {
+    let style = el.style();
+    if !visible {
+        let _ = style.set_property("display", "none");
+        return;
+    }
+
+    let x = (client_x - hotspot_x).round();
+    let y = (client_y - hotspot_y).round();
+    let _ = style.set_property("display", "block");
+    let _ = style.set_property("transform", &format!("translate3d({x}px, {y}px, 0)"));
+}
+
+fn apply_default_cursor_to_overlay(state: &mut AppState) {
+    let Some(el) = ensure_cursor_overlay(state) else {
+        return;
+    };
+    set_default_cursor_overlay(&el);
+    state.cursor_hotspot_x = 2.0;
+    state.cursor_hotspot_y = 2.0;
+    state.cursor_css_width = 22.0;
+    state.cursor_css_height = 30.0;
+    state.cursor_applied_shape_id = 0;
+    position_cursor_overlay_element(
+        &el,
+        state.cursor_client_x,
+        state.cursor_client_y,
+        state.cursor_hotspot_x,
+        state.cursor_hotspot_y,
+        state.cursor_client_visible,
+    );
+}
+
+fn apply_cursor_shape_to_overlay(state: &mut AppState, shape: &CursorShape) {
+    let Some(el) = ensure_cursor_overlay(state) else {
+        return;
+    };
+    if shape.width == 0
+        || shape.height == 0
+        || shape.width > 256
+        || shape.height > 256
+        || shape.rgba.len() != (shape.width as usize * shape.height as usize * 4)
+    {
+        return;
+    }
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(canvas_el) = document.create_element("canvas") else {
+        return;
+    };
+    let Ok(canvas) = canvas_el.dyn_into::<HtmlCanvasElement>() else {
+        return;
+    };
+    canvas.set_width(shape.width);
+    canvas.set_height(shape.height);
+    let css_width = (shape.width as f64 * CURSOR_CSS_SCALE).max(1.0);
+    let css_height = (shape.height as f64 * CURSOR_CSS_SCALE).max(1.0);
+    let canvas_style = canvas.style();
+    let _ = canvas_style.set_property("display", "block");
+    let _ = canvas_style.set_property("width", &cursor_css_px(css_width));
+    let _ = canvas_style.set_property("height", &cursor_css_px(css_height));
+    let _ = canvas_style.set_property("max-width", "none");
+    let _ = canvas_style.set_property("max-height", "none");
+    let _ = canvas_style.set_property("object-fit", "initial");
+    let _ = canvas_style.set_property("cursor", "none");
+    let Ok(Some(ctx)) = canvas.get_context("2d") else {
+        return;
+    };
+    let Ok(ctx2d) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() else {
+        return;
+    };
+    let Ok(image) = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+        Clamped(shape.rgba.as_slice()),
+        shape.width,
+        shape.height,
+    ) else {
+        return;
+    };
+    if ctx2d.put_image_data(&image, 0.0, 0.0).is_err() {
+        return;
+    }
+    el.set_inner_html("");
+    let _ = el.append_child(&canvas);
+    let style = el.style();
+    let _ = style.set_property("width", &cursor_css_px(css_width));
+    let _ = style.set_property("height", &cursor_css_px(css_height));
+    state.cursor_hotspot_x = (shape.hotspot_x as f64 * CURSOR_CSS_SCALE).round();
+    state.cursor_hotspot_y = (shape.hotspot_y as f64 * CURSOR_CSS_SCALE).round();
+    state.cursor_css_width = css_width;
+    state.cursor_css_height = css_height;
+    state.cursor_applied_shape_id = shape.shape_id;
+    position_cursor_overlay_element(
+        &el,
+        state.cursor_client_x,
+        state.cursor_client_y,
+        state.cursor_hotspot_x,
+        state.cursor_hotspot_y,
+        state.cursor_client_visible,
+    );
+}
+
+fn set_cursor_overlay_position(state: &mut AppState, client_x: f64, client_y: f64, visible: bool) {
+    let Some(el) = ensure_cursor_overlay(state) else {
+        return;
+    };
+    state.cursor_client_x = client_x;
+    state.cursor_client_y = client_y;
+    state.cursor_client_visible = visible;
+    position_cursor_overlay_element(
+        &el,
+        client_x,
+        client_y,
+        state.cursor_hotspot_x,
+        state.cursor_hotspot_y,
+        visible,
+    );
+}
+
+fn update_local_cursor_from_event(state: &Rc<RefCell<AppState>>, e: &PointerEvent) {
+    let should_schedule = {
+        let mut st = state.borrow_mut();
+        st.cursor_local_until_ms = js_sys::Date::now() + 250.0;
+        st.cursor_client_x = e.client_x() as f64;
+        st.cursor_client_y = e.client_y() as f64;
+        st.cursor_client_visible = true;
+        if st.cursor_raf_pending {
+            false
+        } else {
+            st.cursor_raf_pending = true;
+            true
+        }
+    };
+    if !should_schedule {
+        return;
+    }
+
+    let state_for_raf = state.clone();
+    let flush = Closure::<dyn FnMut(f64)>::once(move |_: f64| {
+        let mut st = state_for_raf.borrow_mut();
+        st.cursor_raf_pending = false;
+        let client_x = st.cursor_client_x;
+        let client_y = st.cursor_client_y;
+        let visible = st.cursor_client_visible;
+        set_cursor_overlay_position(&mut st, client_x, client_y, visible);
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.request_animation_frame(flush.as_ref().unchecked_ref());
+    }
+    flush.forget();
+}
+
+fn enable_cursor_state_if_supported(state: &Rc<RefCell<AppState>>, protocol_version: u32) {
+    if protocol_version < 8 {
+        return;
+    }
+    let should_send = {
+        let mut st = state.borrow_mut();
+        if st.cursor_state_enabled {
+            false
+        } else {
+            st.cursor_state_enabled = true;
+            let _ = ensure_cursor_overlay(&mut st);
+            true
+        }
+    };
+    if should_send {
+        let st = state.borrow();
+        send_message(&st, &Message::EnableCursorState { enabled: true });
+    }
+}
+
+fn enable_cursor_shape_if_supported(state: &Rc<RefCell<AppState>>, protocol_version: u32) {
+    if protocol_version < 9 {
+        return;
+    }
+    let should_send = {
+        let mut st = state.borrow_mut();
+        if st.cursor_shape_enabled {
+            false
+        } else {
+            st.cursor_shape_enabled = true;
+            true
+        }
+    };
+    if should_send {
+        let st = state.borrow();
+        send_message(&st, &Message::EnableCursorShape { enabled: true });
+    }
+}
+
+fn map_remote_to_client(
+    canvas: &HtmlCanvasElement,
+    x: i32,
+    y: i32,
+    sw: u32,
+    sh: u32,
+) -> Option<(f64, f64)> {
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let rect = canvas.get_bounding_client_rect();
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let aspect = sw as f64 / sh as f64;
+    let css_aspect = rect.width() / rect.height();
+    let (rw, rh, ox, oy) = if aspect > css_aspect {
+        (
+            rect.width(),
+            rect.width() / aspect,
+            0.0,
+            (rect.height() - rect.width() / aspect) / 2.0,
+        )
+    } else {
+        (
+            rect.height() * aspect,
+            rect.height(),
+            (rect.width() - rect.height() * aspect) / 2.0,
+            0.0,
+        )
+    };
+    let rx = x.clamp(0, sw.saturating_sub(1) as i32) as f64 / sw.max(1) as f64;
+    let ry = y.clamp(0, sh.saturating_sub(1) as i32) as f64 / sh.max(1) as f64;
+    Some((rect.left() + ox + rx * rw, rect.top() + oy + ry * rh))
+}
+
+fn handle_cursor_update(state: &Rc<RefCell<AppState>>, cursor: CursorState) {
+    let mut st = state.borrow_mut();
+    st.cursor_shape_id = cursor.shape_id;
+    if cursor.shape_id == 0 && st.cursor_applied_shape_id != 0 {
+        apply_default_cursor_to_overlay(&mut st);
+    } else if cursor.shape_id != 0 && cursor.shape_id != st.cursor_applied_shape_id {
+        if let Some(shape) = st.cursor_shapes.get(&cursor.shape_id).cloned() {
+            apply_cursor_shape_to_overlay(&mut st, &shape);
+        }
+    }
+    if !cursor.visible {
+        set_cursor_overlay_position(&mut st, 0.0, 0.0, false);
+        return;
+    }
+    // Local pointer motion should feel instant; server state is a correction
+    // stream when the remote cursor moves without a local event.
+    if js_sys::Date::now() < st.cursor_local_until_ms {
+        return;
+    }
+    if let Some((client_x, client_y)) = map_remote_to_client(
+        &st.canvas,
+        cursor.x,
+        cursor.y,
+        st.server_width,
+        st.server_height,
+    ) {
+        set_cursor_overlay_position(&mut st, client_x, client_y, true);
+    }
+}
+
+fn handle_cursor_shape(state: &Rc<RefCell<AppState>>, shape: CursorShape) {
+    let mut st = state.borrow_mut();
+    if shape.shape_id == 0 {
+        return;
+    }
+    st.cursor_shapes.insert(shape.shape_id, shape.clone());
+    if shape.shape_id == st.cursor_shape_id && shape.shape_id != st.cursor_applied_shape_id {
+        apply_cursor_shape_to_overlay(&mut st, &shape);
     }
 }
 

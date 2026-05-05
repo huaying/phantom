@@ -18,9 +18,10 @@ use phantom_core::encode::{EncodedFrame, FrameEncoder};
 use phantom_core::input::InputEvent;
 #[cfg(feature = "audio")]
 use phantom_core::protocol::AudioCodec;
-use phantom_core::protocol::Message;
+use phantom_core::protocol::{CursorShape, CursorState, Message};
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -80,6 +81,10 @@ pub enum InboundEvent {
         width: u32,
         height: u32,
     },
+    /// Client opts into server-reported cursor state.
+    EnableCursorState(bool),
+    /// Client opts into server-reported cursor shape bitmaps.
+    EnableCursorShape(bool),
     /// Client asks for a keyframe on the next encode (e.g. tab regained focus).
     RequestKeyframe,
     Disconnected,
@@ -153,6 +158,12 @@ pub fn spawn_receive_thread(
                 }),
                 Ok(Message::ResolutionChange { width, height }) => {
                     send_or_break!(InboundEvent::ResolutionChange { width, height })
+                }
+                Ok(Message::EnableCursorState { enabled }) => {
+                    send_or_break!(InboundEvent::EnableCursorState(enabled))
+                }
+                Ok(Message::EnableCursorShape { enabled }) => {
+                    send_or_break!(InboundEvent::EnableCursorShape(enabled))
                 }
                 Ok(Message::RequestKeyframe) => send_or_break!(InboundEvent::RequestKeyframe),
                 Ok(_) => {}
@@ -451,6 +462,12 @@ pub struct SessionRunner {
     pub current_width: u32,
     #[allow(dead_code)]
     pub current_height: u32,
+    cursor_state_enabled: bool,
+    cursor_shape_enabled: bool,
+    last_cursor_state: Option<CursorState>,
+    last_cursor_state_sent: Instant,
+    cached_cursor_shapes: HashMap<u64, CursorShape>,
+    sent_cursor_shapes: HashSet<u64>,
 }
 
 impl SessionRunner {
@@ -538,6 +555,12 @@ impl SessionRunner {
             paste_fn: None,
             current_width: width,
             current_height: height,
+            cursor_state_enabled: false,
+            cursor_shape_enabled: false,
+            last_cursor_state: None,
+            last_cursor_state_sent: instant_ago(Duration::from_secs(1)),
+            cached_cursor_shapes: HashMap::new(),
+            sent_cursor_shapes: HashSet::new(),
         };
 
         // Generate session token for reconnect
@@ -788,6 +811,23 @@ impl SessionRunner {
                         f(width, height);
                     }
                 }
+                InboundEvent::EnableCursorState(enabled) => {
+                    self.cursor_state_enabled = enabled;
+                    self.last_cursor_state = None;
+                    self.last_cursor_state_sent = instant_ago(Duration::from_secs(1));
+                    tracing::debug!(enabled, "client cursor-state subscription changed");
+                }
+                InboundEvent::EnableCursorShape(enabled) => {
+                    self.cursor_shape_enabled = enabled;
+                    self.sent_cursor_shapes.clear();
+                    if enabled {
+                        let cached: Vec<_> = self.cached_cursor_shapes.values().cloned().collect();
+                        for shape in cached {
+                            let _ = self.send_cursor_shape(shape);
+                        }
+                    }
+                    tracing::debug!(enabled, "client cursor-shape subscription changed");
+                }
                 InboundEvent::RequestKeyframe => {
                     let _ = self.sender.send_msg(&Message::KeyframeFence);
                     // Force `needs_keyframe()` to return true on the next tick.
@@ -805,6 +845,61 @@ impl SessionRunner {
             self.dispatch_input_event(event);
         }
         Ok(())
+    }
+
+    /// Send cursor state if the client opted in. Deduplicate unchanged states
+    /// but refresh periodically so a client that missed one packet can recover.
+    pub fn send_cursor_state(&mut self, state: CursorState) -> Result<()> {
+        if !self.cursor_state_enabled {
+            return Ok(());
+        }
+        let changed = self.last_cursor_state != Some(state);
+        if !changed && self.last_cursor_state_sent.elapsed() < Duration::from_millis(250) {
+            return Ok(());
+        }
+        self.sender.send_msg(&Message::CursorUpdate(state))?;
+        self.last_cursor_state = Some(state);
+        self.last_cursor_state_sent = Instant::now();
+        Ok(())
+    }
+
+    /// Send cursor bitmap if the client explicitly opted into shape updates.
+    /// Shapes are immutable by id, so each id is sent at most once per session.
+    pub fn send_cursor_shape(&mut self, shape: CursorShape) -> Result<()> {
+        if shape.shape_id != 0 {
+            self.cached_cursor_shapes
+                .insert(shape.shape_id, shape.clone());
+        }
+        if !self.cursor_shape_enabled || shape.shape_id == 0 {
+            return Ok(());
+        }
+        if !self.sent_cursor_shapes.insert(shape.shape_id) {
+            return Ok(());
+        }
+        self.sender.send_msg(&Message::CursorShape(shape))?;
+        Ok(())
+    }
+
+    /// Best-effort local cursor polling for non-service sessions. Windows
+    /// service sessions receive cursor state from the agent over IPC instead.
+    pub fn cursor_state_tick(&mut self) -> Result<()> {
+        if !self.cursor_state_enabled
+            || self.last_cursor_state_sent.elapsed() < Duration::from_millis(33)
+        {
+            return Ok(());
+        }
+        let Some(ref mut injector) = self.injector else {
+            return Ok(());
+        };
+        let Some((x, y)) = injector.cursor_position() else {
+            return Ok(());
+        };
+        self.send_cursor_state(CursorState {
+            visible: true,
+            x,
+            y,
+            shape_id: 0,
+        })
     }
 
     /// Poll local clipboard and sync changes to the client (~250ms interval).
@@ -1276,6 +1371,7 @@ fn run_session_inner(
         let loop_start = Instant::now();
 
         runner.pump_events()?;
+        runner.cursor_state_tick()?;
         runner.poll_clipboard()?;
         // Audio FIRST — tiny packets (~100 bytes), must not be blocked by video.
         runner.drain_audio()?;
@@ -1421,6 +1517,7 @@ fn run_session_ipc_inner(
         let loop_start = Instant::now();
 
         runner.pump_events()?;
+        runner.cursor_state_tick()?;
         runner.poll_clipboard()?;
         runner.drain_audio()?;
 
@@ -1463,6 +1560,13 @@ fn run_session_ipc_inner(
         // Forward clipboard from agent to client
         if let Some(text) = ipc.recv_clipboard() {
             let _ = runner.sender.send_msg(&Message::ClipboardSync(text));
+        }
+
+        if let Some(cursor) = ipc.recv_cursor_state() {
+            let _ = runner.send_cursor_state(cursor);
+        }
+        for shape in ipc.recv_cursor_shapes() {
+            let _ = runner.send_cursor_shape(shape);
         }
 
         runner.drain_file_transfers()?;

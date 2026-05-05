@@ -4,10 +4,14 @@ use crate::input::InputEvent;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bump when adding/changing Message variants.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Minimum protocol version we can interoperate with.
 /// Versions below this are rejected at handshake.
+///
+/// Kept at 6 in 0.5.9: `CursorUpdate` (the new v8 addition) is server→client,
+/// but the server only sends it after the client explicitly opts in with
+/// `EnableCursorState`. Older clients never opt in, so they remain compatible.
 ///
 /// Kept at 6 in 0.4.8: `RequestKeyframe` (the new v7 addition) is purely
 /// client→server, so a v6 client simply never sends it and waits the
@@ -21,6 +25,31 @@ pub const MIN_PROTOCOL_VERSION: u32 = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioCodec {
     Opus,
+}
+
+/// Server-reported pointer state in the captured frame coordinate space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorState {
+    pub visible: bool,
+    pub x: i32,
+    pub y: i32,
+    /// Stable id for the current cursor shape. `0` means default arrow.
+    pub shape_id: u64,
+}
+
+/// Cursor bitmap rendered locally by web/native clients.
+///
+/// This follows the same split used by VNC/noVNC/Guacamole: shape changes are
+/// sent rarely as a bitmap + hotspot, while cursor motion stays a tiny
+/// position-only update. `rgba` is tightly packed RGBA8, row-major.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorShape {
+    pub shape_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +84,29 @@ pub enum Message {
 
     /// Client → Server: input event.
     Input(InputEvent),
+
+    /// Client → Server: opt in/out of server-reported cursor state.
+    ///
+    /// The opt-in keeps older clients safe: new servers do not emit
+    /// `CursorUpdate` unless the peer has explicitly said it understands it.
+    EnableCursorState {
+        enabled: bool,
+    },
+
+    /// Client → Server: opt in/out of cursor bitmap shape updates.
+    ///
+    /// Kept separate from `EnableCursorState` so v8 clients that only know how
+    /// to draw the default local pointer never receive the new `CursorShape`
+    /// message.
+    EnableCursorShape {
+        enabled: bool,
+    },
+
+    /// Server → Client: latest cursor state in captured-frame coordinates.
+    CursorUpdate(CursorState),
+
+    /// Server → Client: cursor bitmap + hotspot for a `shape_id`.
+    CursorShape(CursorShape),
 
     /// Bidirectional: clipboard content changed.
     ClipboardSync(String),
@@ -345,6 +397,64 @@ mod tests {
         write_message(&mut buf, &Message::Ping).unwrap();
         let mut cursor = Cursor::new(&buf);
         assert!(matches!(read_message(&mut cursor).unwrap(), Message::Ping));
+    }
+
+    #[test]
+    fn roundtrip_cursor_state_opt_in() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::EnableCursorState { enabled: true }).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::EnableCursorState { enabled } => assert!(enabled),
+            _ => panic!("expected EnableCursorState"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_cursor_shape_opt_in() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::EnableCursorShape { enabled: true }).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::EnableCursorShape { enabled } => assert!(enabled),
+            _ => panic!("expected EnableCursorShape"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_cursor_update() {
+        let state = CursorState {
+            visible: true,
+            x: 123,
+            y: 456,
+            shape_id: 0,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::CursorUpdate(state)).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::CursorUpdate(decoded) => assert_eq!(decoded, state),
+            _ => panic!("expected CursorUpdate"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_cursor_shape() {
+        let shape = CursorShape {
+            shape_id: 42,
+            width: 2,
+            height: 2,
+            hotspot_x: 1,
+            hotspot_y: 0,
+            rgba: vec![255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255],
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &Message::CursorShape(shape.clone())).unwrap();
+        let mut cursor = Cursor::new(&buf);
+        match read_message(&mut cursor).unwrap() {
+            Message::CursorShape(decoded) => assert_eq!(decoded, shape),
+            _ => panic!("expected CursorShape"),
+        }
     }
 
     #[test]

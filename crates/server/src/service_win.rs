@@ -1147,6 +1147,13 @@ fn run_dynamic_ipc_relay(
                     .sender
                     .send_msg(&phantom_core::protocol::Message::ClipboardSync(text));
             }
+
+            if let Some(cursor) = ipc.recv_cursor_state() {
+                let _ = runner.send_cursor_state(cursor);
+            }
+            for shape in ipc.recv_cursor_shapes() {
+                let _ = runner.send_cursor_shape(shape);
+            }
         } else if last_no_ipc_log.elapsed() >= Duration::from_secs(2) {
             svc_log("Relay: waiting for Windows agent IPC while keeping viewer connected");
             last_no_ipc_log = Instant::now();

@@ -3,13 +3,27 @@ use anyhow::Result;
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::POINT;
+use phantom_core::protocol::CursorShape;
+#[cfg(target_os = "windows")]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(target_os = "windows")]
+use std::hash::{Hash, Hasher};
+#[cfg(target_os = "windows")]
+use std::slice;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HANDLE, POINT};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDIBits, GetObjectW,
+    SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    CopyIcon, DestroyIcon, DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, GetSystemMetrics,
+    SetCursorPos, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, HICON, SM_CXCURSOR, SM_CXVIRTUALSCREEN,
+    SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 /// Injects input events into the OS.
@@ -97,6 +111,18 @@ impl InputInjector {
         #[cfg(not(target_os = "windows"))]
         {
             self.inject_enigo(event)
+        }
+    }
+
+    pub fn cursor_position(&mut self) -> Option<(i32, i32)> {
+        #[cfg(target_os = "windows")]
+        {
+            windows_cursor_diagnostics().map(|((x, y), _)| (x, y))
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.enigo.location().ok()
         }
     }
 
@@ -455,10 +481,376 @@ fn windows_send_input(inputs: &[INPUT]) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn windows_cursor_diagnostics() -> Option<((i32, i32), (i32, i32, i32, i32))> {
-    let mut pt = POINT::default();
-    unsafe { GetCursorPos(&mut pt) }
-        .ok()
-        .map(|()| ((pt.x, pt.y), windows_virtual_screen()))
+    windows_cursor_snapshot().map(|snapshot| ((snapshot.x, snapshot.y), snapshot.virtual_screen))
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowsCursorSnapshot {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+    pub handle: usize,
+    pub virtual_screen: (i32, i32, i32, i32),
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_cursor_snapshot() -> Option<WindowsCursorSnapshot> {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetCursorInfo(&mut info) }.is_err() {
+        let mut pt = POINT::default();
+        return unsafe { GetCursorPos(&mut pt) }
+            .ok()
+            .map(|()| WindowsCursorSnapshot {
+                x: pt.x,
+                y: pt.y,
+                visible: true,
+                handle: 0,
+                virtual_screen: windows_virtual_screen(),
+            });
+    }
+    Some(WindowsCursorSnapshot {
+        x: info.ptScreenPos.x,
+        y: info.ptScreenPos.y,
+        visible: info.flags == CURSOR_SHOWING,
+        handle: info.hCursor.0 as usize,
+        virtual_screen: windows_virtual_screen(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_capture_cursor_shape(handle: usize) -> Option<CursorShape> {
+    if handle == 0 {
+        return None;
+    }
+    unsafe {
+        let copied = CopyIcon(HICON(handle as *mut _)).ok()?;
+        let mut icon_info = windows::Win32::UI::WindowsAndMessaging::ICONINFO::default();
+        if GetIconInfo(copied, &mut icon_info).is_err() {
+            let _ = DestroyIcon(copied);
+            return None;
+        }
+
+        let (width, height) = cursor_bitmap_size(&icon_info).unwrap_or_else(|| {
+            let w = GetSystemMetrics(SM_CXCURSOR).max(1) as u32;
+            let h = GetSystemMetrics(SM_CYCURSOR).max(1) as u32;
+            (w, h)
+        });
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            cleanup_icon_info(&icon_info);
+            let _ = DestroyIcon(copied);
+            return None;
+        }
+
+        let mut bgra = draw_cursor_to_bgra(copied, width, height)?;
+        let mask = read_cursor_mask(&icon_info, width, height);
+        cleanup_icon_info(&icon_info);
+        let _ = DestroyIcon(copied);
+
+        let mut rgba = Vec::with_capacity(bgra.len());
+        let mut has_alpha = false;
+        for px in bgra.chunks_exact_mut(4) {
+            let b = px[0];
+            let g = px[1];
+            let r = px[2];
+            let a = px[3];
+            has_alpha |= a != 0;
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+
+        if !has_alpha {
+            if let Some(mask) = mask {
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let idx = (y * width as usize + x) * 4 + 3;
+                        rgba[idx] = if mask[y * width as usize + x] { 0 } else { 255 };
+                    }
+                }
+            } else {
+                // Some legacy cursors render RGB without alpha. Preserve black
+                // cursors by making the drawn bitmap opaque rather than leaving
+                // the browser with an invisible all-zero alpha image.
+                for px in rgba.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+            }
+        }
+        add_light_cursor_contrast_outline(&mut rgba, width, height);
+
+        let mut hasher = DefaultHasher::new();
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        icon_info.xHotspot.hash(&mut hasher);
+        icon_info.yHotspot.hash(&mut hasher);
+        rgba.hash(&mut hasher);
+        let mut shape_id = hasher.finish();
+        if shape_id == 0 {
+            shape_id = 1;
+        }
+
+        Some(CursorShape {
+            shape_id,
+            width,
+            height,
+            hotspot_x: icon_info.xHotspot as i32,
+            hotspot_y: icon_info.yHotspot as i32,
+            rgba,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn add_light_cursor_contrast_outline(rgba: &mut [u8], width: u32, height: u32) {
+    if width == 0 || height == 0 || rgba.len() != (width as usize * height as usize * 4) {
+        return;
+    }
+
+    let mut light_pixels = 0usize;
+    let mut dark_pixels = 0usize;
+    for px in rgba.chunks_exact(4) {
+        if px[3] < 64 {
+            continue;
+        }
+        let luminance = (px[0] as u16 * 299 + px[1] as u16 * 587 + px[2] as u16 * 114) / 1000;
+        if luminance >= 192 {
+            light_pixels += 1;
+        } else if luminance <= 80 {
+            dark_pixels += 1;
+        }
+    }
+
+    // Monochrome/XOR cursors such as the Windows I-beam can become effectively
+    // white when rendered into RGBA. Add a baked one-pixel dark edge only when
+    // the captured shape lacks its own dark stroke; this keeps normal arrow
+    // cursors unchanged and avoids a moving CSS drop-shadow cost.
+    if light_pixels == 0 || dark_pixels.saturating_mul(3) >= light_pixels {
+        return;
+    }
+
+    let original = rgba.to_vec();
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let idx = (y * width_usize + x) * 4;
+            let px = &original[idx..idx + 4];
+            if px[3] < 64 {
+                continue;
+            }
+            let luminance = (px[0] as u16 * 299 + px[1] as u16 * 587 + px[2] as u16 * 114) / 1000;
+            if luminance < 160 {
+                continue;
+            }
+
+            let x0 = x.saturating_sub(1);
+            let y0 = y.saturating_sub(1);
+            let x1 = (x + 1).min(width_usize - 1);
+            let y1 = (y + 1).min(height_usize - 1);
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let nidx = (ny * width_usize + nx) * 4;
+                    if original[nidx + 3] >= 32 {
+                        continue;
+                    }
+                    rgba[nidx] = 0;
+                    rgba[nidx + 1] = 0;
+                    rgba[nidx + 2] = 0;
+                    rgba[nidx + 3] = rgba[nidx + 3].max(220);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn cleanup_icon_info(icon_info: &windows::Win32::UI::WindowsAndMessaging::ICONINFO) {
+    if !icon_info.hbmColor.is_invalid() {
+        let _ = DeleteObject(icon_info.hbmColor);
+    }
+    if !icon_info.hbmMask.is_invalid() {
+        let _ = DeleteObject(icon_info.hbmMask);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn cursor_bitmap_size(
+    icon_info: &windows::Win32::UI::WindowsAndMessaging::ICONINFO,
+) -> Option<(u32, u32)> {
+    let mut bitmap = BITMAP::default();
+    let hbm = if !icon_info.hbmColor.is_invalid() {
+        icon_info.hbmColor
+    } else {
+        icon_info.hbmMask
+    };
+    if hbm.is_invalid() {
+        return None;
+    }
+    let copied = GetObjectW(
+        hbm,
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bitmap as *mut _ as *mut _),
+    );
+    if copied == 0 {
+        return None;
+    }
+    let width = bitmap.bmWidth.max(0) as u32;
+    let mut height = bitmap.bmHeight.unsigned_abs();
+    if icon_info.hbmColor.is_invalid() {
+        height /= 2;
+    }
+    Some((width, height))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn draw_cursor_to_bgra(hicon: HICON, width: u32, height: u32) -> Option<Vec<u8>> {
+    let hdc = CreateCompatibleDC(HDC::default());
+    if hdc.is_invalid() {
+        return None;
+    }
+
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: width * height * 4,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [Default::default()],
+    };
+    let hbm = match CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+        Ok(hbm) => hbm,
+        Err(_) => {
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(hbm);
+        let _ = DeleteDC(hdc);
+        return None;
+    }
+
+    let old = SelectObject(hdc, hbm);
+    let len = (width * height * 4) as usize;
+    std::ptr::write_bytes(bits, 0, len);
+    let draw = DrawIconEx(
+        hdc,
+        0,
+        0,
+        hicon,
+        width as i32,
+        height as i32,
+        0,
+        None,
+        DI_NORMAL,
+    );
+    let data = if draw.is_ok() {
+        Some(slice::from_raw_parts(bits as *const u8, len).to_vec())
+    } else {
+        None
+    };
+    SelectObject(hdc, old);
+    let _ = DeleteObject(hbm);
+    let _ = DeleteDC(hdc);
+    data
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn read_hbitmap_bgra(hbm: HBITMAP, width: u32, height: u32) -> Option<Vec<u8>> {
+    if hbm.is_invalid() || width == 0 || height == 0 {
+        return None;
+    }
+    let hdc = CreateCompatibleDC(HDC::default());
+    if hdc.is_invalid() {
+        return None;
+    }
+    let mut data = vec![0u8; (width * height * 4) as usize];
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: height as i32,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [Default::default()],
+    };
+    let lines = GetDIBits(
+        hdc,
+        hbm,
+        0,
+        height,
+        Some(data.as_mut_ptr() as *mut _),
+        &mut bmi,
+        DIB_RGB_COLORS,
+    );
+    let _ = DeleteDC(hdc);
+    if lines == 0 {
+        return None;
+    }
+    Some(data)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn read_cursor_mask(
+    icon_info: &windows::Win32::UI::WindowsAndMessaging::ICONINFO,
+    width: u32,
+    height: u32,
+) -> Option<Vec<bool>> {
+    if icon_info.hbmMask.is_invalid() {
+        return None;
+    }
+    let mut bitmap = BITMAP::default();
+    if GetObjectW(
+        icon_info.hbmMask,
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bitmap as *mut _ as *mut _),
+    ) == 0
+    {
+        return None;
+    }
+    let mask_height = bitmap.bmHeight.unsigned_abs();
+    let mask_bgra = read_hbitmap_bgra(icon_info.hbmMask, width, mask_height)?;
+    let mut transparent = vec![false; (width * height) as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let mask_y = mask_height as usize - 1 - y;
+            let idx = (mask_y * width as usize + x) * 4;
+            let is_white = mask_bgra
+                .get(idx..idx + 3)
+                .map(|rgb| rgb.iter().all(|v| *v > 127))
+                .unwrap_or(false);
+            if icon_info.hbmColor.is_invalid() {
+                let xor_y = mask_height as usize - 1 - (y + height as usize);
+                let xor_idx = (xor_y * width as usize + x) * 4;
+                let xor_white = mask_bgra
+                    .get(xor_idx..xor_idx + 3)
+                    .map(|rgb| rgb.iter().all(|v| *v > 127))
+                    .unwrap_or(false);
+                transparent[y * width as usize + x] = is_white && !xor_white;
+            } else {
+                transparent[y * width as usize + x] = is_white;
+            }
+        }
+    }
+    Some(transparent)
 }
 
 #[cfg(target_os = "windows")]

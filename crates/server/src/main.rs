@@ -2984,6 +2984,7 @@ fn run_agent_loop(
     use phantom_core::capture::FrameCapture;
     use phantom_core::encode::FrameEncoder;
     use phantom_core::input::InputEvent;
+    use phantom_core::protocol::{CursorShape, CursorState};
 
     let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
     let idle_pipeline_ttl = Duration::from_secs(60);
@@ -3024,6 +3025,11 @@ fn run_agent_loop(
     let mut last_input_detail_log = instant_ago(Duration::from_secs(10));
     let mut last_mouse_move_log = instant_ago(Duration::from_secs(10));
     let mut last_mouse_pos: Option<(i32, i32)> = None;
+    let mut last_cursor_state: Option<CursorState> = None;
+    let mut last_cursor_state_sent = instant_ago(Duration::from_secs(1));
+    let mut last_cursor_handle: usize = 0;
+    let mut last_cursor_shape: Option<CursorShape> = None;
+    let mut last_cursor_shape_failed_handle: usize = 0;
     let mut last_viewer_active = false;
     let mut viewer_idle_since: Option<Instant> = None;
     let mut gpu_prewarm_ready = false;
@@ -3047,6 +3053,12 @@ fn run_agent_loop(
             last_viewer_active = viewer_active;
             viewer_idle_since = if viewer_active {
                 idle_gpu_prewarm_suspended = false;
+                // Cursor shape is session state for the viewer, not just an OS
+                // handle-change event. Force a resend for each newly attached
+                // viewer so clients do not depend on stale IPC timing.
+                last_cursor_handle = 0;
+                last_cursor_shape = None;
+                last_cursor_shape_failed_handle = 0;
                 None
             } else {
                 Some(Instant::now())
@@ -4023,6 +4035,82 @@ fn run_agent_loop(
                 }
             } else {
                 tracing::warn!("no injector available");
+            }
+        }
+
+        if viewer_active && last_cursor_state_sent.elapsed() >= Duration::from_millis(33) {
+            if let Some(snapshot) = crate::input_injector::windows_cursor_snapshot() {
+                if snapshot.handle != 0
+                    && (snapshot.handle != last_cursor_handle || last_cursor_shape.is_none())
+                {
+                    if let Some(shape) =
+                        crate::input_injector::windows_capture_cursor_shape(snapshot.handle)
+                    {
+                        if last_cursor_shape.as_ref().map(|prev| prev.shape_id)
+                            != Some(shape.shape_id)
+                        {
+                            if let Err(e) = ipc.send_cursor_shape(&shape) {
+                                tracing::debug!("IPC cursor shape send failed: {e:#}");
+                            } else {
+                                tracing::debug!(
+                                    handle = snapshot.handle,
+                                    shape_id = shape.shape_id,
+                                    width = shape.width,
+                                    height = shape.height,
+                                    hotspot_x = shape.hotspot_x,
+                                    hotspot_y = shape.hotspot_y,
+                                    "sent cursor shape"
+                                );
+                                last_cursor_shape = Some(shape);
+                                last_cursor_shape_failed_handle = 0;
+                            }
+                        }
+                    } else {
+                        if last_cursor_shape_failed_handle != snapshot.handle {
+                            tracing::debug!(
+                                handle = snapshot.handle,
+                                visible = snapshot.visible,
+                                x = snapshot.x,
+                                y = snapshot.y,
+                                "cursor shape capture failed"
+                            );
+                            last_cursor_shape_failed_handle = snapshot.handle;
+                        }
+                        last_cursor_shape = None;
+                    }
+                    last_cursor_handle = snapshot.handle;
+                }
+
+                let local_x = snapshot.x.saturating_sub(display_x);
+                let local_y = snapshot.y.saturating_sub(display_y);
+                let max_x = width.saturating_sub(1) as i32;
+                let max_y = height.saturating_sub(1) as i32;
+                let visible = width > 0
+                    && height > 0
+                    && snapshot.visible
+                    && local_x >= 0
+                    && local_y >= 0
+                    && local_x <= max_x
+                    && local_y <= max_y;
+                let state = CursorState {
+                    visible,
+                    x: local_x.clamp(0, max_x),
+                    y: local_y.clamp(0, max_y),
+                    shape_id: last_cursor_shape
+                        .as_ref()
+                        .map(|shape| shape.shape_id)
+                        .unwrap_or(0),
+                };
+                if last_cursor_state != Some(state)
+                    || last_cursor_state_sent.elapsed() >= Duration::from_millis(250)
+                {
+                    if let Err(e) = ipc.send_cursor_state(&state) {
+                        tracing::debug!("IPC cursor state send failed: {e:#}");
+                    } else {
+                        last_cursor_state = Some(state);
+                        last_cursor_state_sent = Instant::now();
+                    }
+                }
             }
         }
 

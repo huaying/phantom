@@ -19,13 +19,19 @@
 //! - 0x03 Heartbeat (bidirectional): empty payload
 //! - 0x04 Shutdown (service → agent): empty payload
 //! - 0x05 ForceKeyframe (service → agent): empty payload
+//! - 0x06 ResolutionChange (service → agent): \[u32 width\]\[u32 height\]
+//! - 0x07 PasteText (service → agent): UTF-8 text
+//! - 0x08 ClipboardSync (agent → service): UTF-8 text
 //! - 0x09 ViewerState (service → agent): \[u8 active\]
+//! - 0x0a CursorState (agent → service): \[u8 visible\]\[i32 x\]\[i32 y\]\[u64 shape_id\]
+//! - 0x0b CursorShape (agent → service): \[u64 id\]\[u32 w\]\[u32 h\]\[i32 hot_x\]\[i32 hot_y\]\[rgba\]
 
 #[cfg(target_os = "windows")]
 mod platform {
     use anyhow::{Context, Result};
     use phantom_core::encode::{EncodedFrame, VideoCodec};
     use phantom_core::input::InputEvent;
+    use phantom_core::protocol::{CursorShape, CursorState};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -114,6 +120,8 @@ mod platform {
     const MSG_PASTE_TEXT: u8 = 0x07;
     const MSG_CLIPBOARD_SYNC: u8 = 0x08; // agent → service (clipboard changed)
     const MSG_VIEWER_STATE: u8 = 0x09;
+    const MSG_CURSOR_STATE: u8 = 0x0a;
+    const MSG_CURSOR_SHAPE: u8 = 0x0b;
 
     // ── Low-level pipe I/O helpers ──────────────────────────────────────────
 
@@ -242,6 +250,80 @@ mod platform {
         ))
     }
 
+    fn encode_cursor_state(state: &CursorState) -> [u8; 17] {
+        let mut payload = [0u8; 17];
+        payload[0] = u8::from(state.visible);
+        payload[1..5].copy_from_slice(&state.x.to_le_bytes());
+        payload[5..9].copy_from_slice(&state.y.to_le_bytes());
+        payload[9..17].copy_from_slice(&state.shape_id.to_le_bytes());
+        payload
+    }
+
+    fn decode_cursor_state(payload: &[u8]) -> Result<CursorState> {
+        if payload.len() < 17 {
+            anyhow::bail!("cursor state payload too short: {} bytes", payload.len());
+        }
+        Ok(CursorState {
+            visible: payload[0] != 0,
+            x: i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+            y: i32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]),
+            shape_id: u64::from_le_bytes([
+                payload[9],
+                payload[10],
+                payload[11],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+                payload[16],
+            ]),
+        })
+    }
+
+    fn encode_cursor_shape(shape: &CursorShape) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(24 + shape.rgba.len());
+        payload.extend_from_slice(&shape.shape_id.to_le_bytes());
+        payload.extend_from_slice(&shape.width.to_le_bytes());
+        payload.extend_from_slice(&shape.height.to_le_bytes());
+        payload.extend_from_slice(&shape.hotspot_x.to_le_bytes());
+        payload.extend_from_slice(&shape.hotspot_y.to_le_bytes());
+        payload.extend_from_slice(&shape.rgba);
+        payload
+    }
+
+    fn decode_cursor_shape(payload: &[u8]) -> Result<CursorShape> {
+        if payload.len() < 24 {
+            anyhow::bail!("cursor shape payload too short: {} bytes", payload.len());
+        }
+        let shape_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let width = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+        let height = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+        let hotspot_x = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+        let hotspot_y = i32::from_le_bytes(payload[20..24].try_into().unwrap());
+        let expected = width
+            .checked_mul(height)
+            .and_then(|px| px.checked_mul(4))
+            .map(|n| n as usize)
+            .ok_or_else(|| anyhow::anyhow!("cursor shape dimensions overflow: {width}x{height}"))?;
+        if payload.len() - 24 != expected {
+            anyhow::bail!(
+                "cursor shape rgba size mismatch: got {}, expected {} for {}x{}",
+                payload.len() - 24,
+                expected,
+                width,
+                height
+            );
+        }
+        Ok(CursorShape {
+            shape_id,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            rgba: payload[24..].to_vec(),
+        })
+    }
+
     /// Helper: create a named pipe server-side handle.
     fn create_pipe(name: &str) -> Result<HANDLE> {
         unsafe {
@@ -341,6 +423,8 @@ mod platform {
         frame_rx: Option<mpsc::Receiver<IpcEncodedFrame>>,
         last_keyframe: Arc<std::sync::Mutex<Option<IpcEncodedFrame>>>,
         clipboard_rx: Option<mpsc::Receiver<String>>,
+        cursor_rx: Option<mpsc::Receiver<CursorState>>,
+        cursor_shape_rx: Option<mpsc::Receiver<CursorShape>>,
         input_tx: Option<mpsc::Sender<InputEvent>>,
         shutdown: Arc<AtomicBool>,
         /// Flag set by request_keyframe(), cleared by the write thread after sending.
@@ -373,6 +457,8 @@ mod platform {
                 frame_rx: None,
                 last_keyframe: Arc::new(std::sync::Mutex::new(None)),
                 clipboard_rx: None,
+                cursor_rx: None,
+                cursor_shape_rx: None,
                 input_tx: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
                 keyframe_requested: Arc::new(AtomicBool::new(false)),
@@ -412,9 +498,13 @@ mod platform {
             // Bounded channel — drops old frames when no session is draining.
             let (frame_tx, frame_rx) = mpsc::sync_channel(30);
             let (clipboard_tx, clipboard_rx) = mpsc::sync_channel::<String>(4);
+            let (cursor_tx, cursor_rx) = mpsc::sync_channel::<CursorState>(16);
+            let (cursor_shape_tx, cursor_shape_rx) = mpsc::sync_channel::<CursorShape>(8);
             let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
             self.frame_rx = Some(frame_rx);
             self.clipboard_rx = Some(clipboard_rx);
+            self.cursor_rx = Some(cursor_rx);
+            self.cursor_shape_rx = Some(cursor_shape_rx);
             self.input_tx = Some(input_tx);
             *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
@@ -453,6 +543,22 @@ mod platform {
                                 Ok((MSG_CLIPBOARD_SYNC, payload)) => {
                                     if let Ok(text) = String::from_utf8(payload) {
                                         let _ = clipboard_tx.try_send(text);
+                                    }
+                                }
+                                Ok((MSG_CURSOR_STATE, payload)) => {
+                                    match decode_cursor_state(&payload) {
+                                        Ok(state) => {
+                                            let _ = cursor_tx.try_send(state);
+                                        }
+                                        Err(e) => tracing::warn!("IPC: bad cursor state: {e}"),
+                                    }
+                                }
+                                Ok((MSG_CURSOR_SHAPE, payload)) => {
+                                    match decode_cursor_shape(&payload) {
+                                        Ok(shape) => {
+                                            let _ = cursor_shape_tx.try_send(shape);
+                                        }
+                                        Err(e) => tracing::warn!("IPC: bad cursor shape: {e}"),
                                     }
                                 }
                                 Ok((t, _)) => tracing::debug!("IPC up: unexpected 0x{t:02x}"),
@@ -615,6 +721,28 @@ mod platform {
             self.clipboard_rx.as_ref().and_then(|rx| rx.try_recv().ok())
         }
 
+        /// Receive the latest cursor state from agent, dropping older queued states.
+        pub fn recv_cursor_state(&self) -> Option<CursorState> {
+            let mut latest = None;
+            if let Some(ref rx) = self.cursor_rx {
+                while let Ok(state) = rx.try_recv() {
+                    latest = Some(state);
+                }
+            }
+            latest
+        }
+
+        /// Receive queued cursor shape bitmaps from the agent.
+        pub fn recv_cursor_shapes(&self) -> Vec<CursorShape> {
+            let mut shapes = Vec::new();
+            if let Some(ref rx) = self.cursor_shape_rx {
+                while let Ok(shape) = rx.try_recv() {
+                    shapes.push(shape);
+                }
+            }
+            shapes
+        }
+
         /// Receive all queued encoded frames from the agent.
         /// H.264 frames MUST be forwarded in order — never skip frames.
         pub fn recv_encoded_frames(&self) -> Vec<IpcEncodedFrame> {
@@ -760,6 +888,7 @@ mod platform {
             self.frame_rx = None;
             *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.clipboard_rx = None;
+            self.cursor_rx = None;
             self.input_tx = None;
         }
     }
@@ -919,6 +1048,18 @@ mod platform {
             unsafe { send_message(self.up_handle, MSG_CLIPBOARD_SYNC, text.as_bytes()) }
         }
 
+        /// Send cursor state to service for forwarding to the viewer.
+        pub fn send_cursor_state(&self, state: &CursorState) -> Result<()> {
+            let payload = encode_cursor_state(state);
+            unsafe { send_message(self.up_handle, MSG_CURSOR_STATE, &payload) }
+        }
+
+        /// Send cursor bitmap shape to service for forwarding to the viewer.
+        pub fn send_cursor_shape(&self, shape: &CursorShape) -> Result<()> {
+            let payload = encode_cursor_shape(shape);
+            unsafe { send_message(self.up_handle, MSG_CURSOR_SHAPE, &payload) }
+        }
+
         /// Check and clear the keyframe request flag.
         pub fn take_keyframe_request(&self) -> bool {
             self.keyframe_requested.swap(false, Ordering::SeqCst)
@@ -978,6 +1119,7 @@ mod platform {
     use anyhow::Result;
     use phantom_core::encode::EncodedFrame;
     use phantom_core::input::InputEvent;
+    use phantom_core::protocol::{CursorShape, CursorState};
     use std::time::Duration;
 
     pub struct IpcEncodedFrame {
@@ -995,6 +1137,12 @@ mod platform {
             Ok(false)
         }
         pub fn recv_encoded_frames(&self) -> Vec<IpcEncodedFrame> {
+            Vec::new()
+        }
+        pub fn recv_cursor_state(&self) -> Option<CursorState> {
+            None
+        }
+        pub fn recv_cursor_shapes(&self) -> Vec<CursorShape> {
             Vec::new()
         }
         pub fn send_input(&self, _event: InputEvent) -> Result<()> {
@@ -1021,6 +1169,12 @@ mod platform {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
         pub fn send_encoded_frame(&self, _frame: &EncodedFrame, _w: u32, _h: u32) -> Result<()> {
+            Ok(())
+        }
+        pub fn send_cursor_state(&self, _state: &CursorState) -> Result<()> {
+            Ok(())
+        }
+        pub fn send_cursor_shape(&self, _shape: &CursorShape) -> Result<()> {
             Ok(())
         }
         pub fn take_keyframe_request(&self) -> bool {
