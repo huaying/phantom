@@ -25,6 +25,7 @@ use phantom_core::crypto;
 use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -168,6 +169,10 @@ struct Session {
     /// Shutdown handle to close the TCP connection and unblock the recv thread.
     shutdown_handle: Option<transport_tcp::TcpShutdownHandle>,
     cursor_pos: Option<PhysicalPosition<f64>>,
+    cursor_visible: bool,
+    cursor_shape_id: u64,
+    cursor_shapes: HashMap<u64, display_winit::CursorBitmap>,
+    cursor_local_until: Instant,
     last_sent_mouse: (i32, i32),
     scroll_accum: (f32, f32),
     modifiers: winit::event::Modifiers,
@@ -341,7 +346,7 @@ impl App {
         }
 
         // Read Hello and check protocol version
-        let (width, height, server_audio, video_codec, new_session_token) =
+        let (width, height, server_audio, video_codec, new_session_token, protocol_version) =
             match receiver.recv_msg() {
                 Ok(Message::Hello {
                     width,
@@ -368,7 +373,14 @@ impl App {
                         );
                     }
                     tracing::info!(width, height, audio, protocol_version, "connected");
-                    (width, height, audio, video_codec, session_token)
+                    (
+                        width,
+                        height,
+                        audio,
+                        video_codec,
+                        session_token,
+                        protocol_version,
+                    )
                 }
                 Ok(_) => {
                     tracing::warn!("bad Hello");
@@ -395,6 +407,17 @@ impl App {
             self.last_session_token.clear();
         }
 
+        if protocol_version >= 8 {
+            if let Err(e) = sender.send_msg(&Message::EnableCursorState { enabled: true }) {
+                tracing::warn!("failed to enable cursor state: {e}");
+            }
+        }
+        if protocol_version >= 9 {
+            if let Err(e) = sender.send_msg(&Message::EnableCursorShape { enabled: true }) {
+                tracing::warn!("failed to enable cursor shape: {e}");
+            }
+        }
+
         // Create window — default to windowed (with decorations so the user
         // can move/resize). F11 toggles fullscreen, Esc exits fullscreen.
         // Opening fullscreen by default was annoying on reconnect because
@@ -416,6 +439,7 @@ impl App {
         }
 
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        window.set_cursor_visible(false);
 
         let display = match display_winit::WinitDisplay::new(window.clone(), width, height) {
             Ok(d) => d,
@@ -588,6 +612,10 @@ impl App {
             server_kicked,
             shutdown_handle,
             cursor_pos: None,
+            cursor_visible: false,
+            cursor_shape_id: 0,
+            cursor_shapes: HashMap::new(),
+            cursor_local_until: Instant::now() - Duration::from_secs(1),
             last_sent_mouse: (-1, -1),
             scroll_accum: (0.0, 0.0),
             modifiers: winit::event::Modifiers::default(),
@@ -700,6 +728,26 @@ impl ApplicationHandler for App {
                                 encode_ms = format_args!("{:.1}", encode_us as f64 / 1000.0),
                                 "server stats"
                             );
+                        }
+                        Message::CursorUpdate(cursor) => {
+                            session.cursor_shape_id = cursor.shape_id;
+                            if !cursor.visible {
+                                session.cursor_visible = false;
+                                session.cursor_pos = None;
+                            } else if Instant::now() >= session.cursor_local_until {
+                                session.cursor_visible = true;
+                                session.cursor_pos =
+                                    Some(session.display.map_from_server(cursor.x, cursor.y));
+                            }
+                        }
+                        Message::CursorShape(shape) => {
+                            if shape.shape_id != 0 {
+                                if let Some(cursor) =
+                                    display_winit::CursorBitmap::from_shape(&shape)
+                                {
+                                    session.cursor_shapes.insert(shape.shape_id, cursor);
+                                }
+                            }
                         }
                         Message::FileOffer {
                             transfer_id,
@@ -839,7 +887,16 @@ impl ApplicationHandler for App {
                 }
 
                 // Present
-                let _ = session.display.present(session.cursor_pos);
+                let cursor_shape = session.cursor_shapes.get(&session.cursor_shape_id);
+                let cursor = session.cursor_pos.and_then(|position| {
+                    session
+                        .cursor_visible
+                        .then_some(display_winit::CursorOverlay {
+                            position,
+                            shape: cursor_shape,
+                        })
+                });
+                let _ = session.display.present(cursor);
 
                 // Drain file transfer outbound messages
                 for msg in session.file_xfer.drain_send_events() {
@@ -983,6 +1040,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 session.cursor_pos = Some(position);
+                session.cursor_visible = true;
+                session.cursor_local_until = Instant::now() + Duration::from_millis(250);
                 let (sx, sy) = session.display.map_to_server(position);
                 // Only send if position actually changed (filters trackpad noise)
                 let (lx, ly) = session.last_sent_mouse;

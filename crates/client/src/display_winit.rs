@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use phantom_core::protocol::CursorShape;
 use softbuffer::Surface;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -12,6 +13,39 @@ pub struct WinitDisplay {
     buffer: Vec<u32>,
     server_width: u32,
     server_height: u32,
+}
+
+pub struct CursorBitmap {
+    width: usize,
+    height: usize,
+    hotspot_x: i32,
+    hotspot_y: i32,
+    rgba: Vec<u8>,
+}
+
+impl CursorBitmap {
+    pub fn from_shape(shape: &CursorShape) -> Option<Self> {
+        if shape.width == 0
+            || shape.height == 0
+            || shape.width > 256
+            || shape.height > 256
+            || shape.rgba.len() != (shape.width as usize * shape.height as usize * 4)
+        {
+            return None;
+        }
+        Some(Self {
+            width: shape.width as usize,
+            height: shape.height as usize,
+            hotspot_x: shape.hotspot_x,
+            hotspot_y: shape.hotspot_y,
+            rgba: shape.rgba.clone(),
+        })
+    }
+}
+
+pub struct CursorOverlay<'a> {
+    pub position: PhysicalPosition<f64>,
+    pub shape: Option<&'a CursorBitmap>,
 }
 
 impl WinitDisplay {
@@ -73,7 +107,7 @@ impl WinitDisplay {
 
     /// Draw local cursor and present framebuffer to screen.
     /// If window is smaller than server resolution, downscale with nearest-neighbor.
-    pub fn present(&mut self, cursor_pos: Option<PhysicalPosition<f64>>) -> Result<()> {
+    pub fn present(&mut self, cursor: Option<CursorOverlay<'_>>) -> Result<()> {
         let win_size = self.window.inner_size();
         let dst_w = win_size.width;
         let dst_h = win_size.height;
@@ -148,22 +182,32 @@ impl WinitDisplay {
         }
 
         // Draw cursor overlay
-        if let Some(pos) = cursor_pos {
-            draw_cursor(
-                &mut sb,
-                dst_w as usize,
-                dst_h as usize,
-                pos.x as i32,
-                pos.y as i32,
-            );
+        if let Some(cursor) = cursor {
+            if let Some(shape) = cursor.shape {
+                draw_cursor_bitmap(
+                    &mut sb,
+                    dst_w as usize,
+                    dst_h as usize,
+                    cursor.position.x as i32,
+                    cursor.position.y as i32,
+                    shape,
+                );
+            } else {
+                draw_cursor(
+                    &mut sb,
+                    dst_w as usize,
+                    dst_h as usize,
+                    cursor.position.x as i32,
+                    cursor.position.y as i32,
+                );
+            }
         }
 
-        // macOS: fade the top strip to black so the traffic-light buttons
+        // macOS: draw a solid top strip so the traffic-light buttons
         // (which sit on top of the video because the title bar is
-        // transparent+fullsize_content_view) have a readable backdrop
-        // regardless of what colour the remote desktop is showing.
+        // transparent+fullsize_content_view) have a stable backdrop.
         #[cfg(target_os = "macos")]
-        draw_top_gradient(&mut sb, dst_w as usize, dst_h as usize);
+        draw_top_bar(&mut sb, dst_w as usize, dst_h as usize);
 
         sb.present().map_err(|e| anyhow::anyhow!("present: {e}"))?;
         Ok(())
@@ -197,6 +241,37 @@ impl WinitDisplay {
         let x = ((pos.x - offset_x) / render_w * src_w).clamp(0.0, src_w - 1.0) as i32;
         let y = ((pos.y - offset_y) / render_h * src_h).clamp(0.0, src_h - 1.0) as i32;
         (x, y)
+    }
+
+    pub fn map_from_server(&self, x: i32, y: i32) -> PhysicalPosition<f64> {
+        let win_size = self.window.inner_size();
+        let dst_w = win_size.width as f64;
+        let dst_h = win_size.height as f64;
+        let src_w = self.server_width as f64;
+        let src_h = self.server_height as f64;
+
+        if dst_w == 0.0 || dst_h == 0.0 || src_w == 0.0 || src_h == 0.0 {
+            return PhysicalPosition::new(0.0, 0.0);
+        }
+
+        let src_aspect = src_w / src_h;
+        let dst_aspect = dst_w / dst_h;
+        let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
+            let rw = dst_w;
+            let rh = dst_w / src_aspect;
+            (rw, rh, 0.0, (dst_h - rh) / 2.0)
+        } else {
+            let rh = dst_h;
+            let rw = dst_h * src_aspect;
+            (rw, rh, (dst_w - rw) / 2.0, 0.0)
+        };
+
+        let sx = x.clamp(0, self.server_width.saturating_sub(1) as i32) as f64;
+        let sy = y.clamp(0, self.server_height.saturating_sub(1) as i32) as f64;
+        PhysicalPosition::new(
+            offset_x + sx / src_w.max(1.0) * render_w,
+            offset_y + sy / src_h.max(1.0) * render_h,
+        )
     }
 }
 
@@ -248,25 +323,15 @@ const CURSOR_BITMAP: [u8; CURSOR_W * CURSOR_H] = [
     0,0,0,0,0,0,0,2,0,0,0,0,
 ];
 
-/// Darken the top ~50px of the framebuffer with a vertical gradient: full
-/// black at y=0 fading to the original pixel at y=GRAD_H. Gives the macOS
-/// traffic lights a legible backdrop over any remote-desktop content.
+/// Draw a solid black strip behind the macOS traffic-light buttons.
 #[cfg(target_os = "macos")]
-fn draw_top_gradient(buffer: &mut [u32], buf_w: usize, buf_h: usize) {
-    const GRAD_H: usize = 50;
-    let h = GRAD_H.min(buf_h);
+fn draw_top_bar(buffer: &mut [u32], buf_w: usize, buf_h: usize) {
+    const BAR_H: usize = 50;
+    let h = BAR_H.min(buf_h);
     for y in 0..h {
-        // Scale factor for the original pixel: 0 (fully black) at y=0,
-        // 1 (untouched) at y=h.
-        let alpha = y as f32 / h as f32;
         let row = y * buf_w;
         for x in 0..buf_w {
-            let idx = row + x;
-            let p = buffer[idx];
-            let r = (((p >> 16) & 0xff) as f32 * alpha) as u32;
-            let g = (((p >> 8) & 0xff) as f32 * alpha) as u32;
-            let b = ((p & 0xff) as f32 * alpha) as u32;
-            buffer[idx] = (r << 16) | (g << 8) | b;
+            buffer[row + x] = 0;
         }
     }
 }
@@ -305,6 +370,52 @@ fn draw_cursor(buffer: &mut [u32], buf_w: usize, buf_h: usize, x: i32, y: i32) {
                 2 => 0x00000000,
                 _ => continue,
             };
+        }
+    }
+}
+
+fn draw_cursor_bitmap(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: i32,
+    y: i32,
+    shape: &CursorBitmap,
+) {
+    let origin_x = x - shape.hotspot_x;
+    let origin_y = y - shape.hotspot_y;
+    for cy in 0..shape.height {
+        for cx in 0..shape.width {
+            let px = origin_x as isize + cx as isize;
+            let py = origin_y as isize + cy as isize;
+            if px < 0 || py < 0 || px >= buf_w as isize || py >= buf_h as isize {
+                continue;
+            }
+
+            let src_idx = (cy * shape.width + cx) * 4;
+            let r = shape.rgba[src_idx] as u32;
+            let g = shape.rgba[src_idx + 1] as u32;
+            let b = shape.rgba[src_idx + 2] as u32;
+            let a = shape.rgba[src_idx + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+
+            let dst_idx = py as usize * buf_w + px as usize;
+            if a == 255 {
+                buffer[dst_idx] = (r << 16) | (g << 8) | b;
+                continue;
+            }
+
+            let dst = buffer[dst_idx];
+            let dr = (dst >> 16) & 0xff;
+            let dg = (dst >> 8) & 0xff;
+            let db = dst & 0xff;
+            let inv = 255 - a;
+            let out_r = (r * a + dr * inv) / 255;
+            let out_g = (g * a + dg * inv) / 255;
+            let out_b = (b * a + db * inv) / 255;
+            buffer[dst_idx] = (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 }

@@ -545,40 +545,21 @@ pub fn windows_capture_cursor_shape(handle: usize) -> Option<CursorShape> {
             return None;
         }
 
-        let mut bgra = draw_cursor_to_bgra(copied, width, height)?;
-        let mask = read_cursor_mask(&icon_info, width, height);
+        let is_monochrome = icon_info.hbmColor.is_invalid();
+        let mut rgba = if is_monochrome {
+            decode_monochrome_cursor_rgba(&icon_info, width, height)
+                .or_else(|| render_cursor_to_rgba(copied, &icon_info, width, height))?
+        } else {
+            render_cursor_to_rgba(copied, &icon_info, width, height)?
+        };
         cleanup_icon_info(&icon_info);
         let _ = DestroyIcon(copied);
 
-        let mut rgba = Vec::with_capacity(bgra.len());
-        let mut has_alpha = false;
-        for px in bgra.chunks_exact_mut(4) {
-            let b = px[0];
-            let g = px[1];
-            let r = px[2];
-            let a = px[3];
-            has_alpha |= a != 0;
-            rgba.extend_from_slice(&[r, g, b, a]);
+        if is_monochrome {
+            add_monochrome_cursor_contrast_outline(&mut rgba, width, height);
+        } else {
+            add_light_cursor_contrast_outline(&mut rgba, width, height);
         }
-
-        if !has_alpha {
-            if let Some(mask) = mask {
-                for y in 0..height as usize {
-                    for x in 0..width as usize {
-                        let idx = (y * width as usize + x) * 4 + 3;
-                        rgba[idx] = if mask[y * width as usize + x] { 0 } else { 255 };
-                    }
-                }
-            } else {
-                // Some legacy cursors render RGB without alpha. Preserve black
-                // cursors by making the drawn bitmap opaque rather than leaving
-                // the browser with an invisible all-zero alpha image.
-                for px in rgba.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-            }
-        }
-        add_light_cursor_contrast_outline(&mut rgba, width, height);
 
         let mut hasher = DefaultHasher::new();
         width.hash(&mut hasher);
@@ -600,6 +581,47 @@ pub fn windows_capture_cursor_shape(handle: usize) -> Option<CursorShape> {
             rgba,
         })
     }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn render_cursor_to_rgba(
+    hicon: HICON,
+    icon_info: &windows::Win32::UI::WindowsAndMessaging::ICONINFO,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let mut bgra = draw_cursor_to_bgra(hicon, width, height)?;
+    let mask = read_cursor_mask(icon_info, width, height);
+
+    let mut rgba = Vec::with_capacity(bgra.len());
+    let mut has_alpha = false;
+    for px in bgra.chunks_exact_mut(4) {
+        let b = px[0];
+        let g = px[1];
+        let r = px[2];
+        let a = px[3];
+        has_alpha |= a != 0;
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+
+    if !has_alpha {
+        if let Some(mask) = mask {
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let idx = (y * width as usize + x) * 4 + 3;
+                    rgba[idx] = if mask[y * width as usize + x] { 0 } else { 255 };
+                }
+            }
+        } else {
+            // Some legacy cursors render RGB without alpha. Preserve black
+            // cursors by making the drawn bitmap opaque rather than leaving
+            // the browser with an invisible all-zero alpha image.
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+        }
+    }
+    Some(rgba)
 }
 
 #[cfg(target_os = "windows")]
@@ -659,6 +681,145 @@ fn add_light_cursor_contrast_outline(rgba: &mut [u8], width: u32, height: u32) {
                     rgba[nidx + 1] = 0;
                     rgba[nidx + 2] = 0;
                     rgba[nidx + 3] = rgba[nidx + 3].max(220);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn decode_monochrome_cursor_rgba(
+    icon_info: &windows::Win32::UI::WindowsAndMessaging::ICONINFO,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    if !icon_info.hbmColor.is_invalid() || icon_info.hbmMask.is_invalid() {
+        return None;
+    }
+    let mut bitmap = BITMAP::default();
+    if GetObjectW(
+        icon_info.hbmMask,
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bitmap as *mut _ as *mut _),
+    ) == 0
+    {
+        return None;
+    }
+    let mask_height = bitmap.bmHeight.unsigned_abs();
+    if mask_height < height.saturating_mul(2) {
+        return None;
+    }
+    let mask_bgra = read_hbitmap_bgra(icon_info.hbmMask, width, mask_height)?;
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let mask_height_usize = mask_height as usize;
+    let mut and_mask = vec![false; width_usize * height_usize];
+    let mut xor_mask = vec![false; width_usize * height_usize];
+
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let idx = y * width_usize + x;
+            and_mask[idx] =
+                cursor_mask_pixel_white(&mask_bgra, width_usize, mask_height_usize, x, y);
+            xor_mask[idx] = cursor_mask_pixel_white(
+                &mask_bgra,
+                width_usize,
+                mask_height_usize,
+                x,
+                y + height_usize,
+            );
+        }
+    }
+
+    monochrome_cursor_rgba_from_bits(width_usize, height_usize, &and_mask, &xor_mask)
+}
+
+#[cfg(target_os = "windows")]
+fn cursor_mask_pixel_white(
+    mask_bgra: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    logical_y: usize,
+) -> bool {
+    if x >= width || logical_y >= height {
+        return false;
+    }
+    let row = height - 1 - logical_y;
+    let idx = (row * width + x) * 4;
+    mask_bgra
+        .get(idx..idx + 3)
+        .map(|rgb| rgb.iter().all(|v| *v > 127))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn monochrome_cursor_rgba_from_bits(
+    width: usize,
+    height: usize,
+    and_mask: &[bool],
+    xor_mask: &[bool],
+) -> Option<Vec<u8>> {
+    let len = width.checked_mul(height)?;
+    if len == 0 || and_mask.len() != len || xor_mask.len() != len {
+        return None;
+    }
+
+    let mut rgba = vec![0u8; len * 4];
+    for i in 0..len {
+        let (r, g, b, a) = match (and_mask[i], xor_mask[i]) {
+            (true, false) => (0, 0, 0, 0),
+            (false, false) => (0, 0, 0, 255),
+            (false, true) => (255, 255, 255, 255),
+            // Real Windows draws this by inverting the destination. CursorShape
+            // is static RGBA, so approximate invert as dark; this keeps I-beam
+            // cursors visible on white text fields instead of freezing them
+            // white from a black scratch bitmap.
+            (true, true) => (0, 0, 0, 255),
+        };
+        let idx = i * 4;
+        rgba[idx] = r;
+        rgba[idx + 1] = g;
+        rgba[idx + 2] = b;
+        rgba[idx + 3] = a;
+    }
+    Some(rgba)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn add_monochrome_cursor_contrast_outline(rgba: &mut [u8], width: u32, height: u32) {
+    if width == 0 || height == 0 || rgba.len() != (width as usize * height as usize * 4) {
+        return;
+    }
+
+    let original = rgba.to_vec();
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let idx = (y * width_usize + x) * 4;
+            let px = &original[idx..idx + 4];
+            if px[3] < 64 {
+                continue;
+            }
+            let luminance = (px[0] as u16 * 299 + px[1] as u16 * 587 + px[2] as u16 * 114) / 1000;
+            let outline = if luminance >= 128 {
+                [0, 0, 0, 220]
+            } else {
+                [255, 255, 255, 220]
+            };
+
+            let x0 = x.saturating_sub(1);
+            let y0 = y.saturating_sub(1);
+            let x1 = (x + 1).min(width_usize - 1);
+            let y1 = (y + 1).min(height_usize - 1);
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let nidx = (ny * width_usize + nx) * 4;
+                    if original[nidx + 3] >= 32 {
+                        continue;
+                    }
+                    rgba[nidx..nidx + 4].copy_from_slice(&outline);
                 }
             }
         }
@@ -1014,4 +1175,36 @@ fn keycode_to_windows_vk(key: KeyCode) -> Option<(VIRTUAL_KEY, bool)> {
         _ => return None,
     };
     Some((vk, extended))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_monochrome_cursor_contrast_outline, monochrome_cursor_rgba_from_bits};
+
+    #[test]
+    fn monochrome_cursor_bits_decode_standard_cases() {
+        let and_mask = [true, false, false, true];
+        let xor_mask = [false, false, true, true];
+
+        let rgba = monochrome_cursor_rgba_from_bits(2, 2, &and_mask, &xor_mask).unwrap();
+
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 0]); // transparent
+        assert_eq!(&rgba[4..8], &[0, 0, 0, 255]); // black
+        assert_eq!(&rgba[8..12], &[255, 255, 255, 255]); // white
+        assert_eq!(&rgba[12..16], &[0, 0, 0, 255]); // invert approximates dark
+    }
+
+    #[test]
+    fn monochrome_cursor_outline_preserves_visibility_on_dark_backgrounds() {
+        let and_mask = [true; 9];
+        let mut xor_mask = [false; 9];
+        xor_mask[4] = true;
+        let mut rgba = monochrome_cursor_rgba_from_bits(3, 3, &and_mask, &xor_mask).unwrap();
+
+        add_monochrome_cursor_contrast_outline(&mut rgba, 3, 3);
+
+        assert_eq!(&rgba[16..20], &[0, 0, 0, 255]);
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 220]);
+        assert_eq!(&rgba[32..36], &[255, 255, 255, 220]);
+    }
 }
