@@ -15,6 +15,7 @@ crates/core/src/                  Cross-platform foundation, no cfg gates
   crypto.rs                         ChaCha20-Poly1305 EncryptedWriter / Reader (feature-gated)
   stun.rs                           STUN client for NAT discovery
   file_transfer.rs                  Shared file-transfer protocol types
+  display_modes.rs                  Shared VDD mode bank + viewport mode chooser
 
 crates/server/src/                Capture → encode → ship pixels
   lib.rs                            Re-exports modules so integration tests can
@@ -34,6 +35,10 @@ crates/server/src/                Capture → encode → ship pixels
   service_win.rs                    Windows Service: SCM dispatcher, SessionManager,
                                     agent lifecycle, install/uninstall, VDD install
   display_ccd.rs                    Windows-only: CCD API for VDD primary topology
+  windows_display_policy.rs         Pure Windows desktop/topology/resize decision
+                                    table with cross-platform unit tests
+  windows_session_policy.rs         Pure agent-candidate retry/backoff policy
+                                    with cross-platform unit tests
   input_injector.rs                 enigo: mouse/keyboard/scroll + paste type_text +
                                     modifier release
   input_uinput.rs                   Linux-only: virtual /dev/uinput keyboard
@@ -62,6 +67,7 @@ crates/server/src/                Capture → encode → ship pixels
     quic.rs                           QUIC: quinn, self-signed TLS, keep-alive
     ws.rs                             WebServerTransport: HTTPS static (serves WASM)
                                       + WSS upgrade + WebRTC POST /rtc + JWT auth
+    ws_audio.rs                       Session-token pairing and ownership of WSS audio
     webrtc.rs                         Phantom-owned WebRTC run loop + session bridge
                                       (media tracks + input/control DC, feature `webrtc`)
     webrtc/backend_phantom.rs         ICE/STUN + DTLS + SRTP/SRTCP + RTP packetization
@@ -71,6 +77,10 @@ crates/server/src/                Capture → encode → ship pixels
   bin/mock_server.rs              Animated H.264 frames without screen capture
                                   (for transport + codec pipeline tests)
 
+crates/server/examples/
+  transport_smoke.rs                Synthetic H.264/Opus idle-to-motion source
+  probe_transport.mjs               Chrome CDP rendered-pixel age probe (Node 22+)
+
 crates/client/src/                Native client (winit + softbuffer)
   main.rs                           winit ApplicationHandler, reconnect loop, file
                                     transfer, clipboard sync, borderless fullscreen,
@@ -78,6 +88,8 @@ crates/client/src/                Native client (winit + softbuffer)
                                     preferred_server_resolution
   display_winit.rs                  softbuffer rendering, coordinate mapping, cursor
                                     overlay
+  clipboard_worker.rs               background system clipboard I/O; keeps blocking
+                                    platform clipboard providers off the UI thread
   input_capture.rs                  winit → phantom KeyCode, Sunshine-style scroll
                                     accumulation
   decode_h264.rs                    OpenH264Decoder (CPU H.264 fallback)
@@ -126,8 +138,8 @@ crates/gpu/src/                   NVIDIA GPU pipeline (runtime dlopen, no build 
 
 crates/bench/src/main.rs          Encoder benchmark: OpenH264 vs NVENC × resolutions
 
-Tests (136 total, run in CI)
-----------------------------
+Tests (run in CI)
+-----------------
 crates/server/tests/
   e2e_headless.rs                   End-to-end without GUI capture
   multi_transport_test.rs           TCP + WSS + QUIC simultaneously
@@ -140,6 +152,10 @@ crates/server/tests/
 crates/server/src/session.rs      CongestionTracker / AdaptiveBitrate /
                                     classify_session_error unit tests
 crates/server/src/doorbell.rs     ghost-set policy unit tests
+crates/server/src/windows_display_policy.rs
+                                    Windows display-policy decision-table tests
+crates/server/src/windows_session_policy.rs
+                                    Windows agent-candidate retry-policy tests
 crates/core/src/protocol.rs       Message round-trips
 crates/core/src/color.rs          SIMD vs scalar correctness
 
@@ -153,6 +169,8 @@ Dockerfile + docker-entrypoint.sh XFCE desktop test environment
 README.md                         Public-facing
 CLAUDE.md                         AI-assistant guide, points at docs/
 docs/                             Reference documentation (this directory)
+scripts/windows-audio-polling.ps1 Explicit, backed-up AWS speaker endpoint repair;
+                                  requires an endpoint GUID, supports -Restore
 install.sh / install.ps1          One-line installers (fetch from GitHub Releases
                                   by default; env overrides support local
                                   installer iteration; install.sh --autologin

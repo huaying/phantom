@@ -111,8 +111,10 @@ impl WinitDisplay {
         let win_size = self.window.inner_size();
         let dst_w = win_size.width;
         let dst_h = win_size.height;
+        let content_top = top_bar_physical_height(&self.window).min(dst_h) as usize;
+        let content_h = (dst_h as usize).saturating_sub(content_top);
 
-        if dst_w == 0 || dst_h == 0 {
+        if dst_w == 0 || content_h == 0 {
             return Ok(());
         }
 
@@ -131,24 +133,28 @@ impl WinitDisplay {
         let src_w = self.server_width as usize;
         let src_h = self.server_height as usize;
 
-        if dst_w as usize == src_w && dst_h as usize == src_h {
-            // No scaling needed — direct copy
-            let len = sb.len().min(self.buffer.len());
-            sb[..len].copy_from_slice(&self.buffer[..len]);
+        if dst_w as usize == src_w && content_h == src_h {
+            // No scaling needed. Copy directly into the content area below
+            // client chrome instead of paying for a full-frame bilinear pass.
+            sb.fill(0);
+            let start = content_top * dst_w as usize;
+            let available = sb.len().saturating_sub(start);
+            let len = available.min(self.buffer.len());
+            sb[start..start + len].copy_from_slice(&self.buffer[..len]);
         } else {
             // Maintain aspect ratio with letterboxing
             let src_aspect = src_w as f64 / src_h as f64;
-            let dst_aspect = dst_w as f64 / dst_h as f64;
+            let dst_aspect = dst_w as f64 / content_h as f64;
             let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
-                // Pillarbox (black bars top/bottom)
+                // Letterbox inside the video content area.
                 let rw = dst_w as usize;
                 let rh = (dst_w as f64 / src_aspect) as usize;
-                (rw, rh, 0, (dst_h as usize - rh) / 2)
+                (rw, rh, 0, content_top + (content_h - rh) / 2)
             } else {
-                // Letterbox (black bars left/right)
-                let rh = dst_h as usize;
-                let rw = (dst_h as f64 * src_aspect) as usize;
-                (rw, rh, (dst_w as usize - rw) / 2, 0)
+                // Pillarbox inside the video content area.
+                let rh = content_h;
+                let rw = (content_h as f64 * src_aspect) as usize;
+                (rw, rh, (dst_w as usize - rw) / 2, content_top)
             };
 
             // Clear to black
@@ -207,7 +213,7 @@ impl WinitDisplay {
         // (which sit on top of the video because the title bar is
         // transparent+fullsize_content_view) have a stable backdrop.
         #[cfg(target_os = "macos")]
-        draw_top_bar(&mut sb, dst_w as usize, dst_h as usize);
+        draw_top_bar(&mut sb, dst_w as usize, content_top);
 
         sb.present().map_err(|e| anyhow::anyhow!("present: {e}"))?;
         Ok(())
@@ -219,23 +225,25 @@ impl WinitDisplay {
         let win_size = self.window.inner_size();
         let dst_w = win_size.width as f64;
         let dst_h = win_size.height as f64;
+        let content_top = top_bar_physical_height(&self.window).min(win_size.height) as f64;
+        let content_h = (dst_h - content_top).max(0.0);
         let src_w = self.server_width as f64;
         let src_h = self.server_height as f64;
 
-        if dst_w == 0.0 || dst_h == 0.0 {
+        if dst_w == 0.0 || content_h == 0.0 {
             return (0, 0);
         }
 
         let src_aspect = src_w / src_h;
-        let dst_aspect = dst_w / dst_h;
+        let dst_aspect = dst_w / content_h;
         let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
             let rw = dst_w;
             let rh = dst_w / src_aspect;
-            (rw, rh, 0.0, (dst_h - rh) / 2.0)
+            (rw, rh, 0.0, content_top + (content_h - rh) / 2.0)
         } else {
-            let rh = dst_h;
-            let rw = dst_h * src_aspect;
-            (rw, rh, (dst_w - rw) / 2.0, 0.0)
+            let rh = content_h;
+            let rw = content_h * src_aspect;
+            (rw, rh, (dst_w - rw) / 2.0, content_top)
         };
 
         let x = ((pos.x - offset_x) / render_w * src_w).clamp(0.0, src_w - 1.0) as i32;
@@ -247,23 +255,25 @@ impl WinitDisplay {
         let win_size = self.window.inner_size();
         let dst_w = win_size.width as f64;
         let dst_h = win_size.height as f64;
+        let content_top = top_bar_physical_height(&self.window).min(win_size.height) as f64;
+        let content_h = (dst_h - content_top).max(0.0);
         let src_w = self.server_width as f64;
         let src_h = self.server_height as f64;
 
-        if dst_w == 0.0 || dst_h == 0.0 || src_w == 0.0 || src_h == 0.0 {
+        if dst_w == 0.0 || content_h == 0.0 || src_w == 0.0 || src_h == 0.0 {
             return PhysicalPosition::new(0.0, 0.0);
         }
 
         let src_aspect = src_w / src_h;
-        let dst_aspect = dst_w / dst_h;
+        let dst_aspect = dst_w / content_h;
         let (render_w, render_h, offset_x, offset_y) = if src_aspect > dst_aspect {
             let rw = dst_w;
             let rh = dst_w / src_aspect;
-            (rw, rh, 0.0, (dst_h - rh) / 2.0)
+            (rw, rh, 0.0, content_top + (content_h - rh) / 2.0)
         } else {
-            let rh = dst_h;
-            let rw = dst_h * src_aspect;
-            (rw, rh, (dst_w - rw) / 2.0, 0.0)
+            let rh = content_h;
+            let rw = content_h * src_aspect;
+            (rw, rh, (dst_w - rw) / 2.0, content_top)
         };
 
         let sx = x.clamp(0, self.server_width.saturating_sub(1) as i32) as f64;
@@ -271,6 +281,20 @@ impl WinitDisplay {
         PhysicalPosition::new(
             offset_x + sx / src_w.max(1.0) * render_w,
             offset_y + sy / src_h.max(1.0) * render_h,
+        )
+    }
+
+    /// Logical video viewport used for remote resolution negotiation. The
+    /// macOS title controls occupy a client-only bar and must not inflate the
+    /// requested remote desktop height.
+    pub fn video_viewport_logical_size(&self) -> (u32, u32) {
+        let logical = self
+            .window
+            .inner_size()
+            .to_logical::<u32>(self.window.scale_factor());
+        (
+            logical.width,
+            logical.height.saturating_sub(top_bar_logical_height()),
         )
     }
 }
@@ -283,15 +307,17 @@ pub fn fit_window_size(server_w: u32, server_h: u32) -> LogicalSize<u32> {
 
     let max_w = (screen_w as f32 * 0.8) as u32;
     let max_h = (screen_h as f32 * 0.8) as u32;
+    let bar_h = top_bar_logical_height();
+    let max_video_h = max_h.saturating_sub(bar_h);
 
-    if server_w <= max_w && server_h <= max_h {
-        return LogicalSize::new(server_w, server_h);
+    if server_w <= max_w && server_h <= max_video_h {
+        return LogicalSize::new(server_w, server_h.saturating_add(bar_h));
     }
 
-    let scale = (max_w as f32 / server_w as f32).min(max_h as f32 / server_h as f32);
+    let scale = (max_w as f32 / server_w as f32).min(max_video_h as f32 / server_h as f32);
     LogicalSize::new(
         (server_w as f32 * scale).max(320.0) as u32,
-        (server_h as f32 * scale).max(240.0) as u32,
+        (server_h as f32 * scale).max(240.0).round() as u32 + bar_h,
     )
 }
 
@@ -323,12 +349,27 @@ const CURSOR_BITMAP: [u8; CURSOR_W * CURSOR_H] = [
     0,0,0,0,0,0,0,2,0,0,0,0,
 ];
 
+#[cfg(target_os = "macos")]
+const TOP_BAR_LOGICAL_HEIGHT: u32 = 28;
+
+#[cfg(target_os = "macos")]
+fn top_bar_logical_height() -> u32 {
+    TOP_BAR_LOGICAL_HEIGHT
+}
+
+#[cfg(not(target_os = "macos"))]
+fn top_bar_logical_height() -> u32 {
+    0
+}
+
+fn top_bar_physical_height(window: &Window) -> u32 {
+    (top_bar_logical_height() as f64 * window.scale_factor()).round() as u32
+}
+
 /// Draw a solid black strip behind the macOS traffic-light buttons.
 #[cfg(target_os = "macos")]
-fn draw_top_bar(buffer: &mut [u32], buf_w: usize, buf_h: usize) {
-    const BAR_H: usize = 50;
-    let h = BAR_H.min(buf_h);
-    for y in 0..h {
+fn draw_top_bar(buffer: &mut [u32], buf_w: usize, bar_h: usize) {
+    for y in 0..bar_h {
         let row = y * buf_w;
         for x in 0..buf_w {
             buffer[row + x] = 0;

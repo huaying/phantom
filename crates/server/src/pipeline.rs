@@ -75,7 +75,7 @@ pub trait Pipeline {
         "stats"
     }
 
-    /// Called once after Hello is sent and before the loop starts. Default:
+    /// Called once before Hello is sent and before the loop starts. Default:
     /// no-op. GPU pipelines use this to force the first frame to be a
     /// keyframe (CPU pipelines do that inside `tick` based on `needs_keyframe`).
     fn prepare(&mut self) -> Result<()> {
@@ -204,6 +204,7 @@ impl<'a> Pipeline for CpuPipeline<'a> {
 pub struct NvfbcNvencPipeline<'a> {
     capture: &'a mut phantom_gpu::nvfbc::NvfbcCapture,
     encoder: &'a mut phantom_gpu::nvenc::NvencEncoder,
+    pending_frame: Option<phantom_gpu::nvfbc::GpuFrame>,
     no_frame_count: u32,
 }
 
@@ -216,14 +217,41 @@ impl<'a> NvfbcNvencPipeline<'a> {
         Self {
             capture,
             encoder,
+            pending_frame: None,
             no_frame_count: 0,
         }
+    }
+
+    fn grab(&mut self) -> Result<Option<phantom_gpu::nvfbc::GpuFrame>> {
+        self.capture.bind_context()?;
+        let frame = self.capture.grab_cuda();
+        let release = self.capture.release_context();
+        let frame = frame?;
+        release?;
+        Ok(frame)
     }
 }
 
 #[cfg(target_os = "linux")]
 impl<'a> Pipeline for NvfbcNvencPipeline<'a> {
     fn prepare(&mut self) -> Result<()> {
+        // The desktop may have changed while no client was connected. Use
+        // an actual fresh frame, not cached startup geometry, for Hello.
+        // NOWAIT is intentional: FORCE_REFRESH can block on older drivers.
+        self.capture.reset_session()?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(frame) = self.grab()? {
+                self.encoder.resize(frame.width, frame.height)?;
+                self.pending_frame = Some(frame);
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "NVFBC session first frame timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         self.encoder.force_keyframe();
         Ok(())
     }
@@ -238,14 +266,34 @@ impl<'a> Pipeline for NvfbcNvencPipeline<'a> {
             self.encoder.force_keyframe();
         }
 
-        self.capture.bind_context()?;
-        let gpu_frame = self.capture.grab_cuda();
-        let _ = self.capture.release_context();
+        let gpu_frame = match self.pending_frame.take() {
+            Some(frame) => Ok(Some(frame)),
+            None => self.grab(),
+        };
 
         match gpu_frame {
             Ok(Some(f)) => {
                 self.no_frame_count = 0;
-                let pitch = f.infer_nv12_pitch().unwrap_or(f.width);
+                let pitch = f.infer_nv12_pitch().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid NVFBC NV12 layout: {}x{}, {} bytes",
+                        f.width,
+                        f.height,
+                        f.byte_size
+                    )
+                })?;
+                // NV12's chroma plane starts at pitch * height. Encoding a
+                // resized frame with the old height reads luma as chroma,
+                // producing green/torn output even when pitch is correct.
+                if self.encoder.dimensions() != (f.width, f.height) {
+                    tracing::info!(
+                        old = ?self.encoder.dimensions(),
+                        width = f.width,
+                        height = f.height,
+                        "NVFBC capture geometry changed; rebuilding NVENC"
+                    );
+                    self.encoder.resize(f.width, f.height)?;
+                }
                 let enc_start = Instant::now();
                 let encoded = self.encoder.encode_device_nv12(f.device_ptr, pitch)?;
                 let encode_duration = enc_start.elapsed();

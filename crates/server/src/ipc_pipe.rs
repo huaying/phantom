@@ -2,11 +2,12 @@
 //!
 //! Uses TWO separate unidirectional pipes to avoid Windows synchronous I/O
 //! deadlock (only one I/O operation can be pending per handle at a time):
-//! - `\\.\pipe\PhantomIPC_up_{session_id}`   — agent → service (encoded frames, heartbeat)
-//! - `\\.\pipe\PhantomIPC_down_{session_id}` — service → agent (input, heartbeat, shutdown, keyframe-request)
+//! - `\\.\pipe\PhantomIPC_up_{session_id}_{generation}`   — agent → service
+//! - `\\.\pipe\PhantomIPC_down_{session_id}_{generation}` — service → agent
 //!
-//! Pipe names include the Windows session ID for isolation between multiple
-//! concurrent user sessions.
+//! Pipe names include the Windows session ID and a service-owned generation.
+//! The generation lets a replacement agent become ready before the active agent
+//! is retired without both processes racing for the same named pipes.
 //!
 //! Protocol (little-endian, binary):
 //! ```text
@@ -36,9 +37,16 @@ mod platform {
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use windows::core::HSTRING;
+    use windows::core::{HSTRING, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenGroups, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
@@ -48,6 +56,7 @@ mod platform {
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -64,6 +73,7 @@ mod platform {
     const ERROR_IO_PENDING_CODE: u32 = 997;
     const ERROR_NO_DATA_CODE: u32 = 232;
     const ERROR_PIPE_CONNECTED_CODE: u32 = 535;
+    const SE_GROUP_LOGON_ID: u32 = 0xc000_0000;
 
     fn is_win32_error(error: &windows::core::Error, code: u32) -> bool {
         let hresult = (0x8007_0000u32 | code) as i32;
@@ -105,10 +115,10 @@ mod platform {
     }
 
     /// Build session-isolated pipe names.
-    fn pipe_names(session_id: u32) -> (String, String) {
+    fn pipe_names(session_id: u32, generation: u64) -> (String, String) {
         (
-            format!(r"\\.\pipe\PhantomIPC_up_{session_id}"),
-            format!(r"\\.\pipe\PhantomIPC_down_{session_id}"),
+            format!(r"\\.\pipe\PhantomIPC_up_{session_id}_{generation}"),
+            format!(r"\\.\pipe\PhantomIPC_down_{session_id}_{generation}"),
         )
     }
     const MSG_ENCODED_FRAME: u8 = 0x01;
@@ -127,8 +137,10 @@ mod platform {
 
     unsafe fn pipe_write_once(handle: HANDLE, buf: &[u8]) -> Result<u32> {
         let event = create_overlapped_event()?;
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
         let mut written = 0u32;
         let result = WriteFile(handle, Some(buf), Some(&mut written), Some(&mut overlapped));
         let outcome = match result {
@@ -145,8 +157,10 @@ mod platform {
 
     unsafe fn pipe_read_once(handle: HANDLE, buf: &mut [u8]) -> Result<u32> {
         let event = create_overlapped_event()?;
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
         let mut read = 0u32;
         let result = ReadFile(handle, Some(buf), Some(&mut read), Some(&mut overlapped));
         let outcome = match result {
@@ -324,9 +338,112 @@ mod platform {
         })
     }
 
-    /// Helper: create a named pipe server-side handle.
-    fn create_pipe(name: &str) -> Result<HANDLE> {
+    fn sid_to_string(sid: windows::Win32::Security::PSID) -> Result<String> {
         unsafe {
+            let mut value = PWSTR::null();
+            ConvertSidToStringSidW(sid, &mut value).context("ConvertSidToStringSidW")?;
+            let result = value.to_string().context("decode logon SID");
+            let _ = LocalFree(HLOCAL(value.0.cast()));
+            result
+        }
+    }
+
+    /// Return the per-logon SID from the active session token. A user SID is
+    /// shared across that user's sessions; the logon SID is unique to this
+    /// interactive logon and therefore preserves the session isolation encoded
+    /// in the pipe name.
+    fn session_logon_sid(session_id: u32) -> Result<Option<String>> {
+        unsafe {
+            let mut token = HANDLE::default();
+            if let Err(error) = WTSQueryUserToken(session_id, &mut token) {
+                tracing::debug!(session_id, %error, "IPC: no user token available for pipe ACL");
+                return Ok(None);
+            }
+
+            let result = (|| {
+                let mut required = 0u32;
+                let _ = GetTokenInformation(token, TokenGroups, None, 0, &mut required);
+                if required == 0 {
+                    anyhow::bail!("GetTokenInformation(TokenGroups) returned no size");
+                }
+
+                // Vec<usize> gives TOKEN_GROUPS pointer alignment while still
+                // allowing the Win32 API to report its required byte length.
+                let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+                let mut buffer = vec![0usize; words];
+                GetTokenInformation(
+                    token,
+                    TokenGroups,
+                    Some(buffer.as_mut_ptr().cast()),
+                    required,
+                    &mut required,
+                )
+                .context("GetTokenInformation(TokenGroups)")?;
+
+                let groups = &*(buffer.as_ptr() as *const TOKEN_GROUPS);
+                let entries =
+                    std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize);
+                for entry in entries {
+                    if entry.Attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID {
+                        return sid_to_string(entry.Sid).map(Some);
+                    }
+                }
+                Ok(None)
+            })();
+            let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    fn pipe_security_sddl(logon_sid: Option<&str>) -> String {
+        match logon_sid {
+            Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"),
+            None => "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string(),
+        }
+    }
+
+    struct PipeSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for PipeSecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0));
+                }
+            }
+        }
+    }
+
+    fn create_pipe_security_descriptor(session_id: u32) -> Result<PipeSecurityDescriptor> {
+        let logon_sid = session_logon_sid(session_id)?;
+        let sddl = pipe_security_sddl(logon_sid.as_deref());
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(&sddl),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+            .context("build IPC pipe security descriptor")?;
+        }
+        tracing::debug!(
+            session_id,
+            user_access = logon_sid.is_some(),
+            "IPC: built session pipe ACL"
+        );
+        Ok(PipeSecurityDescriptor(descriptor))
+    }
+
+    /// Helper: create a named pipe server-side handle.
+    fn create_pipe(name: &str, session_id: u32) -> Result<HANDLE> {
+        unsafe {
+            let descriptor = create_pipe_security_descriptor(session_id)?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0 .0,
+                bInheritHandle: false.into(),
+            };
             let h = CreateNamedPipeW(
                 &HSTRING::from(name),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
@@ -335,7 +452,7 @@ mod platform {
                 PIPE_BUFFER_SIZE,
                 PIPE_BUFFER_SIZE,
                 0,
-                None,
+                Some(&attributes),
             );
             if h.is_invalid() {
                 anyhow::bail!(
@@ -349,8 +466,10 @@ mod platform {
 
     fn wait_connect(handle: HANDLE, name: &str, timeout: Duration) -> Result<bool> {
         let event = unsafe { create_overlapped_event()? };
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
         let result = unsafe { ConnectNamedPipe(handle, Some(&mut overlapped)) };
         let outcome = match result {
             Ok(()) => Ok(true),
@@ -445,10 +564,10 @@ mod platform {
     unsafe impl Send for IpcServer {}
 
     impl IpcServer {
-        pub fn new(session_id: u32) -> Result<Self> {
-            let (pipe_up, pipe_down) = pipe_names(session_id);
-            let up_handle = create_pipe(&pipe_up)?;
-            let down_handle = create_pipe(&pipe_down)?;
+        pub fn new(session_id: u32, generation: u64) -> Result<Self> {
+            let (pipe_up, pipe_down) = pipe_names(session_id, generation);
+            let up_handle = create_pipe(&pipe_up, session_id)?;
+            let down_handle = create_pipe(&pipe_down, session_id)?;
 
             Ok(Self {
                 up_handle,
@@ -495,7 +614,9 @@ mod platform {
         }
 
         fn start_io(&mut self) -> Result<()> {
-            // Bounded channel — drops old frames when no session is draining.
+            // Preserve the encoded stream exactly. Dropping an arbitrary H.264
+            // delta frame corrupts every dependent frame until the next IDR.
+            // The bounded channel intentionally backpressures the local pipe.
             let (frame_tx, frame_rx) = mpsc::sync_channel(30);
             let (clipboard_tx, clipboard_rx) = mpsc::sync_channel::<String>(4);
             let (cursor_tx, cursor_rx) = mpsc::sync_channel::<CursorState>(16);
@@ -533,8 +654,9 @@ mod platform {
                                                     .unwrap_or_else(|e| e.into_inner()) =
                                                     Some(frame.clone());
                                             }
-                                            // try_send: drop frame if buffer full (backpressure).
-                                            let _ = frame_tx.try_send(frame);
+                                            if frame_tx.send(frame).is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(e) => tracing::warn!("IPC: bad encoded frame: {e}"),
                                     }
@@ -878,6 +1000,8 @@ mod platform {
                 std::thread::sleep(Duration::from_millis(250));
                 self.shutdown.store(true, Ordering::SeqCst);
                 unsafe {
+                    let _ = CancelIoEx(self.up_handle, None);
+                    let _ = CancelIoEx(self.down_handle, None);
                     let _ = DisconnectNamedPipe(self.up_handle);
                     let _ = DisconnectNamedPipe(self.down_handle);
                 }
@@ -885,11 +1009,20 @@ mod platform {
             } else {
                 self.shutdown.store(true, Ordering::SeqCst);
             }
+            // Drop receivers before joining so a read thread blocked on a
+            // full bounded channel observes disconnection and exits.
             self.frame_rx = None;
             *self.last_keyframe.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.clipboard_rx = None;
             self.cursor_rx = None;
+            self.cursor_shape_rx = None;
             self.input_tx = None;
+            if let Some(thread) = self._read_thread.take() {
+                let _ = thread.join();
+            }
+            if let Some(thread) = self._write_thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -923,7 +1056,7 @@ mod platform {
         /// Connect to the service's IPC pipes.
         /// If `session_id` is provided, uses it directly. Otherwise, auto-detects
         /// from the current process's session ID via ProcessIdToSessionId.
-        pub fn connect(session_id: Option<u32>) -> Result<Self> {
+        pub fn connect(session_id: Option<u32>, generation: Option<u64>) -> Result<Self> {
             let sid = match session_id {
                 Some(id) => id,
                 None => {
@@ -942,7 +1075,8 @@ mod platform {
                     sid
                 }
             };
-            let (pipe_up, pipe_down) = pipe_names(sid);
+            let generation = generation.unwrap_or(0);
+            let (pipe_up, pipe_down) = pipe_names(sid, generation);
             let up_handle = open_pipe(&pipe_up, 50)?;
             let down_handle = open_pipe(&pipe_down, 50)?;
 
@@ -1039,6 +1173,9 @@ mod platform {
             width: u32,
             height: u32,
         ) -> Result<()> {
+            if frame.data.is_empty() {
+                return Ok(());
+            }
             let payload = encode_ipc_frame(frame, width, height);
             unsafe { send_message(self.up_handle, MSG_ENCODED_FRAME, &payload) }
         }
@@ -1104,9 +1241,52 @@ mod platform {
         fn drop(&mut self) {
             self.shutdown.store(true, Ordering::SeqCst);
             unsafe {
+                let _ = CancelIoEx(self.down_handle, None);
+            }
+            if let Some(thread) = self._read_thread.take() {
+                let _ = thread.join();
+            }
+            unsafe {
                 let _ = CloseHandle(self.up_handle);
                 let _ = CloseHandle(self.down_handle);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{decode_cursor_shape, encode_cursor_shape, pipe_security_sddl};
+        use phantom_core::protocol::CursorShape;
+
+        #[test]
+        fn pipe_acl_without_user_is_system_only() {
+            assert_eq!(pipe_security_sddl(None), "D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        }
+
+        #[test]
+        fn pipe_acl_grants_only_the_session_logon_sid() {
+            let sddl = pipe_security_sddl(Some("S-1-5-5-1-2"));
+            assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-5-1-2)");
+            assert!(!sddl.contains(";;;WD"));
+            assert!(!sddl.contains(";;;AU"));
+            assert!(!sddl.contains(";;;IU"));
+        }
+
+        #[test]
+        fn cursor_shape_round_trips_without_duplicate_pixels() {
+            let shape = CursorShape {
+                shape_id: 42,
+                width: 2,
+                height: 1,
+                hotspot_x: 1,
+                hotspot_y: 0,
+                rgba: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            };
+            let encoded = encode_cursor_shape(&shape);
+            assert_eq!(encoded.len(), 24 + shape.rgba.len());
+
+            let decoded = decode_cursor_shape(&encoded).expect("cursor shape should decode");
+            assert_eq!(decoded, shape);
         }
     }
 }
@@ -1130,7 +1310,7 @@ mod platform {
 
     pub struct IpcServer;
     impl IpcServer {
-        pub fn new(_session_id: u32) -> Result<Self> {
+        pub fn new(_session_id: u32, _generation: u64) -> Result<Self> {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
         pub fn wait_for_connection(&mut self, _timeout: Duration) -> Result<bool> {
@@ -1165,7 +1345,7 @@ mod platform {
 
     pub struct IpcClient;
     impl IpcClient {
-        pub fn connect(_session_id: Option<u32>) -> Result<Self> {
+        pub fn connect(_session_id: Option<u32>, _generation: Option<u64>) -> Result<Self> {
             anyhow::bail!("IPC pipes are only supported on Windows")
         }
         pub fn send_encoded_frame(&self, _frame: &EncodedFrame, _w: u32, _h: u32) -> Result<()> {

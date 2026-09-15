@@ -27,6 +27,7 @@ pub struct NvfbcCapture {
     api_minor: u32,
     /// Format requested from NVFBC (BGRA for CPU path, NV12 for GPU path).
     _buffer_format: u32,
+    with_cursor: bool,
     grab_info: NvFbcFrameGrabInfo,
     _lib: DynLib,
 }
@@ -140,6 +141,7 @@ impl NvfbcCapture {
             runtime_version,
             api_minor: chosen_api_minor,
             _buffer_format: buffer_format,
+            with_cursor,
             grab_info: unsafe { std::mem::zeroed() },
             _lib: lib,
         })
@@ -148,9 +150,15 @@ impl NvfbcCapture {
     /// Destroy and recreate the capture session. Resets NVFBC's "seen frames"
     /// state so grab_cuda() returns frames again after a client reconnect.
     pub fn reset_session(&mut self) -> Result<()> {
-        // Bind context for the entire destroy+create sequence
-        let _ = self.bind_context();
+        self.bind_context()?;
+        let result = self.reset_bound_session();
+        let release = self.release_context();
+        result.and(release)
+    }
 
+    /// Called with the NVFBC context bound, including MUST_RECREATE recovery
+    /// inside a grab. Leave it bound for the caller's normal release path.
+    fn reset_bound_session(&mut self) -> Result<()> {
         // Destroy old session (ignore error if already destroyed)
         let mut destroy = NvFbcDestroyCaptureSessionParams::with_api_minor(self.api_minor);
         let _ = unsafe { (self.api.destroy_capture_session)(self.handle, destroy.as_mut_ptr()) };
@@ -159,14 +167,17 @@ impl NvfbcCapture {
         let mut session_params = NvFbcCreateCaptureSessionParams::with_api_minor(self.api_minor);
         session_params.set_capture_type(NVFBC_CAPTURE_SHARED_CUDA);
         session_params.set_tracking_type(NVFBC_TRACKING_DEFAULT);
-        session_params.set_with_cursor(NVFBC_FALSE);
+        session_params.set_with_cursor(if self.with_cursor {
+            NVFBC_TRUE
+        } else {
+            NVFBC_FALSE
+        });
         session_params.set_push_model(NVFBC_FALSE);
         session_params.set_sampling_rate_ms(16);
 
         let status =
             unsafe { (self.api.create_capture_session)(self.handle, session_params.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
-            let _ = self.release_context();
             bail!(
                 "NvFBCCreateCaptureSession (reset) failed: {}",
                 nvfbc_error_detail(&self.api, self.handle, status)
@@ -176,14 +187,13 @@ impl NvfbcCapture {
         let mut setup = NvFbcToCudaSetupParams::with_api_minor(self._buffer_format, self.api_minor);
         let status = unsafe { (self.api.to_cuda_setup)(self.handle, setup.as_mut_ptr()) };
         if status != NVFBC_SUCCESS {
-            let _ = self.release_context();
             bail!(
                 "NvFBCToCudaSetUp (reset) failed: {}",
                 nvfbc_error_detail(&self.api, self.handle, status)
             );
         }
 
-        let _ = self.release_context();
+        self.grab_info = unsafe { std::mem::zeroed() };
         tracing::info!("NVFBC capture session reset");
         Ok(())
     }
@@ -243,7 +253,9 @@ impl NvfbcCapture {
 
         let status = unsafe { (self.api.to_cuda_grab_frame)(self.handle, params.as_mut_ptr()) };
         if status == NVFBC_ERR_MUST_RECREATE {
-            bail!("NVFBC must recreate (display mode change)");
+            tracing::info!("NVFBC recreating capture after display mode change");
+            self.reset_bound_session()?;
+            return Ok(None);
         }
         if status != NVFBC_SUCCESS {
             bail!(
@@ -266,6 +278,8 @@ impl NvfbcCapture {
             height: self.grab_info.height,
             byte_size: self.grab_info.byte_size,
         };
+        self.width = frame.width;
+        self.height = frame.height;
 
         tracing::debug!(
             width = frame.width,
@@ -295,7 +309,11 @@ impl GpuFrame {
     /// NV12 total bytes = pitch * height * 3 / 2.
     /// Returns `None` if byte_size is not consistent with NV12 layout.
     pub fn infer_nv12_pitch(&self) -> Option<u32> {
-        if self.height == 0 {
+        if self.width == 0
+            || self.height == 0
+            || !self.width.is_multiple_of(2)
+            || !self.height.is_multiple_of(2)
+        {
             return None;
         }
         let num = (self.byte_size as u64) * 2;
@@ -304,6 +322,9 @@ impl GpuFrame {
             return None;
         }
         let pitch = num / den;
+        if pitch < u64::from(self.width) || !pitch.is_multiple_of(2) {
+            return None;
+        }
         u32::try_from(pitch).ok()
     }
 }
@@ -403,5 +424,37 @@ fn load_nvfbc_api(lib: &DynLib) -> Result<NvFbcFunctionList> {
                 .sym("NvFBCReleaseContext")
                 .context("NvFBCReleaseContext")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GpuFrame;
+
+    fn pitch(width: u32, height: u32, byte_size: u32) -> Option<u32> {
+        GpuFrame {
+            device_ptr: 0,
+            width,
+            height,
+            byte_size,
+        }
+        .infer_nv12_pitch()
+    }
+
+    #[test]
+    fn nv12_pitch_accepts_tight_and_padded_rows() {
+        assert_eq!(pitch(1920, 1080, 1920 * 1080 * 3 / 2), Some(1920));
+        assert_eq!(pitch(1384, 904, 1408 * 904 * 3 / 2), Some(1408));
+    }
+
+    #[test]
+    fn nv12_pitch_rejects_truncated_or_incompatible_layouts() {
+        assert_eq!(pitch(1920, 1080, 1280 * 1080 * 3 / 2), None);
+        assert_eq!(pitch(1920, 1080, 1920 * 1080 * 3 / 2 - 1), None);
+        assert_eq!(pitch(1920, 1080, 1921 * 1080 * 3 / 2), None);
+        assert_eq!(pitch(0, 1080, 0), None);
+        assert_eq!(pitch(1920, 0, 0), None);
+        assert_eq!(pitch(1385, 904, 1408 * 904 * 3 / 2), None);
+        assert_eq!(pitch(1384, 905, 1408 * 905 * 3 / 2), None);
     }
 }

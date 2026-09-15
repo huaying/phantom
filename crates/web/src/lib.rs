@@ -5,6 +5,7 @@
 //! and renders to an HTML5 canvas. Sends keyboard/mouse input back to
 //! the server and supports clipboard paste.
 
+use phantom_core::display_modes::{closest_mode_for_viewport, WEB_DEFAULT_MAX_MODE};
 use phantom_core::encode::VideoCodec;
 use phantom_core::input::{InputEvent, KeyCode, MouseButton};
 use phantom_core::protocol::{CursorShape, CursorState, Message};
@@ -48,6 +49,8 @@ extern "C" {
     fn configure(this: &JsAudioDecoder, config: &JsValue);
     #[wasm_bindgen(method, js_class = "AudioDecoder")]
     fn decode(this: &JsAudioDecoder, chunk: &JsValue);
+    #[wasm_bindgen(method, catch, js_class = "AudioDecoder")]
+    fn close(this: &JsAudioDecoder) -> Result<(), JsValue>;
 
     #[wasm_bindgen(js_name = EncodedAudioChunk)]
     type JsEncodedAudioChunk;
@@ -152,6 +155,11 @@ struct AppState {
     audio_ctx: Option<web_sys::AudioContext>,
     /// Timestamp counter for audio chunks (in microseconds).
     audio_timestamp_us: i64,
+    audio_ws: Option<WebSocket>,
+    audio_generation: u32,
+    /// Main WSS setup time, used only as a bounded initial audio latency hint.
+    audio_connect_ms: f64,
+    audio_drain_timer: Option<i32>,
     /// Set during page unload/navigation so old sockets don't auto-reconnect
     /// and race the replacement page.
     page_unloading: bool,
@@ -419,6 +427,10 @@ pub fn main() {
         audio_decoder: None,
         audio_ctx: None,
         audio_timestamp_us: 0,
+        audio_ws: None,
+        audio_generation: 0,
+        audio_connect_ms: 0.0,
+        audio_drain_timer: None,
         page_unloading: false,
         use_rtc,
         auth_token: auth_token.clone(),
@@ -637,16 +649,8 @@ fn freeze_rtc_video_frame(st: &mut AppState) {
         return;
     }
 
-    let width = if st.server_width > 0 {
-        st.server_width
-    } else {
-        video.video_width()
-    };
-    let height = if st.server_height > 0 {
-        st.server_height
-    } else {
-        video.video_height()
-    };
+    let width = video.video_width();
+    let height = video.video_height();
     if width == 0 || height == 0 {
         return;
     }
@@ -683,6 +687,9 @@ fn reset_rtc_runtime(st: &mut AppState) {
     st.drop_until_keyframe = false;
     st.decoder = None;
     st.control_assembler = ChunkAssembler::new();
+    // The next peer creates a new server session with no cursor subscriptions.
+    st.cursor_state_enabled = false;
+    st.cursor_shape_enabled = false;
     st.rtc2_media_active = false;
     st.rtc2_video_loop_generation = st.rtc2_video_loop_generation.wrapping_add(1);
     st.rtc_stats = None;
@@ -1077,7 +1084,7 @@ fn reveal_rtc2_video_if_ready(state: &Rc<RefCell<AppState>>, video: &HtmlVideoEl
     if video.ready_state() < 2 {
         return false;
     }
-    let st = state.borrow();
+    let mut st = state.borrow_mut();
     let is_current = st
         .rtc2_video_el
         .as_ref()
@@ -1086,6 +1093,20 @@ fn reveal_rtc2_video_if_ready(state: &Rc<RefCell<AppState>>, video: &HtmlVideoEl
     if !is_current {
         return false;
     }
+    // RTP video carries geometry changes in SPS/PPS without another Hello.
+    // Keep the transparent input overlay and coordinate mapping aligned with
+    // the decoded video, just as the WebCodecs path does for WSS.
+    let (width, height) = (video.video_width(), video.video_height());
+    if width > 0 && height > 0 {
+        st.server_width = width;
+        st.server_height = height;
+        if st.canvas.width() != width {
+            st.canvas.set_width(width);
+        }
+        if st.canvas.height() != height {
+            st.canvas.set_height(height);
+        }
+    }
     clear_rtc_canvas_overlay(&st);
     video.style().set_property("opacity", "1").ok();
     update_debug_snapshot(&st);
@@ -1093,9 +1114,9 @@ fn reveal_rtc2_video_if_ready(state: &Rc<RefCell<AppState>>, video: &HtmlVideoEl
 }
 
 fn install_rtc2_video_reveal_handlers(state: &Rc<RefCell<AppState>>, video: &HtmlVideoElement) {
-    if reveal_rtc2_video_if_ready(state, video) {
-        return;
-    }
+    // Always retain the resize listener, even if the first frame is ready
+    // before handlers are installed.
+    let _ = reveal_rtc2_video_if_ready(state, video);
 
     for event_name in ["loadeddata", "playing", "resize"] {
         let s = state.clone();
@@ -1361,6 +1382,8 @@ fn setup_ws(state: &Rc<RefCell<AppState>>, token: &Option<String>) {
 
 fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
     console::log_1(&format!("Connecting to {url}...").into());
+    let performance = web_sys::window().and_then(|w| w.performance());
+    let connect_started = performance.as_ref().map(|p| p.now());
 
     let ws = match WebSocket::new(url) {
         Ok(ws) => ws,
@@ -1393,6 +1416,11 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
         let ws_clone = ws.clone();
         let cb = Closure::<dyn FnMut()>::new(move || {
             console::log_1(&"WebSocket connected!".into());
+            s.borrow_mut().audio_connect_ms = performance
+                .as_ref()
+                .zip(connect_started)
+                .map(|(p, start)| (p.now() - start).max(0.0))
+                .unwrap_or(0.0);
             let id = s.borrow().client_id;
             let (pw, ph) = preferred_viewport();
             let msg = Message::ClientHello {
@@ -1423,6 +1451,11 @@ fn connect_ws(state: &Rc<RefCell<AppState>>, url: &str, retry_ms: u32) {
                 st.send_input_dc = None;
                 st.send_control_dc = None;
                 st.send_ws = None;
+                // Cursor subscriptions belong to the server session. The next
+                // Hello must opt in again even when this tab keeps its cache.
+                st.cursor_state_enabled = false;
+                st.cursor_shape_enabled = false;
+                reset_wss_audio(&mut st);
                 let override_delay = st.ws_reconnect_delay_override_ms.take();
                 let delay = override_delay.unwrap_or(next_retry);
                 let retry = if override_delay.is_some() {
@@ -1507,6 +1540,7 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             protocol_version,
             audio,
             video_codec,
+            session_token,
             ..
         } => {
             if protocol_version < phantom_core::protocol::MIN_PROTOCOL_VERSION {
@@ -1531,11 +1565,20 @@ fn on_message(state: &Rc<RefCell<AppState>>, data: &[u8]) {
             let rtc_media_active = s.rtc2_media_active;
             update_debug_snapshot(&s);
             drop(s);
+            if rtc_media_active {
+                let video = state.borrow().rtc2_video_el.clone();
+                if let Some(video) = video {
+                    // RTP can arrive before the reliable Hello. Do not let a
+                    // delayed Hello replace geometry already decoded by the
+                    // current media element.
+                    let _ = reveal_rtc2_video_if_ready(state, &video);
+                }
+            }
             if !rtc_media_active {
                 setup_decoder(state, width, height, video_codec);
             }
             if audio && !rtc_media_active {
-                setup_audio(state);
+                setup_audio(state, &session_token);
             }
             // Send viewport size so server can match resolution (adaptive, like DCV)
             send_resolution_change(state);
@@ -1904,8 +1947,36 @@ fn setup_decoder(state: &Rc<RefCell<AppState>>, width: u32, height: u32, codec: 
 
 // -- Audio --
 
+// Tear down the previous WSS audio generation, including asynchronous worklet
+// setup and the non-SAB timer. Reconnect/Hello must not leave silent contexts
+// running or let a late module callback replace the new decoder.
+fn reset_wss_audio(st: &mut AppState) {
+    st.audio_generation = st.audio_generation.wrapping_add(1);
+    if let Some(ws) = st.audio_ws.take() {
+        ws.set_onmessage(None);
+        let _ = ws.close();
+    }
+    if let Some(decoder) = st.audio_decoder.take() {
+        let _ = decoder.close();
+    }
+    if let Some(timer) = st.audio_drain_timer.take() {
+        if let Some(window) = web_sys::window() {
+            window.clear_interval_with_handle(timer);
+        }
+    }
+    if let Some(ctx) = st.audio_ctx.take() {
+        let _ = ctx.close();
+    }
+    st.audio_timestamp_us = 0;
+}
+
 /// Initialize WebCodecs AudioDecoder + Web Audio API for Opus playback.
-fn setup_audio(state: &Rc<RefCell<AppState>>) {
+fn setup_audio(state: &Rc<RefCell<AppState>>, session_token: &[u8]) {
+    let generation = {
+        let mut st = state.borrow_mut();
+        reset_wss_audio(&mut st);
+        st.audio_generation
+    };
     // Open dedicated audio WebSocket (independent from video WS)
     let window = web_sys::window().unwrap();
     let location = window.location();
@@ -1925,23 +1996,33 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
             None
         }
     });
-    let audio_url = match &token {
+    let mut audio_url = match &token {
         Some(t) => format!("{protocol}://{host}/ws/audio?token={t}"),
         None => format!("{protocol}://{host}/ws/audio"),
     };
 
+    if session_token.len() == 32 {
+        let session: String = session_token.iter().map(|b| format!("{b:02x}")).collect();
+        audio_url.push(if token.is_some() { '&' } else { '?' });
+        audio_url.push_str("session=");
+        audio_url.push_str(&session);
+    }
     let s = state.clone();
     match WebSocket::new(&audio_url) {
         Ok(ws) => {
             ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
             let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+                if s.borrow().audio_generation != generation {
+                    return;
+                }
                 if let Ok(buf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
                     on_message(&s, &js_sys::Uint8Array::new(&buf).to_vec());
                 }
             });
             ws.set_onmessage(Some(cb.as_ref().unchecked_ref()));
             cb.forget();
-            console::log_1(&format!("audio WebSocket connected to {audio_url}").into());
+            state.borrow_mut().audio_ws = Some(ws);
+            console::log_1(&"audio WebSocket opening for current session".into());
         }
         Err(e) => {
             console::warn_1(
@@ -1961,6 +2042,7 @@ fn setup_audio(state: &Rc<RefCell<AppState>>) {
             return;
         }
     };
+    state.borrow_mut().audio_ctx = Some(audio_ctx.clone());
     console::log_1(&format!("AudioContext: sampleRate={}", audio_ctx.sample_rate()).into());
 
     // Create a ring buffer for decoded PCM samples.
@@ -2240,8 +2322,13 @@ class PhantomSABProcessor extends AudioWorkletProcessor {
     this.audio = new Float32Array(audioBuffer); // interleaved stereo
     this.ringSize = ringSize;
     this.channels = channels;
-    // Pre-buffer 60ms before starting
-    this.prefill = Math.floor(48000 * 0.06);
+    // Keep the 60ms LAN floor, but allow up to 300ms on a slower WSS path.
+    // Connection setup is a latency hint, not a measurement of packet jitter.
+    // Pick this once before playback; do not insert pauses to change it live.
+    const connectMs = options.processorOptions.connectMs;
+    const hint = Number.isFinite(connectMs) ? connectMs : 60;
+    const prefillMs = Math.ceil(Math.min(300, Math.max(60, hint)) / 20) * 20;
+    this.prefill = 48 * prefillMs;
     this.started = false;
   }
 
@@ -2288,6 +2375,7 @@ registerProcessor('phantom-sab-audio', PhantomSABProcessor);
     let blob = web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_opts).unwrap();
     let url = web_sys::Url::create_object_url_with_blob(&blob).unwrap();
 
+    let generation = state.borrow().audio_generation;
     let ctx_clone = audio_ctx.clone();
     let state_clone = state.clone();
     let url_clone = url.clone();
@@ -2296,10 +2384,14 @@ registerProcessor('phantom-sab-audio', PhantomSABProcessor);
     let ctrl_write = ctrl_main.clone();
     let audio_write = audio_main.clone();
     let ring_size = ring_samples;
+    let connect_ms = state.borrow().audio_connect_ms;
 
     let promise = audio_ctx.audio_worklet().unwrap().add_module(&url).unwrap();
     let on_loaded = Closure::<dyn FnMut(JsValue)>::once(move |_: JsValue| {
         let _ = web_sys::Url::revoke_object_url(&url_clone);
+        if state_clone.borrow().audio_generation != generation {
+            return;
+        }
 
         let opts = js_sys::Object::new();
         let proc_opts = js_sys::Object::new();
@@ -2307,6 +2399,7 @@ registerProcessor('phantom-sab-audio', PhantomSABProcessor);
         let _ = js_sys::Reflect::set(&proc_opts, &"audioBuffer".into(), &audio_sab);
         let _ = js_sys::Reflect::set(&proc_opts, &"ringSize".into(), &ring_size.into());
         let _ = js_sys::Reflect::set(&proc_opts, &"channels".into(), &channels.into());
+        let _ = js_sys::Reflect::set(&proc_opts, &"connectMs".into(), &connect_ms.into());
         let _ = js_sys::Reflect::set(&opts, &"processorOptions".into(), &proc_opts);
         let _ = js_sys::Reflect::set(&opts, &"numberOfInputs".into(), &0.into());
         let _ = js_sys::Reflect::set(&opts, &"numberOfOutputs".into(), &1.into());
@@ -2357,6 +2450,16 @@ fn setup_audio_decoder_sab(
             return;
         }
 
+        // Only the consumer advances readPos. Drop an incoming packet that
+        // cannot fit instead of overwriting audio it has not played yet.
+        // A concurrent consumer can only free more space, so this snapshot is
+        // conservative. Publish buffered only after writing the whole packet.
+        let buffered = js_sys::Atomics::load(&ctrl, 2).unwrap_or(0) as u32;
+        if frames > ring_size || buffered > ring_size - frames {
+            audio_data.close();
+            return;
+        }
+
         // Extract planar float32
         let mut left = vec![0f32; frames as usize];
         let opts = js_sys::Object::new();
@@ -2399,12 +2502,6 @@ fn setup_audio_decoder_sab(
         let new_write_pos = (write_pos + frames) % ring_size;
         let _ = js_sys::Atomics::store(&ctrl, 0, new_write_pos as i32);
         let _ = js_sys::Atomics::add(&ctrl, 2, frames as i32);
-
-        // Cap buffered to ring_size (overflow protection)
-        let buffered = js_sys::Atomics::load(&ctrl, 2).unwrap_or(0) as u32;
-        if buffered > ring_size {
-            let _ = js_sys::Atomics::store(&ctrl, 2, ring_size as i32);
-        }
     });
 
     let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
@@ -2547,10 +2644,12 @@ fn setup_audio_buffersource(state: &Rc<RefCell<AppState>>, audio_ctx: &web_sys::
 
     // Start 20ms drain timer (matches Opus frame duration for smooth playback)
     let window = web_sys::window().unwrap();
-    let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-        drain_cb.as_ref().unchecked_ref(),
-        20,
-    );
+    state.borrow_mut().audio_drain_timer = window
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            drain_cb.as_ref().unchecked_ref(),
+            20,
+        )
+        .ok();
     drain_cb.forget();
 
     let error_cb = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
@@ -3194,42 +3293,14 @@ fn send_input(state: &AppState, event: InputEvent) {
     }
 }
 
-/// Standard resolutions supported by VDD (must match vdd_settings.xml).
-/// Minimum 1024x768 — below this, Windows moves windows between displays
-/// on multi-display VMs (VDD + NVIDIA native).
-const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
-    (1024, 768),
-    (1280, 720),
-    (1280, 800),
-    (1280, 960),
-    (1280, 1024),
-    (1366, 768),
-    (1440, 900),
-    (1600, 900),
-    (1600, 1200),
-    (1680, 1050),
-    (1920, 1080),
-    // Max 1920x1080 — H.264 Baseline Level 4.0 (avc1.42c028) limit.
-    // Higher resolutions need Level 5.1 codec string support.
-];
-
 /// Find the closest standard resolution that fits within the given viewport.
 fn closest_resolution(vw: u32, vh: u32) -> (u32, u32) {
     // Scale up the viewport by 1.3x so small windows still get usable resolution.
     // Example: 800x600 viewport → target 1040x780 → picks 1024x768
-    // Without scale: 800x600 → picks 800x600 (too low to be useful)
-    // Capped at 1920x1080 (H.264 Level 4.0 limit).
-    let scale = 1.3;
-    let tw = (vw as f64 * scale) as u32;
-    let th = (vh as f64 * scale) as u32;
-
-    let mut best = (1024, 768); // minimum — below this, Windows moves windows between displays
-    for &(w, h) in STANDARD_RESOLUTIONS {
-        if w <= tw && h <= th {
-            best = (w, h);
-        }
-    }
-    best
+    // Without scale: 800x600 → stays too low to be useful.
+    // Web stays capped at 1920x1080 until the codec path negotiates >H.264 L4.0.
+    let mode = closest_mode_for_viewport(vw, vh, WEB_DEFAULT_MAX_MODE, 1.3);
+    (mode.width, mode.height)
 }
 
 /// Compute the preferred initial resolution from the current browser viewport.
@@ -3279,18 +3350,24 @@ fn send_resolution_change(state: &Rc<RefCell<AppState>>) {
 }
 
 fn send_message(state: &AppState, msg: &Message) {
+    let _ = try_send_message(state, msg);
+}
+
+fn try_send_message(state: &AppState, msg: &Message) -> bool {
     if let Ok(data) = bincode::serialize(msg) {
         // Prefer the reliable control DataChannel, fallback to WebSocket.
         if let Some(ref dc) = state.send_control_dc {
             if dc.ready_state() == web_sys::RtcDataChannelState::Open {
-                let _ = dc.send_with_u8_array(&data);
-                return;
+                return dc.send_with_u8_array(&data).is_ok();
             }
         }
         if let Some(ref ws) = state.send_ws {
-            let _ = ws.send_with_u8_array(&data);
+            if ws.ready_state() == WebSocket::OPEN {
+                return ws.send_with_u8_array(&data).is_ok();
+            }
         }
     }
+    false
 }
 
 fn ensure_cursor_overlay(state: &mut AppState) -> Option<HtmlElement> {
@@ -3611,17 +3688,26 @@ fn handle_cursor_shape(state: &Rc<RefCell<AppState>>, shape: CursorShape) {
 fn begin_video_recovery(state: &Rc<RefCell<AppState>>, reason: &str) {
     let use_ws_fence = {
         let st = state.borrow();
-        st.send_control_dc.is_none() && st.send_ws.is_some()
+        let control_open = st
+            .send_control_dc
+            .as_ref()
+            .is_some_and(|dc| dc.ready_state() == web_sys::RtcDataChannelState::Open);
+        if !control_open && st.decoder.is_none() {
+            // Focus/visibility can fire while the initial WebSocket or Hello
+            // handshake is pending. There is no playback backlog yet, and a
+            // request sent before that handshake cannot establish a fence.
+            return;
+        }
+        if !try_send_message(&st, &Message::RequestKeyframe) {
+            return;
+        }
+        !control_open
     };
     {
         let mut st = state.borrow_mut();
         st.got_keyframe = false;
         st.waiting_for_keyframe_fence = use_ws_fence;
         st.drop_until_keyframe = !use_ws_fence;
-    }
-    {
-        let st = state.borrow();
-        send_message(&st, &Message::RequestKeyframe);
     }
     let _ = reason;
     send_resolution_change(state);

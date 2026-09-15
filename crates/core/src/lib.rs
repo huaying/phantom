@@ -23,6 +23,7 @@ pub mod clipboard;
 pub mod color;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod display_modes;
 pub mod encode;
 pub mod file_transfer;
 pub mod frame;

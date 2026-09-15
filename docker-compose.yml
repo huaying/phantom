@@ -4,6 +4,8 @@ services:
     build: .
     ports:
       - "9900:9900"
+      - "9901:9901"
+      - "9903:9903/udp"
     environment:
       - RESOLUTION=1280x720x24
     command: ["server"]

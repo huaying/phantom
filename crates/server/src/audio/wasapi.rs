@@ -15,12 +15,12 @@ use tracing::{info, warn};
 
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_LOOPBACK,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-// CreateEventW and WaitForSingleObject removed — loopback mode uses polling, not events
 
 /// Handle to a running audio capture thread. Drop to stop capture.
 pub struct AudioCapture {
@@ -127,9 +127,11 @@ fn wasapi_capture_loop(
             device_channels, bits_per_sample, "WASAPI device format"
         );
 
-        // Request 20ms buffer for loopback capture
-        // REFERENCE_TIME is in 100ns units; 20ms = 200_000 * 100ns
-        let buffer_duration: i64 = 200_000; // 20ms in 100ns units
+        // Allow scheduling jitter without losing unread packets. A nominal
+        // 10ms sleep can outlast a 20ms capture buffer on Windows VMs. This is
+        // capacity, not a playout delay: drain packets as soon as they arrive
+        // and continue emitting 20ms Opus frames.
+        let buffer_duration: i64 = 1_000_000; // 100ms in 100ns units
 
         audio_client
             .Initialize(
@@ -142,8 +144,8 @@ fn wasapi_capture_loop(
             )
             .context("IAudioClient::Initialize")?;
 
-        // Note: SetEventHandle is NOT supported in AUDCLNT_STREAMFLAGS_LOOPBACK mode.
-        // Use polling with GetNextPacketSize instead.
+        // Poll with GetNextPacketSize. Event-driven loopback is also supported
+        // on Windows 10 1703+, but does not repair device-side discontinuities.
 
         // Get the capture client interface
         let capture_client: IAudioCaptureClient = audio_client
@@ -208,27 +210,17 @@ fn wasapi_capture_loop(
                 let total_samples = num_frames as usize * device_channels as usize;
 
                 // Convert device samples to i16 stereo at 48kHz
-                let pcm_i16: Vec<i16> = if is_float {
-                    // f32 → i16
-                    let f32_slice =
-                        std::slice::from_raw_parts(buffer_ptr as *const f32, total_samples);
-                    f32_to_i16(f32_slice)
-                } else if bits_per_sample == 16 {
-                    // Already i16
-                    let i16_slice =
-                        std::slice::from_raw_parts(buffer_ptr as *const i16, total_samples);
-                    i16_slice.to_vec()
-                } else if bits_per_sample == 24 {
-                    // 24-bit PCM → i16 (drop lower 8 bits)
-                    let bytes = std::slice::from_raw_parts(buffer_ptr, total_samples * 3);
-                    i24_to_i16(bytes, total_samples)
-                } else {
-                    // Unsupported format — silence
-                    vec![0i16; total_samples]
-                };
+                let pcm_i16 = read_device_samples(
+                    buffer_ptr,
+                    total_samples,
+                    flags,
+                    bits_per_sample,
+                    is_float,
+                );
 
-                // Release the buffer
+                // Release even when a malformed packet is rejected.
                 let _ = capture_client.ReleaseBuffer(num_frames);
+                let pcm_i16 = pcm_i16?;
 
                 // Channel conversion (if needed: e.g. mono→stereo or >2ch→stereo)
                 let stereo_pcm = if needs_channel_convert {
@@ -282,6 +274,42 @@ fn wasapi_capture_loop(
     }
 
     Ok(())
+}
+
+/// Copy one WASAPI packet, honoring silence before inspecting its data pointer.
+///
+/// # Safety
+/// For a non-silent, supported packet, a non-null `data` must point to
+/// `total_samples` readable samples, aligned for the selected sample format.
+unsafe fn read_device_samples(
+    data: *const u8,
+    total_samples: usize,
+    flags: u32,
+    bits_per_sample: u16,
+    is_float: bool,
+) -> Result<Vec<i16>> {
+    if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || total_samples == 0 {
+        return Ok(vec![0; total_samples]);
+    }
+    anyhow::ensure!(
+        !data.is_null(),
+        "WASAPI returned null data for a non-silent packet"
+    );
+    Ok(if is_float {
+        f32_to_i16(std::slice::from_raw_parts(
+            data.cast::<f32>(),
+            total_samples,
+        ))
+    } else if bits_per_sample == 16 {
+        std::slice::from_raw_parts(data.cast::<i16>(), total_samples).to_vec()
+    } else if bits_per_sample == 24 {
+        i24_to_i16(
+            std::slice::from_raw_parts(data, total_samples * 3),
+            total_samples,
+        )
+    } else {
+        vec![0; total_samples]
+    })
 }
 
 /// Convert f32 samples [-1.0, 1.0] to i16.
@@ -378,4 +406,59 @@ fn resample(pcm: &[i16], channels: usize, from_rate: u32, to_rate: u32) -> Vec<i
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_packet_accepts_null_data_and_preserves_duration() {
+        let pcm = unsafe {
+            read_device_samples(
+                std::ptr::null(),
+                1920,
+                AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+                32,
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(pcm, vec![0; 1920]);
+    }
+
+    #[test]
+    fn silent_packet_ignores_stale_nonzero_samples_and_other_flags() {
+        let stale = [0.5_f32, -0.5];
+        let pcm = unsafe {
+            read_device_samples(
+                stale.as_ptr().cast(),
+                2,
+                AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 | 1,
+                32,
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(pcm, [0, 0]);
+    }
+
+    #[test]
+    fn non_silent_packet_requires_data() {
+        assert!(unsafe { read_device_samples(std::ptr::null(), 2, 0, 32, true) }.is_err());
+    }
+
+    #[test]
+    fn ordinary_float_and_integer_packets_keep_their_samples() {
+        let float = [1.0_f32, -1.0, 0.0];
+        assert_eq!(
+            unsafe { read_device_samples(float.as_ptr().cast(), 3, 0, 32, true) }.unwrap(),
+            [32767, -32767, 0]
+        );
+        let integer = [i16::MAX, i16::MIN, 0];
+        assert_eq!(
+            unsafe { read_device_samples(integer.as_ptr().cast(), 3, 0, 16, false) }.unwrap(),
+            integer
+        );
+    }
 }

@@ -1,12 +1,10 @@
 //! Modern CCD (Connecting and Configuring Displays) API wrappers.
 //!
-//! Makes the VDD the **primary** display via `QueryDisplayConfig` +
-//! `SetDisplayConfig` (with `SDC_VIRTUAL_MODE_AWARE` — required for IDD drivers).
-//! Required because the legacy `ChangeDisplaySettingsExW(CDS_SET_PRIMARY)` API
-//! returns `DISP_CHANGE_FAILED` on Windows 11 24H2+ with IDD-based virtual
-//! displays (VDD issue #471).
+//! Reads active topology through `QueryDisplayConfig` and applies resolution
+//! changes to an already-active, Phantom-managed VDD through
+//! `SetDisplayConfig` (`SDC_VIRTUAL_MODE_AWARE` is required for IDD drivers).
 //!
-//! # Safety design — NEVER detach physical displays
+//! # Safety design — topology ownership is explicit
 //!
 //! Earlier versions cleared `PATH_ACTIVE` on non-VDD paths so VDD was the
 //! ONLY active display. This worked, but when uninstall or service relaunch
@@ -14,10 +12,11 @@
 //! topology that no longer had a valid VDD driver on next boot. Two Win10/Win11
 //! VMs got bricked this way.
 //!
-//! Sunshine (`libdisplaydevice`) never detaches physical paths — VDD is added
-//! as an *extension* display, marked primary via source-mode position (0,0).
-//! We follow the same pattern. Uninstall can never brick because physical
-//! displays stay active throughout.
+//! Explicit Phantom-managed provisioning may select the VDD as the sole active
+//! path, with rollback if any post-condition fails. Preserve-console and
+//! externally managed modes never activate, detach, or rearrange paths.
+//! Resolution changes are allowed only after proving the capture target is the
+//! sole active Phantom-owned VDD.
 //!
 //! Runtime-only (no `SDC_SAVE_TO_DATABASE`) — reboot reverts to defaults.
 #![cfg(target_os = "windows")]
@@ -170,28 +169,145 @@ pub fn source_rect_from_topology(topo: &Topology, gdi_name: &str) -> Option<(i32
     }
 }
 
-/// Ensure the VDD path is active without intentionally making it primary.
-/// This lets DXGI enumerate the virtual output before Tier 1 capture starts.
-pub fn ensure_vdd_active(vdd_gdi_name: &str) -> Result<Topology> {
-    let current = query_active_config()?;
-    if find_vdd_path_idx(&current, vdd_gdi_name).is_some() {
-        return Ok(current);
-    }
-
-    crate::service_win::svc_log(&format!(
-        "CCD: VDD {vdd_gdi_name} not active; enabling as extension"
-    ));
-    activate_vdd_extension_path(vdd_gdi_name).context("SetDisplayConfig (ensure VDD active)")?;
-    let active = query_active_config().context("QueryDisplayConfig after VDD activation")?;
-    find_vdd_path_idx(&active, vdd_gdi_name)
-        .with_context(|| format!("VDD path not found after activation: {vdd_gdi_name}"))?;
-    Ok(active)
-}
-
 /// Human-readable active topology summary for Windows capture diagnostics.
 pub fn active_config_summary() -> Result<Vec<String>> {
     let topo = query_active_config()?;
     Ok(active_config_summary_from_topology(&topo))
+}
+
+pub fn active_path_count() -> Result<usize> {
+    let topo = query_active_config()?;
+    Ok(topo
+        .paths
+        .iter()
+        .filter(|path| (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+        .count())
+}
+
+/// Change an active display source mode through CCD and return the observed
+/// topology. This is more reliable for IDD/VDD than ChangeDisplaySettingsExW
+/// during Winlogon -> Default transitions, where Windows can reconnect VDD at
+/// its 640x480 default.
+pub fn set_source_resolution(gdi_name: &str, width: u32, height: u32) -> Result<Topology> {
+    let current = query_active_config()?;
+    let path_idx = find_vdd_path_idx(&current, gdi_name)
+        .with_context(|| format!("active display path not found for {gdi_name}"))?;
+    let src_idx = source_mode_idx(&current.paths[path_idx]);
+    if src_idx >= current.modes.len()
+        || current.modes[src_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+    {
+        bail!("source mode not found for {gdi_name} at idx {src_idx}");
+    }
+
+    let current_source = unsafe { current.modes[src_idx].Anonymous.sourceMode };
+    if current_source.width == width && current_source.height == height {
+        return Ok(current);
+    }
+
+    crate::service_win::svc_log(&format!(
+        "CCD: applying relaxed source mode {width}x{height} to {gdi_name}"
+    ));
+    match apply_source_resolution(&current, path_idx, src_idx, width, height, true) {
+        Ok(observed) if source_resolution_matches(&observed, gdi_name, width, height) => {
+            log_source_resolution(&observed);
+            return Ok(observed);
+        }
+        Ok(_) => crate::service_win::svc_log(
+            "CCD relaxed source mode was accepted but the requested resolution did not stick; retrying strictly",
+        ),
+        Err(e) => crate::service_win::svc_log(&format!(
+            "CCD relaxed source mode failed: {e:#}; retrying strictly"
+        )),
+    }
+
+    let strict_current =
+        query_active_config().context("query topology before strict mode retry")?;
+    let strict_path_idx = find_vdd_path_idx(&strict_current, gdi_name).with_context(|| {
+        format!("active display path disappeared before strict retry: {gdi_name}")
+    })?;
+    let strict_src_idx = source_mode_idx(&strict_current.paths[strict_path_idx]);
+    if strict_src_idx >= strict_current.modes.len()
+        || strict_current.modes[strict_src_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+    {
+        bail!("source mode not found for strict retry: {gdi_name}");
+    }
+
+    crate::service_win::svc_log(&format!(
+        "CCD: applying strict source mode {width}x{height} to {gdi_name}"
+    ));
+    let observed = apply_source_resolution(
+        &strict_current,
+        strict_path_idx,
+        strict_src_idx,
+        width,
+        height,
+        false,
+    )
+    .context("SetDisplayConfig (strict source resolution)")?;
+    log_source_resolution(&observed);
+    if source_resolution_matches(&observed, gdi_name, width, height) {
+        Ok(observed)
+    } else {
+        bail!(
+            "CCD source resolution did not stick for {gdi_name}: requested {width}x{height}, observed {:?}",
+            source_rect_from_topology(&observed, gdi_name)
+        )
+    }
+}
+
+fn apply_source_resolution(
+    current: &Topology,
+    path_idx: usize,
+    src_idx: usize,
+    width: u32,
+    height: u32,
+    allow_changes: bool,
+) -> Result<Topology> {
+    let mut paths = current.paths.clone();
+    let mut modes = current.modes.clone();
+
+    unsafe {
+        let source = &mut modes[src_idx].Anonymous.sourceMode;
+        source.width = width;
+        source.height = height;
+
+        // Resolution changes invalidate the target timing and desktop-image
+        // modes. Leaving either index populated makes Win11 reject an otherwise
+        // valid IDD source-mode update with ERROR_INVALID_PARAMETER.
+        paths[path_idx].targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    }
+
+    apply_source_mode(&paths, &modes, allow_changes)?;
+    query_active_config().context("QueryDisplayConfig after source resolution")
+}
+
+fn apply_source_mode(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+    allow_changes: bool,
+) -> Result<()> {
+    unsafe {
+        let mut flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;
+        if allow_changes {
+            flags |= SDC_ALLOW_CHANGES;
+        }
+        let result = SetDisplayConfig(Some(paths), Some(modes), flags);
+        if result != ERROR_SUCCESS.0 as i32 {
+            bail!("SetDisplayConfig source mode failed: {result}");
+        }
+        Ok(())
+    }
+}
+
+fn source_resolution_matches(topology: &Topology, gdi_name: &str, width: u32, height: u32) -> bool {
+    source_rect_from_topology(topology, gdi_name)
+        .is_some_and(|(_, _, observed_w, observed_h)| observed_w == width && observed_h == height)
+}
+
+fn log_source_resolution(topology: &Topology) {
+    for line in active_config_summary_from_topology(topology) {
+        crate::service_win::svc_log(&format!("CCD after source resolution: {line}"));
+    }
 }
 
 fn active_config_summary_from_topology(topo: &Topology) -> Vec<String> {
@@ -222,29 +338,20 @@ fn active_config_summary_from_topology(topo: &Topology) -> Vec<String> {
     lines
 }
 
-/// Make VDD the primary display by shifting all source-mode positions so VDD
-/// lands at (0,0). Physical displays stay active — they just move to positive
-/// coordinates (Windows treats the monitor at (0,0) as primary).
-///
-/// Returns the observed topology for diagnostics. Callers intentionally do not
-/// restore topology on agent shutdown because the service relaunches agents
-/// during Winlogon/Default transitions; restoring there causes resolution churn.
-pub fn set_vdd_primary(vdd_gdi_name: &str) -> Result<Topology> {
-    let mut current = query_active_config()?;
-    let vdd_idx = match find_vdd_path_idx(&current, vdd_gdi_name) {
-        Some(idx) => idx,
-        None => {
-            crate::service_win::svc_log(&format!(
-                "CCD: VDD {vdd_gdi_name} not active; activating supplied extend path"
-            ));
-            activate_vdd_extension_path(vdd_gdi_name)
-                .context("SetDisplayConfig (activate VDD extension path)")?;
-            current =
-                query_active_config().context("QueryDisplayConfig after VDD path activation")?;
-            find_vdd_path_idx(&current, vdd_gdi_name)
-                .with_context(|| format!("VDD path not found after activation: {vdd_gdi_name}"))?
-        }
-    };
+/// Repair the origin of an already-active sole VDD after resizing it.
+/// Refuse multi-display topology so this helper can never relocate user windows.
+pub fn repair_sole_vdd_origin(vdd_gdi_name: &str) -> Result<Topology> {
+    let current = query_active_config()?;
+    let active_count = current
+        .paths
+        .iter()
+        .filter(|path| (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+        .count();
+    if active_count != 1 {
+        bail!("refusing to move VDD origin with {active_count} active display paths");
+    }
+    let vdd_idx = find_vdd_path_idx(&current, vdd_gdi_name)
+        .with_context(|| format!("active VDD path not found: {vdd_gdi_name}"))?;
 
     let src_idx = source_mode_idx(&current.paths[vdd_idx]);
     if src_idx >= current.modes.len()
@@ -255,35 +362,14 @@ pub fn set_vdd_primary(vdd_gdi_name: &str) -> Result<Topology> {
 
     let paths = current.paths.clone();
     let mut modes = current.modes.clone();
-    let vdd_width = unsafe { modes[src_idx].Anonymous.sourceMode.width.max(1) };
-    let mut next_x = vdd_width as i32;
-    let mut changed = false;
-    let mut moved_sources = 0usize;
-
-    for (idx, m) in modes.iter_mut().enumerate() {
-        unsafe {
-            if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-                let source = &mut m.Anonymous.sourceMode;
-                let (target_x, target_y) = if idx == src_idx {
-                    (0, 0)
-                } else {
-                    let x = next_x;
-                    next_x += source.width.max(1) as i32;
-                    moved_sources += 1;
-                    (x, 0)
-                };
-                if source.position.x != target_x || source.position.y != target_y {
-                    changed = true;
-                    source.position.x = target_x;
-                    source.position.y = target_y;
-                }
-            }
-        }
-    }
+    let source = unsafe { &mut modes[src_idx].Anonymous.sourceMode };
+    let changed = source.position.x != 0 || source.position.y != 0;
+    source.position.x = 0;
+    source.position.y = 0;
 
     if !changed {
         crate::service_win::svc_log(&format!(
-            "CCD: VDD {vdd_gdi_name} primary layout already stable; {moved_sources} other source(s)"
+            "CCD: sole VDD {vdd_gdi_name} origin already stable"
         ));
         for line in active_config_summary_from_topology(&current) {
             crate::service_win::svc_log(&format!("CCD stable primary: {line}"));
@@ -292,15 +378,103 @@ pub fn set_vdd_primary(vdd_gdi_name: &str) -> Result<Topology> {
     }
 
     crate::service_win::svc_log(&format!(
-        "CCD: applying VDD primary layout; VDD -> (0,0), {moved_sources} other source(s) moved right"
+        "CCD: repairing sole VDD {vdd_gdi_name} origin to (0,0)"
     ));
 
-    apply(&paths, &modes).context("SetDisplayConfig (set_vdd_primary)")?;
-    let observed = query_active_config().context("QueryDisplayConfig after set_vdd_primary")?;
+    apply(&paths, &modes).context("SetDisplayConfig (repair sole VDD origin)")?;
+    let observed =
+        query_active_config().context("QueryDisplayConfig after repairing sole VDD origin")?;
     for line in active_config_summary_from_topology(&observed) {
         crate::service_win::svc_log(&format!("CCD after primary: {line}"));
     }
     Ok(observed)
+}
+
+/// Select one display path and let Windows choose valid source/target modes.
+///
+/// This is an explicit provisioning operation, not runtime recovery. Callers
+/// must only use it for a dedicated managed desktop and should retain the
+/// returned topology until all post-conditions (including resolution) pass.
+pub fn provision_single_display(gdi_name: &str) -> Result<Topology> {
+    let original = query_active_config().context("snapshot active display topology")?;
+    let all = query_all_config().context("query all display paths")?;
+    let mut candidates = Vec::new();
+
+    for path in &all.paths {
+        if gdi_name_for_path(path).is_ok_and(|name| name.eq_ignore_ascii_case(gdi_name)) {
+            candidates.push(*path);
+        }
+    }
+
+    let mut selected = candidates
+        .iter()
+        .find(|path| (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+        .copied()
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|path| path.targetInfo.targetAvailable.as_bool())
+                .copied()
+        })
+        .or_else(|| candidates.first().copied())
+        .with_context(|| format!("display path absent from QDC_ALL_PATHS: {gdi_name}"))?;
+
+    selected.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+    selected.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    selected.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+
+    crate::service_win::svc_log(&format!(
+        "CCD provisioning: selecting {gdi_name} as the sole active display"
+    ));
+    apply_auto_modes(&[selected]).context("SetDisplayConfig (provision single display)")?;
+
+    let observed = query_active_config().context("query provisioned display topology")?;
+    let active_count = observed
+        .paths
+        .iter()
+        .filter(|path| (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+        .count();
+    if active_count != 1 || find_vdd_path_idx(&observed, gdi_name).is_none() {
+        let _ = restore_topology(&original);
+        bail!(
+            "single-display provisioning did not stick for {gdi_name}: active_paths={active_count}"
+        );
+    }
+
+    for line in active_config_summary_from_topology(&observed) {
+        crate::service_win::svc_log(&format!("CCD after provisioning: {line}"));
+    }
+    Ok(original)
+}
+
+/// Restore a topology captured by `query_active_config`.
+pub fn restore_topology(topology: &Topology) -> Result<()> {
+    apply(&topology.paths, &topology.modes).context("restore display topology")
+}
+
+fn apply_auto_modes(paths: &[DISPLAYCONFIG_PATH_INFO]) -> Result<()> {
+    unsafe {
+        let flags = SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_VIRTUAL_MODE_AWARE;
+        let result = SetDisplayConfig(Some(paths), None, flags);
+        if result == ERROR_SUCCESS.0 as i32 {
+            return Ok(());
+        }
+
+        let legacy_result = SetDisplayConfig(
+            Some(paths),
+            None,
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+        );
+        if legacy_result != ERROR_SUCCESS.0 as i32 {
+            bail!(
+                "SetDisplayConfig auto-mode selection failed: virtual={result} legacy={legacy_result}"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> Result<()> {
@@ -324,129 +498,4 @@ fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -
         }
         Ok(())
     }
-}
-
-fn activate_vdd_extension_path(vdd_gdi_name: &str) -> Result<()> {
-    let all = query_all_config()?;
-    let mut selected: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
-    let mut seen = Vec::new();
-    let mut inactive_vdd: Option<DISPLAYCONFIG_PATH_INFO> = None;
-    let mut active_count = 0usize;
-    let mut available_count = 0usize;
-    let mut vdd_candidates = Vec::new();
-
-    for (idx, path) in all.paths.iter().enumerate() {
-        let active = (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
-        let source_name = gdi_name_for_path(path).unwrap_or_else(|e| format!("<source-name: {e}>"));
-        let target_available = path.targetInfo.targetAvailable.as_bool();
-        if active {
-            active_count += 1;
-        }
-        if target_available {
-            available_count += 1;
-        }
-        if source_name == vdd_gdi_name {
-            vdd_candidates.push(format!(
-                "path[{idx}] active={active} target_available={target_available}"
-            ));
-        }
-
-        if active {
-            push_supplied_path(&mut selected, &mut seen, *path);
-        } else if source_name == vdd_gdi_name
-            && inactive_vdd.as_ref().is_none_or(|_| target_available)
-        {
-            inactive_vdd = Some(*path);
-        }
-    }
-
-    crate::service_win::svc_log(&format!(
-        "CCD all paths: total={} active={} target_available={} vdd_candidates={}",
-        all.paths.len(),
-        active_count,
-        available_count,
-        vdd_candidates.join("; ")
-    ));
-
-    let mut vdd_path = inactive_vdd
-        .with_context(|| format!("VDD path absent from QDC_ALL_PATHS: {vdd_gdi_name}"))?;
-    vdd_path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-    invalidate_path_modes(&mut vdd_path);
-    // Keep existing active paths first so the activation step behaves like an
-    // extend operation. `set_vdd_primary` can reorder source-mode positions
-    // after DXGI/NVENC has successfully bound the VDD output.
-    selected.push(vdd_path);
-
-    if selected.is_empty() {
-        bail!("no display paths selected for VDD activation");
-    }
-
-    unsafe {
-        let apply = SetDisplayConfig(
-            Some(&selected),
-            None,
-            SDC_APPLY
-                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                | SDC_ALLOW_CHANGES
-                | SDC_VIRTUAL_MODE_AWARE,
-        );
-        if apply == ERROR_SUCCESS.0 as i32 {
-            crate::service_win::svc_log(&format!(
-                "CCD: supplied VDD topology applied with {} path(s)",
-                selected.len()
-            ));
-            return Ok(());
-        }
-
-        let legacy_apply = SetDisplayConfig(
-            Some(&selected),
-            None,
-            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
-        );
-        if legacy_apply != ERROR_SUCCESS.0 as i32 {
-            bail!(
-                "SetDisplayConfig supplied VDD activation failed: apply={apply} legacy_apply={legacy_apply}"
-            );
-        }
-        crate::service_win::svc_log(&format!(
-            "CCD: supplied VDD topology applied without virtual-mode flag with {} path(s)",
-            selected.len()
-        ));
-        Ok(())
-    }
-}
-
-fn push_supplied_path(
-    selected: &mut Vec<DISPLAYCONFIG_PATH_INFO>,
-    seen: &mut Vec<((i32, u32, u32), (i32, u32, u32))>,
-    mut path: DISPLAYCONFIG_PATH_INFO,
-) {
-    let key = path_key(&path);
-    if seen.contains(&key) {
-        return;
-    }
-    path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-    invalidate_path_modes(&mut path);
-    selected.push(path);
-    seen.push(key);
-}
-
-fn path_key(path: &DISPLAYCONFIG_PATH_INFO) -> ((i32, u32, u32), (i32, u32, u32)) {
-    (
-        (
-            path.sourceInfo.adapterId.HighPart,
-            path.sourceInfo.adapterId.LowPart,
-            path.sourceInfo.id,
-        ),
-        (
-            path.targetInfo.adapterId.HighPart,
-            path.targetInfo.adapterId.LowPart,
-            path.targetInfo.id,
-        ),
-    )
-}
-
-fn invalidate_path_modes(path: &mut DISPLAYCONFIG_PATH_INFO) {
-    path.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-    path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
 }

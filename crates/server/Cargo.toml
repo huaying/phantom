@@ -1,7 +1,11 @@
 [package]
 name = "phantom-server"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
+
+[[example]]
+name = "transport_smoke"
+required-features = ["webrtc", "web-client", "audio"]
 
 [features]
 default = ["web-client", "audio", "sso", "webrtc"]
@@ -64,6 +68,7 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_IO",

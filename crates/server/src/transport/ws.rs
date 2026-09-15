@@ -1,3 +1,4 @@
+use super::ws_audio::{AudioRoutes, SessionAudio};
 use anyhow::{Context, Result};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "webrtc")]
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use tungstenite::WebSocket;
 
 // ── JWT token authentication ────────────────────────────────────────────────
@@ -272,6 +274,7 @@ impl WebServerTransport {
         // Channel for WS connections
         let (ws_tx, ws_rx) = mpsc::channel::<WsConnection>();
         let (audio_ws_tx, audio_ws_rx) = mpsc::channel::<WsSender>();
+        let audio_routes = AudioRoutes::default();
 
         // Shared connection counter for the thread pool
         let conn_count = Arc::new(AtomicUsize::new(0));
@@ -318,6 +321,7 @@ impl WebServerTransport {
                     let rtc_tx = rtc_tx.clone();
                     let ws_tx = ws_tx.clone();
                     let audio_ws_tx = audio_ws_tx.clone();
+                    let audio_routes = audio_routes.clone();
                     let candidate_addr = candidate_addr;
                     let auth = auth_secret.clone();
                     std::thread::Builder::new()
@@ -349,11 +353,16 @@ impl WebServerTransport {
                                     &auth,
                                 ) {
                                     Ok(HttpResult::WsUpgrade) => {
-                                        spawn_ws_connection(stream, ws_tx);
+                                        spawn_ws_connection(stream, ws_tx, audio_routes);
                                         return;
                                     }
-                                    Ok(HttpResult::WsUpgradeAudio) => {
-                                        spawn_audio_ws_connection(stream, audio_ws_tx);
+                                    Ok(HttpResult::WsUpgradeAudio(session)) => {
+                                        spawn_audio_ws_connection(
+                                            stream,
+                                            audio_ws_tx,
+                                            audio_routes,
+                                            session,
+                                        );
                                         return;
                                     }
                                     Ok(HttpResult::Done) => continue,
@@ -395,6 +404,7 @@ impl WebServerTransport {
                     let tls = tls_acceptor.clone();
                     let ws_tx = ws_tx.clone();
                     let audio_ws_tx = audio_ws_tx.clone();
+                    let audio_routes = audio_routes.clone();
                     let auth = auth_secret.clone();
                     std::thread::Builder::new()
                         .name("http-handler".into())
@@ -418,11 +428,16 @@ impl WebServerTransport {
                             for _req_num in 0..MAX_REQUESTS_PER_CONN {
                                 match handle_http_rw(&mut stream, &auth) {
                                     Ok(HttpResult::WsUpgrade) => {
-                                        spawn_ws_connection(stream, ws_tx);
+                                        spawn_ws_connection(stream, ws_tx, audio_routes);
                                         return;
                                     }
-                                    Ok(HttpResult::WsUpgradeAudio) => {
-                                        spawn_audio_ws_connection(stream, audio_ws_tx);
+                                    Ok(HttpResult::WsUpgradeAudio(session)) => {
+                                        spawn_audio_ws_connection(
+                                            stream,
+                                            audio_ws_tx,
+                                            audio_routes,
+                                            session,
+                                        );
                                         return;
                                     }
                                     Ok(HttpResult::Done) => continue,
@@ -496,7 +511,7 @@ enum HttpResult {
     /// WebSocket upgrade for main channel (video + control).
     WsUpgrade,
     /// WebSocket upgrade for audio-only channel.
-    WsUpgradeAudio,
+    WsUpgradeAudio(Option<String>),
 }
 
 /// Check whether the client sent `Connection: close`.
@@ -543,7 +558,9 @@ fn handle_http_rw(
         check_request_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
-            return Ok(HttpResult::WsUpgradeAudio);
+            return Ok(HttpResult::WsUpgradeAudio(
+                extract_query_param(raw_path, "session").map(str::to_owned),
+            ));
         }
         return Ok(HttpResult::WsUpgrade);
     }
@@ -583,7 +600,9 @@ fn handle_http_rw_rtc(
         check_request_auth(stream, raw_path, auth_secret)?;
         send_ws_upgrade(stream, &request)?;
         if path.contains("audio") {
-            return Ok(HttpResult::WsUpgradeAudio);
+            return Ok(HttpResult::WsUpgradeAudio(
+                extract_query_param(raw_path, "session").map(str::to_owned),
+            ));
         }
         return Ok(HttpResult::WsUpgrade);
     }
@@ -702,26 +721,37 @@ fn serve_static(stream: &mut (impl Read + Write), path: &str, keep_alive: bool) 
 fn spawn_ws_connection(
     stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     ws_tx: mpsc::Sender<WsConnection>,
+    audio_routes: AudioRoutes,
 ) {
-    let _ = stream
-        .sock
-        .set_read_timeout(Some(std::time::Duration::from_millis(50)));
-    let _ = stream
-        .sock
-        .set_write_timeout(Some(std::time::Duration::from_millis(150)));
-    let _ = stream.sock.set_nodelay(true);
+    // Winlogon uses software H.264 and can produce a substantially larger
+    // recovery keyframe than the steady-state NVENC stream. A 150 ms socket
+    // timeout could tear down an otherwise healthy WAN connection halfway
+    // through that keyframe, leaving the browser in a reconnect loop. Queue
+    // pressure below remains the authoritative stale-client guard.
+    let stream = match ws_poll_stream(stream, WS_SOCKET_WRITE_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%error, "WebSocket socket configuration failed");
+            return;
+        }
+    };
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("WebSocket client connected via HTTPS port");
     let (send_tx, send_rx) = mpsc::sync_channel(WS_VIDEO_SEND_QUEUE_DEPTH);
     let (recv_tx, recv_rx) = mpsc::channel();
-    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
+    let recovery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let io_recovery = recovery.clone();
+    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx, io_recovery));
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let _ = ws_tx.send(WsConnection {
         data_sender: WsSender {
             tx: send_tx,
-            consecutive_video_full_drops: 0,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery,
             dropped,
+            audio: Some(SessionAudio::new(audio_routes)),
         },
         data_receiver: WsReceiver { rx: recv_rx },
     });
@@ -731,25 +761,43 @@ fn spawn_ws_connection(
 fn spawn_audio_ws_connection(
     stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     audio_ws_tx: mpsc::Sender<WsSender>,
+    audio_routes: AudioRoutes,
+    session: Option<String>,
 ) {
-    let _ = stream
-        .sock
-        .set_read_timeout(Some(std::time::Duration::from_millis(50)));
-    let _ = stream
-        .sock
-        .set_write_timeout(Some(std::time::Duration::from_millis(250)));
-    let _ = stream.sock.set_nodelay(true);
+    let stream = match ws_poll_stream(stream, Duration::from_millis(250)) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%error, "Audio WebSocket socket configuration failed");
+            return;
+        }
+    };
     let ws =
         tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     tracing::info!("audio WebSocket connected");
     let (send_tx, send_rx) = mpsc::sync_channel(WS_AUDIO_SEND_QUEUE_DEPTH);
+    if let Some(ref key) = session {
+        if !audio_routes.attach(key, send_tx.clone()) {
+            tracing::warn!("Audio WebSocket session is unknown, ended or already attached");
+            return;
+        }
+        tracing::info!("Audio WebSocket paired with active WSS session");
+    }
     let (recv_tx, _recv_rx) = mpsc::channel();
-    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx));
+    let recovery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let io_recovery = recovery.clone();
+    std::thread::spawn(move || ws_io_loop(ws, send_rx, recv_tx, io_recovery));
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Paired audio is owned by its main sender, including in Windows service mode.
+    if session.is_some() {
+        return;
+    }
     let _ = audio_ws_tx.send(WsSender {
         tx: send_tx,
-        consecutive_video_full_drops: 0,
+        dropping_video_until_keyframe: false,
+        video_backlog_started_at: None,
+        recovery,
         dropped,
+        audio: None,
     });
 }
 
@@ -762,10 +810,55 @@ fn get_local_ip() -> Option<std::net::IpAddr> {
 
 // -- WebSocket IO loop --
 
+/// The TLS/WebSocket stream has one owning I/O thread. Poll reads without a
+/// socket receive timeout, then restore blocking mode before TLS writes.
+/// This avoids Windows' short SO_RCVTIMEO path (which returned error 997 in
+/// the canary soak) without treating an unexpected native error as success.
+/// Writes keep their bounded blocking semantics: tungstenite may have already
+/// accepted part of a frame, so retrying a whole send on WouldBlock is unsafe.
+struct WsPollSocket(std::net::TcpStream);
+
+impl Read for WsPollSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.set_nonblocking(true)?;
+        let result = self.0.read(buf);
+        self.0.set_nonblocking(false)?;
+        result
+    }
+}
+
+impl Write for WsPollSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.0.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn ws_poll_stream(
+    stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
+    write_timeout: Duration,
+) -> std::io::Result<rustls::StreamOwned<rustls::ServerConnection, WsPollSocket>> {
+    stream.sock.set_read_timeout(None)?;
+    stream.sock.set_write_timeout(Some(write_timeout))?;
+    stream.sock.set_nodelay(true)?;
+    Ok(rustls::StreamOwned::new(
+        stream.conn,
+        WsPollSocket(stream.sock),
+    ))
+}
+
 fn ws_io_loop<S: std::io::Read + std::io::Write>(
     mut ws: WebSocket<S>,
     send_rx: mpsc::Receiver<Vec<u8>>,
     recv_tx: mpsc::Sender<Vec<u8>>,
+    recovery: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     loop {
         // Drain a bounded number of pending outgoing messages. If we drain the
@@ -781,12 +874,31 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
             match send_rx.try_recv() {
                 Ok(data) => {
                     writes += 1;
-                    if ws.send(tungstenite::Message::Binary(data)).is_err() {
+                    let bytes = data.len();
+                    if let Err(error) = ws.send(tungstenite::Message::Binary(data)) {
+                        tracing::warn!(%error, bytes, "WebSocket write failed; closing connection");
                         return;
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // A transient full queue can lose a delta while the TCP
+                    // writer subsequently catches up. Ask the session for a
+                    // fresh keyframe only after draining; otherwise waiting
+                    // for its periodic keyframe can hit the backlog deadline
+                    // even though the socket has recovered. Coalesce requests
+                    // and leave the queue/write/deadline bounds unchanged.
+                    if recovery.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        let request = bincode::serialize(&Message::RequestKeyframe)
+                            .expect("unit protocol message serializes");
+                        if recv_tx.send(request).is_err() {
+                            return;
+                        }
+                        tracing::info!("WSS send queue drained; requesting recovery keyframe");
+                    }
+                    break;
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    tracing::debug!("WebSocket sender dropped; closing connection");
                     let _ = ws.close(None);
                     let _ = ws.flush();
                     return;
@@ -799,12 +911,24 @@ fn ws_io_loop<S: std::io::Read + std::io::Write>(
                     return;
                 }
             }
-            Ok(tungstenite::Message::Close(_)) => return,
+            Ok(tungstenite::Message::Close(frame)) => {
+                tracing::debug!(?frame, "WebSocket peer closed connection");
+                return;
+            }
             Ok(_) => {}
             Err(tungstenite::Error::Io(ref e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => return,
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if writes == 0 {
+                    std::thread::sleep(WS_READ_POLL_INTERVAL);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket read failed; closing connection");
+                return;
+            }
         }
     }
 }
@@ -816,17 +940,30 @@ const WS_VIDEO_SEND_QUEUE_DEPTH: usize = 8;
 /// Audio uses its own WSS channel and benefits from a deeper jitter buffer.
 const WS_AUDIO_SEND_QUEUE_DEPTH: usize = 50;
 
+// Sleep only when neither direction made progress. Outbound media is never
+// paced by an idle peer's read timeout. Keep queue bounds and read fairness.
+const WS_READ_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 /// Interleave writes with reads so client input/pong is not starved by video.
 const WS_MAX_WRITES_PER_READ: usize = 4;
 
-/// If the video queue is full for about a second at 30fps, close the session.
-/// Browser reconnect will get a fresh keyframe instead of replaying stale TCP
-/// backlog at line rate.
-const WS_VIDEO_FULL_DROPS_BEFORE_CLOSE: u32 = 30;
+/// Permit a recovery keyframe to cross a slower WAN link before declaring the
+/// socket unhealthy. The sender-side backlog timer below still bounds stale
+/// video and closes connections that cannot make sustained progress.
+const WS_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A sustained blocked TCP writer is not recoverable in-place. Reconnect before
+/// browser/kernel buffers turn old desktop frames into visible fast-forward.
+const WS_VIDEO_BACKLOG_CLOSE_AFTER: Duration = Duration::from_secs(2);
 
 pub struct WsSender {
+    audio: Option<SessionAudio>,
     tx: mpsc::SyncSender<Vec<u8>>,
-    consecutive_video_full_drops: u32,
+    dropping_video_until_keyframe: bool,
+    video_backlog_started_at: Option<Instant>,
+    /// Set by the producer on video loss; consumed by the I/O owner only
+    /// after the outgoing queue drains, when a recovery keyframe can fit.
+    recovery: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Counts payloads we couldn't push because the IO loop was too far
     /// behind (client TCP receive buffer full → IO loop blocked on write
     /// → channel full). Logged occasionally; never panics.
@@ -844,12 +981,44 @@ impl WsSender {
 
 impl MessageSender for WsSender {
     fn send_msg(&mut self, msg: &Message) -> Result<()> {
-        let is_video = matches!(msg, Message::VideoFrame { .. });
-        let payload = bincode::serialize(msg).context("serialize")?;
+        if let (Some(audio), Message::Hello { session_token, .. }) = (&mut self.audio, msg) {
+            audio.register(session_token);
+        }
+        let video_keyframe = match msg {
+            Message::VideoFrame { frame, .. } => Some(frame.is_keyframe),
+            _ => None,
+        };
+        if self.dropping_video_until_keyframe && video_keyframe == Some(false) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .video_backlog_started_at
+                .is_some_and(|since| since.elapsed() >= WS_VIDEO_BACKLOG_CLOSE_AFTER)
+            {
+                return Err(anyhow::anyhow!("ws video backlog exceeded"));
+            }
+            return Ok(());
+        }
+
+        let mut payload = bincode::serialize(msg).context("serialize")?;
+        if let (Some(audio), Message::AudioFrame { .. }) = (&self.audio, msg) {
+            match audio.send(payload) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(mpsc::TrySendError::Disconnected(data)) => payload = data,
+            }
+        }
         match self.tx.try_send(payload) {
             Ok(()) => {
-                if is_video {
-                    self.consecutive_video_full_drops = 0;
+                if video_keyframe.is_some() {
+                    self.dropping_video_until_keyframe = false;
+                    self.video_backlog_started_at = None;
+                    self.recovery
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
                 Ok(())
             }
@@ -861,10 +1030,14 @@ impl MessageSender for WsSender {
                 // the client catches up.
                 self.dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if is_video {
-                    self.consecutive_video_full_drops =
-                        self.consecutive_video_full_drops.saturating_add(1);
-                    if self.consecutive_video_full_drops >= WS_VIDEO_FULL_DROPS_BEFORE_CLOSE {
+                if video_keyframe.is_some() {
+                    self.dropping_video_until_keyframe = true;
+                    self.recovery
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let since = self
+                        .video_backlog_started_at
+                        .get_or_insert_with(Instant::now);
+                    if since.elapsed() >= WS_VIDEO_BACKLOG_CLOSE_AFTER {
                         return Err(anyhow::anyhow!("ws video backlog exceeded"));
                     }
                 }
@@ -890,5 +1063,251 @@ impl MessageReceiver for WsReceiver {
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("ws closed")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phantom_core::encode::{EncodedFrame, VideoCodec};
+
+    #[test]
+    fn paired_audio_bypasses_a_full_video_queue_and_falls_back_after_close() {
+        let routes = AudioRoutes::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sender = WsSender {
+            audio: Some(SessionAudio::new(routes.clone())),
+            tx,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        sender
+            .send_msg(&Message::Hello {
+                width: 16,
+                height: 16,
+                format: phantom_core::frame::PixelFormat::Bgra8,
+                protocol_version: phantom_core::protocol::PROTOCOL_VERSION,
+                audio: true,
+                video_codec: VideoCodec::H264,
+                session_token: vec![9; 32],
+            })
+            .unwrap();
+        assert!(matches!(
+            bincode::deserialize::<Message>(&rx.recv().unwrap()).unwrap(),
+            Message::Hello { .. }
+        ));
+        let (audio_tx, audio_rx) = mpsc::sync_channel(2);
+        assert!(routes.attach(&"09".repeat(32), audio_tx));
+        sender.send_msg(&video(1, true)).unwrap(); // main queue stays full
+        let audio = Message::AudioFrame {
+            codec: phantom_core::protocol::AudioCodec::Opus,
+            sample_rate: 48000,
+            channels: 2,
+            data: vec![5, 6],
+        };
+        sender.send_msg(&audio).unwrap();
+        assert!(
+            matches!(bincode::deserialize::<Message>(&audio_rx.recv().unwrap()).unwrap(), Message::AudioFrame { data, .. } if data == [5, 6])
+        );
+        assert_eq!(sender.dropped_count(), 0);
+        assert!(matches!(
+            bincode::deserialize::<Message>(&rx.recv().unwrap()).unwrap(),
+            Message::VideoFrame { sequence: 1, .. }
+        ));
+        drop(audio_rx);
+        sender.send_msg(&audio).unwrap();
+        assert!(
+            matches!(bincode::deserialize::<Message>(&rx.recv().unwrap()).unwrap(), Message::AudioFrame { data, .. } if data == [5, 6])
+        );
+    }
+
+    #[test]
+    fn poll_socket_preserves_data_and_restores_blocking_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut socket = WsPollSocket(socket);
+        let mut byte = [0];
+        assert_eq!(
+            socket.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        socket.write_all(b"request").unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut request = [0; 7];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"request");
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(b"reply").unwrap();
+        });
+        // Bypass the polling wrapper to verify its previous empty read left
+        // the socket blocking, with the peer's reply still intact.
+        socket
+            .0
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reply = [0; 5];
+        socket.0.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply");
+        sender.join().unwrap();
+        assert_eq!(socket.read(&mut byte).unwrap(), 0);
+    }
+
+    fn video(sequence: u64, is_keyframe: bool) -> Message {
+        Message::VideoFrame {
+            sequence,
+            frame: Box::new(EncodedFrame {
+                codec: VideoCodec::H264,
+                data: vec![sequence as u8],
+                is_keyframe,
+            }),
+        }
+    }
+
+    #[test]
+    fn queue_loss_drops_deltas_until_next_keyframe() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sender = WsSender {
+            audio: None,
+            tx,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        sender.send_msg(&video(1, true)).unwrap();
+        sender.send_msg(&video(2, false)).unwrap();
+        assert!(sender.dropping_video_until_keyframe);
+
+        let _ = rx.recv().unwrap();
+        sender.send_msg(&video(3, false)).unwrap();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        sender.send_msg(&video(4, true)).unwrap();
+        assert!(!sender.dropping_video_until_keyframe);
+        let decoded: Message = bincode::deserialize(&rx.recv().unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::VideoFrame {
+                sequence: 4,
+                frame
+            } if frame.is_keyframe
+        ));
+    }
+
+    #[test]
+    fn drained_queue_requests_one_keyframe_and_preserves_frame_order() {
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+        struct PausedWriter {
+            entered: Option<mpsc::Sender<()>>,
+            resume: mpsc::Receiver<()>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Read for PausedWriter {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl Write for PausedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let socket = PausedWriter {
+            entered: Some(entered_tx),
+            resume: resume_rx,
+            bytes: bytes.clone(),
+        };
+        let ws = WebSocket::from_raw_socket(socket, tungstenite::protocol::Role::Server, None);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (feedback_tx, feedback_rx) = mpsc::channel();
+        let recovery = Arc::new(AtomicBool::new(false));
+        let mut sender = WsSender {
+            audio: None,
+            tx,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery: recovery.clone(),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let io = std::thread::spawn(move || ws_io_loop(ws, rx, feedback_tx, recovery));
+
+        sender.send_msg(&video(1, true)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        sender.send_msg(&video(2, false)).unwrap(); // buffered behind paused writer
+        sender.send_msg(&video(3, false)).unwrap(); // full: must discard later deltas
+        assert!(sender.dropping_video_until_keyframe);
+        assert!(matches!(
+            feedback_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        resume_tx.send(()).unwrap();
+        let feedback = feedback_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            bincode::deserialize::<Message>(&feedback).unwrap(),
+            Message::RequestKeyframe
+        ));
+        sender.send_msg(&video(4, false)).unwrap(); // still invalid until recovery IDR
+        sender.send_msg(&video(5, true)).unwrap();
+        assert!(!sender.dropping_video_until_keyframe);
+        assert_eq!(sender.dropped_count(), 2);
+        drop(sender);
+        io.join().unwrap();
+        assert!(matches!(
+            feedback_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+
+        let wire = std::io::Cursor::new(bytes.lock().unwrap().clone());
+        let mut reader =
+            WebSocket::from_raw_socket(wire, tungstenite::protocol::Role::Client, None);
+        for expected in [1, 2, 5] {
+            let data = reader.read().unwrap().into_data();
+            assert!(matches!(
+                bincode::deserialize::<Message>(&data).unwrap(),
+                Message::VideoFrame { sequence, .. } if sequence == expected
+            ));
+        }
+        assert!(matches!(
+            reader.read().unwrap(),
+            tungstenite::Message::Close(_)
+        ));
+    }
+
+    #[test]
+    fn persistent_full_queue_still_closes_at_backlog_deadline() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let mut sender = WsSender {
+            audio: None,
+            tx,
+            dropping_video_until_keyframe: false,
+            video_backlog_started_at: None,
+            recovery: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        sender.send_msg(&video(1, true)).unwrap();
+        sender.send_msg(&video(2, false)).unwrap();
+        sender.video_backlog_started_at = Some(Instant::now() - WS_VIDEO_BACKLOG_CLOSE_AFTER);
+        assert!(sender
+            .send_msg(&video(3, false))
+            .unwrap_err()
+            .to_string()
+            .contains("backlog exceeded"));
     }
 }

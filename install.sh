@@ -207,6 +207,13 @@ download_and_install() {
 
     chmod +x "$_tmp"
 
+    # Resolve the directory before generating autostart or running doctor.
+    # A relative/custom destination must refer to the same binary after login.
+    if [ ! -d "$INSTALL_DIR" ]; then
+        mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
+    fi
+    INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+
     # Install — use sudo if needed
     if [ -w "$INSTALL_DIR" ]; then
         mv "$_tmp" "${INSTALL_DIR}/${_name}"
@@ -664,6 +671,22 @@ linux_configure_uinput() {
 # DISPLAY + XAUTHORITY + seat from the live session for free.
 # ===========================================================================
 
+# Desktop Exec arguments have both string-value and command-line escaping.
+# Keep the binary as a positional argument to sh, never interpolate it into code.
+# https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+linux_desktop_exec_arg() {
+    case "$1" in
+        *'
+'*|*"$(printf '\r')"*)
+            echo "Error: install path cannot contain a line break" >&2
+            return 1
+            ;;
+    esac
+    printf '"'
+    printf '%s' "$1" | sed 's/\\/\\\\\\\\/g; s/"/\\\\"/g; s/`/\\\\`/g; s/\$/\\\\$/g; s/%/%%/g'
+    printf '"'
+}
+
 linux_install_autostart() {
     echo ""
     echo "Installing phantom-server autostart entry..."
@@ -679,15 +702,18 @@ linux_install_autostart() {
     # session's autostart would then bind-fail silently. Wrapper kills
     # stale instances first, then launches fresh on the current DISPLAY.
     sudo -u "$TARGET_USER" mkdir -p "$_autostart_dir"
-    sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-server.desktop" > /dev/null <<'EOF'
+    _exec_bin="$(linux_desktop_exec_arg "$INSTALL_DIR/phantom-server")" || return 1
+    {
+        cat <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Phantom Server
 Comment=Remote-desktop server. Edit Exec= below to change transport/encryption/auth.
-Exec=sh -c 'pkill -x phantom-server 2>/dev/null; for i in 1 2 3 4 5; do pgrep -x phantom-server >/dev/null 2>&1 || break; sleep 1; done; exec /usr/local/bin/phantom-server --no-encrypt --transport tcp,web'
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
 EOF
+        printf '%s' 'Exec=sh -c "pkill -x phantom-server 2>/dev/null; for i in 1 2 3 4 5; do pgrep -x phantom-server >/dev/null 2>&1 || break; sleep 1; done; exec \\"\\$1\\" --no-encrypt --transport tcp,web" sh '
+        printf '%s\n' "$_exec_bin"
+        printf '%s\n' 'X-GNOME-Autostart-enabled=true' 'NoDisplay=true'
+    } | sudo -u "$TARGET_USER" tee "$_autostart_dir/phantom-server.desktop" > /dev/null
     echo "  Wrote $_autostart_dir/phantom-server.desktop"
     echo "  phantom-server will start at your next graphical login."
     echo "  Edit Exec= in that file to change transport / encryption / auth flags."
@@ -1281,12 +1307,12 @@ doctor_reboot() {
 }
 
 linux_phantom_server_bin() {
-    if have_cmd phantom-server; then
-        command -v phantom-server
-        return 0
-    fi
     if [ -x "$INSTALL_DIR/phantom-server" ]; then
         echo "$INSTALL_DIR/phantom-server"
+        return 0
+    fi
+    if have_cmd phantom-server; then
+        command -v phantom-server
         return 0
     fi
     return 1

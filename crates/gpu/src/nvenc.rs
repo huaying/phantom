@@ -23,6 +23,7 @@ pub struct NvencEncoder {
     output_buf: *mut c_void,
     width: u32,
     height: u32,
+    fps: u32,
     /// Persistent GPU buffer for NV12 input (reused across frames).
     device_buf: CUdeviceptr,
     _device_buf_size: usize,
@@ -231,6 +232,7 @@ impl NvencEncoder {
             output_buf,
             width,
             height,
+            fps,
             device_buf,
             _device_buf_size: nv12_size,
             nv12_buf: vec![0u8; nv12_size],
@@ -248,6 +250,37 @@ impl NvencEncoder {
 
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Rebuild only when the capture geometry changes. A new session emits
+    /// SPS/PPS for the new dimensions before any delta frames are encoded.
+    /// The shared NVFBC context must be released before calling this method.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.dimensions() == (width, height) {
+            return Ok(());
+        }
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            bail!("invalid NV12 dimensions: {width}x{height}");
+        }
+        // Keep the old encoder intact if creation fails. Transfer context
+        // ownership only after success so dropping it cannot invalidate the
+        // replacement encoder's context.
+        let mut replacement = unsafe {
+            Self::with_context(
+                Arc::clone(&self.cuda),
+                self.ctx,
+                false,
+                width,
+                height,
+                self.fps,
+                self.bitrate_kbps,
+                self.codec,
+            )?
+        };
+        replacement.owns_ctx = self.owns_ctx;
+        self.owns_ctx = false;
+        *self = replacement;
+        Ok(())
     }
 
     /// Encode a raw NV12 buffer that's already on the GPU (CUdeviceptr).

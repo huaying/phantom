@@ -30,3 +30,5 @@ pub mod service_win;
 pub mod session;
 pub mod sso;
 pub mod transport;
+pub mod windows_display_policy;
+pub mod windows_session_policy;

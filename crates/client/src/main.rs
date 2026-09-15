@@ -7,6 +7,7 @@
 
 #[cfg(feature = "audio")]
 mod audio_playback;
+mod clipboard_worker;
 #[cfg(feature = "av1")]
 mod decode_av1;
 mod decode_h264;
@@ -22,6 +23,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use phantom_core::clipboard::ClipboardTracker;
 use phantom_core::crypto;
+use phantom_core::display_modes::{closest_mode_for_viewport, NATIVE_DEFAULT_MAX_MODE};
 use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::transport::{MessageReceiver, MessageSender};
@@ -177,8 +179,7 @@ struct Session {
     scroll_accum: (f32, f32),
     modifiers: winit::event::Modifiers,
     clipboard: ClipboardTracker,
-    arboard: Option<arboard::Clipboard>,
-    clipboard_poll: Instant,
+    clipboard_worker: clipboard_worker::ClipboardWorker,
     /// Pending resolution change (debounce 300ms)
     pending_resize: Option<(u32, u32, Instant)>,
     stats_time: Instant,
@@ -221,24 +222,6 @@ struct App {
     client_id: [u8; 16],
 }
 
-/// Standard VDD resolutions. Must be kept in sync with the web client's
-/// STANDARD_RESOLUTIONS (crates/web/src/lib.rs) and vdd_settings.xml on the
-/// server side — any value here that isn't in vdd_settings.xml won't apply.
-const STANDARD_RESOLUTIONS: &[(u32, u32)] = &[
-    (1024, 768),
-    (1152, 864),
-    (1280, 720),
-    (1280, 800),
-    (1280, 960),
-    (1280, 1024),
-    (1366, 768),
-    (1440, 900),
-    (1600, 900),
-    (1600, 1200),
-    (1680, 1050),
-    (1920, 1080),
-];
-
 /// Pick the resolution the client will converge to after the window opens.
 /// Matches the post-open debounced-resize formula in the event loop
 /// (`window_size * 1.3` then closest standard), so the server lands at the
@@ -260,13 +243,8 @@ fn preferred_server_resolution() -> (u32, u32) {
     };
     let tw = (screen_w as f32 * 0.8 * 1.3) as u32;
     let th = (screen_h as f32 * 0.8 * 1.3) as u32;
-    let mut best = (0u32, 0u32);
-    for &(w, h) in STANDARD_RESOLUTIONS {
-        if w <= tw && h <= th {
-            best = (w, h);
-        }
-    }
-    best
+    let mode = closest_mode_for_viewport(tw, th, NATIVE_DEFAULT_MAX_MODE, 1.0);
+    (mode.width, mode.height)
 }
 
 impl App {
@@ -620,8 +598,7 @@ impl App {
             scroll_accum: (0.0, 0.0),
             modifiers: winit::event::Modifiers::default(),
             clipboard: ClipboardTracker::default(),
-            arboard: arboard::Clipboard::new().ok(),
-            clipboard_poll: Instant::now(),
+            clipboard_worker: clipboard_worker::ClipboardWorker::spawn(),
             pending_resize: None,
             stats_time: Instant::now(),
             stats_video: 0,
@@ -740,15 +717,12 @@ impl ApplicationHandler for App {
                                     Some(session.display.map_from_server(cursor.x, cursor.y));
                             }
                         }
-                        Message::CursorShape(shape) => {
-                            if shape.shape_id != 0 {
-                                if let Some(cursor) =
-                                    display_winit::CursorBitmap::from_shape(&shape)
-                                {
-                                    session.cursor_shapes.insert(shape.shape_id, cursor);
-                                }
+                        Message::CursorShape(shape) if shape.shape_id != 0 => {
+                            if let Some(cursor) = display_winit::CursorBitmap::from_shape(&shape) {
+                                session.cursor_shapes.insert(shape.shape_id, cursor);
                             }
                         }
+                        Message::CursorShape(_) => {}
                         Message::FileOffer {
                             transfer_id,
                             name,
@@ -808,40 +782,34 @@ impl ApplicationHandler for App {
                 // Clipboard from server
                 for text in clipboard_msgs {
                     if session.clipboard.on_remote_update(&text) {
-                        if let Some(ref mut ab) = session.arboard {
-                            let _ = ab.set_text(&text);
-                        }
+                        session.clipboard_worker.set_text(text);
                     }
                 }
 
-                // Debounced resolution change (300ms after last resize)
+                // Clipboard APIs can block while another application lazily
+                // provides data, so all reads and writes stay off the UI thread.
+                for event in session.clipboard_worker.drain_events() {
+                    match event {
+                        clipboard_worker::ClipboardEvent::Observed(text) => {
+                            if let Some(changed) = session.clipboard.check_local_change(&text) {
+                                let _ = session.input_tx.send(Message::ClipboardSync(changed));
+                            }
+                        }
+                        clipboard_worker::ClipboardEvent::Paste(text) if !text.is_empty() => {
+                            let _ = session.input_tx.send(Message::PasteText(text));
+                        }
+                        clipboard_worker::ClipboardEvent::Paste(_) => {}
+                    }
+                }
+
+                // Debounced resolution change. Native resize drags can produce
+                // many intermediate sizes; server-side display mode switches
+                // are expensive, so wait for the drag to settle.
                 if let Some((rw, rh, when)) = session.pending_resize {
-                    if when.elapsed() >= Duration::from_millis(300) {
+                    if when.elapsed() >= Duration::from_millis(700) {
                         session.pending_resize = None;
-                        // 1.3x scale same as web client
-                        let tw = (rw as f64 * 1.3) as u32;
-                        let th = (rh as f64 * 1.3) as u32;
-                        let resolutions: &[(u32, u32)] = &[
-                            (1024, 768),
-                            (1152, 864),
-                            (1280, 720),
-                            (1280, 800),
-                            (1280, 960),
-                            (1280, 1024),
-                            (1366, 768),
-                            (1440, 900),
-                            (1600, 900),
-                            (1600, 1200),
-                            (1680, 1050),
-                            (1920, 1080),
-                        ];
-                        let (w, h) = resolutions
-                            .iter()
-                            .rfind(|&&(rw, rh)| rw <= tw && rh <= th)
-                            .copied()
-                            .unwrap_or((1024, 768));
-                        // Don't go below 1024x768 — very small VDD resolutions cause
-                        // Windows to move windows to the other display.
+                        let mode = closest_mode_for_viewport(rw, rh, NATIVE_DEFAULT_MAX_MODE, 1.3);
+                        let (w, h) = (mode.width, mode.height);
                         if w >= 1024
                             && h >= 768
                             && (w != session.display.server_width()
@@ -864,17 +832,6 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Clipboard poll (local → server)
-                if session.clipboard_poll.elapsed() >= Duration::from_millis(250) {
-                    session.clipboard_poll = Instant::now();
-                    if let Some(ref mut ab) = session.arboard {
-                        if let Ok(text) = ab.get_text() {
-                            if let Some(changed) = session.clipboard.check_local_change(&text) {
-                                let _ = session.input_tx.send(Message::ClipboardSync(changed));
-                            }
-                        }
-                    }
-                }
                 // Flush accumulated scroll (once per frame, like Parsec)
                 if session.scroll_accum.0 != 0.0 || session.scroll_accum.1 != 0.0 {
                     let _ = session
@@ -954,15 +911,8 @@ impl ApplicationHandler for App {
                     )
                     && (mods.super_key() || mods.control_key());
 
-                if is_paste {
-                    if let Some(ref mut ab) = session.arboard {
-                        if let Ok(text) = ab.get_text() {
-                            if !text.is_empty() {
-                                let _ = session.input_tx.send(Message::PasteText(text));
-                                return; // eat the V key
-                            }
-                        }
-                    }
+                if is_paste && session.clipboard_worker.request_paste() {
+                    return; // eat the V key; the worker sends PasteText asynchronously
                 }
 
                 // F11: toggle fullscreen
@@ -1080,13 +1030,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(_) => {
-                // Debounced resolution change — use logical pixels (macOS retina = 2x physical)
-                let logical = session
-                    .display
-                    .window
-                    .inner_size()
-                    .to_logical::<u32>(session.display.window.scale_factor());
-                session.pending_resize = Some((logical.width, logical.height, Instant::now()));
+                // Exclude client-only chrome from remote desktop negotiation.
+                let (width, height) = session.display.video_viewport_logical_size();
+                session.pending_resize = Some((width, height, Instant::now()));
             }
             WindowEvent::DroppedFile(path) => {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy();
