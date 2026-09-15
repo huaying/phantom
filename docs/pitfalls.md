@@ -148,6 +148,18 @@ you're making touches one of these areas, re-read the relevant entry first.
   testing runbook and `scripts/windows-audio-polling.ps1`.
 
 ## Capture / encode (GPU)
+- **NVDEC ABI and readiness**: CUVID packet lengths/flags are C `unsigned long`
+  (8 bytes on Linux). In SDK 12.2, parser userdata/sequence/decode/display
+  callbacks start at offsets 40/48/56/64, and `CUVIDPROCPARAMS` is 264 bytes.
+  Incorrect layouts can let parser initialization succeed while producing no
+  frames. Verify RGB pixels, not initialization or accepted-packet counters.
+  Native FPS must count nonempty decoder output. Mark complete access units
+  with ENDOFPICTURE so a static desktop's last picture is not buffered.
+  Rebuild decode surfaces from sequence coded dimensions/crop and the required
+  surface count; Hello dimensions alone are insufficient after a resize.
+  Preserve the caller CUDA context and release parser/decoder/context on both
+  successful teardown and constructor errors. `nvdec_smoke` checks actual
+  color pixels through five resolutions and context restoration.
 - **NVFBC struct sizes**: must match driver's expected sizeof exactly.
   Use opaque byte arrays, not Rust structs.
 - **NVFBC `FORCE_REFRESH`**: blocks on driver 550. Use NOWAIT + ensure

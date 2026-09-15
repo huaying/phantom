@@ -30,6 +30,9 @@ struct Args {
     /// Serve plaintext TCP on loopback for the native client instead of HTTPS.
     #[arg(long)]
     tcp: bool,
+    /// Log controlled test input without injecting it into the host desktop.
+    #[arg(long)]
+    trace_input: bool,
 }
 
 fn main() -> Result<()> {
@@ -142,6 +145,9 @@ fn serve(
                         hotspot_y: 0,
                         rgba: [255, 255, 255, 255].repeat(64),
                     }))?;
+                }
+                Ok(Message::Input(event)) if args.trace_input => {
+                    tracing::info!(?event, "synthetic input received");
                 }
                 Ok(_) => {}
                 Err(mpsc::TryRecvError::Empty) => break,

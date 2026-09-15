@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   quality:
-    runs-on: ubuntu-22.04
+    # Full-workspace checks include optional AV1: dav1d-sys needs >= 1.3.
+    # Keep the shipped Linux binaries on 22.04 below for glibc compatibility.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

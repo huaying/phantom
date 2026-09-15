@@ -6,6 +6,10 @@ edition = "2021"
 [features]
 nvdec = []
 
+[[example]]
+name = "nvdec_smoke"
+required-features = ["nvdec"]
+
 [dependencies]
 phantom-core = { path = "../core" }
 anyhow = "1"

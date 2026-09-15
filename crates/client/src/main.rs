@@ -661,7 +661,7 @@ impl ApplicationHandler for App {
                         Message::VideoFrame { frame, .. } => {
                             let decode_start = std::time::Instant::now();
                             match session.decoder.decode_frame(&frame.data) {
-                                Ok(rgb32) => {
+                                Ok(rgb32) if !rgb32.is_empty() => {
                                     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
                                     session.stats_decode_ms += decode_ms;
                                     // Check if decoder resolution changed (SPS/PPS update)
@@ -674,6 +674,10 @@ impl ApplicationHandler for App {
                                     last_decoded = Some(rgb32);
                                     session.stats_video += 1;
                                 }
+                                // A parser can accept input before a decoded
+                                // picture is ready. Keep the previous picture
+                                // and do not count empty output as video FPS.
+                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         size = frame.data.len(),

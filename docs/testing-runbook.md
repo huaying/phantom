@@ -152,6 +152,10 @@ Manual Linux checks:
 
 - Open web client and verify non-black desktop.
 - Move/drag a window for at least 10 seconds.
+- When NVDEC or its bindings change, run the GPU-only synthetic regression:
+  `cargo run -p phantom-gpu --release --features nvdec --example nvdec_smoke`.
+  It must emit complete, correctly colored frames through every size change;
+  a successful decoder initialization is insufficient.
 - With a synthetic test desktop, change to another supported resolution and
   back while the viewer remains connected, then repeat with a mode change
   between connections. Test both RTC and WSS. Check decoded dimensions,
@@ -401,6 +405,10 @@ and connect the native client to `127.0.0.1:9920`. This fixture binds loopback,
 ignores clipboard payloads and never injects input into the host OS.
 It supplements real remote input/cursor checks; decoded frames do not replace
 visual verification of the native UI.
+For controlled test keystrokes and mouse actions, add `--trace-input` to the
+fixture and verify the received event order in its log. It still does not
+inject input into the host or process clipboard payloads. An isolated Xvfb
+display can host the Linux native window without disturbing a live desktop.
 
 Check:
 

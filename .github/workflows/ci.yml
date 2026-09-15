@@ -28,7 +28,7 @@ jobs:
         run: ./scripts/validation/test-windows-doctor.ps1
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
