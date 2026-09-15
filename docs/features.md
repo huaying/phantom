@@ -66,7 +66,7 @@ have hardware AV1 decoders.
 |---|---|---|
 | OpenH264 CPU | `client/src/decode_h264.rs` | All |
 | dav1d (AV1) | `client/src/decode_av1.rs` | All (feature `av1`) |
-| NVDEC | `gpu/src/nvdec.rs` | Linux + Windows NVIDIA (feature `nvdec`) |
+| NVDEC | `gpu/src/nvdec.rs` | Linux NVIDIA (feature `nvdec`); Windows currently falls back to software decoding |
 | VideoToolbox | `client/src/decode_videotoolbox.rs` | macOS (H.264 only) |
 | WebCodecs | `web/src/lib.rs` | Browser |
 

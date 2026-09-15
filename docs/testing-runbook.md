@@ -417,6 +417,10 @@ Check:
 - Cursor shape and hotspot are aligned.
 - Top bar/UI changes render correctly.
 - Audio works if audio changed.
+- After native audio changes, reconnect at least three times and verify old
+  device streams and audio workers stop, leaving one active output. With an
+  isolated synthetic tone sink, measure its output PCM after reconnect; decoder
+  initialization and an open device alone do not prove playback or cleanup.
 
 ## 6. Reporting Rules
 
