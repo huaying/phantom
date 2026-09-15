@@ -478,3 +478,13 @@ you're making touches one of these areas, re-read the relevant entry first.
   from the client's `resolution hint`. Investigate whether the
   "1920x1080 default" log line is misleading or the VDD config isn't
   actually being applied.
+
+### Native audio output survives reconnect
+
+The native client previously forgot its CPAL stream and left an endless monitor
+thread per connection. A real reconnect on an isolated PulseAudio null sink
+increased active outputs from one to two. Playback now belongs to the session:
+dropping it stops CPAL, closes the Opus channel and joins the decoder/monitor
+workers. Initialization failures use the same cleanup. Validate repeated native
+reconnects by checking one active output, stopped old workers and continuous
+known-tone PCM; successful audio initialization alone cannot detect this leak.

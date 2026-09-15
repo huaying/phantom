@@ -7,9 +7,42 @@ use anyhow::{Context, Result};
 use std::sync::mpsc;
 use tracing::{info, warn};
 
-/// Start the audio playback pipeline. Returns a sender that accepts raw Opus
-/// packets. Drop the sender to stop playback.
-pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender<Vec<u8>>> {
+/// Own every playback resource for one connection. In particular, CPAL streams
+/// must stop on reconnect rather than remain alive playing an exhausted ring.
+pub struct Playback {
+    tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    stream: Option<cpal::Stream>,
+    decoder: Option<std::thread::JoinHandle<()>>,
+    monitor: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Playback {
+    pub fn enqueue(&self, data: Vec<u8>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(data);
+        }
+    }
+}
+
+impl Drop for Playback {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.stream.take();
+        self.tx.take();
+        if let Some(worker) = self.decoder.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.monitor.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Start playback for one session; dropping the owner stops the output and
+/// joins its workers. The same cleanup applies to initialization failures.
+pub fn start_playback(sample_rate: u32, channels: u8) -> Result<Playback> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let opus_channels = match channels {
@@ -65,7 +98,7 @@ pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender
 
     // Decoder thread: Opus → PCM → ring buffer
     let ch = channels;
-    std::thread::Builder::new()
+    let decoder_worker = std::thread::Builder::new()
         .name("audio-decode".into())
         .spawn(move || {
             // Opus decodes to i16, we convert to f32 for cpal
@@ -123,6 +156,14 @@ pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender
         })
         .context("spawn audio decode thread")?;
 
+    let mut playback = Playback {
+        tx: Some(tx),
+        stream: None,
+        decoder: Some(decoder_worker),
+        monitor: None,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
     // cpal output stream: pulls from ring buffer
     let host = cpal::default_host();
     let device = host
@@ -178,9 +219,7 @@ pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender
 
     stream.play().context("start audio playback")?;
 
-    // Keep stream alive by leaking it (it lives for the session duration).
-    // The stream stops when the process exits.
-    std::mem::forget(stream);
+    playback.stream = Some(stream);
 
     // Monitor thread: every 5s log underrun rate + ring depth so we can
     // tell if jitter buffer is too small / network is dropping packets.
@@ -188,38 +227,45 @@ pub fn start_playback(sample_rate: u32, channels: u8) -> Result<mpsc::SyncSender
     // underrun as ms-of-silence so it's easier to reason about than raw
     // sample counts.
     let samples_per_ms = (sample_rate as u64) * (channels as u64) / 1000;
-    std::thread::Builder::new()
-        .name("audio-monitor".into())
-        .spawn(move || {
-            let mut last_ur = 0u64;
-            let mut last_tr = 0u64;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                let ur = underrun_mon.load(std::sync::atomic::Ordering::Relaxed);
-                let tr = trim_mon.load(std::sync::atomic::Ordering::Relaxed);
-                let dur = ur.saturating_sub(last_ur);
-                let dtr = tr.saturating_sub(last_tr);
-                last_ur = ur;
-                last_tr = tr;
-                let depth_ms = ring_mon
-                    .lock()
-                    .map(|r| r.len() as u64 / samples_per_ms.max(1))
-                    .unwrap_or(0);
-                if dur > 0 || dtr > 0 {
-                    let underrun_ms = dur / samples_per_ms.max(1);
-                    info!(
-                        underrun_ms_5s = underrun_ms,
-                        trims_5s = dtr,
-                        ring_depth_ms = depth_ms,
-                        "audio stats"
-                    );
-                } else {
-                    tracing::debug!(ring_depth_ms = depth_ms, "audio stats");
+    let stop = std::sync::Arc::clone(&playback.stop);
+    playback.monitor = Some(
+        std::thread::Builder::new()
+            .name("audio-monitor".into())
+            .spawn(move || {
+                let mut last_ur = 0u64;
+                let mut last_tr = 0u64;
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(5));
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    let ur = underrun_mon.load(std::sync::atomic::Ordering::Relaxed);
+                    let tr = trim_mon.load(std::sync::atomic::Ordering::Relaxed);
+                    let dur = ur.saturating_sub(last_ur);
+                    let dtr = tr.saturating_sub(last_tr);
+                    last_ur = ur;
+                    last_tr = tr;
+                    let depth_ms = ring_mon
+                        .lock()
+                        .map(|r| r.len() as u64 / samples_per_ms.max(1))
+                        .unwrap_or(0);
+                    if dur > 0 || dtr > 0 {
+                        let underrun_ms = dur / samples_per_ms.max(1);
+                        info!(
+                            underrun_ms_5s = underrun_ms,
+                            trims_5s = dtr,
+                            ring_depth_ms = depth_ms,
+                            "audio stats"
+                        );
+                    } else {
+                        tracing::debug!(ring_depth_ms = depth_ms, "audio stats");
+                    }
                 }
-            }
-        })
-        .context("spawn audio monitor thread")?;
+                info!("audio monitor thread stopped");
+            })
+            .context("spawn audio monitor thread")?,
+    );
 
     info!(sample_rate, channels, "audio playback started");
-    Ok(tx)
+    Ok(playback)
 }

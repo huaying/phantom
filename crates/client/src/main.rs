@@ -185,8 +185,9 @@ struct Session {
     stats_time: Instant,
     stats_video: u64,
     stats_decode_ms: f64,
-    /// Send Opus packets to audio playback thread (None if no audio).
-    audio_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// Playback resources belong to this session and stop on disconnect.
+    #[cfg(feature = "audio")]
+    audio: Option<audio_playback::Playback>,
     /// Session token for reconnect.
     session_token: Vec<u8>,
     /// File transfer handler.
@@ -526,7 +527,7 @@ impl App {
 
         // Start audio playback if server supports it
         #[cfg(feature = "audio")]
-        let audio_tx: Option<mpsc::SyncSender<Vec<u8>>> = if server_audio {
+        let audio = if server_audio {
             match audio_playback::start_playback(48000, 2) {
                 Ok(tx) => Some(tx),
                 Err(e) => {
@@ -538,10 +539,7 @@ impl App {
             None
         };
         #[cfg(not(feature = "audio"))]
-        let audio_tx: Option<mpsc::SyncSender<Vec<u8>>> = {
-            let _ = server_audio;
-            None
-        };
+        let _ = server_audio;
 
         let (frame_tx, frame_rx) = mpsc::channel();
         let recv_connected = connected.clone();
@@ -603,7 +601,8 @@ impl App {
             stats_time: Instant::now(),
             stats_video: 0,
             stats_decode_ms: 0.0,
-            audio_tx,
+            #[cfg(feature = "audio")]
+            audio,
             file_xfer: file_transfer::ClientFileTransfer::new(),
             session_token: new_session_token,
         });
@@ -689,9 +688,12 @@ impl ApplicationHandler for App {
                         }
                         Message::ClipboardSync(t) => clipboard_msgs.push(t),
                         Message::AudioFrame { data, .. } => {
-                            if let Some(ref audio_tx) = session.audio_tx {
-                                let _ = audio_tx.try_send(data);
+                            #[cfg(feature = "audio")]
+                            if let Some(ref audio) = session.audio {
+                                audio.enqueue(data);
                             }
+                            #[cfg(not(feature = "audio"))]
+                            let _ = data;
                         }
                         Message::Ping => {
                             let _ = session.input_tx.send(Message::Pong);
