@@ -241,7 +241,7 @@ linux_install_deps() {
     else
         echo "Warning: could not detect package manager. You may need to install runtime libraries manually."
         echo "  Server: libxcb, libxdo, libpulse"
-        echo "  Client: libasound (ALSA)"
+        echo "  Audio: libopus; client playback also needs libasound (ALSA)"
     fi
 }
 
@@ -256,12 +256,12 @@ linux_install_deps_apt() {
     # Debian / Ubuntu
     _pkgs=""
     if [ "$INSTALL_SERVER" = true ]; then
-        _pkgs="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0"
+        _pkgs="libxcb1 libxcb-shm0 libxcb-randr0 libxtst6 libxdo3 libpulse0 libopus0"
     fi
     if [ "$INSTALL_CLIENT" = true ]; then
         # Client: winit needs xcb + xcb-randr (multi-monitor), softbuffer
         # renders via xcb-shm, alsa for audio output.
-        _pkgs="$_pkgs libxcb1 libxcb-shm0 libxcb-randr0 libasound2"
+        _pkgs="$_pkgs libxcb1 libxcb-shm0 libxcb-randr0 libasound2 libopus0"
     fi
     if [ -n "$_pkgs" ]; then
         linux_apt_update_best_effort
@@ -274,10 +274,10 @@ linux_install_deps_dnf() {
     # Fedora / RHEL
     _pkgs=""
     if [ "$INSTALL_SERVER" = true ]; then
-        _pkgs="libxcb libxdo libXtst pulseaudio-libs"
+        _pkgs="libxcb libxdo libXtst pulseaudio-libs opus"
     fi
     if [ "$INSTALL_CLIENT" = true ]; then
-        _pkgs="$_pkgs libxcb alsa-lib"
+        _pkgs="$_pkgs libxcb alsa-lib opus"
     fi
     if [ -n "$_pkgs" ]; then
         # shellcheck disable=SC2086 # package list must split into separate args
@@ -289,10 +289,10 @@ linux_install_deps_pacman() {
     # Arch Linux
     _pkgs=""
     if [ "$INSTALL_SERVER" = true ]; then
-        _pkgs="libxcb xdotool libxtst libpulse"
+        _pkgs="libxcb xdotool libxtst libpulse opus"
     fi
     if [ "$INSTALL_CLIENT" = true ]; then
-        _pkgs="$_pkgs libxcb alsa-lib"
+        _pkgs="$_pkgs libxcb alsa-lib opus"
     fi
     if [ -n "$_pkgs" ]; then
         # shellcheck disable=SC2086 # package list must split into separate args

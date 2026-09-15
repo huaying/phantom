@@ -488,3 +488,12 @@ dropping it stops CPAL, closes the Opus channel and joins the decoder/monitor
 workers. Initialization failures use the same cleanup. Validate repeated native
 reconnects by checking one active output, stopped old workers and continuous
 known-tone PCM; successful audio initialization alone cannot detect this leak.
+
+### System Opus can remain a runtime dependency
+
+The `audiopus_sys` static feature does not guarantee a self-contained binary:
+`pkg-config` deliberately links libraries under its system root dynamically.
+The Ubuntu canary client linked `libopus.so.0` despite the static feature and
+an installed static archive. Linux installers therefore include the Opus
+runtime for both roles. Inspect `ldd`/`otool -L` on the actual release artifacts;
+do not infer their dependencies from Cargo features alone.
