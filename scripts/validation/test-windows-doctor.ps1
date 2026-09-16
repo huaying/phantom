@@ -70,4 +70,9 @@ Assert-Result 'unknown device state preserves coexistence warning' (Test-VddEnab
 $script:problemQueryFails=$false
 $script:displayDevices+=([pscustomobject]@{FriendlyName='Virtual Display Driver';InstanceId='otherMtt'})
 Assert-Result 'one disabled node must not hide a second enabled VDD' (Test-VddEnabled) $true
+$script:displayDevices=@([pscustomobject]@{FriendlyName='Virtual Display Driver';InstanceId='mtt';ConfigManagerErrorCode=22})
+$script:problemCodes.mtt=$null
+Assert-Result 'disabled CIM node survives missing problem property after reboot' (Test-VddEnabled) $false
+$script:displayDevices[0].ConfigManagerErrorCode=$null
+Assert-Result 'missing CIM and device problem data is not proof of disabled state' (Test-VddEnabled) $true
 Write-Output "Windows doctor regression: $script:checks checks passed"

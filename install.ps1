@@ -237,10 +237,16 @@ function Test-VddEnabled {
         foreach ($device in (Get-PnpDevice -Class Display -ErrorAction Stop)) {
             if (($device.FriendlyName -eq "Virtual Display Driver") -or
                 ($device.InstanceId -like "*MttVDD*")) {
-                $problem = Get-PnpDeviceProperty -InstanceId $device.InstanceId `
-                    -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop
+                # A disabled node can retain CM_PROB_DISABLED in CIM after
+                # reboot while DEVPKEY_Device_ProblemCode has no data.
+                $problemCode = $device.ConfigManagerErrorCode
+                if ($null -eq $problemCode) {
+                    $problem = Get-PnpDeviceProperty -InstanceId $device.InstanceId `
+                        -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop
+                    $problemCode = $problem.Data
+                }
                 # CM_PROB_DISABLED: a retained, disabled driver does not own a head.
-                if ($problem.Data -ne 22) { return $true }
+                if ($problemCode -ne 22) { return $true }
             }
         }
         return $false
