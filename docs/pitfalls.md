@@ -410,6 +410,16 @@ you're making touches one of these areas, re-read the relevant entry first.
   A dedicated Phantom-managed host may provision one sole VDD before capture;
   subsequent capture recovery stays on that target. Adaptive resize and origin
   repair both refuse multi-display topology.
+- **Driver installation also affects display ownership**: installing MTT VDD
+  beside DCV's AWS indirect display can trigger continuous DCV layout changes
+  after sign-out or reboot, even with Phantom stopped. This can block GDI on
+  DWM and leave the login screen black. Automatic installation skips MTT VDD
+  when the DCV service is registered, including while it is stopped; console
+  preservation also skips driver installation. Existing devices are retained,
+  and doctor warns about enabled MTT/DCV coexistence. An operator can identify
+  and disable the redundant `Root\\MttVDD` device when DCV owns the display;
+  do not disable the Basic Display Adapter or AWS display. A compositor already
+  blocked by the layout loop may still need recovery after the conflict ends.
 - **CCD readiness must match the DXGI surface**: an active target name alone is
   insufficient during login transitions. Windows may briefly report an old
   640x480/800x600 duplication surface while CCD already says 1920x1080. Reject

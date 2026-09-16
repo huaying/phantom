@@ -7,7 +7,7 @@ $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path $InstallerPath), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Test-PhantomWinlogonLogReady', 'Test-PhantomSecureDesktopReady')) {
+foreach ($name in @('Test-PhantomWinlogonLogReady', 'Test-PhantomSecureDesktopReady', 'Test-VddPresent', 'Test-VddEnabled')) {
     $fn = $ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
@@ -46,4 +46,28 @@ foreach ($field in @('ServiceLogRecent', 'AgentConnected', 'CaptureEvidence', 'W
 Assert-Result 'missing console fails closed' (Test-PhantomSecureDesktopReady $evidence $false $true $true) $false
 Assert-Result 'stopped service fails closed' (Test-PhantomSecureDesktopReady $evidence $true $false $true) $false
 Assert-Result 'missing browser listener fails closed' (Test-PhantomSecureDesktopReady $evidence $true $true $false) $false
+
+# Exercise device observations without changing the test host's PnP state.
+function Get-PnpDevice {
+    [CmdletBinding()] param([string]$Class)
+    $script:displayDevices
+}
+function Get-PnpDeviceProperty {
+    [CmdletBinding()] param([string]$InstanceId, [string]$KeyName)
+    if ($script:problemQueryFails) { throw 'device state unavailable' }
+    [pscustomobject]@{ Data=$script:problemCodes[$InstanceId] }
+}
+$script:problemQueryFails=$false
+$script:displayDevices=@([pscustomobject]@{FriendlyName='AWS Indirect Display Device';InstanceId='aws'})
+$script:problemCodes=@{mtt=0;otherMtt=0}
+Assert-Result 'AWS display alone needs no Phantom VDD' (Test-VddEnabled) $false
+$script:displayDevices+=([pscustomobject]@{FriendlyName='Virtual Display Driver';InstanceId='mtt'})
+Assert-Result 'enabled MTT must be reported beside AWS' (Test-VddEnabled) $true
+$script:problemCodes.mtt=22
+Assert-Result 'retained disabled MTT does not own a display' (Test-VddEnabled) $false
+$script:problemQueryFails=$true
+Assert-Result 'unknown device state preserves coexistence warning' (Test-VddEnabled) $true
+$script:problemQueryFails=$false
+$script:displayDevices+=([pscustomobject]@{FriendlyName='Virtual Display Driver';InstanceId='otherMtt'})
+Assert-Result 'one disabled node must not hide a second enabled VDD' (Test-VddEnabled) $true
 Write-Output "Windows doctor regression: $script:checks checks passed"

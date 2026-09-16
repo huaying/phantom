@@ -198,6 +198,16 @@ pub enum WindowsProvisioningMode {
 }
 
 impl WindowsProvisioningMode {
+    /// Installing another indirect display can make an external manager keep
+    /// reconfiguring the desktop, even while Phantom itself is stopped.
+    pub fn installs_vdd(self, external_manager_installed: bool) -> bool {
+        match self {
+            Self::PreserveConsole => false,
+            Self::Auto => !external_manager_installed,
+            Self::ManagedVdd => true,
+        }
+    }
+
     pub fn marker_value(self) -> Option<&'static str> {
         match self {
             Self::PreserveConsole => None,
@@ -406,6 +416,29 @@ pub fn decide_layout_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_keeps_external_display_ownership_across_service_restarts() {
+        let mode = WindowsProvisioningMode::Auto;
+        assert!(!mode.installs_vdd(true));
+        for active in [false, true] {
+            assert_ne!(
+                decide_display_provisioning(
+                    mode,
+                    WindowsTopologyKind::NoDisplay,
+                    true,
+                    true,
+                    active,
+                ),
+                WindowsProvisioningDecision::ProvisionVdd,
+            );
+        }
+        assert!(mode.installs_vdd(false));
+        for external_manager in [false, true] {
+            assert!(!WindowsProvisioningMode::PreserveConsole.installs_vdd(external_manager));
+            assert!(WindowsProvisioningMode::ManagedVdd.installs_vdd(external_manager));
+        }
+    }
 
     #[test]
     fn desktop_policy_never_grants_vdd_ownership_outside_default() {

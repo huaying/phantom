@@ -232,6 +232,24 @@ function Test-VddPresent {
     return $false
 }
 
+function Test-VddEnabled {
+    try {
+        foreach ($device in (Get-PnpDevice -Class Display -ErrorAction Stop)) {
+            if (($device.FriendlyName -eq "Virtual Display Driver") -or
+                ($device.InstanceId -like "*MttVDD*")) {
+                $problem = Get-PnpDeviceProperty -InstanceId $device.InstanceId `
+                    -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop
+                # CM_PROB_DISABLED: a retained, disabled driver does not own a head.
+                if ($problem.Data -ne 22) { return $true }
+            }
+        }
+        return $false
+    } catch {
+        # Unknown device state must not hide a possible coexisting display head.
+        return Test-VddPresent
+    }
+}
+
 function Test-ActiveUserSession {
     try {
         $text = @(query user 2>&1)
@@ -553,10 +571,17 @@ function Invoke-PhantomDoctor {
         }
     }
 
-    if (Test-VddPresent) {
-        Add-DoctorResult "OK" "Virtual Display Driver is present"
+    $dcvInstalled = $null -ne (Get-Service -Name 'dcvserver' -ErrorAction SilentlyContinue)
+    if ($dcvInstalled) {
+        if (Test-VddEnabled) {
+            Add-DoctorResult "WARN" "DCV and enabled MTT VDD coexist; this can cause repeated display reconfiguration. Review the MTT device before using DCV as the display owner."
+        } else {
+            Add-DoctorResult "OK" "DCV display manager is installed; Phantom VDD is not required"
+        }
+    } elseif (Test-VddEnabled) {
+        Add-DoctorResult "OK" "Virtual Display Driver is enabled"
     } else {
-        Add-DoctorResult "WARN" "Virtual Display Driver was not detected; headless Windows may black-screen until VDD installs/reboot completes"
+        Add-DoctorResult "WARN" "Virtual Display Driver is not enabled; a headless host needs a working console display or VDD"
     }
 
     $activeUserSession = Test-ActiveUserSession
@@ -711,7 +736,7 @@ if ($noAutostart) {
     Write-Host "  phantom-server.exe" -ForegroundColor Cyan
 } else {
     Write-Host ""
-    Write-Host "Registering Windows Service + installing Virtual Display Driver..." -ForegroundColor Cyan
+    Write-Host "Registering Windows Service and configuring display ownership..." -ForegroundColor Cyan
     $programFilesServerForInstall = Join-Path $env:ProgramFiles "Phantom\phantom-server.exe"
     Stop-ExistingPhantomProcessesForInstall -ProgramFilesServer $programFilesServerForInstall
     Reset-PhantomRuntimeEvidence

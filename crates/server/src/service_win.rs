@@ -3050,10 +3050,33 @@ fn configure_display_provisioning(
     Ok(())
 }
 
+fn dcv_display_manager_installed() -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("check external display manager before installing VDD")?;
+    match manager.open_service("dcvserver", ServiceAccess::QUERY_STATUS) {
+        Ok(_) => Ok(true),
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error()
+                == Some(windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST.0 as i32) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error).context("query DCV service registration"),
+    }
+}
+
 pub fn install_service(
     display_mode: crate::windows_display_policy::WindowsProvisioningMode,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Registration matters even if DCV is stopped during an upgrade. Resolve
+    // this before making changes, and fail closed on access/query errors.
+    let external_manager_installed = dcv_display_manager_installed()?;
 
     // Copy exe to a fixed install location. This avoids binPath being tied
     // to the build directory — updates just overwrite the fixed path.
@@ -3169,16 +3192,26 @@ pub fn install_service(
         }
     };
 
-    // Install Virtual Display Driver (for headless GPU servers).
-    // Non-fatal: server works without it, just at lower resolution on headless VMs.
     println!();
-    println!("Installing Virtual Display Driver...");
-    match install_vdd(&install_dir) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Warning: VDD install failed: {e}");
-            println!("  The server will still work. Install VDD manually if needed.");
+    if display_mode.installs_vdd(external_manager_installed) {
+        if external_manager_installed {
+            println!("  Warning: managed VDD mode requires exclusive display ownership; DCV is also installed.");
         }
+        println!("Installing Virtual Display Driver...");
+        match install_vdd(&install_dir) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Warning: VDD install failed: {e}");
+                println!("  The server will still work. Install VDD manually if needed.");
+            }
+        }
+    } else if external_manager_installed {
+        println!("  DCV is installed; leaving its display driver in control and skipping Phantom VDD installation.");
+        if vdd_device_present() {
+            println!("  Existing MTT VDD is retained. Review enabled MTT devices if DCV repeatedly changes layout.");
+        }
+    } else {
+        println!("  Preserving the existing console; skipping VDD installation.");
     }
 
     configure_display_provisioning(display_mode)?;
@@ -3199,7 +3232,7 @@ pub fn install_service(
 
     // NOTE: do NOT disable Basic Display Adapter — it causes boot failure
     // on reboot. The VDD approach works without disabling other displays.
-    // DXGI targets VDD by device name, so other displays don't interfere.
+    // External display managers retain ownership of their existing drivers.
 
     println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");

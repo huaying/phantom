@@ -124,6 +124,10 @@ before calling it good:
   must not spend the full 10-second IPC/capture timeout on a stale generation.
 - Compare CCD topology before and after lock/unlock/sign-out. Runtime recovery
   must not enable a second display, change primary, or relocate the active path.
+- On a DCV-managed host, verify installation skips Phantom VDD even when the
+  DCV service is temporarily stopped. Retained disabled MTT devices must remain
+  disabled after upgrade; doctor must warn if an enabled MTT device coexists.
+  Include a boot and sign-out check for recurring DCV layout changes.
 - If both WSS and RTC are in scope, test both `https://<host>:9901/?wss` and
   `https://<host>:9901/?rtc`.
 
