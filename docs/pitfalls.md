@@ -7,6 +7,13 @@ you're making touches one of these areas, re-read the relevant entry first.
 - **WASM build order**: must `wasm-pack build` BEFORE
   `cargo build -p phantom-server`. Server embeds the WASM via
   `include_bytes!`, so stale WASM = stale browser bundle.
+- **Pinned Rust versions do not make cross-host WASM byte-identical**: the
+  Linux CI build changed closure symbol hashes and table indices relative to
+  a macOS-generated bundle. Do not use a cross-host binary diff as the freshness
+  gate. CI builds one JS/WASM pair from its checked-out source and passes that
+  artifact to every server build, including Windows and Docker. Its manifest
+  records the source commit, tool versions and both file hashes. This also
+  prevents Windows from silently embedding an older committed web bundle.
 - **WASM feature flag**: `--no-default-features` builds the server
   without WASM (for GPU-only VMs without wasm-pack). Browser will
   receive a stub JS that prints `console.error` and the canvas stays

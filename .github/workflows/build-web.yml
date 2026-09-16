@@ -1,0 +1,62 @@
+name: Build web bundle
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: web-bundle
+      - name: Build WASM
+        run: |
+          cargo install wasm-pack --version 0.14.0 --locked
+          wasm-pack build crates/web --target web --no-typescript -- --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate and record bundle provenance
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node --check crates/web/pkg/phantom_web.js
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {execFileSync} from 'node:child_process';
+          const root = 'crates/web/pkg/';
+          const files = ['phantom_web.js', 'phantom_web_bg.wasm'];
+          const artifacts = files.map(file => {
+            const data = fs.readFileSync(root + file);
+            if (file.endsWith('.wasm') && !WebAssembly.validate(data)) {
+              throw Error('Generated WASM is invalid');
+            }
+            return {file, bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex')};
+          });
+          const manifest = {
+            sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(),
+            candidateCommit: process.env.CANDIDATE_SHA,
+            rustc: execFileSync('rustc', ['--version'], {encoding: 'utf8'}).trim(),
+            wasmPack: execFileSync('wasm-pack', ['--version'], {encoding: 'utf8'}).trim(),
+            artifacts,
+          };
+          fs.writeFileSync(root + 'build-info.json', JSON.stringify(manifest, null, 2) + '\n');
+          console.log(JSON.stringify(manifest));
+          JS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-bundle
+          path: |
+            crates/web/pkg/phantom_web.js
+            crates/web/pkg/phantom_web_bg.wasm
+            crates/web/pkg/build-info.json
+          if-no-files-found: error

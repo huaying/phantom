@@ -6,31 +6,48 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Opus still declares compatibility with CMake versions older than 3.5.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
 jobs:
+  web:
+    uses: ./.github/workflows/build-web.yml
+
   check-windows:
+    needs: web
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       - name: Check server (Windows features)
-        run: cargo check -p phantom-server --features audio
+        run: cargo check --locked -p phantom-server --features audio
       - name: Check client (Windows features, no dav1d)
-        run: cargo check -p phantom-client --no-default-features --features audio
+        run: cargo check --locked -p phantom-client --no-default-features --features audio
       - name: Clippy server (release features)
-        run: cargo clippy -p phantom-server --all-targets -- -D warnings
+        run: cargo clippy --locked -p phantom-server --all-targets -- -D warnings
       - name: Clippy client (release features, no dav1d)
-        run: cargo clippy -p phantom-client --no-default-features --features audio --all-targets -- -D warnings
+        run: cargo clippy --locked -p phantom-client --no-default-features --features audio --all-targets -- -D warnings
       - name: Windows installer doctor regression
         shell: powershell
         run: ./scripts/validation/test-windows-doctor.ps1
 
   test:
+    needs: web
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
@@ -44,18 +61,12 @@ jobs:
             libpulse-dev libopus-dev libasound2-dev python3-gi
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Build WASM (needed for server)
-        run: |
-          cargo install wasm-pack --version 0.14.0 --locked
-          wasm-pack build crates/web --target web --no-typescript
-      - name: Verify generated web bundle is committed
-        run: git diff --exit-code -- crates/web/pkg
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace -- -D warnings
       - name: Doc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
