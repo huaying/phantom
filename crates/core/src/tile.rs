@@ -30,36 +30,12 @@ impl TileDiffer {
         }
     }
 
-    /// Quick check: did anything change at all? (Cheap — samples ~64 points.)
+    /// Check every pixel: small idle updates must not wait for user input.
     pub fn has_changes(&self, frame: &Frame) -> bool {
-        if !self.initialized || self.width != frame.width || self.height != frame.height {
-            return true;
-        }
-
-        let len = frame.data.len();
-        if len != self.prev_data.len() {
-            return true;
-        }
-        if len < 4 {
-            return frame.data != self.prev_data;
-        }
-
-        // Sample 64 evenly-spaced 4-byte pixels
-        let step = (len / 256).max(4);
-        let mut offset = 0;
-        while offset + 4 <= len {
-            if frame.data[offset..offset + 4] != self.prev_data[offset..offset + 4] {
-                return true;
-            }
-            offset += step;
-        }
-
-        // Check last few bytes too
-        if frame.data[len - 4..] != self.prev_data[len - 4..] {
-            return true;
-        }
-
-        false
+        !self.initialized
+            || self.width != frame.width
+            || self.height != frame.height
+            || frame.data != self.prev_data
     }
 
     /// Full diff: return list of changed tiles. Updates internal state.
@@ -208,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn has_changes_fast_check() {
+    fn has_changes_detects_first_static_and_changed_frames() {
         let mut differ = TileDiffer::new();
         let frame = make_frame(128, 128, 42);
         assert!(differ.has_changes(&frame)); // first time
@@ -216,7 +192,7 @@ mod tests {
         assert!(!differ.has_changes(&frame)); // same frame
 
         let mut frame2 = make_frame(128, 128, 42);
-        // Change the last 4 bytes (always checked by has_changes)
+        // Change the final pixel
         let len = frame2.data.len();
         frame2.data[len - 1] = 99;
         assert!(differ.has_changes(&frame2)); // changed

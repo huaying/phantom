@@ -288,14 +288,11 @@ impl X11GetImageCapture {
         let screen_height = unsafe { (xlib.XDisplayHeight)(display, screen) }.max(1) as u32;
         let width = width.min(screen_width);
         let height = height.min(screen_height);
-        let drawable = find_desktop_drawable(&xlib, display, root, width, height).unwrap_or(root);
-        if drawable != root {
-            tracing::info!(
-                root = format_args!("0x{root:x}"),
-                drawable = format_args!("0x{drawable:x}"),
-                "X11 GetImage using desktop drawable"
-            );
-        }
+        // Application windows are siblings of the desktop/wallpaper window.
+        // Reading that window can return only its backing pixels, omitting all
+        // applications above it. Capture their common root to include the
+        // visible desktop, applications and window-manager decorations.
+        let drawable = root;
         Ok(Self {
             xlib,
             display,
@@ -414,90 +411,6 @@ fn frame_sample_stats(data: &[u8]) -> (u32, u32, u32, u32) {
         (sum_g / sampled as u64) as u32,
         (sum_b / sampled as u64) as u32,
     )
-}
-
-#[cfg(target_os = "linux")]
-fn find_desktop_drawable(
-    xlib: &x11_dl::xlib::Xlib,
-    display: *mut x11_dl::xlib::Display,
-    root: std::os::raw::c_ulong,
-    width: u32,
-    height: u32,
-) -> Option<std::os::raw::c_ulong> {
-    use std::ffi::CString;
-    use std::os::raw::{c_int, c_uchar, c_ulong};
-
-    let prop_name = CString::new("_NET_CLIENT_LIST_STACKING").ok()?;
-    let prop = unsafe { (xlib.XInternAtom)(display, prop_name.as_ptr(), 1) };
-    if prop == 0 {
-        return None;
-    }
-
-    let mut actual_type: c_ulong = 0;
-    let mut actual_format: c_int = 0;
-    let mut nitems: c_ulong = 0;
-    let mut bytes_after: c_ulong = 0;
-    let mut data: *mut c_uchar = std::ptr::null_mut();
-
-    let status = unsafe {
-        (xlib.XGetWindowProperty)(
-            display,
-            root,
-            prop,
-            0,
-            4096,
-            0,
-            x11_dl::xlib::XA_WINDOW,
-            &mut actual_type,
-            &mut actual_format,
-            &mut nitems,
-            &mut bytes_after,
-            &mut data,
-        )
-    };
-    if status != x11_dl::xlib::Success as i32 || data.is_null() || actual_format != 32 {
-        if !data.is_null() {
-            unsafe {
-                let _ = (xlib.XFree)(data.cast());
-            }
-        }
-        return None;
-    }
-
-    let windows = unsafe { std::slice::from_raw_parts(data as *const c_ulong, nitems as usize) };
-    let mut best = None;
-    let mut best_area = 0i64;
-    for &window in windows {
-        let mut attrs = std::mem::MaybeUninit::<x11_dl::xlib::XWindowAttributes>::uninit();
-        let ok = unsafe { (xlib.XGetWindowAttributes)(display, window, attrs.as_mut_ptr()) };
-        if ok == 0 {
-            continue;
-        }
-        let attrs = unsafe { attrs.assume_init() };
-        if attrs.class != x11_dl::xlib::InputOutput
-            || attrs.map_state != x11_dl::xlib::IsViewable
-            || attrs.width <= 0
-            || attrs.height <= 0
-        {
-            continue;
-        }
-        let covers_origin = attrs.x <= 0 && attrs.y <= 0;
-        let large_enough = attrs.width as u32 >= width.saturating_mul(3) / 4
-            && attrs.height as u32 >= height.saturating_mul(3) / 4;
-        if !covers_origin || !large_enough {
-            continue;
-        }
-        let area = attrs.width as i64 * attrs.height as i64;
-        if area > best_area {
-            best = Some(window);
-            best_area = area;
-        }
-    }
-
-    unsafe {
-        let _ = (xlib.XFree)(data.cast());
-    }
-    best
 }
 
 #[cfg(target_os = "linux")]

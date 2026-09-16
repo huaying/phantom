@@ -18,9 +18,8 @@ use std::time::{Duration, Instant};
 /// Information the session loop hands to the pipeline each tick.
 pub struct TickCtx {
     /// True iff the session saw an input event since the last tick.
-    /// Pipelines that gate encoding on "did the screen change" (the CPU tile
-    /// differ) use this to force a re-encode after a keystroke — the screen
-    /// often changes shortly after input, but the capture might race.
+    /// GPU capture may wait briefly for the desktop to update after input.
+    /// CPU capture checks every pixel on each available frame.
     pub had_input: bool,
     /// True iff a periodic keyframe is due. Pipelines should honor this on
     /// the next encode.
@@ -130,18 +129,15 @@ impl<'a> Pipeline for CpuPipeline<'a> {
         };
 
         let first_frame = !self.sent_first_frame_encoded;
-        let changed = first_frame || ctx.had_input || self.differ.has_changes(&frame);
-        if !changed {
+        let needs_keyframe = ctx.needs_keyframe || first_frame;
+        if !needs_keyframe && !self.differ.has_changes(&frame) {
             return Ok(None);
         }
 
-        let dirty_tiles = self.differ.diff(&frame);
-
-        if !first_frame && self.congestion.should_skip_frame() {
-            return Ok(None);
-        }
-
-        if dirty_tiles.is_empty() && !first_frame {
+        // A skipped update must remain different from the last encoded frame,
+        // even if the desktop stops changing immediately afterward. Recovery
+        // keyframes must also work on a static desktop and bypass frame skips.
+        if !needs_keyframe && self.congestion.should_skip_frame() {
             return Ok(None);
         }
 
@@ -152,6 +148,7 @@ impl<'a> Pipeline for CpuPipeline<'a> {
         let enc_start = Instant::now();
         let encoded = self.encoder.encode_frame(&frame)?;
         let encode_duration = enc_start.elapsed();
+        self.differ.diff(&frame);
 
         if encoded.is_keyframe && !self.sent_first_frame_encoded {
             tracing::info!(size = encoded.data.len(), "first keyframe sent");

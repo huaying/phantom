@@ -222,6 +222,17 @@ you're making touches one of these areas, re-read the relevant entry first.
   mode and agent mode).
 
 ## Capture / encode (CPU + DXGI)
+- **Sparse change sampling can freeze small CPU desktop updates**: clocks and
+  short text updates can miss every sampled pixel. Compare the full frame,
+  preserve the last encoded baseline when congestion skips an update, and honor
+  requested keyframes even when the desktop is static. The three CPU pipeline
+  regression cases fail with the old behavior and cover each recovery boundary.
+- **X11 capture must include application windows**: capturing a large desktop
+  child window can return its own wallpaper/backing pixels while omitting every
+  application above it. The GetImage fallback must read the root drawable.
+  A non-black first frame is insufficient: open a window, type or animate it,
+  and verify those changing pixels through both WSS and RTC. This was reproduced
+  in the XFCE/Xvfb Docker image with a running clock invisible in the stream.
 - **DXGI `AcquireNextFrame` timeout**: must use a blocking timeout
   (e.g. 33ms), NOT 0. With timeout=0, the capture loop misses frames
   between polls → 15fps instead of 30+fps.

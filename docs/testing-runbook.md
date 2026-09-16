@@ -152,6 +152,9 @@ Manual Linux checks:
 
 - Open web client and verify non-black desktop.
 - Move/drag a window for at least 10 seconds.
+- For CPU/X11 and Docker capture, open an application above the desktop and
+  verify its changing contents through both RTC and WSS. A visible wallpaper
+  and advancing capture loop do not prove application windows are captured.
 - When NVDEC or its bindings change, run the GPU-only synthetic regression:
   `cargo run -p phantom-gpu --release --features nvdec --example nvdec_smoke`.
   It must emit complete, correctly colored frames through every size change;
