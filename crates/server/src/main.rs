@@ -2450,6 +2450,10 @@ fn create_windows_agent_encoder(
 }
 
 #[cfg(target_os = "windows")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Fallback borrows caller-owned capture state; keep the individual mutable fields explicit"
+)]
 fn activate_gdi_fallback(
     cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
     gdi_capture: &mut Option<capture::gdi::GdiCapture>,
@@ -2508,6 +2512,10 @@ fn activate_gdi_fallback(
 }
 
 #[cfg(target_os = "windows")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Fallback borrows caller-owned capture state; keep the individual mutable fields explicit"
+)]
 fn activate_gdi_primary_fallback(
     cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
     gdi_capture: &mut Option<capture::gdi::GdiCapture>,
@@ -2532,6 +2540,10 @@ fn activate_gdi_primary_fallback(
 }
 
 #[cfg(target_os = "windows")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Fallback borrows caller-owned capture state; keep the individual mutable fields explicit"
+)]
 fn activate_gdi_fallback_region(
     cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
     gdi_capture: &mut Option<capture::gdi::GdiCapture>,
@@ -2614,6 +2626,10 @@ fn activate_gdi_fallback_region(
 }
 
 #[cfg(target_os = "windows")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Fallback borrows caller-owned capture state; keep the individual mutable fields explicit"
+)]
 fn activate_cpu_fallback(
     reason: &str,
     cpu_encoder: &mut Option<Box<dyn phantom_core::encode::FrameEncoder>>,
