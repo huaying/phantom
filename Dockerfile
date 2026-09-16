@@ -53,7 +53,9 @@ COPY --from=builder /build/target/release/mock_server /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-EXPOSE 9900/tcp 9900/udp 9901/tcp
+# `server-web`: HTTPS 9900 + RTC UDP 9902.
+# Default `server`: native TCP 9900 + HTTPS 9901 + RTC UDP 9903.
+EXPOSE 9900/tcp 9901/tcp 9902/udp 9903/udp
 
 ENV DISPLAY=:99
 ENV RESOLUTION=1280x720x24

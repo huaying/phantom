@@ -22,10 +22,11 @@ use windows::Win32::Graphics::Gdi::{
     CAPTUREBLT, DIB_RGB_COLORS, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    CloseDesktop, CloseWindowStation, GetThreadDesktop, GetUserObjectInformationW,
+    OpenInputDesktop, OpenWindowStationW, SetProcessWindowStation, SetThreadDesktop,
     DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_CREATEMENU, DESKTOP_CREATEWINDOW,
     DESKTOP_ENUMERATE, DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
-    DESKTOP_WRITEOBJECTS, HDESK, UOI_NAME,
+    DESKTOP_WRITEOBJECTS, HDESK, HWINSTA, UOI_NAME,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,8 +35,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 thread_local! {
-    static SELECTED_INPUT_DESKTOP: RefCell<Option<HDESK>> = RefCell::new(None);
+    static SELECTED_WINDOW_STATION: RefCell<Option<HWINSTA>> = const { RefCell::new(None) };
+    static SELECTED_INPUT_DESKTOP: RefCell<Option<HDESK>> = const { RefCell::new(None) };
 }
+
+const WINSTA_INTERACTIVE_ACCESS: u32 = 0x0000_037f;
 
 fn desktop_name(hdesk: HDESK) -> Option<String> {
     unsafe {
@@ -54,6 +58,37 @@ fn desktop_name(hdesk: HDESK) -> Option<String> {
         }
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..end]))
+    }
+}
+
+/// Attach the process to the interactive window station before selecting a
+/// desktop. Service-launched agents can otherwise inherit a non-interactive
+/// station even when their token/session are correct, which makes display
+/// enumeration and BitBlt behave like Session 0.
+pub fn switch_to_interactive_window_station() -> bool {
+    unsafe {
+        let name: Vec<u16> = "winsta0".encode_utf16().chain(std::iter::once(0)).collect();
+        let Ok(station) = OpenWindowStationW(
+            windows::core::PCWSTR(name.as_ptr()),
+            false,
+            WINSTA_INTERACTIVE_ACCESS,
+        ) else {
+            return false;
+        };
+
+        if SetProcessWindowStation(station).is_err() {
+            let _ = CloseWindowStation(station);
+            return false;
+        }
+
+        SELECTED_WINDOW_STATION.with(|selected| {
+            if let Some(old) = selected.replace(Some(station)) {
+                if old.0 != station.0 {
+                    let _ = CloseWindowStation(old);
+                }
+            }
+        });
+        true
     }
 }
 

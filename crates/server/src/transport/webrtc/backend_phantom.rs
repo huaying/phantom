@@ -1,5 +1,5 @@
 use super::{
-    make_session_bridge,
+    drain_ready, make_session_bridge,
     sctp::{PhantomSctpStack, SctpNotice},
     BackendClient, MediaAudioFrame, RtcMode, WebRtcReceiver, WebRtcSender,
 };
@@ -22,8 +22,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use stun_types::attribute::{Username, XorMappedAddress};
 use stun_types::message::{
-    IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt,
-    MessageWriteVec, ShortTermCredentials, BINDING,
+    IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageIntegrityCredentials,
+    MessageWrite, MessageWriteExt, MessageWriteVec, ShortTermCredentials, BINDING,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,8 @@ const VIDEO_RTX_CACHE_SIZE: usize = 512;
 const RTC_MAX_UDP_PACKETS_PER_FLUSH: usize = 32;
 const RTC_MAX_VIDEO_FRAMES_PER_DRAIN: usize = 2;
 const RTC_STATS_INTERVAL: Duration = Duration::from_secs(5);
+const RTC_SESSION_BRIDGE_CLOSE_GRACE: Duration = Duration::from_millis(500);
+const RTC_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 // Fallback only. When the browser offer contains H.264 fmtp for the selected
 // payload, answer with the offered fmtp so Chrome's decoder path stays on the
 // exact negotiated profile. In-band SPS/PPS still carry the real bitstream
@@ -99,6 +101,8 @@ pub(super) struct PhantomClient {
     last_source: Option<SocketAddr>,
     alive: bool,
     disconnecting: bool,
+    bridge_closed_at: Option<Instant>,
+    peer_consent: PeerConsent,
     connected: bool,
     pending_transmits: VecDeque<(SocketAddr, Vec<u8>)>,
     sctp: PhantomSctpStack,
@@ -139,6 +143,8 @@ impl PhantomClient {
             last_source: None,
             alive: true,
             disconnecting: false,
+            bridge_closed_at: None,
+            peer_consent: PeerConsent::new(Instant::now()),
             connected: false,
             pending_transmits: VecDeque::new(),
             sctp: PhantomSctpStack::new(),
@@ -287,11 +293,12 @@ impl PhantomClient {
         for (i, payload) in payloads.drain(..).enumerate() {
             let marker = i + 1 == packet_count;
             octet_count = octet_count.wrapping_add(payload.len() as u32);
-            let sequence_number = self.media_tx.video_seq;
+            let packet_index = self.media_tx.video_sequence.take();
+            let sequence_number = packet_index as u16;
             let packet = srtp.protect_rtp(RtpProtectParams {
                 payload_type: self.params.video_payload_type,
                 marker,
-                sequence_number,
+                packet_index,
                 timestamp: video_timestamp,
                 ssrc: self.media_tx.video_ssrc,
                 mid_ext_id: self.params.video_mid_ext_id,
@@ -300,7 +307,6 @@ impl PhantomClient {
             });
             cached_packets.push((sequence_number, packet.clone()));
             self.pending_transmits.push_back((source, packet));
-            self.media_tx.video_seq = self.media_tx.video_seq.wrapping_add(1);
         }
         for (sequence_number, packet) in cached_packets {
             self.cache_video_packet(sequence_number, packet);
@@ -328,7 +334,7 @@ impl PhantomClient {
         let packet = srtp.protect_rtp(RtpProtectParams {
             payload_type: self.params.audio_payload_type,
             marker: false,
-            sequence_number: self.media_tx.audio_seq,
+            packet_index: self.media_tx.audio_sequence.take(),
             timestamp: self.media_tx.audio_timestamp,
             ssrc: self.media_tx.audio_ssrc,
             mid_ext_id: self.params.audio_mid_ext_id,
@@ -336,7 +342,6 @@ impl PhantomClient {
             payload: &frame.data,
         });
         self.pending_transmits.push_back((source, packet));
-        self.media_tx.audio_seq = self.media_tx.audio_seq.wrapping_add(1);
         self.media_tx.audio_packet_count = self.media_tx.audio_packet_count.wrapping_add(1);
         self.media_tx.audio_octet_count = self
             .media_tx
@@ -344,6 +349,8 @@ impl PhantomClient {
             .wrapping_add(frame.data.len() as u32);
         self.stats.note_audio_packet(frame.data.len() as u64);
         self.media_tx.audio_last_rtp_timestamp = self.media_tx.audio_timestamp;
+        self.media_tx.audio_last_sent_at = Instant::now();
+        self.media_tx.audio_clock_rate = frame.sample_rate;
         self.media_tx.audio_timestamp = self
             .media_tx
             .audio_timestamp
@@ -362,13 +369,16 @@ impl PhantomClient {
         }
         self.last_rtcp_report_at = Instant::now();
 
+        let report_at = Instant::now();
         let (ntp_secs, ntp_frac) = current_ntp_timestamp();
+        let (video_timestamp, audio_timestamp) =
+            self.media_tx.sender_report_timestamps_at(report_at);
         if self.media_tx.video_packet_count != 0 {
             let sr = build_rtcp_sender_report(
                 self.media_tx.video_ssrc,
                 ntp_secs,
                 ntp_frac,
-                self.media_tx.video_last_rtp_timestamp,
+                video_timestamp,
                 self.media_tx.video_packet_count,
                 self.media_tx.video_octet_count,
             );
@@ -385,7 +395,7 @@ impl PhantomClient {
                 self.media_tx.audio_ssrc,
                 ntp_secs,
                 ntp_frac,
-                self.media_tx.audio_last_rtp_timestamp,
+                audio_timestamp,
                 self.media_tx.audio_packet_count,
                 self.media_tx.audio_octet_count,
             );
@@ -448,6 +458,10 @@ impl BackendClient for PhantomClient {
 
     fn should_disconnect(&self) -> bool {
         self.disconnecting
+            || self.peer_consent.is_expired(Instant::now())
+            || self
+                .bridge_closed_at
+                .is_some_and(|closed_at| closed_at.elapsed() >= RTC_SESSION_BRIDGE_CLOSE_GRACE)
     }
 
     fn poll_and_flush(
@@ -531,20 +545,20 @@ impl BackendClient for PhantomClient {
         let mut control_msgs = Vec::new();
         let mut video_frames = Vec::new();
         let mut audio_frames = Vec::new();
+        let mut bridge_connected = true;
         if let Some(rx) = &self.control_out_rx {
-            control_msgs.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            bridge_connected &= drain_ready(rx, &mut control_msgs, usize::MAX);
         }
         if let Some(rx) = &self.media_video_rx {
-            while video_frames.len() < RTC_MAX_VIDEO_FRAMES_PER_DRAIN {
-                match rx.try_recv() {
-                    Ok(frame) => video_frames.push(frame),
-                    Err(_) => break,
-                }
-            }
+            bridge_connected &= drain_ready(rx, &mut video_frames, RTC_MAX_VIDEO_FRAMES_PER_DRAIN);
         }
         self.stats.note_video_drain(video_frames.len());
         if let Some(rx) = &self.media_audio_rx {
-            audio_frames.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            bridge_connected &= drain_ready(rx, &mut audio_frames, usize::MAX);
+        }
+        if !bridge_connected && self.bridge_closed_at.is_none() {
+            self.bridge_closed_at = Some(Instant::now());
+            tracing::info!("phantom backend session bridge closed");
         }
         let Some(stream_id) = self.control_stream else {
             return;
@@ -562,16 +576,6 @@ impl BackendClient for PhantomClient {
     }
 
     fn handle_receive(&mut self, _candidate_addr: SocketAddr, source: SocketAddr, contents: &[u8]) {
-        self.last_source = Some(source);
-        if !self.logged_first_packet {
-            self.logged_first_packet = true;
-            tracing::info!(
-                source = %source,
-                len = contents.len(),
-                first_byte = contents.first().copied().unwrap_or_default(),
-                "phantom backend received first UDP packet"
-            );
-        }
         if let Some(request) = parse_stun_binding_request(contents) {
             if !self.logged_first_stun {
                 self.logged_first_stun = true;
@@ -582,7 +586,20 @@ impl BackendClient for PhantomClient {
                     "phantom backend received STUN binding request"
                 );
             }
-            if request.username.as_deref() == Some(self.expected_stun_username().as_str()) {
+            let expected_username = self.expected_stun_username();
+            if validate_stun_binding_request(contents, &expected_username, &self.params.ice_pwd)
+                .is_some()
+            {
+                self.last_source = Some(source);
+                self.peer_consent.refresh(Instant::now());
+                if !self.logged_first_packet {
+                    self.logged_first_packet = true;
+                    tracing::info!(
+                        source = %source,
+                        len = contents.len(),
+                        "phantom backend nominated authenticated UDP source"
+                    );
+                }
                 if let Some(response) = build_stun_success_response(contents, source, &self.params)
                 {
                     self.pending_transmits.push_back((source, response));
@@ -593,13 +610,17 @@ impl BackendClient for PhantomClient {
             } else {
                 tracing::debug!(
                     username = ?request.username,
-                    expected = %self.expected_stun_username(),
-                    "phantom backend ignored STUN request with unexpected username"
+                    expected = %expected_username,
+                    "phantom backend ignored unauthenticated STUN request"
                 );
             }
             return;
         }
         if Self::is_stun_packet(contents) {
+            return;
+        }
+        if self.last_source != Some(source) {
+            tracing::debug!(%source, "phantom backend ignored packet from non-nominated source");
             return;
         }
         if is_rtcp_packet(contents) {
@@ -684,17 +705,47 @@ fn is_rtcp_packet(packet: &[u8]) -> bool {
             .unwrap_or(false)
 }
 
+// RFC 3711 section 3.3.1: each SSRC owns a 48-bit packet index. Keeping
+// SEQ and ROC together prevents media from becoming undecryptable at the first
+// 16-bit wrap. Retransmissions reuse cached ciphertext and never allocate here.
+#[derive(Debug, Clone)]
+struct RtpSendSequence {
+    next_index: u64,
+}
+
+impl RtpSendSequence {
+    fn new(initial_sequence: u16) -> Self {
+        Self {
+            next_index: u64::from(initial_sequence),
+        }
+    }
+
+    fn take(&mut self) -> u64 {
+        // A key must not repeat a packet index. A new DTLS session is required
+        // before exhausting the SRTP 48-bit lifetime (not just the wire SEQ).
+        assert!(
+            self.next_index < (1_u64 << 48),
+            "SRTP packet index exhausted"
+        );
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MediaTxState {
     video_ssrc: u32,
     audio_ssrc: u32,
-    video_seq: u16,
-    audio_seq: u16,
+    video_sequence: RtpSendSequence,
+    audio_sequence: RtpSendSequence,
     video_timestamp: u32,
     video_clock_started_at: Instant,
     audio_timestamp: u32,
     video_last_rtp_timestamp: u32,
     audio_last_rtp_timestamp: u32,
+    audio_last_sent_at: Instant,
+    audio_clock_rate: u32,
     video_packet_count: u32,
     audio_packet_count: u32,
     video_octet_count: u32,
@@ -707,16 +758,19 @@ struct MediaTxState {
 impl MediaTxState {
     fn new() -> Self {
         let seed = Uuid::new_v4().as_u128();
+        let now = Instant::now();
         Self {
             video_ssrc: (seed as u32).max(1),
             audio_ssrc: ((seed >> 32) as u32).max(1),
-            video_seq: (seed >> 64) as u16,
-            audio_seq: (seed >> 80) as u16,
+            video_sequence: RtpSendSequence::new((seed >> 64) as u16),
+            audio_sequence: RtpSendSequence::new((seed >> 80) as u16),
             video_timestamp: (seed >> 96) as u32,
-            video_clock_started_at: Instant::now(),
+            video_clock_started_at: now,
             audio_timestamp: (seed >> 64) as u32,
             video_last_rtp_timestamp: (seed >> 96) as u32,
             audio_last_rtp_timestamp: (seed >> 64) as u32,
+            audio_last_sent_at: now,
+            audio_clock_rate: 48_000,
             video_packet_count: 0,
             audio_packet_count: 0,
             video_octet_count: 0,
@@ -727,10 +781,17 @@ impl MediaTxState {
         }
     }
 
+    fn video_timestamp_at(&self, now: Instant) -> u32 {
+        rtp_timestamp_at(
+            self.video_timestamp,
+            self.video_clock_started_at,
+            now,
+            90_000,
+        )
+    }
+
     fn video_timestamp_now(&mut self) -> u32 {
-        let elapsed_ticks =
-            (self.video_clock_started_at.elapsed().as_micros() as u64).saturating_mul(90) / 1000;
-        let timestamp = self.video_timestamp.wrapping_add(elapsed_ticks as u32);
+        let timestamp = self.video_timestamp_at(Instant::now());
         // A single backend drain can flush several queued desktop frames faster
         // than the 90 kHz RTP clock advances. Keep timestamps strictly
         // increasing so browser jitter buffers never see a tiny backwards step.
@@ -741,6 +802,28 @@ impl MediaTxState {
         }
         timestamp
     }
+
+    fn sender_report_timestamps_at(&self, now: Instant) -> (u32, u32) {
+        // RFC 3550 section 6.4.1: RTP and NTP in an SR describe the same
+        // instant. A static desktop may have sent no video for many seconds;
+        // pairing its last packet timestamp with today's NTP time tells the
+        // receiver that the media clock stopped, delaying subsequent motion.
+        (
+            self.video_timestamp_at(now),
+            rtp_timestamp_at(
+                self.audio_last_rtp_timestamp,
+                self.audio_last_sent_at,
+                now,
+                self.audio_clock_rate,
+            ),
+        )
+    }
+}
+
+fn rtp_timestamp_at(base: u32, sampled_at: Instant, now: Instant, clock_rate: u32) -> u32 {
+    let ticks = now.saturating_duration_since(sampled_at).as_nanos() * u128::from(clock_rate)
+        / 1_000_000_000;
+    base.wrapping_add(ticks as u32)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -913,6 +996,7 @@ impl RtcStatsWindow {
 
 struct PhantomSrtpTxContext {
     rtp: PhantomSrtpCipher,
+    rtcp: PhantomSrtpCipher,
 }
 
 struct PhantomSrtpRxContext {
@@ -922,7 +1006,7 @@ struct PhantomSrtpRxContext {
 struct RtpProtectParams<'a> {
     payload_type: u8,
     marker: bool,
-    sequence_number: u16,
+    packet_index: u64,
     timestamp: u32,
     ssrc: u32,
     mid_ext_id: Option<u8>,
@@ -946,50 +1030,74 @@ enum PhantomSrtpCipher {
     },
 }
 
+#[derive(Clone, Copy)]
+enum SrtpKeyUsage {
+    Rtp,
+    Rtcp,
+}
+
+impl SrtpKeyUsage {
+    fn labels(self) -> (u8, u8, u8) {
+        match self {
+            Self::Rtp => (0, 1, 2),
+            Self::Rtcp => (3, 4, 5),
+        }
+    }
+}
+
+fn build_srtp_cipher(
+    profile: SrtpProfile,
+    material: &KeyingMaterial,
+    left: bool,
+    usage: SrtpKeyUsage,
+) -> Result<PhantomSrtpCipher> {
+    match profile {
+        SrtpProfile::AEAD_AES_128_GCM => {
+            let (key, salt) = derive_gcm_material_128(material, left, usage)?;
+            Ok(PhantomSrtpCipher::AeadAes128Gcm {
+                key: Box::new(
+                    Aes128Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
+                ),
+                salt,
+            })
+        }
+        SrtpProfile::AEAD_AES_256_GCM => {
+            let (key, salt) = derive_gcm_material_256(material, left, usage)?;
+            Ok(PhantomSrtpCipher::AeadAes256Gcm {
+                key: Box::new(
+                    Aes256Gcm::new_from_slice(&key)
+                        .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
+                ),
+                salt,
+            })
+        }
+        SrtpProfile::AES128_CM_SHA1_80 => {
+            let (enc_key, auth_key, salt) = derive_cm_material_128(material, left, usage)?;
+            Ok(PhantomSrtpCipher::Aes128CmSha1_80 {
+                enc_key,
+                auth_key,
+                salt,
+            })
+        }
+        _ => bail!("unsupported SRTP profile {}", profile),
+    }
+}
+
 impl PhantomSrtpTxContext {
     fn new(profile: SrtpProfile, material: &KeyingMaterial, active: bool) -> Result<Self> {
         let left = active;
-        let rtp = match profile {
-            SrtpProfile::AEAD_AES_128_GCM => {
-                let (key, salt) = derive_gcm_material_128(material, left)?;
-                PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Box::new(
-                        Aes128Gcm::new_from_slice(&key)
-                            .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
-                    ),
-                    salt,
-                }
-            }
-            SrtpProfile::AEAD_AES_256_GCM => {
-                let (key, salt) = derive_gcm_material_256(material, left)?;
-                PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Box::new(
-                        Aes256Gcm::new_from_slice(&key)
-                            .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
-                    ),
-                    salt,
-                }
-            }
-            SrtpProfile::AES128_CM_SHA1_80 => {
-                let (enc_key, auth_key, salt) = derive_cm_material_128(material, left)?;
-                PhantomSrtpCipher::Aes128CmSha1_80 {
-                    enc_key,
-                    auth_key,
-                    salt,
-                }
-            }
-            _ => {
-                bail!("unsupported SRTP profile {}", profile);
-            }
-        };
-        Ok(Self { rtp })
+        Ok(Self {
+            rtp: build_srtp_cipher(profile, material, left, SrtpKeyUsage::Rtp)?,
+            rtcp: build_srtp_cipher(profile, material, left, SrtpKeyUsage::Rtcp)?,
+        })
     }
 
     fn protect_rtp(&mut self, params: RtpProtectParams<'_>) -> Vec<u8> {
         let header = build_rtp_header(
             params.payload_type,
             params.marker,
-            params.sequence_number,
+            params.packet_index as u16,
             params.timestamp,
             params.ssrc,
             params.mid_ext_id,
@@ -1000,8 +1108,7 @@ impl PhantomSrtpTxContext {
                 key.as_ref(),
                 *salt,
                 &header,
-                params.sequence_number,
-                params.timestamp,
+                params.packet_index,
                 params.ssrc,
                 params.payload,
             ),
@@ -1009,8 +1116,7 @@ impl PhantomSrtpTxContext {
                 key.as_ref(),
                 *salt,
                 &header,
-                params.sequence_number,
-                params.timestamp,
+                params.packet_index,
                 params.ssrc,
                 params.payload,
             ),
@@ -1023,7 +1129,7 @@ impl PhantomSrtpTxContext {
                 auth_key,
                 *salt,
                 &header,
-                params.sequence_number,
+                params.packet_index,
                 params.ssrc,
                 params.payload,
             ),
@@ -1031,16 +1137,18 @@ impl PhantomSrtpTxContext {
     }
 
     fn protect_rtcp(&mut self, packet: &[u8], ssrc: u32, srtcp_index: u32) -> Vec<u8> {
-        match &mut self.rtp {
+        match &mut self.rtcp {
             PhantomSrtpCipher::AeadAes128Gcm { key, salt } => {
                 protect_rtcp_gcm(key.as_ref(), *salt, packet, ssrc, srtcp_index)
             }
             PhantomSrtpCipher::AeadAes256Gcm { key, salt } => {
                 protect_rtcp_gcm(key.as_ref(), *salt, packet, ssrc, srtcp_index)
             }
-            PhantomSrtpCipher::Aes128CmSha1_80 { auth_key, .. } => {
-                protect_rtcp_aes_cm_sha1_80(auth_key, packet, srtcp_index)
-            }
+            PhantomSrtpCipher::Aes128CmSha1_80 {
+                enc_key,
+                auth_key,
+                salt,
+            } => protect_rtcp_aes_cm_sha1_80(enc_key, auth_key, *salt, packet, ssrc, srtcp_index),
         }
     }
 }
@@ -1048,39 +1156,7 @@ impl PhantomSrtpTxContext {
 impl PhantomSrtpRxContext {
     fn new(profile: SrtpProfile, material: &KeyingMaterial, active: bool) -> Result<Self> {
         let left = active;
-        let rtcp = match profile {
-            SrtpProfile::AEAD_AES_128_GCM => {
-                let (key, salt) = derive_gcm_material_128(material, left)?;
-                PhantomSrtpCipher::AeadAes128Gcm {
-                    key: Box::new(
-                        Aes128Gcm::new_from_slice(&key)
-                            .map_err(|_| anyhow!("invalid AES-128-GCM key"))?,
-                    ),
-                    salt,
-                }
-            }
-            SrtpProfile::AEAD_AES_256_GCM => {
-                let (key, salt) = derive_gcm_material_256(material, left)?;
-                PhantomSrtpCipher::AeadAes256Gcm {
-                    key: Box::new(
-                        Aes256Gcm::new_from_slice(&key)
-                            .map_err(|_| anyhow!("invalid AES-256-GCM key"))?,
-                    ),
-                    salt,
-                }
-            }
-            SrtpProfile::AES128_CM_SHA1_80 => {
-                let (enc_key, auth_key, salt) = derive_cm_material_128(material, left)?;
-                PhantomSrtpCipher::Aes128CmSha1_80 {
-                    enc_key,
-                    auth_key,
-                    salt,
-                }
-            }
-            _ => {
-                bail!("unsupported SRTP profile {}", profile);
-            }
-        };
+        let rtcp = build_srtp_cipher(profile, material, left, SrtpKeyUsage::Rtcp)?;
         Ok(Self { rtcp })
     }
 
@@ -1137,15 +1213,14 @@ fn protect_rtp_gcm<C>(
     key: &C,
     salt: [u8; 12],
     header: &[u8],
-    sequence_number: u16,
-    _timestamp: u32,
+    packet_index: u64,
     ssrc: u32,
     payload: &[u8],
 ) -> Vec<u8>
 where
     C: AeadInPlace,
 {
-    let iv = rtp_gcm_iv(salt, ssrc, 0, sequence_number);
+    let iv = rtp_gcm_iv(salt, ssrc, (packet_index >> 16) as u32, packet_index as u16);
     let nonce = Nonce::from_slice(&iv);
     let mut body = payload.to_vec();
     let tag = key
@@ -1323,35 +1398,47 @@ fn parse_rtcp_receiver_report(packet: &[u8]) -> Option<ReceiverReportSummary> {
     }
 }
 
-fn derive_gcm_material_128(material: &KeyingMaterial, left: bool) -> Result<([u8; 16], [u8; 12])> {
+fn derive_gcm_material_128(
+    material: &KeyingMaterial,
+    left: bool,
+    usage: SrtpKeyUsage,
+) -> Result<([u8; 16], [u8; 12])> {
     let master = slice_master::<16, 12>(material, left)?;
+    let (enc_label, _, salt_label) = usage.labels();
     let mut key = [0u8; 16];
-    derive_aes_ctr_material::<Aes128, 16, 12>(&master.0, &master.1, 0, &mut key);
+    derive_aes_ctr_material::<Aes128, 16, 12>(&master.0, &master.1, enc_label, &mut key);
     let mut salt = [0u8; 12];
-    derive_aes_ctr_material::<Aes128, 16, 12>(&master.0, &master.1, 2, &mut salt);
+    derive_aes_ctr_material::<Aes128, 16, 12>(&master.0, &master.1, salt_label, &mut salt);
     Ok((key, salt))
 }
 
-fn derive_gcm_material_256(material: &KeyingMaterial, left: bool) -> Result<([u8; 32], [u8; 12])> {
+fn derive_gcm_material_256(
+    material: &KeyingMaterial,
+    left: bool,
+    usage: SrtpKeyUsage,
+) -> Result<([u8; 32], [u8; 12])> {
     let master = slice_master::<32, 12>(material, left)?;
+    let (enc_label, _, salt_label) = usage.labels();
     let mut key = [0u8; 32];
-    derive_aes_ctr_material::<Aes256, 32, 12>(&master.0, &master.1, 0, &mut key);
+    derive_aes_ctr_material::<Aes256, 32, 12>(&master.0, &master.1, enc_label, &mut key);
     let mut salt = [0u8; 12];
-    derive_aes_ctr_material::<Aes256, 32, 12>(&master.0, &master.1, 2, &mut salt);
+    derive_aes_ctr_material::<Aes256, 32, 12>(&master.0, &master.1, salt_label, &mut salt);
     Ok((key, salt))
 }
 
 fn derive_cm_material_128(
     material: &KeyingMaterial,
     left: bool,
+    usage: SrtpKeyUsage,
 ) -> Result<([u8; 16], [u8; 20], [u8; 14])> {
     let master = slice_master::<16, 14>(material, left)?;
+    let (enc_label, auth_label, salt_label) = usage.labels();
     let mut enc_key = [0u8; 16];
-    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, 0, &mut enc_key);
+    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, enc_label, &mut enc_key);
     let mut auth_key = [0u8; 20];
-    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, 1, &mut auth_key);
+    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, auth_label, &mut auth_key);
     let mut salt = [0u8; 14];
-    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, 2, &mut salt);
+    derive_aes_ctr_material::<Aes128, 16, 14>(&master.0, &master.1, salt_label, &mut salt);
     Ok((enc_key, auth_key, salt))
 }
 
@@ -1407,16 +1494,16 @@ fn protect_rtp_aes_cm_sha1_80(
     auth_key: &[u8; 20],
     salt: [u8; 14],
     header: &[u8],
-    sequence_number: u16,
+    packet_index: u64,
     ssrc: u32,
     payload: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(header.len() + payload.len() + 10);
     out.extend_from_slice(header);
     out.extend_from_slice(payload);
-    let roc = 0u32;
+    let roc = (packet_index >> 16) as u32;
     if !payload.is_empty() {
-        let iv = rtp_aes_cm_iv(salt, ssrc, roc, sequence_number);
+        let iv = rtp_aes_cm_iv(salt, ssrc, roc, packet_index as u16);
         aes_ctr_xor_in_place::<Aes128>(enc_key, &iv, &mut out[header.len()..]);
     }
     let mut auth_input = out.clone();
@@ -1429,10 +1516,21 @@ fn protect_rtp_aes_cm_sha1_80(
     out
 }
 
-fn protect_rtcp_aes_cm_sha1_80(auth_key: &[u8; 20], packet: &[u8], srtcp_index: u32) -> Vec<u8> {
-    let e_and_si = srtcp_index & 0x7fff_ffff;
+fn protect_rtcp_aes_cm_sha1_80(
+    enc_key: &[u8; 16],
+    auth_key: &[u8; 20],
+    salt: [u8; 14],
+    packet: &[u8],
+    ssrc: u32,
+    srtcp_index: u32,
+) -> Vec<u8> {
+    let e_and_si = 0x8000_0000 | (srtcp_index & 0x7fff_ffff);
     let mut out = Vec::with_capacity(packet.len() + 4 + 10);
     out.extend_from_slice(packet);
+    if out.len() > 8 {
+        let iv = rtcp_aes_cm_iv(salt, ssrc, srtcp_index);
+        aes_ctr_xor_in_place::<Aes128>(enc_key, &iv, &mut out[8..]);
+    }
     out.extend_from_slice(&e_and_si.to_be_bytes());
     let tag = hmac::sign(
         &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, auth_key),
@@ -2046,6 +2144,27 @@ struct StunBindingRequest {
     username: Option<String>,
 }
 
+#[derive(Debug)]
+struct PeerConsent {
+    last_valid_binding_at: Instant,
+}
+
+impl PeerConsent {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_valid_binding_at: now,
+        }
+    }
+
+    fn refresh(&mut self, now: Instant) {
+        self.last_valid_binding_at = now;
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_valid_binding_at) >= RTC_CONSENT_TIMEOUT
+    }
+}
+
 fn parse_stun_binding_request(packet: &[u8]) -> Option<StunBindingRequest> {
     let msg = StunMessage::from_bytes(packet).ok()?;
     if !msg.has_class(MessageClass::Request) || msg.method() != BINDING {
@@ -2057,6 +2176,22 @@ fn parse_stun_binding_request(packet: &[u8]) -> Option<StunBindingRequest> {
             .ok()
             .map(|u| u.username().to_string()),
     })
+}
+
+fn validate_stun_binding_request(
+    packet: &[u8],
+    expected_username: &str,
+    ice_pwd: &str,
+) -> Option<StunBindingRequest> {
+    let request = parse_stun_binding_request(packet)?;
+    if request.username.as_deref() != Some(expected_username) {
+        return None;
+    }
+    let message = StunMessage::from_bytes(packet).ok()?;
+    let credentials: MessageIntegrityCredentials =
+        ShortTermCredentials::new(ice_pwd.to_owned()).into();
+    message.validate_integrity(&credentials).ok()?;
+    Some(request)
 }
 
 fn build_stun_success_response(
@@ -2178,15 +2313,18 @@ fn format_fingerprint(fingerprint: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stun_success_response, parse_stun_binding_request, protect_rtcp_aes_cm_sha1_80,
-        unprotect_rtcp_aes_cm_sha1_80, AnswerBuilder, MediaTxState, ParsedOffer,
-        PhantomSessionParams,
+        build_stun_success_response, derive_aes_ctr_material, parse_stun_binding_request,
+        protect_rtcp_aes_cm_sha1_80, unprotect_rtcp_aes_cm_sha1_80, validate_stun_binding_request,
+        AnswerBuilder, MediaTxState, ParsedOffer, PeerConsent, PhantomSessionParams, SrtpKeyUsage,
+        RTC_CONSENT_TIMEOUT,
     };
     use crate::transport::webrtc::sctp::{parse_dcep_open_label, DCEP_OPEN};
+    use aes::Aes128;
+    use std::time::Duration;
     use stun_types::attribute::{Fingerprint, MessageIntegrity, Username, XorMappedAddress};
     use stun_types::message::{
-        Message as StunMessage, MessageClass, MessageWrite, MessageWriteExt, MessageWriteVec,
-        BINDING,
+        IntegrityAlgorithm, Message as StunMessage, MessageClass, MessageIntegrityCredentials,
+        MessageWrite, MessageWriteExt, MessageWriteVec, ShortTermCredentials, BINDING,
     };
 
     #[test]
@@ -2309,9 +2447,16 @@ mod tests {
         request
             .add_attribute(&Username::new(&username).unwrap())
             .unwrap();
+        let credentials: MessageIntegrityCredentials =
+            ShortTermCredentials::new(params.ice_pwd.clone()).into();
+        request
+            .add_message_integrity(&credentials, IntegrityAlgorithm::Sha1)
+            .unwrap();
+        request.add_fingerprint().unwrap();
         let request = request.finish();
         let parsed = parse_stun_binding_request(&request).unwrap();
         assert_eq!(parsed.username.as_deref(), Some(username.as_str()));
+        assert!(validate_stun_binding_request(&request, &username, &params.ice_pwd).is_some());
 
         let response =
             build_stun_success_response(&request, "10.0.0.9:50000".parse().unwrap(), &params)
@@ -2329,6 +2474,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_stun_binding_without_valid_session_credentials() {
+        let username = "serverUfrag:browserUfrag";
+        let mut unsigned = StunMessage::builder_request(BINDING, MessageWriteVec::new());
+        unsigned
+            .add_attribute(&Username::new(username).unwrap())
+            .unwrap();
+        assert!(validate_stun_binding_request(&unsigned.finish(), username, "secret").is_none());
+
+        let mut signed = StunMessage::builder_request(BINDING, MessageWriteVec::new());
+        signed
+            .add_attribute(&Username::new(username).unwrap())
+            .unwrap();
+        let wrong_credentials: MessageIntegrityCredentials =
+            ShortTermCredentials::new("wrong-secret".to_owned()).into();
+        signed
+            .add_message_integrity(&wrong_credentials, IntegrityAlgorithm::Sha1)
+            .unwrap();
+        let signed = signed.finish();
+        assert!(validate_stun_binding_request(&signed, username, "secret").is_none());
+        assert!(validate_stun_binding_request(&signed, "wrong:username", "wrong-secret").is_none());
+    }
+
+    #[test]
+    fn peer_consent_expires_at_rfc_timeout() {
+        let started = std::time::Instant::now();
+        let mut consent = PeerConsent::new(started);
+        assert!(!consent
+            .is_expired(started + RTC_CONSENT_TIMEOUT - std::time::Duration::from_millis(1)));
+        assert!(consent.is_expired(started + RTC_CONSENT_TIMEOUT));
+
+        consent.refresh(started + std::time::Duration::from_secs(20));
+        assert!(!consent.is_expired(started + std::time::Duration::from_secs(49)));
+        assert!(consent.is_expired(started + std::time::Duration::from_secs(50)));
+    }
+
+    #[test]
     fn parses_dcep_open_label() {
         let mut payload = vec![0u8; 12];
         payload[0] = DCEP_OPEN;
@@ -2339,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn aes_cm_srtcp_unprotect_accepts_authentic_plain_rtcp() {
+    fn aes_cm_srtcp_encrypts_and_round_trips() {
         let enc_key = [0x11; 16];
         let auth_key = [0x22; 20];
         let salt = [0x33; 14];
@@ -2350,7 +2531,13 @@ mod tests {
             0x00, 0x09, 0x00, 0x00, // one lost sequence
         ];
 
-        let protected = protect_rtcp_aes_cm_sha1_80(&auth_key, &rtcp, 7);
+        let protected =
+            protect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &rtcp, 0x1234_5678, 7);
+        assert_ne!(&protected[8..rtcp.len()], &rtcp[8..]);
+        assert_eq!(
+            u32::from_be_bytes(protected[rtcp.len()..rtcp.len() + 4].try_into().unwrap()),
+            0x8000_0007
+        );
         let unprotected =
             unprotect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &protected).unwrap();
 
@@ -2366,11 +2553,106 @@ mod tests {
             0x81, 205, 0x00, 0x03, 0x12, 0x34, 0x56, 0x78, 0x87, 0x65, 0x43, 0x21, 0x00, 0x09,
             0x00, 0x00,
         ];
-        let mut protected = protect_rtcp_aes_cm_sha1_80(&auth_key, &rtcp, 7);
+        let mut protected =
+            protect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &rtcp, 0x1234_5678, 7);
         let last = protected.last_mut().unwrap();
         *last ^= 0x01;
 
         assert!(unprotect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &protected).is_none());
+    }
+
+    #[test]
+    fn srtcp_kdf_uses_rfc_3711_labels() {
+        let master_key = [
+            0xe1, 0xf9, 0x7a, 0x0d, 0x3e, 0x01, 0x8b, 0xe0, 0xd6, 0x4f, 0xa3, 0x2c, 0x06, 0xde,
+            0x41, 0x39,
+        ];
+        let master_salt = [
+            0x0e, 0xc6, 0x75, 0xad, 0x49, 0x8a, 0xfe, 0xeb, 0xb6, 0x96, 0x0b, 0x3a, 0xab, 0xe6,
+        ];
+        let (enc_label, auth_label, salt_label) = SrtpKeyUsage::Rtcp.labels();
+
+        let mut enc_key = [0u8; 16];
+        derive_aes_ctr_material::<Aes128, 16, 14>(
+            &master_key,
+            &master_salt,
+            enc_label,
+            &mut enc_key,
+        );
+        let mut auth_key = [0u8; 20];
+        derive_aes_ctr_material::<Aes128, 16, 14>(
+            &master_key,
+            &master_salt,
+            auth_label,
+            &mut auth_key,
+        );
+        let mut salt = [0u8; 14];
+        derive_aes_ctr_material::<Aes128, 16, 14>(&master_key, &master_salt, salt_label, &mut salt);
+
+        assert_eq!(
+            enc_key,
+            [
+                0x4c, 0x1a, 0xa4, 0x5a, 0x81, 0xf7, 0x3d, 0x61, 0xc8, 0x00, 0xbb, 0xb0, 0x0f, 0xbb,
+                0x1e, 0xaa,
+            ]
+        );
+        assert_eq!(
+            auth_key,
+            [
+                0x8d, 0x54, 0x53, 0x4f, 0xeb, 0x49, 0xae, 0x8e, 0x79, 0x93, 0xa6, 0xbd, 0x0b, 0x84,
+                0x4f, 0xc3, 0x23, 0xa9, 0x3d, 0xfd,
+            ]
+        );
+        assert_eq!(
+            salt,
+            [0x95, 0x81, 0xc7, 0xad, 0x87, 0xb3, 0xe5, 0x30, 0xbf, 0x3e, 0x44, 0x54, 0xa8, 0xb3,]
+        );
+    }
+
+    #[test]
+    fn aes_cm_srtcp_matches_pion_interop_vector() {
+        // Pion's AES_128_CM_HMAC_SHA1_80 SRTCP lifecycle vector.
+        let master_key = [
+            0xfd, 0xa6, 0x25, 0x95, 0xd7, 0xf6, 0x92, 0x6f, 0x7d, 0x9c, 0x02, 0x4c, 0xc9, 0x20,
+            0x9f, 0x34,
+        ];
+        let master_salt = [
+            0xa9, 0x65, 0x19, 0x85, 0x54, 0x0b, 0x47, 0xbe, 0x2f, 0x27, 0xa8, 0xb8, 0x81, 0x23,
+        ];
+        let plaintext = [
+            0x80, 0xc8, 0x00, 0x06, 0x66, 0xef, 0x91, 0xff, 0xdf, 0x48, 0x80, 0xdd, 0x61, 0xa6,
+            0x2e, 0xd3, 0xd8, 0xbc, 0xde, 0xbe, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x16, 0x04,
+            0x81, 0xca, 0x00, 0x06, 0x66, 0xef, 0x91, 0xff, 0x01, 0x10, 0x52, 0x6e, 0x54, 0x35,
+            0x43, 0x6d, 0x4a, 0x68, 0x7a, 0x79, 0x65, 0x74, 0x41, 0x78, 0x77, 0x2b, 0x00, 0x00,
+        ];
+        let expected = [
+            0x80, 0xc8, 0x00, 0x06, 0x66, 0xef, 0x91, 0xff, 0xcd, 0x34, 0xc5, 0x78, 0xb2, 0x8b,
+            0xe1, 0x6b, 0xc5, 0x09, 0xd5, 0x77, 0xe4, 0xce, 0x5f, 0x20, 0x80, 0x21, 0xbd, 0x66,
+            0x74, 0x65, 0xe9, 0x5f, 0x49, 0xe5, 0xf5, 0xc0, 0x68, 0x4e, 0xe5, 0x6a, 0x78, 0x07,
+            0x75, 0x46, 0xed, 0x90, 0xf6, 0xdc, 0x9d, 0xef, 0x3b, 0xdf, 0xf2, 0x79, 0xa9, 0xd8,
+            0x80, 0x00, 0x00, 0x01, 0x60, 0xc0, 0xae, 0xb5, 0x6f, 0x40, 0x88, 0x0e, 0x28, 0xba,
+        ];
+        let (enc_label, auth_label, salt_label) = SrtpKeyUsage::Rtcp.labels();
+        let mut enc_key = [0u8; 16];
+        let mut auth_key = [0u8; 20];
+        let mut salt = [0u8; 14];
+        derive_aes_ctr_material::<Aes128, 16, 14>(
+            &master_key,
+            &master_salt,
+            enc_label,
+            &mut enc_key,
+        );
+        derive_aes_ctr_material::<Aes128, 16, 14>(
+            &master_key,
+            &master_salt,
+            auth_label,
+            &mut auth_key,
+        );
+        derive_aes_ctr_material::<Aes128, 16, 14>(&master_key, &master_salt, salt_label, &mut salt);
+
+        let protected =
+            protect_rtcp_aes_cm_sha1_80(&enc_key, &auth_key, salt, &plaintext, 0x66ef_91ff, 1);
+        assert_eq!(protected, expected);
     }
 
     #[test]
@@ -2384,5 +2666,160 @@ mod tests {
         tx.video_last_rtp_timestamp = first;
         let second = tx.video_timestamp_now();
         assert_eq!(second, first.wrapping_add(1));
+    }
+
+    #[test]
+    fn sender_report_clock_advances_while_video_is_idle() {
+        let mut tx = MediaTxState::new();
+        let start = tx.video_clock_started_at;
+        tx.video_timestamp = 1234;
+        tx.video_last_rtp_timestamp = 1234;
+        let first = tx
+            .sender_report_timestamps_at(start + Duration::from_secs(1))
+            .0;
+        let later = tx
+            .sender_report_timestamps_at(start + Duration::from_secs(11))
+            .0;
+
+        assert_eq!(first, 91_234);
+        assert_eq!(later.wrapping_sub(first), 900_000);
+        assert_eq!(tx.video_last_rtp_timestamp, 1234);
+        assert_eq!(
+            later,
+            tx.video_timestamp_at(start + Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn sender_report_audio_extrapolates_from_last_sample() {
+        let mut tx = MediaTxState::new();
+        let start = tx.video_clock_started_at;
+        tx.audio_last_sent_at = start + Duration::from_millis(500);
+        tx.audio_last_rtp_timestamp = 10_000;
+        tx.audio_clock_rate = 48_000;
+        let (_, audio) = tx.sender_report_timestamps_at(start + Duration::from_millis(750));
+
+        assert_eq!(audio, 22_000);
+        assert_eq!(tx.audio_last_rtp_timestamp, 10_000);
+    }
+
+    #[test]
+    fn sender_report_clock_wraps_at_rtp_boundary() {
+        let mut tx = MediaTxState::new();
+        let start = tx.video_clock_started_at;
+        tx.video_timestamp = u32::MAX - 44_999;
+        tx.audio_last_rtp_timestamp = u32::MAX - 23_999;
+        let (video, audio) = tx.sender_report_timestamps_at(start + Duration::from_secs(1));
+
+        assert_eq!(video, 45_000);
+        assert_eq!(audio, 24_000);
+    }
+    #[test]
+    fn rtp_packet_indices_roll_over_independently_per_stream() {
+        let mut video = super::RtpSendSequence::new(u16::MAX - 1);
+        let mut audio = super::RtpSendSequence::new(123);
+        assert_eq!(video.take(), 65_534);
+        assert_eq!(audio.take(), 123);
+        assert_eq!(video.take(), 65_535);
+        assert_eq!(video.take(), 65_536);
+        assert_eq!(audio.take(), 124);
+        for expected in 65_537..=131_072 {
+            assert_eq!(video.take(), expected);
+        }
+        assert_eq!(audio.take(), 125);
+    }
+
+    #[test]
+    #[should_panic(expected = "SRTP packet index exhausted")]
+    fn rtp_packet_index_never_reuses_a_nonce_at_key_lifetime_limit() {
+        let mut sequence = super::RtpSendSequence {
+            next_index: (1_u64 << 48) - 1,
+        };
+        assert_eq!(sequence.take(), (1_u64 << 48) - 1);
+        sequence.take();
+    }
+
+    #[test]
+    fn srtp_ciphertext_matches_independent_vectors_across_two_rollovers() {
+        use super::{PhantomSrtpCipher, PhantomSrtpTxContext, RtpProtectParams, RtpSendSequence};
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit};
+        // Fixed session-key vectors generated independently with Python
+        // cryptography/OpenSSL. IV layouts: RFC 3711 section 4.1.1 and
+        // RFC 7714 section 8.1. They cover ROC 0, 1, and 2 for all profiles.
+        let vectors = [
+            [
+                "80e0fffe0102030411223344dbcfdfee49ef082f47794b45e404e7fbb65c2a4c9c4d56083a7dc57766e7fd94",
+                "80e0ffff0102030411223344202b1bcaadb9a9df82e4a8fb27516cc6c042d96f9318aea66b77ac5bce8f1dae",
+                "80e0000001020304112233447cd87ca4e36ab4cfd5eda3f6e6d233f12be981171527fb4c87854126c0110b4a",
+                "80e00001010203041122334492b7d3a4187a1f824d8a40f3aaf80373fa9ac6499751f838e461a20e82ce8ecb",
+                "80e000000102030411223344172f7ea08ce5db574170e153a8506d82218a2e47cffb1ce9a468256ec50d2bbf",
+            ],
+            [
+                "80e0fffe0102030411223344495ca9032f7cc5c801076adafcf2f5f59f3fa4a1cccef79063f10fbef1380078",
+                "80e0ffff01020304112233443a671565770b77e220cafc3e02b3358914d096c227846ca49a6fbaaefee4b890",
+                "80e000000102030411223344b8dbb9e9d9b0e6568f93fe69f386a2de788dce51660d9e763c6275c1b2e9d118",
+                "80e000010102030411223344e7c42c6f9f5cad63f0aa18aa3eb29e0bdd0e6b0dcb0d1cf5763ff0b26393148c",
+                "80e00000010203041122334405e271ac0578c034ff32604a651a6d4d550ebd7921218b9f3bb09a695a63b784",
+            ],
+            [
+                "80e0fffe01020304112233449b07be8274157f05433e220bd5141de39e8e361d90deb06514ff",
+                "80e0ffff0102030411223344441820dd59fa6584f6644045542999f11a3b80505bbaf3545b2f",
+                "80e000000102030411223344728d575506fda6fb0269bf6dd4f3e0d51d4ef3fe215fb084d9f3",
+                "80e00001010203041122334448ffe0b482a9e278f7217a73c8e9ec53e3334e2782049cf44b93",
+                "80e000000102030411223344183ea44db3b707b6312e2a07763afaf78746ec974d8403b55795",
+            ],
+        ];
+        for (profile, expected_packets) in vectors.iter().enumerate() {
+            let cipher = || match profile {
+                0 => PhantomSrtpCipher::AeadAes128Gcm {
+                    key: Box::new(Aes128Gcm::new_from_slice(&[0x11; 16]).unwrap()),
+                    salt: [0x22; 12],
+                },
+                1 => PhantomSrtpCipher::AeadAes256Gcm {
+                    key: Box::new(Aes256Gcm::new_from_slice(&[0x11; 32]).unwrap()),
+                    salt: [0x22; 12],
+                },
+                _ => PhantomSrtpCipher::Aes128CmSha1_80 {
+                    enc_key: [0x11; 16],
+                    auth_key: [0x33; 20],
+                    salt: [0x22; 14],
+                },
+            };
+            let mut tx = PhantomSrtpTxContext {
+                rtp: cipher(),
+                rtcp: cipher(),
+            };
+            let mut sequence = RtpSendSequence::new(65_534);
+            let mut expected = [65_534, 65_535, 65_536, 65_537, 131_072]
+                .into_iter()
+                .zip(expected_packets)
+                .peekable();
+            for _ in 65_534..=131_072 {
+                let packet_index = sequence.take();
+                if expected
+                    .peek()
+                    .is_none_or(|(index, _)| *index != packet_index)
+                {
+                    continue;
+                }
+                let (_, hex) = expected.next().unwrap();
+                let reference: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                    .collect();
+                let packet = tx.protect_rtp(RtpProtectParams {
+                    payload_type: 96,
+                    marker: true,
+                    packet_index,
+                    timestamp: 0x0102_0304,
+                    ssrc: 0x1122_3344,
+                    mid_ext_id: None,
+                    mid: None,
+                    payload: b"Phantom rollover",
+                });
+                assert_eq!(packet, reference, "profile={profile} index={packet_index}");
+            }
+            assert!(expected.next().is_none());
+        }
     }
 }

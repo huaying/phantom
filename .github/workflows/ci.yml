@@ -6,26 +6,51 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Opus still declares compatibility with CMake versions older than 3.5.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
 jobs:
+  web:
+    uses: ./.github/workflows/build-web.yml
+
   check-windows:
+    needs: web
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check server (Windows features)
-        run: cargo check -p phantom-server --features audio
-      - name: Check client (Windows features, no dav1d)
-        run: cargo check -p phantom-client --no-default-features --features audio
-      - name: Clippy
-        run: cargo clippy -p phantom-server --features audio -p phantom-client --no-default-features --features audio -p phantom-core -p phantom-gpu -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check server (Windows features)
+        run: cargo check --locked -p phantom-server --features audio
+      - name: Check client (Windows features, no dav1d)
+        run: cargo check --locked -p phantom-client --no-default-features --features audio
+      - name: Clippy server (release features)
+        run: cargo clippy --locked -p phantom-server --all-targets -- -D warnings
+      - name: Clippy client (release features, no dav1d)
+        run: cargo clippy --locked -p phantom-client --no-default-features --features audio --all-targets -- -D warnings
+      - name: Windows installer doctor regression
+        shell: powershell
+        run: ./scripts/validation/test-windows-doctor.ps1
+
+  test:
+    needs: web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
@@ -33,16 +58,21 @@ jobs:
           sudo apt-get update && sudo apt-get install -y \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev \
             libdav1d-dev nasm cmake \
-            libpulse-dev libopus-dev libasound2-dev
+            libpulse-dev libopus-dev libasound2-dev python3-gi
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Build WASM (needed for server)
-        run: |
-          cargo install wasm-pack
-          wasm-pack build crates/web --target web --no-typescript
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace -- -D warnings
       - name: Doc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Audio measurement and buffer regression
+        run: |
+          node scripts/validation/test-media-soak-monitor.mjs
+          node scripts/validation/test-wss-audio-buffer.mjs
+      - name: Linux installer regression
+        run: PHANTOM_TEST_REQUIRE_GIO=1 python3 scripts/validation/test-linux-installer.py

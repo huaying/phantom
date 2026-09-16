@@ -3,8 +3,8 @@
 A high-performance, open-source remote desktop built in Rust. Low latency,
 single-binary deployment, browser + native access.
 
-~18,000 lines Rust (across 6 crates), 136 tests, MIT license. Runs on Linux +
-Windows; native client also runs on macOS.
+Multi-crate Rust workspace with unit, transport, and headless integration tests.
+Runs on Linux + Windows; native client also runs on macOS.
 
 ## Design decisions
 
@@ -31,9 +31,11 @@ Current shape:
 
 ### WebRTC, not WebTransport
 
-WebTransport requires HTTPS + certificates. Self-signed ≤14 days in Chrome.
-Pure IP (most users) doesn't work. WebRTC works with any IP, has built-in
-DTLS + NAT traversal.
+WebTransport requires HTTPS + certificates. Self-signed certificates and pure
+IP deployments have browser restrictions. WebRTC gives Phantom browser-native
+DTLS media and DataChannels, but the current server advertises a host candidate
+only. Full WAN traversal still needs STUN candidate gathering, TURN fallback,
+and eventually trickle ICE.
 
 ### In-tree WebRTC backend
 
@@ -43,6 +45,8 @@ The WebRTC transport loop and protocol wiring are Phantom-owned:
 - ICE/STUN handling + DTLS handshake
 - SRTP/SRTCP packetization for media tracks
 - SCTP DataChannel bridge for input/control messages
+- ICE consent freshness: only authenticated Binding requests nominate the UDP
+  peer, and 30 seconds without valid consent tears down the session.
 
 ### Dual web transport: WebRTC default + WSS fallback
 
@@ -50,6 +54,15 @@ The WebRTC transport loop and protocol wiring are Phantom-owned:
   for video/audio + DataChannels for input/control. POST `/rtc` signaling.
 - **WSS** (`?wss` / `?ws`): WebSocket upgrade on the same HTTPS port 9900.
   Reliable fallback for debugging or UDP-blocked environments.
+  The browser pairs `/ws/audio` with the current Hello's random session token.
+  The main sender owns and routes this dedicated bounded channel, including
+  Windows service mode; an unavailable channel falls back to main WSS.
+  SAB audio chooses an initial 60–300ms prefill from the main socket's
+  connection-setup duration, as a bounded latency hint. Slower paths trade
+  additional audio buffering for tolerance of bursty arrivals; this hint is
+  not a measured RTT or an assurance against arbitrary network stalls.
+  The 500ms PCM ring accepts whole packets only when space is available;
+  overflow drops incoming PCM without overwriting unplayed samples.
 - **Native**: raw QUIC (no browser overhead) + raw TCP.
 - All produce same `Box<dyn MessageSender/Receiver>` → same session loop.
 
@@ -136,6 +149,12 @@ Server forces IDR every 2 seconds. Recovers from:
 - `poll_output` after `drain_outgoing` — flush written data immediately.
 - New POST /rtc → drain all pending `Rtc`, keep latest → replace active
   client immediately.
+- If the shared session loop replaces RTC with WSS/native, the dropped bridge
+  channels terminate the old RTC backend; it must not remain as a UDP
+  keepalive-only zombie.
+- The active UDP source is selected only by a username-matching,
+  MESSAGE-INTEGRITY-authenticated ICE Binding request. A hard-closed browser is
+  removed after the 30-second consent timeout even when no replacement connects.
 - Session delivered via `Mutex<Option>` slot (always latest, stale
   auto-dropped).
 - Bounded queues in the bridge (`sync_channel(8)` video,
@@ -197,25 +216,42 @@ Desktop Duplication → ID3D11Texture2D → NVENC encode → H.264 bytes
 
 ## Windows Service mode
 
-Architecture follows RustDesk/Sunshine pattern:
+Architecture follows the service/desktop-agent split used by mature Windows
+remote-desktop implementations:
 
 - **Service** (Session 0, LocalSystem): manages lifecycle, accepts
   client connections, forwards encoded frames.
-- **Agent** (user session): launched via `CreateProcessAsUser` with
-  SYSTEM token (not user token — required for Winlogon desktop access
-  on the lock screen).
-- **IPC**: two named pipes — `PhantomIPC_up_{session_id}` for frames,
-  `PhantomIPC_down_{session_id}` for input. Windows synchronous I/O
-  deadlocks if you use a single duplex pipe with concurrent read+write
-  on the same handle.
+- **Agent** (console session + one desktop): Default agents use the interactive
+  user's shell token; Winlogon agents use a SYSTEM token in that console
+  session. An agent never claims a different WTS session.
+- **Handoff**: every candidate gets a monotonically increasing generation. The
+  service keeps the committed agent streaming until the candidate has connected
+  both pipes and produced a non-empty H.264 keyframe. Stale candidates are
+  cancelled when the console session or input desktop changes.
+- **IPC**: two generation-scoped named pipes,
+  `PhantomIPC_up_{session_id}_{generation}` for frames and
+  `PhantomIPC_down_{session_id}_{generation}` for input. ACLs grant only
+  LocalSystem, administrators, and that interactive logon's SID. Windows
+  synchronous I/O deadlocks if one duplex handle has concurrent read+write.
 - Agent does DXGI→NVENC encoding and sends H.264 bytes over pipe
   (~50KB, not 8MB raw frames).
 - Service uses `run_session_ipc()` which reuses `SessionRunner` for
   input/clipboard/keepalive/audio/stats.
-- On lock screen: DXGI fails → agent falls back to GDI capture +
-  OpenH264 → auto-recovers to DXGI on unlock.
-- Agent calls `OpenInputDesktop()` + `SetThreadDesktop()` before
-  capture (follows the active desktop like RustDesk/Sunshine).
+- Winlogon candidates use GDI + OpenH264 with the secure desktop's primary
+  screen metrics, which can differ from the CCD source mode after sign-out;
+  Default candidates use strict-target DXGI + NVENC when available. The
+  service swaps generations at lock/unlock rather than carrying a Desktop
+  Duplication object across secure-desktop boundaries.
+- Display topology has one owner. If an external manager such as NICE DCV is
+  running, Phantom adopts its active target and never mutates that topology.
+  On a dedicated host configured for Phantom-managed display, provisioning
+  establishes one active VDD before Default-desktop capture. Winlogon keeps
+  Windows-owned topology and defers provisioning until Default is active.
+  Capture recovery within an agent generation never switches to a different
+  output.
+- Default-desktop DXGI is committed only after its surface dimensions match the
+  target's active CCD source mode. An adaptive resize is allowed only when the
+  sole active path is Phantom's VDD.
 - `--install` / `--uninstall` / `--install-vdd` manage the service +
   Virtual Display Driver.
 

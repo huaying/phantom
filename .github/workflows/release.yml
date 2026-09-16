@@ -3,13 +3,48 @@ name: Release
 on:
   push:
     tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
+  web:
+    uses: ./.github/workflows/build-web.yml
+
+  quality:
+    needs: web
+    # Full-workspace checks include optional AV1: dav1d-sys needs >= 1.3.
+    # Keep the shipped Linux binaries on 22.04 below for glibc compatibility.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxdo-dev \
+            libdav1d-dev nasm cmake \
+            libpulse-dev libopus-dev libasound2-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+
   build:
+    needs: web
     strategy:
       fail-fast: false
       matrix:
@@ -54,8 +89,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Every server embeds the same freshly built JS/WASM pair from this run.
+      - uses: actions/download-artifact@v4
+        if: matrix.build_server
+        with:
+          name: web-bundle
+          path: crates/web/pkg
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
@@ -103,32 +145,25 @@ jobs:
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
 
-      # Build WASM for server (Linux native only — Windows/macOS/cross use committed WASM files)
-      - name: Build WASM
-        if: matrix.build_server && !contains(matrix.target, 'windows') && !matrix.cross
-        run: |
-          cargo install wasm-pack
-          wasm-pack build crates/web --target web --no-typescript
-
       # Build server (Linux native: with embedded web client from fresh WASM build)
       - name: Build server (Linux, with web client)
         if: matrix.build_server && !contains(matrix.target, 'windows') && !matrix.cross
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-server
+        run: cargo build --locked --release --target ${{ matrix.target }} -p phantom-server
 
-      # Build server (Windows: uses committed WASM files for web-client)
+      # Build server (Windows: embeds the same bundle as Linux)
       - name: Build server (Windows, with web client)
         if: matrix.build_server && contains(matrix.target, 'windows')
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --features audio
+        run: cargo build --locked --release --target ${{ matrix.target }} -p phantom-server --features audio
 
       # Build server (cross-compile: without web client, with audio)
       - name: Build server (cross-compile, no web client)
         if: matrix.build_server && matrix.cross
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio,webrtc
+        run: cargo build --locked --release --target ${{ matrix.target }} -p phantom-server --no-default-features --features audio,webrtc
 
       # Build client (all platforms: without av1/dav1d for portability)
       - name: Build client
         if: matrix.build_client
-        run: cargo build --release --target ${{ matrix.target }} -p phantom-client --no-default-features --features audio
+        run: cargo build --locked --release --target ${{ matrix.target }} -p phantom-client --no-default-features --features audio
 
       # Package — Unix
       - name: Package binaries (Unix)
@@ -163,55 +198,78 @@ jobs:
 
   # Build and push Docker image to GitHub Container Registry
   docker:
+    needs: [web, quality, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-bundle
+          path: crates/web/pkg
 
       - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Select image version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=candidate-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
 
   release:
-    needs: [build]
-    # Don't let a single matrix-leg failure (e.g. flaky cross-compile)
-    # block publishing the rest of the artifacts. download-artifact will
-    # only pull the legs that actually uploaded.
-    if: always() && !cancelled()
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, build, docker]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: binaries-*
           path: dist
           merge-multiple: true
 
       - name: List artifacts
         run: find dist -type f && ls -la dist/
 
+      - name: Verify required release artifacts
+        run: |
+          test -f dist/phantom-server-linux-x86_64
+          test -f dist/phantom-client-linux-x86_64
+          test -f dist/phantom-server-windows-x86_64.exe
+          test -f dist/phantom-client-windows-x86_64.exe
+          test -f dist/phantom-client-macos-aarch64
+          test -f dist/phantom-client-macos-x86_64
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           body: |
             ## Install
 
@@ -227,7 +285,8 @@ jobs:
 
             **Docker:**
             ```bash
-            docker run --rm -p 9900:9900 ghcr.io/huaying/phantom:latest
+            docker run --rm -p 9900:9900 -p 9902:9902/udp \
+              -e PHANTOM_HOST=127.0.0.1 ghcr.io/huaying/phantom:latest server-web
             ```
 
             See [README](https://github.com/huaying/phantom#installation) for more options.

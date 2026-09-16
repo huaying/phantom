@@ -23,6 +23,8 @@ if (!(Test-Path $installDir)) {
 #   $env:PHANTOM_ASSET_BASE_URL="http://10.0.0.1:8000"
 #   $env:PHANTOM_INSTALL_DIR="C:\tmp\phantom-bin"
 #   $env:PHANTOM_NO_PATH=1
+#   $env:PHANTOM_MANAGED_DISPLAY=1   # force one VDD-backed desktop
+#   $env:PHANTOM_CONSOLE_DISPLAY=1   # preserve the existing display topology
 $baseUrl = if ($env:PHANTOM_ASSET_BASE_URL) {
     $env:PHANTOM_ASSET_BASE_URL.TrimEnd("/")
 } else {
@@ -150,6 +152,28 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltinRole]::Administrator)
 
+function Test-IsVirtualMachine {
+    try {
+        $system = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $identity = "$($system.Manufacturer) $($system.Model)"
+        return [bool]($identity -match "Virtual|VMware|KVM|HVM|Xen|QEMU|Hyper-V")
+    } catch {
+        return $false
+    }
+}
+
+$displayPolicy = if ($env:PHANTOM_MANAGED_DISPLAY -eq "1") {
+    "managed-vdd"
+} elseif ($env:PHANTOM_CONSOLE_DISPLAY -eq "1") {
+    "console"
+} elseif (Test-IsVirtualMachine) {
+    "auto"
+} else {
+    "console"
+}
+$managedDisplay = $displayPolicy -eq "managed-vdd"
+$autoDisplay = $displayPolicy -eq "auto"
+
 function Add-DoctorResult {
     param(
         [string]$Level,
@@ -208,6 +232,30 @@ function Test-VddPresent {
     return $false
 }
 
+function Test-VddEnabled {
+    try {
+        foreach ($device in (Get-PnpDevice -Class Display -ErrorAction Stop)) {
+            if (($device.FriendlyName -eq "Virtual Display Driver") -or
+                ($device.InstanceId -like "*MttVDD*")) {
+                # A disabled node can retain CM_PROB_DISABLED in CIM after
+                # reboot while DEVPKEY_Device_ProblemCode has no data.
+                $problemCode = $device.ConfigManagerErrorCode
+                if ($null -eq $problemCode) {
+                    $problem = Get-PnpDeviceProperty -InstanceId $device.InstanceId `
+                        -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop
+                    $problemCode = $problem.Data
+                }
+                # CM_PROB_DISABLED: a retained, disabled driver does not own a head.
+                if ($problemCode -ne 22) { return $true }
+            }
+        }
+        return $false
+    } catch {
+        # Unknown device state must not hide a possible coexisting display head.
+        return Test-VddPresent
+    }
+}
+
 function Test-ActiveUserSession {
     try {
         $text = @(query user 2>&1)
@@ -236,6 +284,9 @@ function Get-PhantomRuntimeEvidence {
     param([int]$FreshMinutes = 15)
 
     $cutoff = (Get-Date).AddMinutes(-1 * $FreshMinutes)
+    if (($null -ne $script:runtimeEvidenceNotBefore) -and ($script:runtimeEvidenceNotBefore -gt $cutoff)) {
+        $cutoff = $script:runtimeEvidenceNotBefore
+    }
     $svcLog = Join-Path $env:WINDIR "Temp\phantom-debug.log"
     $agentLog = Join-Path $env:WINDIR "Temp\phantom-agent.log"
     $evidence = [ordered]@{
@@ -247,26 +298,67 @@ function Get-PhantomRuntimeEvidence {
         AgentLogRecent = $false
         AgentConnected = $false
         CaptureEvidence = $false
+        ManagedDisplayReady = $false
+        AutoDisplayReady = $false
+        WinlogonCaptureReady = $false
     }
 
     if (Test-Path $svcLog) {
         $evidence.ServiceLogExists = $true
         $evidence.ServiceLogRecent = (Get-Item $svcLog).LastWriteTime -gt $cutoff
         $tail = @(Get-Content $svcLog -Tail 250 -ErrorAction SilentlyContinue)
-        $evidence.AgentConnected = [bool]($tail -match "IPC: agent connected")
+        $evidence.AgentConnected = [bool]($tail -match "IPC: agent connected|Committed agent generation")
         $evidence.CaptureEvidence = [bool]($tail -match "capture=|Tier 1:|Tier 2:|Tier 3:|dxgi_nvenc|gdi")
+        $evidence.ManagedDisplayReady = [bool]($tail -match "managed single-display provisioning ready")
+        $evidence.AutoDisplayReady = [bool]($tail -match "auto display policy ready")
+        $evidence.WinlogonCaptureReady = $evidence.ServiceLogRecent -and
+            (Test-PhantomWinlogonLogReady -Lines $tail)
+    }
+
+    $generationLog = Get-ChildItem -Path (Join-Path $env:WINDIR "Temp") `
+        -Filter "phantom-agent-*.log" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -ne $generationLog) {
+        $agentLog = $generationLog.FullName
+        $evidence.AgentLogPath = $agentLog
     }
 
     if (Test-Path $agentLog) {
         $evidence.AgentLogExists = $true
         $evidence.AgentLogRecent = (Get-Item $agentLog).LastWriteTime -gt $cutoff
         $tail = @(Get-Content $agentLog -Tail 250 -ErrorAction SilentlyContinue)
-        if ($tail -match "Tier 1:|Tier 2:|Tier 3:|capture=|dxgi_nvenc|gdi") {
+        if ($evidence.AgentLogRecent -and ($tail -match "Tier 1:|Tier 2:|Tier 3:|capture=|dxgi_nvenc|gdi")) {
             $evidence.CaptureEvidence = $true
         }
     }
 
     return [pscustomobject]$evidence
+}
+
+function Test-PhantomWinlogonLogReady {
+    param([object[]]$Lines)
+
+    # Committing an agent requires its first keyframe. A launch or a selected
+    # capture tier alone does not establish that the login screen is usable.
+    $transition = @($Lines | Select-String -Pattern "Session/desktop changed:") | Select-Object -Last 1
+    $commit = @($Lines | Select-String -Pattern "Committed agent generation") | Select-Object -Last 1
+    if (($null -eq $transition) -or ($null -eq $commit)) { return $false }
+    if ($transition.Line -notmatch ' -> (\d+)/Winlogon\s*$') { return $false }
+    $session = $Matches[1]
+    return [bool]($commit.Line -match "Committed agent generation \d+ for session $session/Winlogon;")
+}
+
+function Test-PhantomSecureDesktopReady {
+    param(
+        [object]$Evidence,
+        [bool]$ConsoleAvailable,
+        [bool]$ServiceRunning,
+        [bool]$BrowserListening
+    )
+    return $Evidence.ServiceLogRecent -and $Evidence.AgentConnected -and
+        $Evidence.CaptureEvidence -and $Evidence.WinlogonCaptureReady -and
+        $ConsoleAvailable -and $ServiceRunning -and $BrowserListening
 }
 
 function Test-ExpectedLocalProbeIsolationFailure {
@@ -291,6 +383,16 @@ function Enable-PhantomServiceRecovery {
     if ($LASTEXITCODE -ne 0) {
         throw "sc failureflag PhantomServer failed with exit code $LASTEXITCODE"
     }
+}
+
+function Reset-PhantomRuntimeEvidence {
+    $serviceLog = Join-Path $env:WINDIR "Temp\phantom-debug.log"
+    $previousLog = Join-Path $env:WINDIR "Temp\phantom-debug.previous.log"
+    if (Test-Path $serviceLog) {
+        Copy-Item -LiteralPath $serviceLog -Destination $previousLog -Force -ErrorAction SilentlyContinue
+        Clear-Content -LiteralPath $serviceLog -ErrorAction SilentlyContinue
+    }
+    $script:runtimeEvidenceNotBefore = Get-Date
 }
 
 function Test-PhantomServiceRecovery {
@@ -397,6 +499,17 @@ function Invoke-PhantomDoctor {
     Write-Host ""
     Write-Host "Running Phantom Windows doctor..." -ForegroundColor Cyan
     $runtimeEvidence = Get-PhantomRuntimeEvidence
+    for ($i = 0; $i -lt 15; $i++) {
+        $displayReady = (-not $managedDisplay -and -not $autoDisplay) -or
+            ($managedDisplay -and $runtimeEvidence.ManagedDisplayReady) -or
+            ($autoDisplay -and $runtimeEvidence.AutoDisplayReady) -or
+            $runtimeEvidence.WinlogonCaptureReady
+        if ($runtimeEvidence.AgentConnected -and $runtimeEvidence.CaptureEvidence -and $displayReady) {
+            break
+        }
+        Start-Sleep -Seconds 1
+        $runtimeEvidence = Get-PhantomRuntimeEvidence
+    }
 
     if (Test-Path $ServerExe) {
         Add-DoctorResult "OK" "phantom-server.exe found at $ServerExe"
@@ -464,14 +577,45 @@ function Invoke-PhantomDoctor {
         }
     }
 
-    if (Test-VddPresent) {
-        Add-DoctorResult "OK" "Virtual Display Driver is present"
+    $dcvInstalled = $null -ne (Get-Service -Name 'dcvserver' -ErrorAction SilentlyContinue)
+    if ($dcvInstalled) {
+        if (Test-VddEnabled) {
+            Add-DoctorResult "WARN" "DCV and enabled MTT VDD coexist; this can cause repeated display reconfiguration. Review the MTT device before using DCV as the display owner."
+        } else {
+            Add-DoctorResult "OK" "DCV display manager is installed; Phantom VDD is not required"
+        }
+    } elseif (Test-VddEnabled) {
+        Add-DoctorResult "OK" "Virtual Display Driver is enabled"
     } else {
-        Add-DoctorResult "WARN" "Virtual Display Driver was not detected; headless Windows may black-screen until VDD installs/reboot completes"
+        Add-DoctorResult "WARN" "Virtual Display Driver is not enabled; a headless host needs a working console display or VDD"
     }
 
     $activeUserSession = Test-ActiveUserSession
     $consoleSessionAvailable = Test-ConsoleSessionAvailable
+    $browserPortListening = Test-ListeningPort 9901
+    $secureDesktopReady = Test-PhantomSecureDesktopReady -Evidence $runtimeEvidence `
+        -ConsoleAvailable $consoleSessionAvailable `
+        -ServiceRunning ($null -ne $service -and $service.Status -eq "Running") `
+        -BrowserListening $browserPortListening
+
+    if ($managedDisplay) {
+        if ($runtimeEvidence.ManagedDisplayReady) {
+            Add-DoctorResult "OK" "managed single-display topology is ready"
+        } elseif ($secureDesktopReady) {
+            Add-DoctorResult "WARN" "Winlogon capture is ready; managed display provisioning is deferred until the Default desktop"
+        } else {
+            Add-DoctorResult "FAIL" "managed display was requested but provisioning did not become ready"
+        }
+    } elseif ($autoDisplay) {
+        if ($runtimeEvidence.AutoDisplayReady) {
+            Add-DoctorResult "OK" "automatic display policy selected a stable capture topology"
+        } elseif ($secureDesktopReady) {
+            Add-DoctorResult "WARN" "Winlogon capture is ready; automatic display provisioning is deferred until the Default desktop"
+        } else {
+            Add-DoctorResult "FAIL" "automatic display policy did not become ready"
+        }
+    }
+
     if ($activeUserSession) {
         Add-DoctorResult "OK" "active interactive user session detected"
     } elseif ($consoleSessionAvailable) {
@@ -480,7 +624,6 @@ function Invoke-PhantomDoctor {
         Add-DoctorResult "WARN" "no console session detected; service agent cannot capture until Windows creates a console session"
     }
 
-    $browserPortListening = Test-ListeningPort 9901
     if ($browserPortListening) {
         Add-DoctorResult "OK" "browser port 9901 is listening"
     } elseif ($null -ne $service -and $service.Status -eq "Running") {
@@ -599,10 +742,20 @@ if ($noAutostart) {
     Write-Host "  phantom-server.exe" -ForegroundColor Cyan
 } else {
     Write-Host ""
-    Write-Host "Registering Windows Service + installing Virtual Display Driver..." -ForegroundColor Cyan
+    Write-Host "Registering Windows Service and configuring display ownership..." -ForegroundColor Cyan
     $programFilesServerForInstall = Join-Path $env:ProgramFiles "Phantom\phantom-server.exe"
     Stop-ExistingPhantomProcessesForInstall -ProgramFilesServer $programFilesServerForInstall
-    & $serverExe --install
+    Reset-PhantomRuntimeEvidence
+    if ($managedDisplay) {
+        Write-Host "Forcing a managed single-Phantom-VDD desktop." -ForegroundColor Cyan
+        & $serverExe --install --managed-display
+    } elseif ($autoDisplay) {
+        Write-Host "Using automatic display selection (virtual-machine default)." -ForegroundColor Cyan
+        & $serverExe --install --auto-display
+    } else {
+        Write-Host "Preserving the existing console display topology." -ForegroundColor Cyan
+        & $serverExe --install
+    }
     if ($LASTEXITCODE -eq 0) {
         Enable-PhantomServiceRecovery
         Enable-PhantomCrashDumps

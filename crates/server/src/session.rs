@@ -1383,6 +1383,7 @@ fn run_session_inner(
 
         match pipeline.tick(ctx)? {
             Some(result) => {
+                (runner.current_width, runner.current_height) = pipeline.dimensions();
                 runner.record_encode_time(result.encode_duration);
                 runner.send_video_frame(result.encoded, pipeline.congestion_mut())?;
             }

@@ -38,6 +38,17 @@ trait BackendClient {
     fn handle_timeout(&mut self);
 }
 
+fn drain_ready<T>(rx: &mpsc::Receiver<T>, out: &mut Vec<T>, limit: usize) -> bool {
+    while out.len() < limit {
+        match rx.try_recv() {
+            Ok(item) => out.push(item),
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+    true
+}
+
 impl PendingRtcSession {
     pub fn mode(&self) -> RtcMode {
         self.mode
@@ -433,5 +444,16 @@ mod tests {
         assert!(matches!(control_hello, Message::Hello { .. }));
         assert!(media_video_rx.try_recv().is_err());
         assert!(media_audio_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn drain_ready_reports_a_closed_session_bridge() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(7).unwrap();
+        drop(tx);
+
+        let mut values = Vec::new();
+        assert!(!drain_ready(&rx, &mut values, usize::MAX));
+        assert_eq!(values, vec![7]);
     }
 }

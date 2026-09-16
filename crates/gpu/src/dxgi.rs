@@ -54,16 +54,10 @@ impl DxgiCapture {
     }
 
     /// Create a new capture, optionally targeting a specific display device by name.
-    /// When `target_device` is set (e.g. `\\.\DISPLAY10`), that output is selected
-    /// if it is active. Windows can remap GDI display names across Winlogon ->
-    /// Default transitions, so an explicit but stale target falls back to the
-    /// best active NVIDIA output instead of failing into a wrong low-res GDI path.
-    /// This is how DCV/Parsec target their own VDD — by device name, not by resolution.
-    /// Falls back to the highest-resolution NVIDIA output when no explicit
-    /// target is requested. If an explicit target became stale during a
-    /// Winlogon/Default transition, a usable NVIDIA output may be selected and
-    /// reported as `output_matches_target=false` so the caller can decide
-    /// whether to retarget or reject it.
+    /// When `target_device` is set (e.g. `\\.\DISPLAY10`), that exact active
+    /// output must exist. Silently selecting another NVIDIA output destroys the
+    /// caller's display-ownership guarantee and can stream a different desktop.
+    /// With no explicit target, the highest-resolution NVIDIA output is used.
     pub fn with_target_device(target_device: Option<&str>) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
@@ -164,20 +158,10 @@ impl DxgiCapture {
             let c = best.context("no DXGI adapter with active output found")?;
             if let Some(target) = target_device {
                 if !c.matches_device {
-                    if !c.is_nvidia || c.width < 1024 || c.height < 720 {
-                        bail!(
-                            "DXGI target output '{}' was not found among usable active outputs: {}",
-                            target,
-                            seen_outputs.join("; ")
-                        );
-                    }
-                    tracing::warn!(
+                    bail!(
+                        "DXGI target output '{}' was not found among active outputs: {}",
                         target,
-                        selected_device = %c.device_name,
-                        selected_width = c.width,
-                        selected_height = c.height,
-                        seen = %seen_outputs.join("; "),
-                        "DXGI target output was not active; using best active NVIDIA output"
+                        seen_outputs.join("; ")
                     );
                 }
             }
@@ -491,14 +475,14 @@ impl DxgiCapture {
                     }
                     adapter_idx += 1;
                 }
-                if let Some((adapter, adapter_name, output_idx, device_name, is_nvidia)) = found {
-                    self.adapter = adapter;
-                    self.adapter_name = adapter_name;
-                    self.output_idx = output_idx;
-                    self.output_device_name = device_name;
-                    self.output_is_nvidia = is_nvidia;
-                    self.output_matches_target = true;
-                }
+                let (adapter, adapter_name, output_idx, device_name, is_nvidia) =
+                    found.with_context(|| format!("DXGI target output disappeared: {target}"))?;
+                self.adapter = adapter;
+                self.adapter_name = adapter_name;
+                self.output_idx = output_idx;
+                self.output_device_name = device_name;
+                self.output_is_nvidia = is_nvidia;
+                self.output_matches_target = true;
             }
 
             let output: IDXGIOutput = self.adapter.EnumOutputs(self.output_idx)?;

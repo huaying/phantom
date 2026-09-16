@@ -44,7 +44,7 @@ impl InputInjector {
         {
             windows_release_modifiers();
             tracing::info!("InputInjector initialized (Windows native SendInput)");
-            return Ok(Self {});
+            Ok(Self {})
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -413,7 +413,18 @@ fn windows_key(vk: VIRTUAL_KEY, pressed: bool, extended: bool) -> Result<()> {
         flags |= KEYEVENTF_EXTENDEDKEY.0;
     }
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC_EX) as u16 };
-    windows_send_input(&[key_input(vk, scan, KEYBD_EVENT_FLAGS(flags))])
+    if scan != 0 {
+        // Physical scan-code injection is accepted by Winlogon and Raw Input
+        // consumers that ignore synthetic virtual-key events.
+        flags |= KEYEVENTF_SCANCODE.0;
+        windows_send_input(&[key_input(
+            VIRTUAL_KEY(0),
+            scan & 0x00ff,
+            KEYBD_EVENT_FLAGS(flags),
+        )])
+    } else {
+        windows_send_input(&[key_input(vk, 0, KEYBD_EVENT_FLAGS(flags))])
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -480,7 +491,10 @@ fn windows_send_input(inputs: &[INPUT]) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn windows_cursor_diagnostics() -> Option<((i32, i32), (i32, i32, i32, i32))> {
+pub type WindowsCursorDiagnostics = ((i32, i32), (i32, i32, i32, i32));
+
+#[cfg(target_os = "windows")]
+pub fn windows_cursor_diagnostics() -> Option<WindowsCursorDiagnostics> {
     windows_cursor_snapshot().map(|snapshot| ((snapshot.x, snapshot.y), snapshot.virtual_screen))
 }
 

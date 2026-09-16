@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><title>Phantom media soak source</title>
+<style>html,body{margin:0;background:#101828;overflow:hidden}canvas{width:100vw;height:100vh;display:block}</style>
+<canvas id="source" width="1920" height="1080"></canvas>
+<script>
+// Independent desktop fixture. Space holds the exact pixels for 20 seconds;
+// audio continues. Escape exits kiosk via the browser's normal close action.
+const canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');
+let frames=0,last=0,holdUntil=0,audio;
+const start=Date.now();
+async function startAudio(){
+  if(audio)return;
+  audio=new AudioContext({sampleRate:48000});
+  const tone=audio.createOscillator(),gain=audio.createGain();
+  tone.frequency.value=440;gain.gain.value=.035;
+  tone.connect(gain).connect(audio.destination);tone.start();await audio.resume();
+  window.__soakSource={start,audio,tone,gain};
+}
+startAudio();addEventListener('pointerdown',()=>audio?.resume());
+addEventListener('keydown',e=>{if(e.code==='Space'){holdUntil=Date.now()+20000;e.preventDefault();}});
+function draw(t){
+  requestAnimationFrame(draw);if(t-last<1000/30||Date.now()<holdUntil)return;last=t;
+  const now=Date.now(),elapsed=(now-start)/1000;
+  ctx.fillStyle='#101828';ctx.fillRect(0,0,1920,1080);
+  ctx.fillStyle='#e8edf5';ctx.font='bold 40px sans-serif';ctx.fillText('PHANTOM  /  CONTINUOUS MEDIA',96,48);
+  const bits='10100101'+now.toString(2).padStart(48,'0')+'01011010';
+  for(let i=0;i<64;i++){ctx.fillStyle=bits[i]==='1'?'#fff':'#000';ctx.fillRect(96+i*24,72,24,48);}
+  ctx.font='28px monospace';ctx.fillStyle='#acbacd';ctx.fillText(new Date(now).toISOString(),96,172);
+  ctx.fillText(`frame ${++frames}    elapsed ${elapsed.toFixed(1)} s    audio ${audio?.state}`,96,215);
+  const gradient=ctx.createLinearGradient(0,270,1920,900);gradient.addColorStop(0,'#164e63');gradient.addColorStop(1,'#312e81');
+  ctx.fillStyle=gradient;ctx.fillRect(64,260,1792,650);
+  for(let i=0;i<12;i++){
+    const x=96+((elapsed*140+i*145)%1650),y=410+Math.sin(elapsed*1.2+i*.55)*110;
+    ctx.fillStyle=`hsl(${(elapsed*12+i*30)%360} 75% 60%)`;ctx.fillRect(x,y,75,75);
+  }
+  ctx.fillStyle='#f6ce65';ctx.fillRect(96,790,((elapsed%10)/10)*1728,36);
+  ctx.fillStyle='#e8edf5';ctx.font='28px sans-serif';ctx.fillText('440 Hz continuous tone  •  30 fps motion  •  UTC pixel timestamp',96,980);
+  ctx.font='22px sans-serif';ctx.fillStyle='#a8b7ca';ctx.fillText('Space: hold pixels for 20 seconds while audio continues',96,1025);
+}
+requestAnimationFrame(draw);
+</script>

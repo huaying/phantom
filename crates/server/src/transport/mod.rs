@@ -10,6 +10,7 @@
 pub mod quic;
 pub mod tcp;
 pub mod ws;
+mod ws_audio;
 
 #[cfg(feature = "webrtc")]
 pub mod webrtc;

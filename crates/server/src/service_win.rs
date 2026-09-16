@@ -6,8 +6,10 @@
 //!
 //! Architecture (like Sunshine/RustDesk):
 //! - Service (Session 0): handles network connections, manages agent lifecycle.
-//!   Polls `WTSGetActiveConsoleSessionId()` until a console session appears
-//!   (Session 1+ is created by winlogon a few seconds after boot).
+//!   Polls the active console session until a user desktop appears (Session 1+
+//!   is created by winlogon a few seconds after boot). If Windows reports the
+//!   console session as temporarily invalid, only the WTS `Console` station is
+//!   allowed as a recovery path; arbitrary active RDP sessions are ignored.
 //! - Agent (User Session): launched via CreateProcessAsUser into the active
 //!   console session and the currently-visible desktop (`Default` or
 //!   `Winlogon`). The service relaunches the agent when Windows reports
@@ -56,9 +58,12 @@ const SERVICE_DESCRIPTION: &str =
 // so DXGI Desktop Duplication can capture from the NVIDIA GPU.
 const VDD_HARDWARE_ID: &str = r"Root\MttVDD";
 const VDD_CLASS_GUID: &str = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
+const MANAGED_DISPLAY_MARKER: &str = r"C:\ProgramData\Phantom\managed-display.enabled";
 const VDD_DRIVER_URL: &str = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip";
+const VDD_DRIVER_SHA256: &str = "e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a";
 const NEFCON_URL: &str =
     "https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip";
+const NEFCON_SHA256: &str = "812bae7ed7dfb7d6d2284bc7de2f8ccebc92ed2a0b1ae893c53b337096e50c1a";
 
 /// Entry point when invoked by the Windows Service Control Manager.
 /// Call this from main() when `--service` flag is passed.
@@ -281,9 +286,10 @@ fn run_server_loop(
     svc_log("Initial session update");
     session_mgr.update();
     svc_log(&format!(
-        "After update: agent={} ipc={}",
+        "After initial update: committed_agent={} committed_ipc={} candidate_pending={}",
         session_mgr.agent.is_some(),
-        session_mgr.ipc.is_some()
+        session_mgr.ipc.is_some(),
+        session_mgr.pending_agent.is_some()
     ));
     tracing::info!(
         has_agent = session_mgr.agent.is_some(),
@@ -451,19 +457,20 @@ fn run_server_loop(
             && session_mgr.current_session_id == active_session
             && session_mgr.agent.is_some()
             && session_mgr.current_desktop_kind != active_desktop_kind;
+        let handoff_pending = session_mgr.handoff_pending_for(active_session, active_desktop_kind);
         if session_changed.swap(false, Ordering::Relaxed)
             || session_mgr.agent.is_none()
             || session_mgr.ipc().is_none()
             || session_drift
             || desktop_drift
         {
-            if session_drift {
+            if session_drift && !handoff_pending {
                 svc_log(&format!(
                     "Session drift detected: active={active_session} current={}",
                     session_mgr.current_session_id
                 ));
             }
-            if desktop_drift {
+            if desktop_drift && !handoff_pending {
                 svc_log(&format!(
                     "Desktop drift detected: active={active_desktop_kind:?} current={:?}",
                     session_mgr.current_desktop_kind
@@ -551,7 +558,7 @@ fn create_service_session(
                     ));
             }
             None
-        } else if windows_tier1_fixed_resolution_enabled() {
+        } else if !crate::windows_display_policy::tier1_adaptive_enabled() {
             if let Some((hw, hh)) = resolution_hint {
                 svc_log(&format!(
                     "create_service_session: ignoring resolution hint {hw}x{hh} while Windows Tier 1 fixed-resolution mode is enabled"
@@ -628,9 +635,12 @@ fn create_service_session(
             ));
         }
 
-        // Request keyframe from agent — triggers DXGI capture reset so the
-        // agent produces a frame even on a static desktop.
-        let _ = ipc.request_keyframe();
+        // A cached prewarm keyframe is already a complete decoder bootstrap.
+        // Only request another one when we actually have to wait; otherwise a
+        // static desktop enters an unnecessary keyframe-retry loop.
+        if prewarmed_startup_frame.is_none() {
+            let _ = ipc.request_keyframe();
+        }
 
         // Wait for a decodable startup keyframe from the agent. Starting a web
         // session from a delta frame leaves the browser black until another
@@ -645,7 +655,6 @@ fn create_service_session(
             fallback_keyframe.as_ref().map(|ef| (ef.width, ef.height));
         let mut fallback_since: Option<Instant> =
             fallback_keyframe.as_ref().map(|_| Instant::now());
-        let mut suspicious_keyframe_since: Option<Instant> = None;
         let mut stale_frame_logs = 0u32;
         let startup_frame = if let Some(ef) = prewarmed_startup_frame {
             svc_log(&format!(
@@ -687,35 +696,6 @@ fn create_service_session(
                         ));
                         }
                         continue;
-                    }
-                    if is_suspicious_transition_keyframe(&ef) {
-                        stale_frame_logs += 1;
-                        let suspicious_since =
-                            suspicious_keyframe_since.get_or_insert_with(Instant::now);
-                        if suspicious_since.elapsed() < Duration::from_millis(750) {
-                            if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
-                                svc_log(&format!(
-                                    "Skipping suspicious startup keyframe {}x{} {} bytes (count={})",
-                                    ef.width,
-                                    ef.height,
-                                    ef.encoded.data.len(),
-                                    stale_frame_logs
-                                ));
-                            }
-                            fallback_frame_size = Some((ef.width, ef.height));
-                            fallback_since.get_or_insert_with(Instant::now);
-                            let _ = ipc.request_keyframe();
-                            continue;
-                        }
-                        if stale_frame_logs <= 5 || stale_frame_logs.is_multiple_of(30) {
-                            svc_log(&format!(
-                                "Accepting suspicious startup keyframe after transition wait {}x{} {} bytes (count={})",
-                                ef.width,
-                                ef.height,
-                                ef.encoded.data.len(),
-                                stale_frame_logs
-                            ));
-                        }
                     }
                     svc_log(&format!(
                         "Got startup keyframe: {}x{} {} bytes",
@@ -840,17 +820,7 @@ fn create_service_session(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_tier1_fixed_resolution_enabled() -> bool {
-    !matches!(
-        std::env::var("PHANTOM_WINDOWS_TIER1_ADAPTIVE")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
-}
-
-#[cfg(target_os = "windows")]
-type ViewerAttachKey = (u32, Option<AgentDesktopKind>);
+type ViewerAttachKey = (u32, Option<AgentDesktopKind>, u64);
 
 #[cfg(target_os = "windows")]
 struct IpcViewerActiveGuard<'a> {
@@ -873,12 +843,15 @@ impl Drop for IpcViewerActiveGuard<'_> {
 }
 
 #[cfg(target_os = "windows")]
+type SharedOptional<T> = Arc<Mutex<Option<T>>>;
+
+#[cfg(target_os = "windows")]
 #[derive(Clone, Default)]
 struct DynamicAgentControls {
-    input_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<phantom_core::input::InputEvent>>>>,
-    resolution_arc: Arc<Mutex<Option<Arc<Mutex<Option<(u32, u32)>>>>>>,
-    paste_arc: Arc<Mutex<Option<Arc<Mutex<Option<String>>>>>>,
-    desired_resolution: Arc<Mutex<Option<(u32, u32)>>>,
+    input_tx: SharedOptional<std::sync::mpsc::Sender<phantom_core::input::InputEvent>>,
+    resolution_arc: SharedOptional<SharedOptional<(u32, u32)>>,
+    paste_arc: SharedOptional<SharedOptional<String>>,
+    desired_resolution: SharedOptional<(u32, u32)>,
 }
 
 #[cfg(target_os = "windows")]
@@ -972,6 +945,7 @@ fn attach_viewer_to_current_ipc(
     let key = (
         session_mgr.current_session_id,
         session_mgr.current_desktop_kind,
+        session_mgr.current_generation,
     );
     if attached_to.as_ref() == Some(&key) {
         return;
@@ -990,6 +964,7 @@ fn release_viewer_from_current_ipc(
     let key = (
         session_mgr.current_session_id,
         session_mgr.current_desktop_kind,
+        session_mgr.current_generation,
     );
     if attached_to.as_ref() == Some(&key) {
         if let Some(ipc) = session_mgr.ipc() {
@@ -1012,14 +987,15 @@ fn service_ipc_refresh_needed(session_mgr: &SessionManager, session_changed: &At
     let desktop_drift = is_valid_console_session_id(active_session)
         && session_mgr.current_session_id == active_session
         && session_mgr.current_desktop_kind != active_desktop_kind;
+    let handoff_pending = session_mgr.handoff_pending_for(active_session, active_desktop_kind);
 
-    if session_drift {
+    if session_drift && !handoff_pending {
         svc_log(&format!(
             "Relay session drift: active={active_session} current={}",
             session_mgr.current_session_id
         ));
     }
-    if desktop_drift {
+    if desktop_drift && !handoff_pending {
         svc_log(&format!(
             "Relay desktop drift: active={active_desktop_kind:?} current={:?}",
             session_mgr.current_desktop_kind
@@ -1056,15 +1032,13 @@ fn run_dynamic_ipc_relay(
     }
     runner.send_video_frame(startup_frame.encoded, None)?;
 
-    let mut wait_for_live_keyframe = true;
-    let mut skipped_suspicious_transition_keyframe = false;
+    // `startup_frame` came from the currently attached agent and was just sent
+    // successfully. A new fence is only required after the agent/desktop
+    // changes below, not at initial relay entry.
+    let mut wait_for_live_keyframe = false;
     let mut last_keyframe_nudge = Instant::now() - Duration::from_secs(1);
     let mut last_agent_refresh = Instant::now() - Duration::from_secs(1);
     let mut last_no_ipc_log = Instant::now() - Duration::from_secs(5);
-
-    if let Some(ipc) = session_mgr.ipc() {
-        let _ = ipc.request_keyframe();
-    }
 
     loop {
         runner.check_cancelled()?;
@@ -1075,16 +1049,28 @@ fn run_dynamic_ipc_relay(
             && service_ipc_refresh_needed(session_mgr, &session_changed)
         {
             last_agent_refresh = Instant::now();
-            svc_log("Relay: refreshing Windows agent/IPC without dropping viewer");
-            release_viewer_from_current_ipc(session_mgr, viewer_attached_to);
+            let previous_key = (
+                session_mgr.current_session_id,
+                session_mgr.current_desktop_kind,
+                session_mgr.current_generation,
+            );
             session_mgr.update();
-            sync_controls_to_current_ipc(session_mgr, &controls);
-            attach_viewer_to_current_ipc(session_mgr, viewer_attached_to);
-            wait_for_live_keyframe = true;
-            skipped_suspicious_transition_keyframe = false;
-            last_keyframe_nudge = Instant::now() - Duration::from_secs(1);
-            if let Some(ipc) = session_mgr.ipc() {
-                let _ = ipc.request_keyframe();
+            let current_key = (
+                session_mgr.current_session_id,
+                session_mgr.current_desktop_kind,
+                session_mgr.current_generation,
+            );
+            if current_key != previous_key {
+                svc_log(&format!(
+                    "Relay: switching committed Windows agent {previous_key:?} -> {current_key:?}"
+                ));
+                sync_controls_to_current_ipc(session_mgr, &controls);
+                attach_viewer_to_current_ipc(session_mgr, viewer_attached_to);
+                wait_for_live_keyframe = true;
+                last_keyframe_nudge = Instant::now() - Duration::from_secs(1);
+                if let Some(ipc) = session_mgr.ipc() {
+                    let _ = ipc.request_keyframe();
+                }
             }
         }
 
@@ -1103,19 +1089,6 @@ fn run_dynamic_ipc_relay(
             for ipc_frame in ipc.recv_encoded_frames() {
                 if wait_for_live_keyframe {
                     if ipc_frame.encoded.is_keyframe {
-                        if !skipped_suspicious_transition_keyframe
-                            && is_suspicious_transition_keyframe(&ipc_frame)
-                        {
-                            skipped_suspicious_transition_keyframe = true;
-                            svc_log(&format!(
-                                "Relay: skipped suspicious tiny transition keyframe {}x{} {} bytes",
-                                ipc_frame.width,
-                                ipc_frame.height,
-                                ipc_frame.encoded.data.len()
-                            ));
-                            let _ = ipc.request_keyframe();
-                            continue;
-                        }
                         wait_for_live_keyframe = false;
                         svc_log(&format!(
                             "Relay: forwarding first live keyframe {}x{} after agent refresh",
@@ -1166,13 +1139,6 @@ fn run_dynamic_ipc_relay(
     }
 }
 
-#[cfg(target_os = "windows")]
-fn is_suspicious_transition_keyframe(frame: &crate::ipc_pipe::IpcEncodedFrame) -> bool {
-    let pixels = (frame.width as usize).saturating_mul(frame.height as usize);
-    let min_expected_bytes = (pixels / 250).clamp(4096, 32 * 1024);
-    frame.encoded.data.len() < min_expected_bytes
-}
-
 // ── Process Handle Wrapper ──────────────────────────────────────────────────
 
 /// Wrapper around a raw Win32 process handle from CreateProcessAsUser.
@@ -1184,6 +1150,11 @@ struct WinProcessHandle {
     handle: windows::Win32::Foundation::HANDLE,
     pid: u32,
 }
+
+// The process handle is exclusively owned by this wrapper and is only moved to
+// the retirement/preparation worker; no thread accesses it concurrently.
+#[cfg(target_os = "windows")]
+unsafe impl Send for WinProcessHandle {}
 
 #[cfg(target_os = "windows")]
 impl WinProcessHandle {
@@ -1308,6 +1279,31 @@ struct DesktopKindObservation {
 #[cfg(target_os = "windows")]
 static DESKTOP_DETECT_DEBOUNCE: OnceLock<Mutex<DesktopDetectDebounce>> = OnceLock::new();
 
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+struct ConsoleSessionFallbackLog {
+    last_session_id: Option<u32>,
+    last_log_at: Option<Instant>,
+}
+
+#[cfg(target_os = "windows")]
+static CONSOLE_SESSION_FALLBACK_LOG: OnceLock<Mutex<ConsoleSessionFallbackLog>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+struct PreparedAgent {
+    process: WinProcessHandle,
+    ipc: crate::ipc_pipe::IpcServer,
+}
+
+#[cfg(target_os = "windows")]
+struct PendingAgent {
+    session_id: u32,
+    desktop_kind: AgentDesktopKind,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    result_rx: std::sync::mpsc::Receiver<Result<PreparedAgent, String>>,
+}
+
 /// Monitors Windows user sessions and manages the agent process lifecycle.
 /// When a user logs in, it launches a phantom agent in their session
 /// and establishes an IPC pipe for frame/input proxying.
@@ -1318,6 +1314,14 @@ struct SessionManager {
     current_session_id: u32,
     #[cfg(target_os = "windows")]
     current_desktop_kind: Option<AgentDesktopKind>,
+    #[cfg(target_os = "windows")]
+    current_generation: u64,
+    #[cfg(target_os = "windows")]
+    next_generation: u64,
+    #[cfg(target_os = "windows")]
+    candidate_retry: crate::windows_session_policy::CandidateRetryBackoff<(u32, AgentDesktopKind)>,
+    #[cfg(target_os = "windows")]
+    pending_agent: Option<PendingAgent>,
     #[cfg(target_os = "windows")]
     ipc: Option<crate::ipc_pipe::IpcServer>,
 }
@@ -1331,6 +1335,14 @@ impl SessionManager {
             current_session_id: 0,
             #[cfg(target_os = "windows")]
             current_desktop_kind: None,
+            #[cfg(target_os = "windows")]
+            current_generation: 0,
+            #[cfg(target_os = "windows")]
+            next_generation: 1,
+            #[cfg(target_os = "windows")]
+            candidate_retry: Default::default(),
+            #[cfg(target_os = "windows")]
+            pending_agent: None,
             #[cfg(target_os = "windows")]
             ipc: None,
         }
@@ -1346,21 +1358,14 @@ impl SessionManager {
     fn update(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            let mut session_id = get_active_console_session_id();
+            let session_id = get_active_console_session_id();
             let desired_desktop_kind = if is_valid_console_session_id(session_id) {
                 Some(detect_agent_desktop_kind(session_id))
             } else {
                 None
             };
-            svc_log(&format!(
-                "update: current={}/{:?} detected={}/{:?} agent={} ipc={}",
-                self.current_session_id,
-                self.current_desktop_kind,
-                session_id,
-                desired_desktop_kind,
-                self.agent.is_some(),
-                self.ipc.is_some()
-            ));
+            self.poll_pending_agent(session_id, desired_desktop_kind);
+            self.cancel_stale_pending_agent(session_id, desired_desktop_kind);
 
             // Check IPC health — if IO threads died, clean up so we relaunch.
             let ipc_alive = self.ipc.as_ref().is_some_and(|ipc| ipc.is_connected());
@@ -1379,26 +1384,34 @@ impl SessionManager {
                 return; // Session unchanged and agent is healthy — nothing to do
             }
 
-            // No valid session yet (boot race: winlogon hasn't created Session 1)
+            // No valid session yet (boot/login transition). Keep the committed
+            // agent and last frame alive. A transient invalid console ID must
+            // not tear down the viewer or force a capture from another session.
             if !is_valid_console_session_id(session_id) {
-                if self.agent.is_some() || self.ipc.is_some() {
-                    svc_log(&format!(
-                        "No valid console session ({session_id}); killing current agent"
-                    ));
-                    self.kill_agent();
-                }
-                self.current_session_id = session_id;
-                self.current_desktop_kind = None;
+                svc_log(&format!(
+                    "No valid console session ({session_id}); retaining committed agent while waiting"
+                ));
                 return;
             }
 
-            let mut desired_desktop_kind =
+            let desired_desktop_kind =
                 desired_desktop_kind.expect("valid session has desktop kind");
 
-            // Session or desktop changed — kill old agent before launching new one.
-            if session_id != self.current_session_id
-                || self.current_desktop_kind != Some(desired_desktop_kind)
-            {
+            let target_changed = session_id != self.current_session_id
+                || self.current_desktop_kind != Some(desired_desktop_kind);
+            if !target_changed && self.agent.is_some() && ipc_alive {
+                return;
+            }
+
+            if self.pending_agent.is_some() {
+                return;
+            }
+            let target = (session_id, desired_desktop_kind);
+            self.candidate_retry.reset_if_target_changed(target);
+            if !self.candidate_retry.can_attempt(target, Instant::now()) {
+                return;
+            }
+            if target_changed {
                 svc_log(&format!(
                     "Session/desktop changed: {}/{:?} -> {}/{:?}",
                     self.current_session_id,
@@ -1406,105 +1419,163 @@ impl SessionManager {
                     session_id,
                     desired_desktop_kind
                 ));
-                self.current_session_id = session_id;
-                self.current_desktop_kind = Some(desired_desktop_kind);
-                self.kill_agent();
+            }
+            let generation = self.next_generation;
+            self.next_generation = self.next_generation.saturating_add(1);
 
-                // Stopping the old agent can take several seconds. During
-                // Windows login/logout transitions the visible desktop often
-                // changes again in that window (Winlogon spinner -> Default,
-                // or Default -> Winlogon). Re-read the target before creating
-                // the new process so we never launch an agent for a stale
-                // desktop decision.
-                let refreshed_session_id = get_active_console_session_id();
-                if !is_valid_console_session_id(refreshed_session_id) {
-                    svc_log(&format!(
-                        "Console session became invalid ({refreshed_session_id}) while stopping agent; deferring relaunch"
-                    ));
-                    self.current_session_id = refreshed_session_id;
-                    self.current_desktop_kind = None;
-                    return;
+            svc_log(&format!(
+                "Preparing agent generation {generation} for session {session_id}/{desired_desktop_kind:?}; committed generation {} remains active",
+                self.current_generation
+            ));
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            let candidate_cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&candidate_cancel);
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("agent-prepare-{generation}"))
+                .spawn(move || {
+                    let result = prepare_agent_generation(
+                        session_id,
+                        desired_desktop_kind,
+                        generation,
+                        &worker_cancel,
+                    );
+                    if let Err(error) = result_tx.send(result) {
+                        if let Ok(prepared) = error.0 {
+                            stop_agent_resources(
+                                Some(prepared.process),
+                                Some(prepared.ipc),
+                                generation,
+                            );
+                        }
+                    }
+                });
+            match spawn_result {
+                Ok(_) => {
+                    self.pending_agent = Some(PendingAgent {
+                        session_id,
+                        desktop_kind: desired_desktop_kind,
+                        generation,
+                        cancel: candidate_cancel,
+                        result_rx,
+                    });
                 }
-                let refreshed_desktop_kind = detect_agent_desktop_kind(refreshed_session_id);
-                if refreshed_session_id != session_id
-                    || refreshed_desktop_kind != desired_desktop_kind
-                {
+                Err(e) => {
+                    let retry_in = self.candidate_retry.record_failure(target, Instant::now());
                     svc_log(&format!(
-                        "Retargeting agent launch after stop: {session_id}/{desired_desktop_kind:?} -> {refreshed_session_id}/{refreshed_desktop_kind:?}"
+                        "Failed to start candidate generation {generation} worker: {e}; retrying in {}ms",
+                        retry_in.as_millis()
                     ));
-                    session_id = refreshed_session_id;
-                    desired_desktop_kind = refreshed_desktop_kind;
-                    self.current_session_id = session_id;
-                    self.current_desktop_kind = Some(desired_desktop_kind);
                 }
             }
+        }
+    }
 
-            // Already have a working agent — nothing to do
-            if self.agent.is_some() && ipc_alive {
+    #[cfg(target_os = "windows")]
+    fn handoff_pending_for(&self, session_id: u32, desktop_kind: Option<AgentDesktopKind>) -> bool {
+        self.pending_agent.as_ref().is_some_and(|pending| {
+            pending.session_id == session_id && Some(pending.desktop_kind) == desktop_kind
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cancel_stale_pending_agent(
+        &mut self,
+        desired_session_id: u32,
+        desired_desktop_kind: Option<AgentDesktopKind>,
+    ) {
+        let stale = self.pending_agent.as_ref().is_some_and(|pending| {
+            pending.session_id != desired_session_id
+                || Some(pending.desktop_kind) != desired_desktop_kind
+        });
+        if !stale {
+            return;
+        }
+
+        let pending = self
+            .pending_agent
+            .take()
+            .expect("stale pending agent exists");
+        pending.cancel.store(true, Ordering::SeqCst);
+        svc_log(&format!(
+            "Cancelling stale candidate generation {} for {}/{:?}; detected target is {desired_session_id}/{desired_desktop_kind:?}",
+            pending.generation, pending.session_id, pending.desktop_kind
+        ));
+        // A target change should not inherit failed launch history.
+        self.candidate_retry.reset();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_pending_agent(
+        &mut self,
+        desired_session_id: u32,
+        desired_desktop_kind: Option<AgentDesktopKind>,
+    ) {
+        let result = match self.pending_agent.as_ref() {
+            Some(pending) => pending.result_rx.try_recv(),
+            None => return,
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let pending = self.pending_agent.take().expect("pending agent exists");
+                svc_log(&format!(
+                    "Candidate generation {} worker exited without a result",
+                    pending.generation
+                ));
+                let retry_in = self
+                    .candidate_retry
+                    .record_failure((pending.session_id, pending.desktop_kind), Instant::now());
+                svc_log(&format!(
+                    "Candidate generation {} will retry in {}ms",
+                    pending.generation,
+                    retry_in.as_millis()
+                ));
                 return;
             }
+        };
+        let pending = self.pending_agent.take().expect("pending agent exists");
 
-            // Need to launch agent (first time, or after crash/session change)
-            if self.agent.is_some() {
-                // Agent exists but IPC is broken — kill and relaunch
-                svc_log("Agent exists but IPC disconnected, relaunching");
-                self.kill_agent();
-            }
-            kill_lingering_agents_for_other_sessions(session_id);
-
+        match result {
+            Ok(prepared)
+                if desired_session_id == pending.session_id
+                    && desired_desktop_kind == Some(pending.desktop_kind) =>
             {
-                svc_log(&format!("Creating IPC pipe for session {session_id}"));
-                match crate::ipc_pipe::IpcServer::new(session_id) {
-                    Ok(mut ipc_server) => {
-                        svc_log(&format!(
-                            "IPC pipe created, launching {desired_desktop_kind:?} agent"
-                        ));
-                        match launch_agent_in_session(session_id, desired_desktop_kind) {
-                            Ok(proc) => {
-                                svc_log(&format!("Agent launched PID={}", proc.pid));
-                                self.agent = Some(proc);
-
-                                // Wait for agent to connect to the IPC pipe (up to 10s)
-                                svc_log("Waiting for agent IPC connection (10s timeout)...");
-                                match ipc_server.wait_for_connection(Duration::from_secs(10)) {
-                                    Ok(true) => {
-                                        svc_log("IPC: agent connected!");
-                                        self.ipc = Some(ipc_server);
-                                    }
-                                    Ok(false) => {
-                                        svc_log("IPC: agent did not connect within timeout");
-                                        ipc_server.disconnect();
-                                    }
-                                    Err(e) => {
-                                        svc_log(&format!("IPC: connection error: {e}"));
-                                        ipc_server.disconnect();
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(session_id, "Failed to launch agent: {e}");
-                                ipc_server.disconnect();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create IPC pipe: {e}");
-                        // Still try to launch agent (it will fail to connect but that's OK)
-                        match launch_agent_in_session(session_id, desired_desktop_kind) {
-                            Ok(proc) => {
-                                tracing::info!(
-                                    session_id,
-                                    pid = proc.pid,
-                                    "Launched agent (no IPC)"
-                                );
-                                self.agent = Some(proc);
-                            }
-                            Err(e) => {
-                                tracing::error!(session_id, "Failed to launch agent: {e}");
-                            }
-                        }
-                    }
-                }
+                self.candidate_retry.reset();
+                let old_agent = self.agent.replace(prepared.process);
+                let old_ipc = self.ipc.replace(prepared.ipc);
+                let old_generation = self.current_generation;
+                self.current_session_id = pending.session_id;
+                self.current_desktop_kind = Some(pending.desktop_kind);
+                self.current_generation = pending.generation;
+                svc_log(&format!(
+                    "Committed agent generation {} for session {}/{:?}; retiring generation {old_generation}",
+                    pending.generation, pending.session_id, pending.desktop_kind
+                ));
+                retire_agent_async(old_agent, old_ipc, old_generation);
+            }
+            Ok(prepared) => {
+                self.candidate_retry.reset();
+                svc_log(&format!(
+                    "Candidate generation {} became stale before commit; detected target is {desired_session_id}/{desired_desktop_kind:?}",
+                    pending.generation
+                ));
+                retire_agent_async(
+                    Some(prepared.process),
+                    Some(prepared.ipc),
+                    pending.generation,
+                );
+            }
+            Err(error) => {
+                let retry_in = self
+                    .candidate_retry
+                    .record_failure((pending.session_id, pending.desktop_kind), Instant::now());
+                svc_log(&format!(
+                    "Candidate generation {} failed: {error}; keeping generation {}; retrying in {}ms",
+                    pending.generation,
+                    self.current_generation,
+                    retry_in.as_millis()
+                ));
             }
         }
     }
@@ -1536,30 +1607,12 @@ impl SessionManager {
     fn kill_agent(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            // Disconnect IPC first (sends shutdown to agent)
-            if let Some(ref mut ipc) = self.ipc {
-                ipc.disconnect();
+            // The preparation worker retires its candidate when this receiver
+            // disappears, so service shutdown cannot leave an orphan agent.
+            if let Some(pending) = self.pending_agent.take() {
+                pending.cancel.store(true, Ordering::SeqCst);
             }
-            self.ipc = None;
-
-            if let Some(agent) = self.agent.take() {
-                tracing::info!(pid = agent.pid, "Stopping agent");
-                if agent.wait(Duration::from_secs(3)) {
-                    svc_log(&format!(
-                        "Agent PID={} exited after IPC shutdown",
-                        agent.pid
-                    ));
-                } else {
-                    svc_log(&format!(
-                        "Agent PID={} did not exit after IPC shutdown; terminating",
-                        agent.pid
-                    ));
-                    if !agent.terminate_and_wait(Duration::from_secs(3)) {
-                        force_kill_process(agent.pid);
-                    }
-                }
-                // Handle is closed on drop.
-            }
+            stop_agent_resources(self.agent.take(), self.ipc.take(), self.current_generation);
         }
     }
 
@@ -1567,6 +1620,143 @@ impl SessionManager {
     #[cfg(target_os = "windows")]
     fn ipc(&self) -> Option<&crate::ipc_pipe::IpcServer> {
         self.ipc.as_ref().filter(|ipc| ipc.is_connected())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn retire_agent_async(
+    agent: Option<WinProcessHandle>,
+    ipc: Option<crate::ipc_pipe::IpcServer>,
+    generation: u64,
+) {
+    if agent.is_none() && ipc.is_none() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name(format!("agent-retire-{generation}"))
+        .spawn(move || stop_agent_resources(agent, ipc, generation));
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_agent_generation(
+    session_id: u32,
+    desktop_kind: AgentDesktopKind,
+    generation: u64,
+    cancel: &AtomicBool,
+) -> Result<PreparedAgent, String> {
+    let mut ipc = crate::ipc_pipe::IpcServer::new(session_id, generation)
+        .map_err(|e| format!("create IPC: {e:#}"))?;
+    svc_log(&format!(
+        "IPC generation {generation} created, launching {desktop_kind:?} agent"
+    ));
+    let process = match launch_agent_in_session(session_id, desktop_kind, generation) {
+        Ok(process) => process,
+        Err(error) => {
+            ipc.disconnect();
+            return Err(format!("launch agent: {error:#}"));
+        }
+    };
+    svc_log(&format!(
+        "Candidate agent generation {generation} launched PID={}",
+        process.pid
+    ));
+
+    let connect_deadline = Instant::now() + Duration::from_secs(10);
+    let connected = loop {
+        if cancel.load(Ordering::Relaxed) {
+            stop_agent_resources(Some(process), Some(ipc), generation);
+            return Err("candidate cancelled while waiting for IPC".to_string());
+        }
+        if let Some(exit_code) = process.try_wait() {
+            ipc.disconnect();
+            return Err(format!(
+                "candidate process exited before IPC connection with code {exit_code}"
+            ));
+        }
+        let Some(remaining) = connect_deadline.checked_duration_since(Instant::now()) else {
+            break false;
+        };
+        let wait_slice = remaining.min(Duration::from_millis(500));
+        match ipc.wait_for_connection(wait_slice) {
+            Ok(true) => break true,
+            Ok(false) => continue,
+            Err(error) => {
+                stop_agent_resources(Some(process), Some(ipc), generation);
+                return Err(format!("IPC connection: {error:#}"));
+            }
+        }
+    };
+    if !connected {
+        stop_agent_resources(Some(process), Some(ipc), generation);
+        return Err("IPC connection timed out".to_string());
+    }
+
+    // A connected pipe only proves process startup. Temporarily activate
+    // capture and require a non-empty keyframe before this generation can own
+    // the viewer. This also initializes Winlogon/GDI agents, which stay idle
+    // when no real viewer is attached.
+    ipc.set_viewer_active(true);
+    let _ = ipc.request_keyframe();
+    let capture_deadline = Instant::now() + Duration::from_secs(8);
+    let ready = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break None;
+        }
+        if let Some(frame) = ipc.last_keyframe() {
+            if !frame.encoded.data.is_empty() {
+                break Some(frame);
+            }
+        }
+        if Instant::now() >= capture_deadline || !ipc.is_connected() {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    ipc.set_viewer_active(false);
+    let Some(ready) = ready else {
+        stop_agent_resources(Some(process), Some(ipc), generation);
+        return Err(if cancel.load(Ordering::Relaxed) {
+            "candidate cancelled while waiting for capture".to_string()
+        } else {
+            "capture produced no keyframe within 8s".to_string()
+        });
+    };
+    svc_log(&format!(
+        "Candidate generation {generation} capture ready: {}x{} bytes={}",
+        ready.width,
+        ready.height,
+        ready.encoded.data.len()
+    ));
+    Ok(PreparedAgent { process, ipc })
+}
+
+#[cfg(target_os = "windows")]
+fn stop_agent_resources(
+    agent: Option<WinProcessHandle>,
+    mut ipc: Option<crate::ipc_pipe::IpcServer>,
+    generation: u64,
+) {
+    if let Some(ref mut ipc) = ipc {
+        ipc.disconnect();
+    }
+    drop(ipc);
+
+    if let Some(agent) = agent {
+        tracing::info!(pid = agent.pid, generation, "Stopping agent");
+        if agent.wait(Duration::from_secs(3)) {
+            svc_log(&format!(
+                "Agent generation {generation} PID={} exited after IPC shutdown",
+                agent.pid
+            ));
+        } else {
+            svc_log(&format!(
+                "Agent generation {generation} PID={} did not exit after IPC shutdown; terminating",
+                agent.pid
+            ));
+            if !agent.terminate_and_wait(Duration::from_secs(3)) {
+                force_kill_process(agent.pid);
+            }
+        }
     }
 }
 
@@ -1578,12 +1768,92 @@ fn get_active_console_session_id() -> u32 {
     extern "system" {
         fn WTSGetActiveConsoleSessionId() -> u32;
     }
-    unsafe { WTSGetActiveConsoleSessionId() }
+
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    if is_valid_console_session_id(session_id) {
+        return session_id;
+    }
+
+    if let Some((fallback_session_id, fallback_name)) = enumerate_active_wts_console_session() {
+        log_console_session_fallback(session_id, fallback_session_id, &fallback_name);
+        return fallback_session_id;
+    }
+
+    session_id
 }
 
 #[cfg(target_os = "windows")]
 fn is_valid_console_session_id(session_id: u32) -> bool {
     session_id != 0 && session_id != 0xFFFFFFFF
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_active_wts_console_session() -> Option<(u32, String)> {
+    use windows::Win32::System::RemoteDesktop::{
+        WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTS_CURRENT_SERVER_HANDLE,
+        WTS_SESSION_INFOW,
+    };
+
+    unsafe {
+        let mut sessions: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+        let mut count = 0u32;
+        if WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)
+            .is_err()
+        {
+            return None;
+        }
+
+        let session_slice = std::slice::from_raw_parts(sessions, count as usize);
+        let mut console_active: Option<(u32, String)> = None;
+
+        for session in session_slice {
+            if session.State != WTSActive || !is_valid_console_session_id(session.SessionId) {
+                continue;
+            }
+
+            let station_name = if session.pWinStationName.is_null() {
+                String::new()
+            } else {
+                session.pWinStationName.to_string().unwrap_or_default()
+            };
+
+            let candidate = (session.SessionId, station_name.clone());
+            if station_name.eq_ignore_ascii_case("console") {
+                console_active = Some(candidate);
+                break;
+            }
+        }
+
+        if !sessions.is_null() {
+            WTSFreeMemory(sessions as *mut std::ffi::c_void);
+        }
+
+        console_active
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn log_console_session_fallback(
+    raw_session_id: u32,
+    fallback_session_id: u32,
+    fallback_name: &str,
+) {
+    let state = CONSOLE_SESSION_FALLBACK_LOG
+        .get_or_init(|| Mutex::new(ConsoleSessionFallbackLog::default()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let should_log = state.last_session_id != Some(fallback_session_id)
+        || state
+            .last_log_at
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10));
+
+    if should_log {
+        svc_log(&format!(
+            "WTSGetActiveConsoleSessionId returned {raw_session_id}; using WTS Console session {fallback_session_id} ({fallback_name})"
+        ));
+        state.last_session_id = Some(fallback_session_id);
+        state.last_log_at = Some(now);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1800,6 +2070,7 @@ fn get_session_username(session_id: u32) -> Option<String> {
 fn launch_agent_in_session(
     session_id: u32,
     desktop_kind: AgentDesktopKind,
+    generation: u64,
 ) -> anyhow::Result<WinProcessHandle> {
     use anyhow::Context;
     use std::mem;
@@ -1812,10 +2083,16 @@ fn launch_agent_in_session(
 
     unsafe {
         let exe_path = std::env::current_exe().context("get current exe")?;
+        let desktop_arg = match desktop_kind {
+            AgentDesktopKind::Default => "default",
+            AgentDesktopKind::Winlogon => "winlogon",
+        };
         let cmd_line = format!(
-            "\"{}\" --agent-mode --ipc-session {} --listen 127.0.0.1:9910 --no-encrypt",
+            "\"{}\" --agent-mode --ipc-session {} --ipc-generation {} --ipc-desktop {} --listen 127.0.0.1:9910 --no-encrypt",
             exe_path.display(),
             session_id,
+            generation,
+            desktop_arg,
         );
 
         if desktop_kind == AgentDesktopKind::Default {
@@ -2044,58 +2321,6 @@ fn force_kill_process(pid: u32) {
 }
 
 #[cfg(target_os = "windows")]
-fn kill_lingering_agents_for_other_sessions(target_session_id: u32) {
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-
-    let current_pid = std::process::id();
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return;
-        };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return;
-        }
-
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
-        while ok {
-            let end = entry
-                .szExeFile
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
-            if exe.eq_ignore_ascii_case("phantom-server.exe")
-                && entry.th32ProcessID != current_pid
-                && entry.th32ParentProcessID == current_pid
-            {
-                let mut proc_session = 0u32;
-                if ProcessIdToSessionId(entry.th32ProcessID, &mut proc_session).is_ok()
-                    && proc_session != 0
-                    && proc_session != target_session_id
-                {
-                    svc_log(&format!(
-                        "Killing lingering phantom agent PID={} session={} before launching session {}",
-                        entry.th32ProcessID, proc_session, target_session_id
-                    ));
-                    force_kill_process(entry.th32ProcessID);
-                }
-            }
-            ok = Process32NextW(snapshot, &mut entry).is_ok();
-        }
-        let _ = CloseHandle(snapshot);
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn create_agent_process_with_token(
     token: windows::Win32::Foundation::HANDLE,
     cmd_line: &str,
@@ -2262,7 +2487,7 @@ fn disable_basic_display_adapter() {
 
 /// Generate vdd_settings.xml content with desired resolution and GPU.
 fn vdd_settings_xml() -> String {
-    r#"<?xml version='1.0' encoding='utf-8'?>
+    let mut xml = r#"<?xml version='1.0' encoding='utf-8'?>
 <vdd_settings>
     <monitors>
         <count>1</count>
@@ -2274,21 +2499,18 @@ fn vdd_settings_xml() -> String {
         <g_refresh_rate>60</g_refresh_rate>
     </global>
     <resolutions>
-        <resolution><width>640</width><height>480</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>800</width><height>600</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1024</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1152</width><height>864</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1280</width><height>720</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1280</width><height>800</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1280</width><height>960</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1280</width><height>1024</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1366</width><height>768</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1440</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1600</width><height>900</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1600</width><height>1200</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1680</width><height>1050</height><refresh_rate>60</refresh_rate></resolution>
-        <resolution><width>1920</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>
-    </resolutions>
+"#
+    .to_string();
+
+    for mode in phantom_core::display_modes::VDD_MODE_BANK {
+        xml.push_str(&format!(
+            "        <resolution><width>{}</width><height>{}</height><refresh_rate>60</refresh_rate></resolution>\n",
+            mode.width, mode.height
+        ));
+    }
+
+    xml.push_str(
+        r#"    </resolutions>
     <options>
         <CustomEdid>false</CustomEdid>
         <HardwareCursor>true</HardwareCursor>
@@ -2297,15 +2519,16 @@ fn vdd_settings_xml() -> String {
         <logging>false</logging>
         <debuglogging>false</debuglogging>
     </options>
-</vdd_settings>"#
-        .to_string()
+</vdd_settings>"#,
+    );
+    xml
 }
 
 /// Download a file using PowerShell (no extra Rust deps needed).
 /// Retries up to 3 times with 2s sleep between attempts — first-install on
 /// Win11 has occasionally hit a transient TLS / SAS-redirect blip where an
 /// immediate manual retry of the exact same URL succeeds.
-fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+fn ps_download(url: &str, dest: &std::path::Path, expected_sha256: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     let status = std::process::Command::new("powershell")
         .args([
@@ -2318,6 +2541,11 @@ fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
                  for ($i = 1; $i -le 3; $i++) {{ \
                    try {{ \
                      Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; \
+                     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash.ToLowerInvariant(); \
+                     if ($actual -ne '{}') {{ \
+                       Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue; \
+                       throw ('SHA256 mismatch: expected {}, got ' + $actual) \
+                     }}; \
                      exit 0 \
                    }} catch {{ \
                      Write-Host \"download attempt $i failed: $_\"; \
@@ -2326,7 +2554,11 @@ fn ps_download(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
                  }}; \
                  exit 1",
                 url,
-                dest.display()
+                dest.display(),
+                dest.display(),
+                expected_sha256,
+                dest.display(),
+                expected_sha256
             ),
         ])
         .status()
@@ -2406,7 +2638,7 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     // Download VDD driver
     println!("  Downloading Virtual Display Driver...");
     let vdd_zip = tmp.join("phantom-vdd.zip");
-    ps_download(VDD_DRIVER_URL, &vdd_zip)?;
+    ps_download(VDD_DRIVER_URL, &vdd_zip, VDD_DRIVER_SHA256)?;
     ps_unzip(&vdd_zip, &tmp.join("phantom-vdd"))?;
     let _ = std::fs::remove_file(&vdd_zip);
 
@@ -2429,7 +2661,7 @@ pub fn install_vdd(install_dir: &std::path::Path) -> anyhow::Result<()> {
     // Download nefcon
     println!("  Downloading nefcon (driver installer)...");
     let nefcon_zip = tmp.join("phantom-nefcon.zip");
-    ps_download(NEFCON_URL, &nefcon_zip)?;
+    ps_download(NEFCON_URL, &nefcon_zip, NEFCON_SHA256)?;
     ps_unzip(&nefcon_zip, &tmp.join("phantom-nefcon"))?;
     let _ = std::fs::remove_file(&nefcon_zip);
 
@@ -2789,8 +3021,62 @@ fn reg_add(args: &[&str]) {
 ///
 /// Uses `sc.exe` to create a service that runs as LocalSystem at boot.
 /// The `--service` flag in binPath tells the server to enter SCM dispatcher mode.
-pub fn install_service() -> anyhow::Result<()> {
+pub fn display_provisioning_mode() -> crate::windows_display_policy::WindowsProvisioningMode {
+    use crate::windows_display_policy::WindowsProvisioningMode;
+
+    let marker = std::path::Path::new(MANAGED_DISPLAY_MARKER);
+    let Ok(value) = std::fs::read_to_string(marker) else {
+        return WindowsProvisioningMode::PreserveConsole;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => WindowsProvisioningMode::Auto,
+        // Treat the old prose marker as force-managed for upgrade compatibility.
+        _ => WindowsProvisioningMode::ManagedVdd,
+    }
+}
+
+fn configure_display_provisioning(
+    mode: crate::windows_display_policy::WindowsProvisioningMode,
+) -> anyhow::Result<()> {
+    let marker = std::path::Path::new(MANAGED_DISPLAY_MARKER);
+    if let Some(value) = mode.marker_value() {
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(marker, format!("{value}\n"))?;
+    } else if marker.exists() {
+        std::fs::remove_file(marker)?;
+    }
+    Ok(())
+}
+
+fn dcv_display_manager_installed() -> anyhow::Result<bool> {
     use anyhow::Context;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("check external display manager before installing VDD")?;
+    match manager.open_service("dcvserver", ServiceAccess::QUERY_STATUS) {
+        Ok(_) => Ok(true),
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error()
+                == Some(windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST.0 as i32) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error).context("query DCV service registration"),
+    }
+}
+
+pub fn install_service(
+    display_mode: crate::windows_display_policy::WindowsProvisioningMode,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Registration matters even if DCV is stopped during an upgrade. Resolve
+    // this before making changes, and fail closed on access/query errors.
+    let external_manager_installed = dcv_display_manager_installed()?;
 
     // Copy exe to a fixed install location. This avoids binPath being tied
     // to the build directory — updates just overwrite the fixed path.
@@ -2906,21 +3192,47 @@ pub fn install_service() -> anyhow::Result<()> {
         }
     };
 
-    // Install Virtual Display Driver (for headless GPU servers).
-    // Non-fatal: server works without it, just at lower resolution on headless VMs.
     println!();
-    println!("Installing Virtual Display Driver...");
-    match install_vdd(&install_dir) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("  Warning: VDD install failed: {e}");
-            println!("  The server will still work. Install VDD manually if needed.");
+    if display_mode.installs_vdd(external_manager_installed) {
+        if external_manager_installed {
+            println!("  Warning: managed VDD mode requires exclusive display ownership; DCV is also installed.");
         }
+        println!("Installing Virtual Display Driver...");
+        match install_vdd(&install_dir) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  Warning: VDD install failed: {e}");
+                println!("  The server will still work. Install VDD manually if needed.");
+            }
+        }
+    } else if external_manager_installed {
+        println!("  DCV is installed; leaving its display driver in control and skipping Phantom VDD installation.");
+        if vdd_device_present() {
+            println!("  Existing MTT VDD is retained. Review enabled MTT devices if DCV repeatedly changes layout.");
+        }
+    } else {
+        println!("  Preserving the existing console; skipping VDD installation.");
     }
+
+    configure_display_provisioning(display_mode)?;
+    println!(
+        "  Display policy: {}",
+        match display_mode {
+            crate::windows_display_policy::WindowsProvisioningMode::PreserveConsole => {
+                "existing console topology"
+            }
+            crate::windows_display_policy::WindowsProvisioningMode::Auto => {
+                "automatic (adopt one working display, otherwise provision VDD)"
+            }
+            crate::windows_display_policy::WindowsProvisioningMode::ManagedVdd => {
+                "forced single Phantom VDD (dedicated host)"
+            }
+        }
+    );
 
     // NOTE: do NOT disable Basic Display Adapter — it causes boot failure
     // on reboot. The VDD approach works without disabling other displays.
-    // DXGI targets VDD by device name, so other displays don't interfere.
+    // External display managers retain ownership of their existing drivers.
 
     println!();
     println!("Installed: {SERVICE_DISPLAY_NAME} (Windows Service)");
@@ -3068,6 +3380,9 @@ pub fn uninstall_service() -> anyhow::Result<()> {
     }
 
     uninstall_firewall_rule();
+    configure_display_provisioning(
+        crate::windows_display_policy::WindowsProvisioningMode::PreserveConsole,
+    )?;
 
     // Intentionally *not* removing the Virtual Display Driver here — we
     // want `--uninstall` to be safe to run as part of an upgrade. The

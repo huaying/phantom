@@ -1,6 +1,6 @@
 # Phantom — Feature Reference
 
-Accurate as of v0.5.3. Each entry points at the code that implements it.
+Tracks current `main`. Each entry points at the code that implements it.
 
 ## Transports
 
@@ -66,7 +66,7 @@ have hardware AV1 decoders.
 |---|---|---|
 | OpenH264 CPU | `client/src/decode_h264.rs` | All |
 | dav1d (AV1) | `client/src/decode_av1.rs` | All (feature `av1`) |
-| NVDEC | `gpu/src/nvdec.rs` | Linux + Windows NVIDIA (feature `nvdec`) |
+| NVDEC | `gpu/src/nvdec.rs` | Linux NVIDIA (feature `nvdec`); Windows currently falls back to software decoding |
 | VideoToolbox | `client/src/decode_videotoolbox.rs` | macOS (H.264 only) |
 | WebCodecs | `web/src/lib.rs` | Browser |
 
@@ -185,9 +185,18 @@ Structured fields via `tracing`; stdout + file if `--log-file` set.
                                        production logging
 Windows only:
 --install / --uninstall / --install-vdd
+--display-diagnostics                 print VDD/topology/mode diagnostics
 --agent-mode / --service / --ipc-session
                                        internal use
 ```
+
+Windows Tier 1 DXGI/VDD uses a fixed `1920x1080` managed VDD mode by default for
+login/logout stability. Set `PHANTOM_WINDOWS_TIER1_ADAPTIVE=1` before starting
+the service to allow client viewport resize hints, but the agent only applies
+them when the managed VDD is the sole active display path. On VDD + physical /
+Basic-display topologies, resize hints are denied and the client should scale
+locally so Windows does not leave desktop icons or windows on a non-captured
+hidden display.
 
 ### Client (`phantom-client`)
 

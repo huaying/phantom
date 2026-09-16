@@ -14,7 +14,8 @@
 //!   on an mpsc channel so tests can inject input events.
 //! - Audio capture starts inside SessionRunner::new when the `audio` feature
 //!   is on. It's best-effort (fails silently if no PulseAudio), so tests pass
-//!   on macOS / headless Linux.
+//!   on macOS / headless Linux. Local clipboard polling and input injection
+//!   are disabled so tests do not depend on or modify the host desktop.
 //! - Tests don't assert exact frame counts — the capture/encode loop runs at
 //!   whatever rate the machine allows. We assert lower bounds ("at least one
 //!   VideoFrame was sent") and qualitative shape ("first message is Hello").
@@ -27,7 +28,7 @@ use phantom_core::input::{InputEvent, KeyCode};
 use phantom_core::protocol::Message;
 use phantom_core::tile::TileDiffer;
 use phantom_core::transport::{MessageReceiver, MessageSender};
-use phantom_server::session::{run_session_cpu, SessionConfig};
+use phantom_server::session::{run_session_cpu, InputForwarder, SessionConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -35,10 +36,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Global serial lock for this test file. Rust runs `#[test]` functions on a
-/// thread pool by default; several of the real components SessionRunner::new
-/// constructs (notably `arboard` on macOS, which talks to NSPasteboard) are
-/// not thread-safe and will segfault under concurrent use. Each test
-/// acquires this lock at the top so we effectively run serially.
+/// thread pool by default; SessionRunner::new still starts best-effort audio
+/// capture, so keep tests from competing for the same host audio device.
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -96,6 +95,8 @@ impl FrameCapture for MockCapture {
 
 /// Returns a fake encoded frame on every call. `force_keyframe()` sets a flag
 /// the next encode picks up so we can observe keyframe triggering.
+type SharedCounter = Arc<Mutex<u32>>;
+
 struct MockEncoder {
     bitrate_kbps: Arc<Mutex<u32>>,
     force_kf: Arc<Mutex<bool>>,
@@ -104,12 +105,7 @@ struct MockEncoder {
 }
 
 impl MockEncoder {
-    fn new() -> (
-        Self,
-        Arc<Mutex<u32>>, // bitrate
-        Arc<Mutex<u32>>, // encode_count
-        Arc<Mutex<u32>>, // keyframe_count
-    ) {
+    fn new() -> (Self, SharedCounter, SharedCounter, SharedCounter) {
         let bitrate = Arc::new(Mutex::new(5000u32));
         let encode_count = Arc::new(Mutex::new(0u32));
         let keyframe_count = Arc::new(Mutex::new(0u32));
@@ -210,6 +206,18 @@ impl MessageReceiver for MockReceiver {
     }
 }
 
+/// Record input at the session boundary without invoking the host OS.
+struct MockInputForwarder {
+    events: Arc<Mutex<Vec<InputEvent>>>,
+}
+
+impl InputForwarder for MockInputForwarder {
+    fn forward_input(&self, event: &InputEvent) -> Result<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
 // Message isn't Clone (EncodedFrame etc. may not be). Hand-roll just what we
 // need for assertions: the variants the session loop actually emits.
 fn clone_message(msg: &Message) -> Message {
@@ -269,6 +277,7 @@ struct Harness {
     cancel: Arc<AtomicBool>,
     sent: Arc<Mutex<Vec<Message>>>,
     input_tx: mpsc::Sender<Message>,
+    forwarded_inputs: Arc<Mutex<Vec<InputEvent>>>,
     encode_count: Arc<Mutex<u32>>,
     keyframe_count: Arc<Mutex<u32>>,
     bitrate: Arc<Mutex<u32>>,
@@ -284,6 +293,10 @@ impl Harness {
         let (mut encoder, bitrate, encode_count, keyframe_count) = MockEncoder::new();
         let (sender, sent) = MockSender::new();
         let (receiver, input_tx) = MockReceiver::new();
+        let forwarded_inputs = Arc::new(Mutex::new(Vec::new()));
+        let input_forwarder = MockInputForwarder {
+            events: forwarded_inputs.clone(),
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -298,10 +311,10 @@ impl Harness {
                 send_file: None,
                 video_codec: VideoCodec::H264,
                 is_resume: false,
-                input_forwarder: None,
+                input_forwarder: Some(Box::new(input_forwarder)),
                 audio_ws_rx: None,
                 resolution_change_fn: None,
-                paste_fn: None,
+                paste_fn: Some(Box::new(|_| {})),
             };
             let _ = run_session_cpu(&mut capture, &mut encoder, &mut differ, cfg);
         });
@@ -311,6 +324,7 @@ impl Harness {
                 cancel,
                 sent,
                 input_tx,
+                forwarded_inputs,
                 encode_count,
                 keyframe_count,
                 bitrate,
@@ -472,46 +486,57 @@ fn cancel_ends_session_cleanly() {
 #[test]
 fn input_channel_does_not_block_session() {
     let _lock = test_lock();
-    // Sanity check: spamming input events at the session doesn't deadlock or
-    // crash it. We aren't asserting per-event side effects here (injector is
-    // real, not mocked — the actual inject call is a no-op when there's no
-    // display); just that the session keeps running and producing frames.
+    // Input must reach the forwarder in order while capture keeps advancing.
+    // OS injection is covered by remote smoke, not this control-flow test.
     let (h, fill) = Harness::start(64, 64, 300);
     assert!(
         h.wait_for_ready(Duration::from_secs(3)),
         "session not ready"
     );
-    for _ in 0..20 {
-        let _ = h.input_tx.send(Message::Input(InputEvent::Key {
+    let expected: Vec<_> = (0..20)
+        .map(|i| InputEvent::Key {
             key: KeyCode::A,
-            pressed: true,
-        }));
+            pressed: i % 2 == 0,
+        })
+        .collect();
+    for event in &expected {
+        h.input_tx.send(Message::Input(event.clone())).unwrap();
         {
             let mut f = fill.lock().unwrap();
             *f = f.wrapping_add(1);
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let msgs_before = h.sent().len();
+    let frames_before = count_variants(&h.sent(), |m| matches!(m, Message::VideoFrame { .. }));
     let start = Instant::now();
-    let mut msgs_after = msgs_before;
+    let mut frames_after = frames_before;
     while start.elapsed() < Duration::from_millis(500) {
         {
             let mut f = fill.lock().unwrap();
             *f = f.wrapping_add(1);
         }
         thread::sleep(Duration::from_millis(10));
-        msgs_after = h.sent().len();
-        if msgs_after > msgs_before {
+        frames_after = count_variants(&h.sent(), |m| matches!(m, Message::VideoFrame { .. }));
+        if frames_after > frames_before
+            && h.forwarded_inputs.lock().unwrap().len() == expected.len()
+        {
             break;
         }
     }
+    let forwarded = h.forwarded_inputs.lock().unwrap().clone();
     h.stop();
 
+    assert_eq!(forwarded.len(), expected.len(), "session lost input events");
+    for (i, event) in forwarded.iter().enumerate() {
+        assert!(
+            matches!(event, InputEvent::Key { key: KeyCode::A, pressed } if *pressed == (i % 2 == 0)),
+            "unexpected input event at {i}: {event:?}"
+        );
+    }
     assert!(
-        msgs_after > msgs_before,
-        "session stopped producing messages after input barrage \
-         ({msgs_before} → {msgs_after})"
+        frames_after > frames_before,
+        "session stopped producing video frames after input barrage \
+         ({frames_before} → {frames_after})"
     );
 }
 

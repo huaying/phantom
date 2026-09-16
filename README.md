@@ -121,7 +121,8 @@ the install scripts configure.
 
 ```bash
 docker build -t phantom .
-docker run --rm -p 9900:9900 -e PHANTOM_HOST=127.0.0.1 phantom server-web
+docker run --rm -p 9900:9900 -p 9902:9902/udp \
+  -e PHANTOM_HOST=127.0.0.1 phantom server-web
 # → open https://127.0.0.1:9900
 ```
 

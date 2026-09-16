@@ -1,7 +1,11 @@
 [package]
 name = "phantom-server"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
+
+[[example]]
+name = "transport_smoke"
+required-features = ["webrtc", "web-client", "audio"]
 
 [features]
 default = ["web-client", "audio", "sso", "webrtc"]
@@ -41,7 +45,8 @@ enigo = "0.3"
 arboard = "3"
 openh264 = "0.6"
 phantom-gpu = { path = "../gpu" }
-# Audio: Opus encoding (cross-platform, static link to avoid libopus runtime dep)
+# Audio: request static Opus; pkg-config can still select the system library.
+# The Linux installer also supplies the shared runtime for those builds.
 audiopus = { version = "0.3.0-rc.0", optional = true }
 audiopus_sys = { version = "0.2", optional = true, features = ["static"] }
 ctrlc = "3"
@@ -64,6 +69,7 @@ windows = { version = "0.58", optional = true, features = [
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_IO",

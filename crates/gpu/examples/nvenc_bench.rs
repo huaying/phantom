@@ -1,6 +1,8 @@
 //! GPU-focused tests: NVENC init + encode, NVFBC grab, zero-copy pipeline.
 //! Run: DISPLAY=:0 cargo run --release --example nvenc_bench -p phantom-gpu
 
+#[cfg(target_os = "linux")]
+use phantom_core::capture::FrameCapture;
 use phantom_gpu::cuda::CudaLib;
 #[cfg(target_os = "linux")]
 use phantom_gpu::nvenc::NvencEncoder;
